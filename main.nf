@@ -269,7 +269,7 @@ def htmlReportEnabled           = htmlCfg.htmlReportEnabled
 def htmlReportAutoRefresh       = htmlCfg.htmlReportAutoRefresh
 def htmlReportRefreshSecondsStr = htmlCfg.htmlReportRefreshSecondsStr
 def htmlReportUrlPrefix         = htmlCfg.htmlReportUrlPrefix
-def htmlReportSamplePlotMaxVal  = htmlCfg.htmlReportSamplePlotMaxVal
+def htmlReportSamplePlotMaxStr  = htmlCfg.htmlReportSamplePlotMaxStr
 
 // Avoid "Access to undefined parameter" warnings for optional params.
 if ( !params.containsKey('hostnames') || params.hostnames == null ) {
@@ -6447,10 +6447,9 @@ def validateHtmlReportParams() {
     if (!(htmlReportSamplePlotMaxStr ==~ /[0-9]+/)) {
         exit 1, "Invalid --html_report_sample_plot_max '${params.html_report_sample_plot_max}'. Provide an integer >= 0."
     }
-    def htmlReportSamplePlotMaxVal = htmlReportSamplePlotMaxStr.toInteger()
     return [htmlReportEnabled: htmlReportEnabled, htmlReportAutoRefresh: htmlReportAutoRefresh,
             htmlReportRefreshSecondsStr: htmlReportRefreshSecondsStr, htmlReportUrlPrefix: htmlReportUrlPrefix,
-            htmlReportSamplePlotMaxVal: htmlReportSamplePlotMaxVal]
+            htmlReportSamplePlotMaxStr: htmlReportSamplePlotMaxStr]
 }
 
 def validateOtuRecoveryPruneParams() {
