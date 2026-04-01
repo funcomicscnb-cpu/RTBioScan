@@ -254,98 +254,22 @@ summary['Run Mode'] = runMode
 summary['Run Name'] = custom_runName ?: workflow.runName
 summary['State ID'] = stateId
 
-if ( !params.containsKey('file_wait_minutes') || params.file_wait_minutes == null ) {
-    params.file_wait_minutes = 30
-}
+def timingCfg  = validateTimingLockParams()
+def staleLockTtlMinutesStr      = timingCfg.staleLockTtlMinutesStr
+def roundLockScopeCanonical     = timingCfg.roundLockScopeCanonical
 
-// How long to wait for the per-POD5 "round lock" (0 = wait indefinitely).
-// This lock is used to prevent Nextflow from overlapping rounds when multiple POD5s
-// are available at once, which can otherwise cause later rounds to read stale/partial
-// rolling state files under `${params.outdir}/temp/ongoing/state/<stateId>/_state`.
-if ( !params.containsKey('round_lock_wait_minutes') || params.round_lock_wait_minutes == null ) {
-    params.round_lock_wait_minutes = 360
-}
+def forkCfg    = validateForkParams()
+def maxForksFastVal             = forkCfg.maxForksFastVal
+def maxForksReportingVal        = forkCfg.maxForksReportingVal
+def maxForksConsensusVal        = forkCfg.maxForksConsensusVal
+def maxForksCoreCpuVal          = forkCfg.maxForksCoreCpuVal
 
-// Stale lock reclaim TTL for the per-state "round lock" (minutes).
-// See the lock logic in `fast_on_target_detection`.
-if ( !params.containsKey('stale_lock_ttl_minutes') || params.stale_lock_ttl_minutes == null ) {
-    params.stale_lock_ttl_minutes = 360
-}
-def staleLockTtlMinutesStr = params.stale_lock_ttl_minutes.toString().trim()
-if (!(staleLockTtlMinutesStr ==~ /^\d+$/)) {
-    exit 1, "Invalid --stale_lock_ttl_minutes '${params.stale_lock_ttl_minutes}'. Provide an integer >= 0."
-}
-
-// Used for portable (no `flock`) directory-based locking.
-if ( !params.containsKey('lock_wait_seconds') || params.lock_wait_seconds == null ) {
-    params.lock_wait_seconds = 300
-}
-if ( !params.containsKey('round_lock_scope') || params.round_lock_scope == null ) {
-    params.round_lock_scope = 'full_round'
-}
-def roundLockScopeCanonical = params.round_lock_scope.toString().trim().toLowerCase()
-if (!(roundLockScopeCanonical in ['full_round', 'dorado_only'])) {
-    exit 1, "Invalid --round_lock_scope '${params.round_lock_scope}'. Allowed values: full_round, dorado_only"
-}
-if ( !params.containsKey('maxforks_fast') || params.maxforks_fast == null ) {
-    params.maxforks_fast = 1
-}
-def maxForksFastStr = params.maxforks_fast.toString().trim()
-if (!(maxForksFastStr ==~ /[0-9]+/) || maxForksFastStr.toInteger() < 1) {
-    exit 1, "Invalid --maxforks_fast '${params.maxforks_fast}'. Provide an integer >= 1."
-}
-def maxForksFastVal = maxForksFastStr.toInteger()
-if ( !params.containsKey('maxforks_reporting') || params.maxforks_reporting == null ) {
-    params.maxforks_reporting = 2
-}
-def maxForksReportingStr = params.maxforks_reporting.toString().trim()
-if (!(maxForksReportingStr ==~ /[0-9]+/) || maxForksReportingStr.toInteger() < 1) {
-    exit 1, "Invalid --maxforks_reporting '${params.maxforks_reporting}'. Provide an integer >= 1."
-}
-def maxForksReportingVal = maxForksReportingStr.toInteger()
-if ( !params.containsKey('maxforks_consensus') || params.maxforks_consensus == null ) {
-    params.maxforks_consensus = 1
-}
-def maxForksConsensusStr = params.maxforks_consensus.toString().trim()
-if (!(maxForksConsensusStr ==~ /[0-9]+/) || maxForksConsensusStr.toInteger() < 1) {
-    exit 1, "Invalid --maxforks_consensus '${params.maxforks_consensus}'. Provide an integer >= 1."
-}
-def maxForksConsensusVal = maxForksConsensusStr.toInteger()
-if ( !params.containsKey('maxforks_core_cpu') || params.maxforks_core_cpu == null ) {
-    params.maxforks_core_cpu = 1
-}
-def maxForksCoreCpuStr = params.maxforks_core_cpu.toString().trim()
-if (!(maxForksCoreCpuStr ==~ /[0-9]+/) || maxForksCoreCpuStr.toInteger() < 1) {
-    exit 1, "Invalid --maxforks_core_cpu '${params.maxforks_core_cpu}'. Provide an integer >= 1."
-}
-def maxForksCoreCpuVal = maxForksCoreCpuStr.toInteger()
-if ( !params.containsKey('html_report_enabled') || params.html_report_enabled == null ) {
-    params.html_report_enabled = true
-}
-def htmlReportEnabled = parseBoolStrict(params.html_report_enabled, true, 'html_report_enabled')
-if ( !params.containsKey('html_report_auto_refresh') || params.html_report_auto_refresh == null ) {
-    params.html_report_auto_refresh = true
-}
-def htmlReportAutoRefresh = parseBoolStrict(params.html_report_auto_refresh, true, 'html_report_auto_refresh')
-if ( !params.containsKey('html_report_refresh_seconds') || params.html_report_refresh_seconds == null ) {
-    params.html_report_refresh_seconds = 15
-}
-def htmlReportRefreshSecondsStr = params.html_report_refresh_seconds.toString().trim()
-if (!(htmlReportRefreshSecondsStr ==~ /[0-9]+/) || htmlReportRefreshSecondsStr.toInteger() < 1) {
-    exit 1, "Invalid --html_report_refresh_seconds '${params.html_report_refresh_seconds}'. Provide an integer >= 1."
-}
-if ( !params.containsKey('html_report_url_prefix') || params.html_report_url_prefix == null ) {
-    params.html_report_url_prefix = ""
-}
-def htmlReportUrlPrefix = params.html_report_url_prefix.toString().trim()
-if ( !params.containsKey('html_report_sample_plot_max') || params.html_report_sample_plot_max == null ) {
-    params.html_report_sample_plot_max = 10
-}
-def htmlReportSamplePlotMaxStr = params.html_report_sample_plot_max.toString().trim()
-if (!(htmlReportSamplePlotMaxStr ==~ /[0-9]+/)) {
-    exit 1, "Invalid --html_report_sample_plot_max '${params.html_report_sample_plot_max}'. Provide an integer >= 0."
-}
-def htmlReportSamplePlotMaxVal = htmlReportSamplePlotMaxStr.toInteger()
+def htmlCfg    = validateHtmlReportParams()
+def htmlReportEnabled           = htmlCfg.htmlReportEnabled
+def htmlReportAutoRefresh       = htmlCfg.htmlReportAutoRefresh
+def htmlReportRefreshSecondsStr = htmlCfg.htmlReportRefreshSecondsStr
+def htmlReportUrlPrefix         = htmlCfg.htmlReportUrlPrefix
+def htmlReportSamplePlotMaxVal  = htmlCfg.htmlReportSamplePlotMaxVal
 
 // Avoid "Access to undefined parameter" warnings for optional params.
 if ( !params.containsKey('hostnames') || params.hostnames == null ) {
@@ -354,338 +278,56 @@ if ( !params.containsKey('hostnames') || params.hostnames == null ) {
 if ( !params.containsKey('restart_force') || params.restart_force == null ) {
     params.restart_force = false
 }
-// Frozen-rep incremental OTU clustering defaults.
-if ( !params.containsKey('otu_frozen_enabled') || params.otu_frozen_enabled == null ) {
-    params.otu_frozen_enabled = true
-}
-if ( !params.containsKey('otu_frozen_min_rounds') || params.otu_frozen_min_rounds == null ) {
-    params.otu_frozen_min_rounds = 3
-}
-if ( !params.containsKey('otu_frozen_min_reads') || params.otu_frozen_min_reads == null ) {
-    params.otu_frozen_min_reads = 50
-}
-if ( !params.containsKey('otu_frozen_growth_window') || params.otu_frozen_growth_window == null ) {
-    params.otu_frozen_growth_window = 3
-}
-if ( !params.containsKey('otu_frozen_drop_ratio') || params.otu_frozen_drop_ratio == null ) {
-    params.otu_frozen_drop_ratio = 0.25
-}
-if ( !params.containsKey('otu_frozen_min_frac') || params.otu_frozen_min_frac == null ) {
-    params.otu_frozen_min_frac = 0.0
-}
-if ( !params.containsKey('otu_incremental_min_new') || params.otu_incremental_min_new == null ) {
-    params.otu_incremental_min_new = 1
-}
-if ( !params.containsKey('otu_hashmap_mixed_policy') || params.otu_hashmap_mixed_policy == null ) {
-    params.otu_hashmap_mixed_policy = 'pipe_only'
-}
-if ( !params.containsKey('otu_allow_unsafe_recovery') || params.otu_allow_unsafe_recovery == null ) {
-    params.otu_allow_unsafe_recovery = false
-}
-if ( !params.containsKey('otu_strict_ids') || params.otu_strict_ids == null ) {
-    params.otu_strict_ids = true
-}
-if ( !params.containsKey('otu_commit_dropped_hashes') || params.otu_commit_dropped_hashes == null ) {
-    params.otu_commit_dropped_hashes = false
-}
-if ( !params.containsKey('otu_pool_decision_include_hash') || params.otu_pool_decision_include_hash == null ) {
-    params.otu_pool_decision_include_hash = false
-}
-if ( !params.containsKey('otu_frozen_db_only_policy') || params.otu_frozen_db_only_policy == null ) {
-    params.otu_frozen_db_only_policy = 'auto'
-}
-def otuDbOnlyPolicyCanonical = params.otu_frozen_db_only_policy.toString().trim().toLowerCase()
-if (!(otuDbOnlyPolicyCanonical in ['auto', 'fail', 'warn_skip'])) {
-    exit 1, "Invalid --otu_frozen_db_only_policy '${params.otu_frozen_db_only_policy}'. Allowed values: auto, fail, warn_skip"
-}
-if ( !params.containsKey('otu_pruned_recovery_enabled') || params.otu_pruned_recovery_enabled == null ) {
-    params.otu_pruned_recovery_enabled = false
-}
-def otuPrunedRecoveryEnabled = parseBoolStrict(params.otu_pruned_recovery_enabled, false, 'otu_pruned_recovery_enabled')
-if ( !params.containsKey('otu_pruned_recovery_identity') || params.otu_pruned_recovery_identity == null ) {
-    params.otu_pruned_recovery_identity = params.otu_id
-}
-def otuPrunedRecoveryIdentity = formatOtuIdentity(params.otu_pruned_recovery_identity)
-if ( !params.containsKey('otu_pruned_recovery_target_policy') || params.otu_pruned_recovery_target_policy == null ) {
-    params.otu_pruned_recovery_target_policy = 'same_target_only'
-}
-def otuPrunedRecoveryTargetPolicyCanonical = params.otu_pruned_recovery_target_policy.toString().trim().toLowerCase()
-if (!(otuPrunedRecoveryTargetPolicyCanonical in ['same_target_only', 'any'])) {
-    exit 1, "Invalid --otu_pruned_recovery_target_policy '${params.otu_pruned_recovery_target_policy}'. Allowed values: same_target_only, any"
-}
-if ( !params.containsKey('otu_pruned_recovery_failure_policy') || params.otu_pruned_recovery_failure_policy == null ) {
-    params.otu_pruned_recovery_failure_policy = 'warn_skip'
-}
-def otuPrunedRecoveryFailurePolicyCanonical = params.otu_pruned_recovery_failure_policy.toString().trim().toLowerCase()
-if (!(otuPrunedRecoveryFailurePolicyCanonical in ['warn_skip', 'fail'])) {
-    exit 1, "Invalid --otu_pruned_recovery_failure_policy '${params.otu_pruned_recovery_failure_policy}'. Allowed values: warn_skip, fail"
-}
-// Consensus generation: minimum reads per OTU to attempt consensus.
-if ( !params.containsKey('consensus_min_reads') || params.consensus_min_reads == null ) {
-    params.consensus_min_reads = 5
-}
-if ( !params.containsKey('consensus_max_reads') || params.consensus_max_reads == null ) {
-    params.consensus_max_reads = 15
-}
-if ( !params.containsKey('consensus_min_qscore') || params.consensus_min_qscore == null ) {
-    params.consensus_min_qscore = 15
-}
-if ( !params.containsKey('consensus_consolidated_min_qscore') || params.consensus_consolidated_min_qscore == null ) {
-    params.consensus_consolidated_min_qscore = 20
-}
-if ( !params.containsKey('consensus_reads_mode') || params.consensus_reads_mode == null ) {
-    params.consensus_reads_mode = 'representative'
-}
-if ( !params.containsKey('consensus_max_N') || params.consensus_max_N == null ) {
-    params.consensus_max_N = 4
-}
-if ( !params.containsKey('consensus_keep_original_reads') || params.consensus_keep_original_reads == null ) {
-    params.consensus_keep_original_reads = false
-}
-def consensusKeepOriginalReads = parseBoolStrict(params.consensus_keep_original_reads, false, 'consensus_keep_original_reads')
-if ( !params.containsKey('prune_unassigned_clusters') || params.prune_unassigned_clusters == null ) {
-    params.prune_unassigned_clusters = false
-}
-def pruneUnassignedClusters = parseBoolStrict(params.prune_unassigned_clusters, false, 'prune_unassigned_clusters')
-if ( !params.containsKey('prune_unassigned_drop_reads') || params.prune_unassigned_drop_reads == null ) {
-    params.prune_unassigned_drop_reads = false
-}
-def pruneUnassignedDropReads = parseBoolStrict(params.prune_unassigned_drop_reads, false, 'prune_unassigned_drop_reads')
-if (!pruneUnassignedClusters && pruneUnassignedDropReads) {
-    pruneUnassignedDropReads = false
-    params.prune_unassigned_drop_reads = false
-    log.warn "prune_unassigned_drop_reads disabled because prune_unassigned_clusters is false"
-}
-if ( !params.containsKey('prune_unassigned_grace_rounds') || params.prune_unassigned_grace_rounds == null ) {
-    params.prune_unassigned_grace_rounds = 3
-}
-def pruneUnassignedGraceRoundsStr = params.prune_unassigned_grace_rounds.toString().trim()
-if (!(pruneUnassignedGraceRoundsStr ==~ /[0-9]+/)) {
-    exit 1, "Invalid --prune_unassigned_grace_rounds '${params.prune_unassigned_grace_rounds}'. Provide an integer >= 0."
-}
-if ( !params.containsKey('prune_unassigned_keep_top') || params.prune_unassigned_keep_top == null ) {
-    params.prune_unassigned_keep_top = 5
-}
-def pruneUnassignedKeepTopStr = params.prune_unassigned_keep_top.toString().trim()
-if (!(pruneUnassignedKeepTopStr ==~ /[0-9]+/)) {
-    exit 1, "Invalid --prune_unassigned_keep_top '${params.prune_unassigned_keep_top}'. Provide an integer >= 0."
-}
-if ( !params.containsKey('consensus_zero_emit_policy') || params.consensus_zero_emit_policy == null ) {
-    params.consensus_zero_emit_policy = 'warn'
-}
-def consensusZeroEmitPolicyCanonical = params.consensus_zero_emit_policy.toString().trim().toLowerCase()
-if (!(consensusZeroEmitPolicyCanonical in ['warn', 'fail'])) {
-    exit 1, "Invalid --consensus_zero_emit_policy '${params.consensus_zero_emit_policy}'. Allowed values: warn, fail"
-}
-if ( !params.containsKey('consensus_id_mismatch_policy') || params.consensus_id_mismatch_policy == null ) {
-    // Default to warn: 0-resolved eligible reads is a valid operational state when all reads for
-    // an OTU have been pruned in a previous round. resolve_ids_to_supreads uses multi-level
-    // fallback matching, so a genuine ID-format bug would surface as many warnings across all OTUs,
-    // not as a hard failure on a single OTU. Use --consensus_id_mismatch_policy fail to opt in.
-    params.consensus_id_mismatch_policy = 'warn'
-}
-def consensusIdMismatchPolicyCanonical = params.consensus_id_mismatch_policy.toString().trim().toLowerCase()
-if (!(consensusIdMismatchPolicyCanonical in ['warn', 'fail'])) {
-    exit 1, "Invalid --consensus_id_mismatch_policy '${params.consensus_id_mismatch_policy}'. Allowed values: warn, fail"
-}
-if ( !params.containsKey('consensus_cache_below_min_policy') || params.consensus_cache_below_min_policy == null ) {
-    params.consensus_cache_below_min_policy = 'keep'
-}
-def consensusCacheBelowMinPolicyCanonical = params.consensus_cache_below_min_policy.toString().trim().toLowerCase()
-if (!(consensusCacheBelowMinPolicyCanonical in ['keep', 'drop'])) {
-    exit 1, "Invalid --consensus_cache_below_min_policy '${params.consensus_cache_below_min_policy}'. Allowed values: keep, drop"
-}
-if ( !params.containsKey('otu_consolidation_lock') || params.otu_consolidation_lock == null ) {
-    params.otu_consolidation_lock = true
-}
-if ( !params.containsKey('otu_prune_frozen_policy') || params.otu_prune_frozen_policy == null ) {
-    params.otu_prune_frozen_policy = 'until_consolidated'
-}
-def otuPruneFrozenPolicyCanonical = params.otu_prune_frozen_policy.toString().trim().toLowerCase()
-if (!(otuPruneFrozenPolicyCanonical in ['always', 'until_consolidated', 'never'])) {
-    exit 1, "Invalid --otu_prune_frozen_policy '${params.otu_prune_frozen_policy}'. Allowed values: always, until_consolidated, never"
-}
-if ( !params.containsKey('otu_prune_samples_file') || params.otu_prune_samples_file == null ) {
-    params.otu_prune_samples_file = ''
-}
-def otuPruneSamplesFileValue = params.otu_prune_samples_file.toString().trim()
-def _runId        = params.run_id?.toString()?.trim() ?: ""
-def podBaseDir    = _runId ? "${workflow.launchDir}/results/pod5/${_runId}"         : "${workflow.launchDir}/results/pod5"
-def sampleInfoDir = _runId ? "${workflow.launchDir}/results/sample_info/${_runId}" : "${workflow.launchDir}/results/sample_info"
-if ( !params.containsKey('otu_lock_force_prune_max_fasta_mb') || params.otu_lock_force_prune_max_fasta_mb == null ) {
-    params.otu_lock_force_prune_max_fasta_mb = 0
-}
-def otuLockForcePruneMaxFastaMbStr = params.otu_lock_force_prune_max_fasta_mb.toString().trim()
-if (!(otuLockForcePruneMaxFastaMbStr ==~ /[0-9]+([.][0-9]+)?/)) {
-    exit 1, "Invalid --otu_lock_force_prune_max_fasta_mb '${params.otu_lock_force_prune_max_fasta_mb}'. Provide a number >= 0."
-}
-if ( !params.containsKey('otu_force_prune_override') || params.otu_force_prune_override == null ) {
-    params.otu_force_prune_override = false
-}
-def otuForcePruneOverride = parseBoolStrict(params.otu_force_prune_override, false, 'otu_force_prune_override')
-if ( !params.containsKey('otu_consolidated_keys_mixed_policy') || params.otu_consolidated_keys_mixed_policy == null ) {
-    params.otu_consolidated_keys_mixed_policy = 'sample_scoped_only'
-}
-def otuConsolidatedKeysMixedPolicyCanonical = params.otu_consolidated_keys_mixed_policy.toString().trim().toLowerCase()
-if (!(otuConsolidatedKeysMixedPolicyCanonical in ['sample_scoped_only', 'warn_and_sample_scoped', 'fail'])) {
-    exit 1, "Invalid --otu_consolidated_keys_mixed_policy '${params.otu_consolidated_keys_mixed_policy}'. Allowed values: sample_scoped_only, warn_and_sample_scoped, fail"
-}
-if ( !params.containsKey('otu_lock_small_cluster_ratio') || params.otu_lock_small_cluster_ratio == null ) {
-    params.otu_lock_small_cluster_ratio = 0.1
-}
-def otuLockRatioStr = params.otu_lock_small_cluster_ratio.toString().trim()
-if (!(otuLockRatioStr ==~ /[0-9]+([.][0-9]+)?/)) {
-    exit 1, "Invalid --otu_lock_small_cluster_ratio '${params.otu_lock_small_cluster_ratio}'. Provide a decimal ratio (e.g. 0.1)."
-}
-if ( !params.containsKey('otu_lock_min_consolidated_reads') || params.otu_lock_min_consolidated_reads == null ) {
-    params.otu_lock_min_consolidated_reads = 10
-}
-def otuLockMinConsReadsStr = params.otu_lock_min_consolidated_reads.toString().trim()
-if (!(otuLockMinConsReadsStr ==~ /[0-9]+/)) {
-    exit 1, "Invalid --otu_lock_min_consolidated_reads '${params.otu_lock_min_consolidated_reads}'. Provide an integer >= 0."
-}
-if ( !params.containsKey('otu_lock_min_stable_rounds') || params.otu_lock_min_stable_rounds == null ) {
-    params.otu_lock_min_stable_rounds = 1
-}
-def otuLockMinStableRoundsStr = params.otu_lock_min_stable_rounds.toString().trim()
-if (!(otuLockMinStableRoundsStr ==~ /[0-9]+/) || otuLockMinStableRoundsStr.toInteger() < 1) {
-    exit 1, "Invalid --otu_lock_min_stable_rounds '${params.otu_lock_min_stable_rounds}'. Provide an integer >= 1."
-}
-if ( !params.containsKey('otu_lock_revalidate_every_rounds') || params.otu_lock_revalidate_every_rounds == null ) {
-    params.otu_lock_revalidate_every_rounds = 0
-}
-def otuLockRevalidateEveryRoundsStr = params.otu_lock_revalidate_every_rounds.toString().trim()
-if (!(otuLockRevalidateEveryRoundsStr ==~ /[0-9]+/)) {
-    exit 1, "Invalid --otu_lock_revalidate_every_rounds '${params.otu_lock_revalidate_every_rounds}'. Provide an integer >= 0."
-}
-if ( !params.containsKey('otu_lock_reset_keys') || params.otu_lock_reset_keys == null ) {
-    params.otu_lock_reset_keys = ''
-}
-if ( !params.containsKey('otu_size_streak_mode') || params.otu_size_streak_mode == null ) {
-    params.otu_size_streak_mode = 'enforce'
-}
-def otuSizeStreakModeCanonical = params.otu_size_streak_mode.toString().trim().toLowerCase()
-if (!(otuSizeStreakModeCanonical in ['off', 'observe', 'enforce'])) {
-    exit 1, "Invalid --otu_size_streak_mode '${params.otu_size_streak_mode}'. Allowed values: off, observe, enforce"
-}
-if ( !params.containsKey('otu_size_streak_min_rounds') || params.otu_size_streak_min_rounds == null ) {
-    params.otu_size_streak_min_rounds = 3
-}
-def otuSizeStreakMinRoundsStr = params.otu_size_streak_min_rounds.toString().trim()
-if (!(otuSizeStreakMinRoundsStr ==~ /[0-9]+/) || otuSizeStreakMinRoundsStr.toInteger() < 1) {
-    exit 1, "Invalid --otu_size_streak_min_rounds '${params.otu_size_streak_min_rounds}'. Provide an integer >= 1."
-}
-if ( !params.containsKey('otu_blast_min_members') || params.otu_blast_min_members == null ) {
-    params.otu_blast_min_members = 3
-}
-def otuBlastMinMembersStr = params.otu_blast_min_members.toString().trim()
-if (!(otuBlastMinMembersStr ==~ /[0-9]+/)) {
-    exit 1, "Invalid --otu_blast_min_members '${params.otu_blast_min_members}'. Provide an integer >= 0."
-}
-if ( !params.containsKey('otu_blast_filter_mode') || params.otu_blast_filter_mode == null ) {
-    params.otu_blast_filter_mode = 'enforce'
-}
-def otuBlastFilterModeCanonical = params.otu_blast_filter_mode.toString().trim().toLowerCase()
-if (!(otuBlastFilterModeCanonical in ['off', 'observe', 'enforce'])) {
-    exit 1, "Invalid --otu_blast_filter_mode '${params.otu_blast_filter_mode}'. Allowed values: off, observe, enforce"
-}
-if ( !params.containsKey('otu_blast_force_use_filtered') || params.otu_blast_force_use_filtered == null ) {
-    params.otu_blast_force_use_filtered = true
-}
-def otuBlastForceUseFiltered = parseBoolStrict(params.otu_blast_force_use_filtered, false, 'otu_blast_force_use_filtered')
-if (otuBlastForceUseFiltered && otuBlastFilterModeCanonical != 'enforce') {
-    exit 1, "Invalid --otu_blast_force_use_filtered with --otu_blast_filter_mode='${otuBlastFilterModeCanonical}'. Set --otu_blast_filter_mode enforce."
-}
-if ( !params.containsKey('otu_blast_filter_skip_rounds') || params.otu_blast_filter_skip_rounds == null ) {
-    params.otu_blast_filter_skip_rounds = '3'
-}
-def otuBlastFilterSkipRoundsRaw = params.otu_blast_filter_skip_rounds.toString().trim().toLowerCase()
-if (otuBlastFilterSkipRoundsRaw == '' || otuBlastFilterSkipRoundsRaw == '0') {
-    otuBlastFilterSkipRoundsRaw = 'none'
-}
-def otuBlastFilterSkipRoundsCanonical = ''
-if (otuBlastFilterSkipRoundsRaw ==~ /[0-9]+/) {
-    def skipRoundsVal = otuBlastFilterSkipRoundsRaw.toInteger()
-    if (skipRoundsVal < 0) {
-        exit 1, "Invalid --otu_blast_filter_skip_rounds '${params.otu_blast_filter_skip_rounds}'. Allowed values: none, all, or integer >= 0."
-    }
-    otuBlastFilterSkipRoundsCanonical = (skipRoundsVal == 0) ? 'none' : skipRoundsVal.toString()
-} else if (otuBlastFilterSkipRoundsRaw in ['none', 'all']) {
-    otuBlastFilterSkipRoundsCanonical = otuBlastFilterSkipRoundsRaw
-} else {
-    exit 1, "Invalid --otu_blast_filter_skip_rounds '${params.otu_blast_filter_skip_rounds}'. Allowed values: none, all, or integer >= 0."
-}
-if ( !params.containsKey('otu_blast_unassigned_grace_rounds') || params.otu_blast_unassigned_grace_rounds == null ) {
-    params.otu_blast_unassigned_grace_rounds = 3
-}
-def otuBlastUnassignedGraceRoundsStr = params.otu_blast_unassigned_grace_rounds.toString().trim()
-if (!(otuBlastUnassignedGraceRoundsStr ==~ /[0-9]+/)) {
-    exit 1, "Invalid --otu_blast_unassigned_grace_rounds '${params.otu_blast_unassigned_grace_rounds}'. Provide an integer >= 0."
-}
-if ( !params.containsKey('otu_blast_enforce_missing_max_frac') || params.otu_blast_enforce_missing_max_frac == null ) {
-    params.otu_blast_enforce_missing_max_frac = 0.1
-}
-def otuBlastEnforceMissingMaxFracStr = params.otu_blast_enforce_missing_max_frac.toString().trim()
-if (!(otuBlastEnforceMissingMaxFracStr ==~ /[0-9]+([.][0-9]+)?/)) {
-    exit 1, "Invalid --otu_blast_enforce_missing_max_frac '${params.otu_blast_enforce_missing_max_frac}'. Provide a decimal fraction in [0,1]."
-}
-if (otuBlastEnforceMissingMaxFracStr == '') {
-    otuBlastEnforceMissingMaxFracStr = '0.1'
-}
-def otuBlastEnforceMissingMaxFracVal = otuBlastEnforceMissingMaxFracStr.toBigDecimal()
-if (otuBlastEnforceMissingMaxFracVal < 0 || otuBlastEnforceMissingMaxFracVal > 1) {
-    exit 1, "Invalid --otu_blast_enforce_missing_max_frac '${params.otu_blast_enforce_missing_max_frac}'. Provide a decimal fraction in [0,1]."
-}
-if ( !params.containsKey('otu_blast_enforce_no_clusters_policy') || params.otu_blast_enforce_no_clusters_policy == null ) {
-    params.otu_blast_enforce_no_clusters_policy = 'fallback_unfiltered'
-}
-def otuBlastEnforceNoClustersPolicyCanonical = params.otu_blast_enforce_no_clusters_policy.toString().trim().toLowerCase()
-if (!(otuBlastEnforceNoClustersPolicyCanonical in ['fail', 'fallback_unfiltered', 'allow_empty'])) {
-    exit 1, "Invalid --otu_blast_enforce_no_clusters_policy '${params.otu_blast_enforce_no_clusters_policy}'. Allowed values: fail, fallback_unfiltered, allow_empty"
-}
-if ( !params.containsKey('otu_blast_unassigned_mode') || params.otu_blast_unassigned_mode == null ) {
-    params.otu_blast_unassigned_mode = 'enforce'
-}
-def otuBlastUnassignedModeCanonical = params.otu_blast_unassigned_mode.toString().trim().toLowerCase()
-if (!(otuBlastUnassignedModeCanonical in ['off', 'observe', 'enforce'])) {
-    exit 1, "Invalid --otu_blast_unassigned_mode '${params.otu_blast_unassigned_mode}'. Allowed values: off, observe, enforce"
-}
-if ( !params.containsKey('otu_blast_unassigned_max_otu_size') || params.otu_blast_unassigned_max_otu_size == null ) {
-    params.otu_blast_unassigned_max_otu_size = 50
-}
-if ( !params.containsKey('otu_unassigned_streak_mode') || params.otu_unassigned_streak_mode == null ) {
-    params.otu_unassigned_streak_mode = 'enforce'
-}
-def otuUnassignedStreakModeCanonical = params.otu_unassigned_streak_mode.toString().trim().toLowerCase()
-if (!(otuUnassignedStreakModeCanonical in ['off', 'observe', 'enforce'])) {
-    exit 1, "Invalid --otu_unassigned_streak_mode '${params.otu_unassigned_streak_mode}'. Allowed values: off, observe, enforce"
-}
-if ( !params.containsKey('otu_unassigned_streak_min_rounds') || params.otu_unassigned_streak_min_rounds == null ) {
-    params.otu_unassigned_streak_min_rounds = 3
-}
-if ( !params.containsKey('otu_unassigned_streak_min_size') || params.otu_unassigned_streak_min_size == null ) {
-    params.otu_unassigned_streak_min_size = 2
-}
-if ( !params.containsKey('otu_unassigned_streak_max_size') || params.otu_unassigned_streak_max_size == null ) {
-    params.otu_unassigned_streak_max_size = 50
-}
+
+def otuRecoveryCfg = validateOtuRecoveryPruneParams()
+def otuDbOnlyPolicyCanonical                 = otuRecoveryCfg.otuDbOnlyPolicyCanonical
+def otuPrunedRecoveryEnabled                 = otuRecoveryCfg.otuPrunedRecoveryEnabled
+def otuPrunedRecoveryIdentity                = otuRecoveryCfg.otuPrunedRecoveryIdentity
+def otuPrunedRecoveryTargetPolicyCanonical   = otuRecoveryCfg.otuPrunedRecoveryTargetPolicyCanonical
+def otuPrunedRecoveryFailurePolicyCanonical  = otuRecoveryCfg.otuPrunedRecoveryFailurePolicyCanonical
+def pruneUnassignedClusters                  = otuRecoveryCfg.pruneUnassignedClusters
+def pruneUnassignedDropReads                 = otuRecoveryCfg.pruneUnassignedDropReads
+def pruneUnassignedGraceRoundsStr            = otuRecoveryCfg.pruneUnassignedGraceRoundsStr
+def pruneUnassignedKeepTopStr                = otuRecoveryCfg.pruneUnassignedKeepTopStr
+def otuPruneFrozenPolicyCanonical            = otuRecoveryCfg.otuPruneFrozenPolicyCanonical
+def otuPruneSamplesFileValue                 = otuRecoveryCfg.otuPruneSamplesFileValue
+def otuLockForcePruneMaxFastaMbStr           = otuRecoveryCfg.otuLockForcePruneMaxFastaMbStr
+def otuForcePruneOverride                    = otuRecoveryCfg.otuForcePruneOverride
+def otuConsolidatedKeysMixedPolicyCanonical  = otuRecoveryCfg.otuConsolidatedKeysMixedPolicyCanonical
+
+def consensusCfg = validateConsensusAssignParams()
+def consensusKeepOriginalReads           = consensusCfg.consensusKeepOriginalReads
+def consensusZeroEmitPolicyCanonical     = consensusCfg.consensusZeroEmitPolicyCanonical
+def consensusIdMismatchPolicyCanonical   = consensusCfg.consensusIdMismatchPolicyCanonical
+def consensusCacheBelowMinPolicyCanonical = consensusCfg.consensusCacheBelowMinPolicyCanonical
+def assignProtLevelCanonical             = consensusCfg.assignProtLevelCanonical
+def pruneCumulativePoolAll               = consensusCfg.pruneCumulativePoolAll
+
+def otuClusterCfg = validateOtuClusterLockParams()
+def otuLockRatioStr                  = otuClusterCfg.otuLockRatioStr
+def otuLockMinConsReadsStr           = otuClusterCfg.otuLockMinConsReadsStr
+def otuLockMinStableRoundsStr        = otuClusterCfg.otuLockMinStableRoundsStr
+def otuLockRevalidateEveryRoundsStr  = otuClusterCfg.otuLockRevalidateEveryRoundsStr
+def otuSizeStreakModeCanonical       = otuClusterCfg.otuSizeStreakModeCanonical
+def otuSizeStreakMinRoundsStr        = otuClusterCfg.otuSizeStreakMinRoundsStr
+
+def otuBlastCfg = validateOtuBlastParams()
+def otuBlastMinMembersStr                    = otuBlastCfg.otuBlastMinMembersStr
+def otuBlastFilterModeCanonical              = otuBlastCfg.otuBlastFilterModeCanonical
+def otuBlastForceUseFiltered                 = otuBlastCfg.otuBlastForceUseFiltered
+def otuBlastFilterSkipRoundsCanonical        = otuBlastCfg.otuBlastFilterSkipRoundsCanonical
+def otuBlastUnassignedGraceRoundsStr         = otuBlastCfg.otuBlastUnassignedGraceRoundsStr
+def otuBlastEnforceMissingMaxFracStr         = otuBlastCfg.otuBlastEnforceMissingMaxFracStr
+def otuBlastEnforceNoClustersPolicyCanonical = otuBlastCfg.otuBlastEnforceNoClustersPolicyCanonical
+def otuBlastUnassignedModeCanonical          = otuBlastCfg.otuBlastUnassignedModeCanonical
+def otuUnassignedStreakModeCanonical         = otuBlastCfg.otuUnassignedStreakModeCanonical
+
 if ( !params.containsKey('make_round_tar') || params.make_round_tar == null ) {
     params.make_round_tar = false
 }
-def assignProtLevelCanonical = (params.containsKey('assign_protection_level') && params.assign_protection_level != null
-    ? params.assign_protection_level.toString().trim().toLowerCase()
-    : "genus")
-if (!(assignProtLevelCanonical in ['family', 'genus', 'species'])) {
-    log.warn "assign_protection_level '${params.assign_protection_level}' unknown; defaulting to 'genus'"
-    assignProtLevelCanonical = "genus"
-}
-if ( !params.containsKey('prune_round_sequences') || params.prune_round_sequences == null ) {
-    params.prune_round_sequences = true
-}
-if ( !params.containsKey('prune_cumulative_pool_all') || params.prune_cumulative_pool_all == null ) {
-    params.prune_cumulative_pool_all = true
-}
-def pruneCumulativePoolAll = parseBoolStrict(params.prune_cumulative_pool_all, true, 'prune_cumulative_pool_all')
+def _runId        = params.run_id?.toString()?.trim() ?: ""
+def podBaseDir    = _runId ? "${workflow.launchDir}/results/pod5/${_runId}"         : "${workflow.launchDir}/results/pod5"
+def sampleInfoDir = _runId ? "${workflow.launchDir}/results/sample_info/${_runId}" : "${workflow.launchDir}/results/sample_info"
 // Optional "species/genus of interest" inputs (used for filtering which taxa appear in plots/tables).
 // Keep defaults defined to avoid Nextflow "Access to undefined parameter" warnings.
 if ( !params.containsKey('metazoa_spc_basics') ) {
@@ -6702,6 +6344,487 @@ workflow.onComplete {
 
 }
 
+
+// ============================================================
+// PREAMBLE VALIDATION METHODS — hoisted; called from §3 above
+// ============================================================
+
+def validateTimingLockParams() {
+    if ( !params.containsKey('file_wait_minutes') || params.file_wait_minutes == null ) {
+        params.file_wait_minutes = 30
+    }
+    // How long to wait for the per-POD5 "round lock" (0 = wait indefinitely).
+    // This lock is used to prevent Nextflow from overlapping rounds when multiple POD5s
+    // are available at once, which can otherwise cause later rounds to read stale/partial
+    // rolling state files under `${params.outdir}/temp/ongoing/state/<stateId>/_state`.
+    if ( !params.containsKey('round_lock_wait_minutes') || params.round_lock_wait_minutes == null ) {
+        params.round_lock_wait_minutes = 360
+    }
+    // Stale lock reclaim TTL for the per-state "round lock" (minutes).
+    // See the lock logic in `fast_on_target_detection`.
+    if ( !params.containsKey('stale_lock_ttl_minutes') || params.stale_lock_ttl_minutes == null ) {
+        params.stale_lock_ttl_minutes = 360
+    }
+    def staleLockTtlMinutesStr = params.stale_lock_ttl_minutes.toString().trim()
+    if (!(staleLockTtlMinutesStr ==~ /^\d+$/)) {
+        exit 1, "Invalid --stale_lock_ttl_minutes '${params.stale_lock_ttl_minutes}'. Provide an integer >= 0."
+    }
+    // Used for portable (no `flock`) directory-based locking.
+    if ( !params.containsKey('lock_wait_seconds') || params.lock_wait_seconds == null ) {
+        params.lock_wait_seconds = 300
+    }
+    if ( !params.containsKey('round_lock_scope') || params.round_lock_scope == null ) {
+        params.round_lock_scope = 'full_round'
+    }
+    def roundLockScopeCanonical = params.round_lock_scope.toString().trim().toLowerCase()
+    if (!(roundLockScopeCanonical in ['full_round', 'dorado_only'])) {
+        exit 1, "Invalid --round_lock_scope '${params.round_lock_scope}'. Allowed values: full_round, dorado_only"
+    }
+    return [staleLockTtlMinutesStr: staleLockTtlMinutesStr, roundLockScopeCanonical: roundLockScopeCanonical]
+}
+
+def validateForkParams() {
+    if ( !params.containsKey('maxforks_fast') || params.maxforks_fast == null ) {
+        params.maxforks_fast = 1
+    }
+    def maxForksFastStr = params.maxforks_fast.toString().trim()
+    if (!(maxForksFastStr ==~ /[0-9]+/) || maxForksFastStr.toInteger() < 1) {
+        exit 1, "Invalid --maxforks_fast '${params.maxforks_fast}'. Provide an integer >= 1."
+    }
+    def maxForksFastVal = maxForksFastStr.toInteger()
+    if ( !params.containsKey('maxforks_reporting') || params.maxforks_reporting == null ) {
+        params.maxforks_reporting = 2
+    }
+    def maxForksReportingStr = params.maxforks_reporting.toString().trim()
+    if (!(maxForksReportingStr ==~ /[0-9]+/) || maxForksReportingStr.toInteger() < 1) {
+        exit 1, "Invalid --maxforks_reporting '${params.maxforks_reporting}'. Provide an integer >= 1."
+    }
+    def maxForksReportingVal = maxForksReportingStr.toInteger()
+    if ( !params.containsKey('maxforks_consensus') || params.maxforks_consensus == null ) {
+        params.maxforks_consensus = 1
+    }
+    def maxForksConsensusStr = params.maxforks_consensus.toString().trim()
+    if (!(maxForksConsensusStr ==~ /[0-9]+/) || maxForksConsensusStr.toInteger() < 1) {
+        exit 1, "Invalid --maxforks_consensus '${params.maxforks_consensus}'. Provide an integer >= 1."
+    }
+    def maxForksConsensusVal = maxForksConsensusStr.toInteger()
+    if ( !params.containsKey('maxforks_core_cpu') || params.maxforks_core_cpu == null ) {
+        params.maxforks_core_cpu = 1
+    }
+    def maxForksCoreCpuStr = params.maxforks_core_cpu.toString().trim()
+    if (!(maxForksCoreCpuStr ==~ /[0-9]+/) || maxForksCoreCpuStr.toInteger() < 1) {
+        exit 1, "Invalid --maxforks_core_cpu '${params.maxforks_core_cpu}'. Provide an integer >= 1."
+    }
+    def maxForksCoreCpuVal = maxForksCoreCpuStr.toInteger()
+    return [maxForksFastVal: maxForksFastVal, maxForksReportingVal: maxForksReportingVal,
+            maxForksConsensusVal: maxForksConsensusVal, maxForksCoreCpuVal: maxForksCoreCpuVal]
+}
+
+def validateHtmlReportParams() {
+    if ( !params.containsKey('html_report_enabled') || params.html_report_enabled == null ) {
+        params.html_report_enabled = true
+    }
+    def htmlReportEnabled = parseBoolStrict(params.html_report_enabled, true, 'html_report_enabled')
+    if ( !params.containsKey('html_report_auto_refresh') || params.html_report_auto_refresh == null ) {
+        params.html_report_auto_refresh = true
+    }
+    def htmlReportAutoRefresh = parseBoolStrict(params.html_report_auto_refresh, true, 'html_report_auto_refresh')
+    if ( !params.containsKey('html_report_refresh_seconds') || params.html_report_refresh_seconds == null ) {
+        params.html_report_refresh_seconds = 15
+    }
+    def htmlReportRefreshSecondsStr = params.html_report_refresh_seconds.toString().trim()
+    if (!(htmlReportRefreshSecondsStr ==~ /[0-9]+/) || htmlReportRefreshSecondsStr.toInteger() < 1) {
+        exit 1, "Invalid --html_report_refresh_seconds '${params.html_report_refresh_seconds}'. Provide an integer >= 1."
+    }
+    if ( !params.containsKey('html_report_url_prefix') || params.html_report_url_prefix == null ) {
+        params.html_report_url_prefix = ""
+    }
+    def htmlReportUrlPrefix = params.html_report_url_prefix.toString().trim()
+    if ( !params.containsKey('html_report_sample_plot_max') || params.html_report_sample_plot_max == null ) {
+        params.html_report_sample_plot_max = 10
+    }
+    def htmlReportSamplePlotMaxStr = params.html_report_sample_plot_max.toString().trim()
+    if (!(htmlReportSamplePlotMaxStr ==~ /[0-9]+/)) {
+        exit 1, "Invalid --html_report_sample_plot_max '${params.html_report_sample_plot_max}'. Provide an integer >= 0."
+    }
+    def htmlReportSamplePlotMaxVal = htmlReportSamplePlotMaxStr.toInteger()
+    return [htmlReportEnabled: htmlReportEnabled, htmlReportAutoRefresh: htmlReportAutoRefresh,
+            htmlReportRefreshSecondsStr: htmlReportRefreshSecondsStr, htmlReportUrlPrefix: htmlReportUrlPrefix,
+            htmlReportSamplePlotMaxVal: htmlReportSamplePlotMaxVal]
+}
+
+def validateOtuRecoveryPruneParams() {
+    // Frozen-rep incremental OTU clustering defaults.
+    if ( !params.containsKey('otu_frozen_enabled') || params.otu_frozen_enabled == null ) {
+        params.otu_frozen_enabled = true
+    }
+    if ( !params.containsKey('otu_frozen_min_rounds') || params.otu_frozen_min_rounds == null ) {
+        params.otu_frozen_min_rounds = 3
+    }
+    if ( !params.containsKey('otu_frozen_min_reads') || params.otu_frozen_min_reads == null ) {
+        params.otu_frozen_min_reads = 50
+    }
+    if ( !params.containsKey('otu_frozen_growth_window') || params.otu_frozen_growth_window == null ) {
+        params.otu_frozen_growth_window = 3
+    }
+    if ( !params.containsKey('otu_frozen_drop_ratio') || params.otu_frozen_drop_ratio == null ) {
+        params.otu_frozen_drop_ratio = 0.25
+    }
+    if ( !params.containsKey('otu_frozen_min_frac') || params.otu_frozen_min_frac == null ) {
+        params.otu_frozen_min_frac = 0.0
+    }
+    if ( !params.containsKey('otu_incremental_min_new') || params.otu_incremental_min_new == null ) {
+        params.otu_incremental_min_new = 1
+    }
+    if ( !params.containsKey('otu_hashmap_mixed_policy') || params.otu_hashmap_mixed_policy == null ) {
+        params.otu_hashmap_mixed_policy = 'pipe_only'
+    }
+    if ( !params.containsKey('otu_allow_unsafe_recovery') || params.otu_allow_unsafe_recovery == null ) {
+        params.otu_allow_unsafe_recovery = false
+    }
+    if ( !params.containsKey('otu_strict_ids') || params.otu_strict_ids == null ) {
+        params.otu_strict_ids = true
+    }
+    if ( !params.containsKey('otu_commit_dropped_hashes') || params.otu_commit_dropped_hashes == null ) {
+        params.otu_commit_dropped_hashes = false
+    }
+    if ( !params.containsKey('otu_pool_decision_include_hash') || params.otu_pool_decision_include_hash == null ) {
+        params.otu_pool_decision_include_hash = false
+    }
+    if ( !params.containsKey('otu_frozen_db_only_policy') || params.otu_frozen_db_only_policy == null ) {
+        params.otu_frozen_db_only_policy = 'auto'
+    }
+    def otuDbOnlyPolicyCanonical = params.otu_frozen_db_only_policy.toString().trim().toLowerCase()
+    if (!(otuDbOnlyPolicyCanonical in ['auto', 'fail', 'warn_skip'])) {
+        exit 1, "Invalid --otu_frozen_db_only_policy '${params.otu_frozen_db_only_policy}'. Allowed values: auto, fail, warn_skip"
+    }
+    if ( !params.containsKey('otu_pruned_recovery_enabled') || params.otu_pruned_recovery_enabled == null ) {
+        params.otu_pruned_recovery_enabled = false
+    }
+    def otuPrunedRecoveryEnabled = parseBoolStrict(params.otu_pruned_recovery_enabled, false, 'otu_pruned_recovery_enabled')
+    if ( !params.containsKey('otu_pruned_recovery_identity') || params.otu_pruned_recovery_identity == null ) {
+        params.otu_pruned_recovery_identity = params.otu_id
+    }
+    def otuPrunedRecoveryIdentity = formatOtuIdentity(params.otu_pruned_recovery_identity)
+    if ( !params.containsKey('otu_pruned_recovery_target_policy') || params.otu_pruned_recovery_target_policy == null ) {
+        params.otu_pruned_recovery_target_policy = 'same_target_only'
+    }
+    def otuPrunedRecoveryTargetPolicyCanonical = params.otu_pruned_recovery_target_policy.toString().trim().toLowerCase()
+    if (!(otuPrunedRecoveryTargetPolicyCanonical in ['same_target_only', 'any'])) {
+        exit 1, "Invalid --otu_pruned_recovery_target_policy '${params.otu_pruned_recovery_target_policy}'. Allowed values: same_target_only, any"
+    }
+    if ( !params.containsKey('otu_pruned_recovery_failure_policy') || params.otu_pruned_recovery_failure_policy == null ) {
+        params.otu_pruned_recovery_failure_policy = 'warn_skip'
+    }
+    def otuPrunedRecoveryFailurePolicyCanonical = params.otu_pruned_recovery_failure_policy.toString().trim().toLowerCase()
+    if (!(otuPrunedRecoveryFailurePolicyCanonical in ['warn_skip', 'fail'])) {
+        exit 1, "Invalid --otu_pruned_recovery_failure_policy '${params.otu_pruned_recovery_failure_policy}'. Allowed values: warn_skip, fail"
+    }
+    if ( !params.containsKey('prune_unassigned_clusters') || params.prune_unassigned_clusters == null ) {
+        params.prune_unassigned_clusters = false
+    }
+    def pruneUnassignedClusters = parseBoolStrict(params.prune_unassigned_clusters, false, 'prune_unassigned_clusters')
+    if ( !params.containsKey('prune_unassigned_drop_reads') || params.prune_unassigned_drop_reads == null ) {
+        params.prune_unassigned_drop_reads = false
+    }
+    def pruneUnassignedDropReads = parseBoolStrict(params.prune_unassigned_drop_reads, false, 'prune_unassigned_drop_reads')
+    if (!pruneUnassignedClusters && pruneUnassignedDropReads) {
+        pruneUnassignedDropReads = false
+        params.prune_unassigned_drop_reads = false
+        log.warn "prune_unassigned_drop_reads disabled because prune_unassigned_clusters is false"
+    }
+    if ( !params.containsKey('prune_unassigned_grace_rounds') || params.prune_unassigned_grace_rounds == null ) {
+        params.prune_unassigned_grace_rounds = 3
+    }
+    def pruneUnassignedGraceRoundsStr = params.prune_unassigned_grace_rounds.toString().trim()
+    if (!(pruneUnassignedGraceRoundsStr ==~ /[0-9]+/)) {
+        exit 1, "Invalid --prune_unassigned_grace_rounds '${params.prune_unassigned_grace_rounds}'. Provide an integer >= 0."
+    }
+    if ( !params.containsKey('prune_unassigned_keep_top') || params.prune_unassigned_keep_top == null ) {
+        params.prune_unassigned_keep_top = 5
+    }
+    def pruneUnassignedKeepTopStr = params.prune_unassigned_keep_top.toString().trim()
+    if (!(pruneUnassignedKeepTopStr ==~ /[0-9]+/)) {
+        exit 1, "Invalid --prune_unassigned_keep_top '${params.prune_unassigned_keep_top}'. Provide an integer >= 0."
+    }
+    if ( !params.containsKey('otu_prune_frozen_policy') || params.otu_prune_frozen_policy == null ) {
+        params.otu_prune_frozen_policy = 'until_consolidated'
+    }
+    def otuPruneFrozenPolicyCanonical = params.otu_prune_frozen_policy.toString().trim().toLowerCase()
+    if (!(otuPruneFrozenPolicyCanonical in ['always', 'until_consolidated', 'never'])) {
+        exit 1, "Invalid --otu_prune_frozen_policy '${params.otu_prune_frozen_policy}'. Allowed values: always, until_consolidated, never"
+    }
+    if ( !params.containsKey('otu_prune_samples_file') || params.otu_prune_samples_file == null ) {
+        params.otu_prune_samples_file = ''
+    }
+    def otuPruneSamplesFileValue = params.otu_prune_samples_file.toString().trim()
+    if ( !params.containsKey('otu_lock_force_prune_max_fasta_mb') || params.otu_lock_force_prune_max_fasta_mb == null ) {
+        params.otu_lock_force_prune_max_fasta_mb = 0
+    }
+    def otuLockForcePruneMaxFastaMbStr = params.otu_lock_force_prune_max_fasta_mb.toString().trim()
+    if (!(otuLockForcePruneMaxFastaMbStr ==~ /[0-9]+([.][0-9]+)?/)) {
+        exit 1, "Invalid --otu_lock_force_prune_max_fasta_mb '${params.otu_lock_force_prune_max_fasta_mb}'. Provide a number >= 0."
+    }
+    if ( !params.containsKey('otu_force_prune_override') || params.otu_force_prune_override == null ) {
+        params.otu_force_prune_override = false
+    }
+    def otuForcePruneOverride = parseBoolStrict(params.otu_force_prune_override, false, 'otu_force_prune_override')
+    if ( !params.containsKey('otu_consolidated_keys_mixed_policy') || params.otu_consolidated_keys_mixed_policy == null ) {
+        params.otu_consolidated_keys_mixed_policy = 'sample_scoped_only'
+    }
+    def otuConsolidatedKeysMixedPolicyCanonical = params.otu_consolidated_keys_mixed_policy.toString().trim().toLowerCase()
+    if (!(otuConsolidatedKeysMixedPolicyCanonical in ['sample_scoped_only', 'warn_and_sample_scoped', 'fail'])) {
+        exit 1, "Invalid --otu_consolidated_keys_mixed_policy '${params.otu_consolidated_keys_mixed_policy}'. Allowed values: sample_scoped_only, warn_and_sample_scoped, fail"
+    }
+    return [otuDbOnlyPolicyCanonical: otuDbOnlyPolicyCanonical,
+            otuPrunedRecoveryEnabled: otuPrunedRecoveryEnabled,
+            otuPrunedRecoveryIdentity: otuPrunedRecoveryIdentity,
+            otuPrunedRecoveryTargetPolicyCanonical: otuPrunedRecoveryTargetPolicyCanonical,
+            otuPrunedRecoveryFailurePolicyCanonical: otuPrunedRecoveryFailurePolicyCanonical,
+            pruneUnassignedClusters: pruneUnassignedClusters,
+            pruneUnassignedDropReads: pruneUnassignedDropReads,
+            pruneUnassignedGraceRoundsStr: pruneUnassignedGraceRoundsStr,
+            pruneUnassignedKeepTopStr: pruneUnassignedKeepTopStr,
+            otuPruneFrozenPolicyCanonical: otuPruneFrozenPolicyCanonical,
+            otuPruneSamplesFileValue: otuPruneSamplesFileValue,
+            otuLockForcePruneMaxFastaMbStr: otuLockForcePruneMaxFastaMbStr,
+            otuForcePruneOverride: otuForcePruneOverride,
+            otuConsolidatedKeysMixedPolicyCanonical: otuConsolidatedKeysMixedPolicyCanonical]
+}
+
+def validateConsensusAssignParams() {
+    // Consensus generation: minimum reads per OTU to attempt consensus.
+    if ( !params.containsKey('consensus_min_reads') || params.consensus_min_reads == null ) {
+        params.consensus_min_reads = 5
+    }
+    if ( !params.containsKey('consensus_max_reads') || params.consensus_max_reads == null ) {
+        params.consensus_max_reads = 15
+    }
+    if ( !params.containsKey('consensus_min_qscore') || params.consensus_min_qscore == null ) {
+        params.consensus_min_qscore = 15
+    }
+    if ( !params.containsKey('consensus_consolidated_min_qscore') || params.consensus_consolidated_min_qscore == null ) {
+        params.consensus_consolidated_min_qscore = 20
+    }
+    if ( !params.containsKey('consensus_reads_mode') || params.consensus_reads_mode == null ) {
+        params.consensus_reads_mode = 'representative'
+    }
+    if ( !params.containsKey('consensus_max_N') || params.consensus_max_N == null ) {
+        params.consensus_max_N = 4
+    }
+    if ( !params.containsKey('consensus_keep_original_reads') || params.consensus_keep_original_reads == null ) {
+        params.consensus_keep_original_reads = false
+    }
+    def consensusKeepOriginalReads = parseBoolStrict(params.consensus_keep_original_reads, false, 'consensus_keep_original_reads')
+    if ( !params.containsKey('consensus_zero_emit_policy') || params.consensus_zero_emit_policy == null ) {
+        params.consensus_zero_emit_policy = 'warn'
+    }
+    def consensusZeroEmitPolicyCanonical = params.consensus_zero_emit_policy.toString().trim().toLowerCase()
+    if (!(consensusZeroEmitPolicyCanonical in ['warn', 'fail'])) {
+        exit 1, "Invalid --consensus_zero_emit_policy '${params.consensus_zero_emit_policy}'. Allowed values: warn, fail"
+    }
+    if ( !params.containsKey('consensus_id_mismatch_policy') || params.consensus_id_mismatch_policy == null ) {
+        // Default to warn: 0-resolved eligible reads is a valid operational state when all reads for
+        // an OTU have been pruned in a previous round. resolve_ids_to_supreads uses multi-level
+        // fallback matching, so a genuine ID-format bug would surface as many warnings across all OTUs,
+        // not as a hard failure on a single OTU. Use --consensus_id_mismatch_policy fail to opt in.
+        params.consensus_id_mismatch_policy = 'warn'
+    }
+    def consensusIdMismatchPolicyCanonical = params.consensus_id_mismatch_policy.toString().trim().toLowerCase()
+    if (!(consensusIdMismatchPolicyCanonical in ['warn', 'fail'])) {
+        exit 1, "Invalid --consensus_id_mismatch_policy '${params.consensus_id_mismatch_policy}'. Allowed values: warn, fail"
+    }
+    if ( !params.containsKey('consensus_cache_below_min_policy') || params.consensus_cache_below_min_policy == null ) {
+        params.consensus_cache_below_min_policy = 'keep'
+    }
+    def consensusCacheBelowMinPolicyCanonical = params.consensus_cache_below_min_policy.toString().trim().toLowerCase()
+    if (!(consensusCacheBelowMinPolicyCanonical in ['keep', 'drop'])) {
+        exit 1, "Invalid --consensus_cache_below_min_policy '${params.consensus_cache_below_min_policy}'. Allowed values: keep, drop"
+    }
+    if ( !params.containsKey('otu_consolidation_lock') || params.otu_consolidation_lock == null ) {
+        params.otu_consolidation_lock = true
+    }
+    def assignProtLevelCanonical = (params.containsKey('assign_protection_level') && params.assign_protection_level != null
+        ? params.assign_protection_level.toString().trim().toLowerCase()
+        : "genus")
+    if (!(assignProtLevelCanonical in ['family', 'genus', 'species'])) {
+        log.warn "assign_protection_level '${params.assign_protection_level}' unknown; defaulting to 'genus'"
+        assignProtLevelCanonical = "genus"
+    }
+    if ( !params.containsKey('prune_round_sequences') || params.prune_round_sequences == null ) {
+        params.prune_round_sequences = true
+    }
+    if ( !params.containsKey('prune_cumulative_pool_all') || params.prune_cumulative_pool_all == null ) {
+        params.prune_cumulative_pool_all = true
+    }
+    def pruneCumulativePoolAll = parseBoolStrict(params.prune_cumulative_pool_all, true, 'prune_cumulative_pool_all')
+    return [consensusKeepOriginalReads: consensusKeepOriginalReads,
+            consensusZeroEmitPolicyCanonical: consensusZeroEmitPolicyCanonical,
+            consensusIdMismatchPolicyCanonical: consensusIdMismatchPolicyCanonical,
+            consensusCacheBelowMinPolicyCanonical: consensusCacheBelowMinPolicyCanonical,
+            assignProtLevelCanonical: assignProtLevelCanonical,
+            pruneCumulativePoolAll: pruneCumulativePoolAll]
+}
+
+def validateOtuClusterLockParams() {
+    if ( !params.containsKey('otu_lock_small_cluster_ratio') || params.otu_lock_small_cluster_ratio == null ) {
+        params.otu_lock_small_cluster_ratio = 0.1
+    }
+    def otuLockRatioStr = params.otu_lock_small_cluster_ratio.toString().trim()
+    if (!(otuLockRatioStr ==~ /[0-9]+([.][0-9]+)?/)) {
+        exit 1, "Invalid --otu_lock_small_cluster_ratio '${params.otu_lock_small_cluster_ratio}'. Provide a decimal ratio (e.g. 0.1)."
+    }
+    if ( !params.containsKey('otu_lock_min_consolidated_reads') || params.otu_lock_min_consolidated_reads == null ) {
+        params.otu_lock_min_consolidated_reads = 10
+    }
+    def otuLockMinConsReadsStr = params.otu_lock_min_consolidated_reads.toString().trim()
+    if (!(otuLockMinConsReadsStr ==~ /[0-9]+/)) {
+        exit 1, "Invalid --otu_lock_min_consolidated_reads '${params.otu_lock_min_consolidated_reads}'. Provide an integer >= 0."
+    }
+    if ( !params.containsKey('otu_lock_min_stable_rounds') || params.otu_lock_min_stable_rounds == null ) {
+        params.otu_lock_min_stable_rounds = 1
+    }
+    def otuLockMinStableRoundsStr = params.otu_lock_min_stable_rounds.toString().trim()
+    if (!(otuLockMinStableRoundsStr ==~ /[0-9]+/) || otuLockMinStableRoundsStr.toInteger() < 1) {
+        exit 1, "Invalid --otu_lock_min_stable_rounds '${params.otu_lock_min_stable_rounds}'. Provide an integer >= 1."
+    }
+    if ( !params.containsKey('otu_lock_revalidate_every_rounds') || params.otu_lock_revalidate_every_rounds == null ) {
+        params.otu_lock_revalidate_every_rounds = 0
+    }
+    def otuLockRevalidateEveryRoundsStr = params.otu_lock_revalidate_every_rounds.toString().trim()
+    if (!(otuLockRevalidateEveryRoundsStr ==~ /[0-9]+/)) {
+        exit 1, "Invalid --otu_lock_revalidate_every_rounds '${params.otu_lock_revalidate_every_rounds}'. Provide an integer >= 0."
+    }
+    if ( !params.containsKey('otu_lock_reset_keys') || params.otu_lock_reset_keys == null ) {
+        params.otu_lock_reset_keys = ''
+    }
+    if ( !params.containsKey('otu_size_streak_mode') || params.otu_size_streak_mode == null ) {
+        params.otu_size_streak_mode = 'enforce'
+    }
+    def otuSizeStreakModeCanonical = params.otu_size_streak_mode.toString().trim().toLowerCase()
+    if (!(otuSizeStreakModeCanonical in ['off', 'observe', 'enforce'])) {
+        exit 1, "Invalid --otu_size_streak_mode '${params.otu_size_streak_mode}'. Allowed values: off, observe, enforce"
+    }
+    if ( !params.containsKey('otu_size_streak_min_rounds') || params.otu_size_streak_min_rounds == null ) {
+        params.otu_size_streak_min_rounds = 3
+    }
+    def otuSizeStreakMinRoundsStr = params.otu_size_streak_min_rounds.toString().trim()
+    if (!(otuSizeStreakMinRoundsStr ==~ /[0-9]+/) || otuSizeStreakMinRoundsStr.toInteger() < 1) {
+        exit 1, "Invalid --otu_size_streak_min_rounds '${params.otu_size_streak_min_rounds}'. Provide an integer >= 1."
+    }
+    return [otuLockRatioStr: otuLockRatioStr,
+            otuLockMinConsReadsStr: otuLockMinConsReadsStr,
+            otuLockMinStableRoundsStr: otuLockMinStableRoundsStr,
+            otuLockRevalidateEveryRoundsStr: otuLockRevalidateEveryRoundsStr,
+            otuSizeStreakModeCanonical: otuSizeStreakModeCanonical,
+            otuSizeStreakMinRoundsStr: otuSizeStreakMinRoundsStr]
+}
+
+def validateOtuBlastParams() {
+    if ( !params.containsKey('otu_blast_min_members') || params.otu_blast_min_members == null ) {
+        params.otu_blast_min_members = 3
+    }
+    def otuBlastMinMembersStr = params.otu_blast_min_members.toString().trim()
+    if (!(otuBlastMinMembersStr ==~ /[0-9]+/)) {
+        exit 1, "Invalid --otu_blast_min_members '${params.otu_blast_min_members}'. Provide an integer >= 0."
+    }
+    if ( !params.containsKey('otu_blast_filter_mode') || params.otu_blast_filter_mode == null ) {
+        params.otu_blast_filter_mode = 'enforce'
+    }
+    def otuBlastFilterModeCanonical = params.otu_blast_filter_mode.toString().trim().toLowerCase()
+    if (!(otuBlastFilterModeCanonical in ['off', 'observe', 'enforce'])) {
+        exit 1, "Invalid --otu_blast_filter_mode '${params.otu_blast_filter_mode}'. Allowed values: off, observe, enforce"
+    }
+    if ( !params.containsKey('otu_blast_force_use_filtered') || params.otu_blast_force_use_filtered == null ) {
+        params.otu_blast_force_use_filtered = true
+    }
+    def otuBlastForceUseFiltered = parseBoolStrict(params.otu_blast_force_use_filtered, false, 'otu_blast_force_use_filtered')
+    if (otuBlastForceUseFiltered && otuBlastFilterModeCanonical != 'enforce') {
+        exit 1, "Invalid --otu_blast_force_use_filtered with --otu_blast_filter_mode='${otuBlastFilterModeCanonical}'. Set --otu_blast_filter_mode enforce."
+    }
+    if ( !params.containsKey('otu_blast_filter_skip_rounds') || params.otu_blast_filter_skip_rounds == null ) {
+        params.otu_blast_filter_skip_rounds = '3'
+    }
+    def otuBlastFilterSkipRoundsRaw = params.otu_blast_filter_skip_rounds.toString().trim().toLowerCase()
+    if (otuBlastFilterSkipRoundsRaw == '' || otuBlastFilterSkipRoundsRaw == '0') {
+        otuBlastFilterSkipRoundsRaw = 'none'
+    }
+    def otuBlastFilterSkipRoundsCanonical = ''
+    if (otuBlastFilterSkipRoundsRaw ==~ /[0-9]+/) {
+        def skipRoundsVal = otuBlastFilterSkipRoundsRaw.toInteger()
+        if (skipRoundsVal < 0) {
+            exit 1, "Invalid --otu_blast_filter_skip_rounds '${params.otu_blast_filter_skip_rounds}'. Allowed values: none, all, or integer >= 0."
+        }
+        otuBlastFilterSkipRoundsCanonical = (skipRoundsVal == 0) ? 'none' : skipRoundsVal.toString()
+    } else if (otuBlastFilterSkipRoundsRaw in ['none', 'all']) {
+        otuBlastFilterSkipRoundsCanonical = otuBlastFilterSkipRoundsRaw
+    } else {
+        exit 1, "Invalid --otu_blast_filter_skip_rounds '${params.otu_blast_filter_skip_rounds}'. Allowed values: none, all, or integer >= 0."
+    }
+    if ( !params.containsKey('otu_blast_unassigned_grace_rounds') || params.otu_blast_unassigned_grace_rounds == null ) {
+        params.otu_blast_unassigned_grace_rounds = 3
+    }
+    def otuBlastUnassignedGraceRoundsStr = params.otu_blast_unassigned_grace_rounds.toString().trim()
+    if (!(otuBlastUnassignedGraceRoundsStr ==~ /[0-9]+/)) {
+        exit 1, "Invalid --otu_blast_unassigned_grace_rounds '${params.otu_blast_unassigned_grace_rounds}'. Provide an integer >= 0."
+    }
+    if ( !params.containsKey('otu_blast_enforce_missing_max_frac') || params.otu_blast_enforce_missing_max_frac == null ) {
+        params.otu_blast_enforce_missing_max_frac = 0.1
+    }
+    def otuBlastEnforceMissingMaxFracStr = params.otu_blast_enforce_missing_max_frac.toString().trim()
+    if (!(otuBlastEnforceMissingMaxFracStr ==~ /[0-9]+([.][0-9]+)?/)) {
+        exit 1, "Invalid --otu_blast_enforce_missing_max_frac '${params.otu_blast_enforce_missing_max_frac}'. Provide a decimal fraction in [0,1]."
+    }
+    if (otuBlastEnforceMissingMaxFracStr == '') {
+        otuBlastEnforceMissingMaxFracStr = '0.1'
+    }
+    def otuBlastEnforceMissingMaxFracVal = otuBlastEnforceMissingMaxFracStr.toBigDecimal()
+    if (otuBlastEnforceMissingMaxFracVal < 0 || otuBlastEnforceMissingMaxFracVal > 1) {
+        exit 1, "Invalid --otu_blast_enforce_missing_max_frac '${params.otu_blast_enforce_missing_max_frac}'. Provide a decimal fraction in [0,1]."
+    }
+    if ( !params.containsKey('otu_blast_enforce_no_clusters_policy') || params.otu_blast_enforce_no_clusters_policy == null ) {
+        params.otu_blast_enforce_no_clusters_policy = 'fallback_unfiltered'
+    }
+    def otuBlastEnforceNoClustersPolicyCanonical = params.otu_blast_enforce_no_clusters_policy.toString().trim().toLowerCase()
+    if (!(otuBlastEnforceNoClustersPolicyCanonical in ['fail', 'fallback_unfiltered', 'allow_empty'])) {
+        exit 1, "Invalid --otu_blast_enforce_no_clusters_policy '${params.otu_blast_enforce_no_clusters_policy}'. Allowed values: fail, fallback_unfiltered, allow_empty"
+    }
+    if ( !params.containsKey('otu_blast_unassigned_mode') || params.otu_blast_unassigned_mode == null ) {
+        params.otu_blast_unassigned_mode = 'enforce'
+    }
+    def otuBlastUnassignedModeCanonical = params.otu_blast_unassigned_mode.toString().trim().toLowerCase()
+    if (!(otuBlastUnassignedModeCanonical in ['off', 'observe', 'enforce'])) {
+        exit 1, "Invalid --otu_blast_unassigned_mode '${params.otu_blast_unassigned_mode}'. Allowed values: off, observe, enforce"
+    }
+    if ( !params.containsKey('otu_blast_unassigned_max_otu_size') || params.otu_blast_unassigned_max_otu_size == null ) {
+        params.otu_blast_unassigned_max_otu_size = 50
+    }
+    if ( !params.containsKey('otu_unassigned_streak_mode') || params.otu_unassigned_streak_mode == null ) {
+        params.otu_unassigned_streak_mode = 'enforce'
+    }
+    def otuUnassignedStreakModeCanonical = params.otu_unassigned_streak_mode.toString().trim().toLowerCase()
+    if (!(otuUnassignedStreakModeCanonical in ['off', 'observe', 'enforce'])) {
+        exit 1, "Invalid --otu_unassigned_streak_mode '${params.otu_unassigned_streak_mode}'. Allowed values: off, observe, enforce"
+    }
+    if ( !params.containsKey('otu_unassigned_streak_min_rounds') || params.otu_unassigned_streak_min_rounds == null ) {
+        params.otu_unassigned_streak_min_rounds = 3
+    }
+    if ( !params.containsKey('otu_unassigned_streak_min_size') || params.otu_unassigned_streak_min_size == null ) {
+        params.otu_unassigned_streak_min_size = 2
+    }
+    if ( !params.containsKey('otu_unassigned_streak_max_size') || params.otu_unassigned_streak_max_size == null ) {
+        params.otu_unassigned_streak_max_size = 50
+    }
+    return [otuBlastMinMembersStr: otuBlastMinMembersStr,
+            otuBlastFilterModeCanonical: otuBlastFilterModeCanonical,
+            otuBlastForceUseFiltered: otuBlastForceUseFiltered,
+            otuBlastFilterSkipRoundsCanonical: otuBlastFilterSkipRoundsCanonical,
+            otuBlastUnassignedGraceRoundsStr: otuBlastUnassignedGraceRoundsStr,
+            otuBlastEnforceMissingMaxFracStr: otuBlastEnforceMissingMaxFracStr,
+            otuBlastEnforceNoClustersPolicyCanonical: otuBlastEnforceNoClustersPolicyCanonical,
+            otuBlastUnassignedModeCanonical: otuBlastUnassignedModeCanonical,
+            otuUnassignedStreakModeCanonical: otuUnassignedStreakModeCanonical]
+}
 
 // ============================================================
 // PREAMBLE HELPERS — hoisted top-level methods (callable before their position)
