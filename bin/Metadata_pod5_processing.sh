@@ -89,6 +89,7 @@ rollback_metadata_commit() {
 	rm -f \
 		"${sample_info_dir}/${run_name}_metadata.txt" \
 		"${sample_info_dir}/demult.fasta" \
+		"${sample_info_dir}/replicate_identity.tsv" \
 		"${sample_info_dir}/samples.txt" \
 		"${sample_info_dir}/${general_copy}" \
 		"${sample_info_dir}/primers.fasta"
@@ -180,11 +181,12 @@ select_and_validate_metadata_rows() {
 				if (value == "") add_problem(field " is empty")
 			}
 
-			sample_id = $(header_idx["Sample_ID"])
-			replicate = $(header_idx["Replicate"])
-			well = $(header_idx["Well"])
-			plate = $(header_idx["Plate"])
-			demult_id = $(header_idx["demult_id"])
+				sample_id = $(header_idx["Sample_ID"])
+				pipeline_id = $(header_idx["Pipeline_ID"])
+				replicate = $(header_idx["Replicate"])
+				well = $(header_idx["Well"])
+				plate = $(header_idx["Plate"])
+				demult_id = $(header_idx["demult_id"])
 
 			if (replicate ~ /[[:space:]_]/) add_problem("Replicate must not contain whitespace or _")
 			if (well ~ /[[:space:]_]/) add_problem("Well must not contain whitespace or _")
@@ -200,11 +202,11 @@ select_and_validate_metadata_rows() {
 				exit 1
 			}
 
-			print $0
-			printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", NR, sample_id, replicate, well, plate, well "_" plate, replicate "_" well "_" plate >> row_info
-			selected_count++
-		}
-	' "$metadata_path" > "$selected_out"
+				print $0
+				printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", NR, sample_id, pipeline_id, replicate, well, plate, demult_id, well "_" plate, replicate "_" well "_" plate >> row_info
+				selected_count++
+			}
+		' "$metadata_path" > "$selected_out"
 }
 
 prompt_replicate_fallback_confirmation() {
@@ -241,29 +243,35 @@ prompt_replicate_fallback_confirmation() {
 }
 
 # Resolve one metadata row into one or more demultiplexing FASTA records.
-# Usage: resolve_metadata_row <sample_name> <line_no> <replicate> <well> <plate> <general_fasta> <primers_fasta> <metadata_path> <records_out> <meta_out>
+# Usage: resolve_metadata_row <sample_name> <line_no> <replicate_id> <replicate_number> <well> <plate> <demult_id> <general_fasta> <primers_fasta> <metadata_path> <records_out> <sidecar_out> <meta_out>
 resolve_metadata_row() {
 	local sample_name="$1"
 	local line_no="$2"
-	local replicate="$3"
-	local well="$4"
-	local plate="$5"
-	local fasta="$6"
-	local primers_fasta="$7"
-	local metadata_path="$8"
-	local records_out="$9"
-	local meta_out="${10}"
+	local replicate_id="$3"
+	local replicate="$4"
+	local well="$5"
+	local plate="$6"
+	local demult_id="$7"
+	local fasta="$8"
+	local primers_fasta="$9"
+	local metadata_path="${10}"
+	local records_out="${11}"
+	local sidecar_out="${12}"
+	local meta_out="${13}"
 
 	awk \
 		-v sample_name="$sample_name" \
 		-v line_no="$line_no" \
+		-v replicate_id="$replicate_id" \
 		-v replicate="$replicate" \
 		-v well="$well" \
 		-v plate="$plate" \
+		-v demult_id="$demult_id" \
 		-v fasta="$fasta" \
 		-v primers_fasta="$primers_fasta" \
 		-v metadata_path="$metadata_path" \
 		-v records_out="$records_out" \
+		-v sidecar_out="$sidecar_out" \
 		-v meta_out="$meta_out" '
 		function trim_cr(s) {
 			sub(/\r$/, "", s)
@@ -303,17 +311,19 @@ resolve_metadata_row() {
 			if (name == key2) return "exact2"
 			return ""
 		}
-		function store_candidate(mode, header, seq, parts) {
+		function store_candidate(mode, header, seq, record_index, parts) {
 			if (mode == "exact1") {
 				key1_count++
 				key1_header[key1_count] = header
 				key1_seq[key1_count] = seq
+				key1_record_index[key1_count] = record_index
 				split(header, parts, "_")
 				key1_plate[key1_count] = parts[2]
 			} else if (mode == "exact2") {
 				key2_count++
 				key2_header[key2_count] = header
 				key2_seq[key2_count] = seq
+				key2_record_index[key2_count] = record_index
 				split(header, parts, "_")
 				key2_plate[key2_count] = parts[3]
 			}
@@ -352,16 +362,17 @@ resolve_metadata_row() {
 		}
 		function process_record(header, seq, cls) {
 			if (header == "") return
+			fasta_record_index++
 			cls = classify_header(header)
 			if (cls == "exact1" || cls == "exact2") {
-				store_candidate(cls, header, seq)
+				store_candidate(cls, header, seq, fasta_record_index)
 			}
 		}
 		function fail_row(message) {
 			print "ERROR: metadata file " metadata_path ", line " line_no ", Sample_ID " sample_name ": " message > "/dev/stderr"
 			exit 1
 		}
-		function resolve_candidates(count, headers, seqs, plates, active_key, active_label,    i, p, parsed, parts, left, right, marker, candidate_plate, hit_count, primer_info, primer_parts, output_suffix) {
+		function resolve_candidates(count, headers, seqs, plates, record_indexes, active_key, active_label,    i, p, parsed, parts, left, right, marker, candidate_plate, hit_count, primer_info, primer_parts, output_suffix, suffix_mode, unit_id_collapse, unit_id_track) {
 			for (i = 1; i <= count; i++) {
 				candidate_plate = plates[i]
 				if (candidate_plate != plate) {
@@ -396,25 +407,45 @@ resolve_metadata_row() {
 				}
 				resolved_marker[i] = marker
 			}
-			print active_label > meta_out
-			for (i = 1; i <= count; i++) {
-				output_suffix = resolved_marker[i]
-				if (output_suffix == "") {
-					fail_row(active_label " candidate " headers[i] " did not resolve to a marker")
-				}
-				if (seen_marker[output_suffix]) {
-					print "WARN: Barcode key " active_key " matched multiple sequences for marker " output_suffix " in " fasta "; using fallback suffix for duplicate header " headers[i] > "/dev/stderr"
-					output_suffix = fallback_suffix(active_key, headers[i], i)
-					while (seen_marker[output_suffix]) {
-						output_suffix = fallback_suffix(active_key, headers[i], i "_" seen_marker[output_suffix])
+				print active_label > meta_out
+				for (i = 1; i <= count; i++) {
+					output_suffix = resolved_marker[i]
+					suffix_mode = "marker"
+					if (output_suffix == "") {
+						fail_row(active_label " candidate " headers[i] " did not resolve to a marker")
 					}
+					if (seen_marker[output_suffix]) {
+						print "WARN: Barcode key " active_key " matched multiple sequences for marker " output_suffix " in " fasta "; using fallback suffix for duplicate header " headers[i] > "/dev/stderr"
+						output_suffix = fallback_suffix(active_key, headers[i], i)
+						while (seen_marker[output_suffix]) {
+							output_suffix = fallback_suffix(active_key, headers[i], i "_" seen_marker[output_suffix])
+						}
+						suffix_mode = "fallback"
+					}
+					seen_marker[output_suffix]++
+					unit_id_collapse = sample_name "_" output_suffix
+					unit_id_track = replicate_id "_" output_suffix
+					print ">" unit_id_collapse > records_out
+					print seqs[i] > records_out
+					printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+						sample_name,
+						replicate_id,
+						replicate,
+						resolved_marker[i],
+						headers[i],
+						record_indexes[i],
+						suffix_mode,
+						output_suffix,
+						unit_id_collapse,
+						unit_id_track,
+						demult_id,
+						key1,
+						key2,
+						active_label,
+						line_no >> sidecar_out
 				}
-				seen_marker[output_suffix]++
-				print ">" sample_name "_" output_suffix > records_out
-				print seqs[i] > records_out
+				return 0
 			}
-			return 0
-		}
 		BEGIN {
 			key1 = well "_" plate
 			key2 = replicate "_" well "_" plate
@@ -435,22 +466,22 @@ resolve_metadata_row() {
 		{
 			current_seq = current_seq trim_cr($0)
 		}
-			END {
-				process_record(current_header, current_seq)
+				END {
+					process_record(current_header, current_seq)
 
-				if (key1_count > 0) {
-					active_key = key1
-					active_label = "WELL_PLATE"
-					resolve_candidates(key1_count, key1_header, key1_seq, key1_plate, active_key, active_label)
-					exit 0
-				}
+					if (key1_count > 0) {
+						active_key = key1
+						active_label = "WELL_PLATE"
+						resolve_candidates(key1_count, key1_header, key1_seq, key1_plate, key1_record_index, active_key, active_label)
+						exit 0
+					}
 
-				if (key2_count > 0) {
-					active_key = key2
-					active_label = "REPLICATE_WELL_PLATE"
-					resolve_candidates(key2_count, key2_header, key2_seq, key2_plate, active_key, active_label)
-					exit 0
-				}
+					if (key2_count > 0) {
+						active_key = key2
+						active_label = "REPLICATE_WELL_PLATE"
+						resolve_candidates(key2_count, key2_header, key2_seq, key2_plate, key2_record_index, active_key, active_label)
+						exit 0
+					}
 
 			fail_row("no exact general_fasta key matched either " key1 " or " key2 " in " fasta)
 		}
@@ -640,16 +671,18 @@ if [ $do_metadata -eq 1 ]; then
 		trap 'cleanup_metadata_stage_dir; exit 1' INT TERM HUP
 		trap 'cleanup_metadata_stage_dir' EXIT
 
-		staged_metadata="${metadata_stage_dir}/${run_id}_metadata.txt"
-		row_info_file="${metadata_stage_dir}/row_info.tsv"
-		staged_output_fasta="${metadata_stage_dir}/demult.fasta"
-		staged_samples="${metadata_stage_dir}/samples.txt"
-		warn_seen_file="${metadata_stage_dir}/.demult_warn_seen"
-		fallback_rows_file="${metadata_stage_dir}/.fallback_rows.tsv"
-		: > "$row_info_file"
-		: > "$warn_seen_file"
-		: > "$fallback_rows_file"
-		: > "$staged_output_fasta"
+			staged_metadata="${metadata_stage_dir}/${run_id}_metadata.txt"
+			row_info_file="${metadata_stage_dir}/row_info.tsv"
+			staged_output_fasta="${metadata_stage_dir}/demult.fasta"
+			staged_replicate_identity="${metadata_stage_dir}/replicate_identity.tsv"
+			staged_samples="${metadata_stage_dir}/samples.txt"
+			warn_seen_file="${metadata_stage_dir}/.demult_warn_seen"
+			fallback_rows_file="${metadata_stage_dir}/.fallback_rows.tsv"
+			: > "$row_info_file"
+			: > "$warn_seen_file"
+			: > "$fallback_rows_file"
+			: > "$staged_output_fasta"
+			printf '%s\n' "sample_id	replicate_id	replicate_number	marker_id	matched_general_fasta_header	matched_general_fasta_record_index	suffix_resolution_mode	unit_suffix_current	unit_id_collapse	unit_id_track	demult_id_metadata	lookup_key_primary	lookup_key_fallback	lookup_grammar_used	metadata_line_no" > "$staged_replicate_identity"
 
 		if ! select_and_validate_metadata_rows "$metadata" "$run_id" "$staged_metadata" "$row_info_file"; then
 			exit 1
@@ -672,20 +705,22 @@ if [ $do_metadata -eq 1 ]; then
 		# Lookup resolves in order: WELL_PLATE, then REPLICATE_WELL_PLATE only if the first grammar has no exact candidates.
 		# Each active candidate must resolve cleanly through primer-based marker assignment.
 		expected_records=0
-		while IFS=$'\t' read -r line_no sample_name replicate well plate key1 key2; do
-			tmp_records="${metadata_stage_dir}/.demult_match.tmp"
-			tmp_warn="${metadata_stage_dir}/.demult_match.warn"
-			tmp_meta="${metadata_stage_dir}/.demult_match.meta"
-			: > "$tmp_meta"
-			if ! resolve_metadata_row "$sample_name" "$line_no" "$replicate" "$well" "$plate" "$general_fasta" "$primers_fasta" "$metadata" "$tmp_records" "$tmp_meta" 2> "$tmp_warn"; then
-				if [ -s "$tmp_warn" ]; then
-					cat "$tmp_warn" >&2
+			while IFS=$'\t' read -r line_no sample_name replicate_id replicate well plate demult_id key1 key2; do
+				tmp_records="${metadata_stage_dir}/.demult_match.tmp"
+				tmp_sidecar="${metadata_stage_dir}/.demult_match.sidecar"
+				tmp_warn="${metadata_stage_dir}/.demult_match.warn"
+				tmp_meta="${metadata_stage_dir}/.demult_match.meta"
+				: > "$tmp_meta"
+				: > "$tmp_sidecar"
+				if ! resolve_metadata_row "$sample_name" "$line_no" "$replicate_id" "$replicate" "$well" "$plate" "$demult_id" "$general_fasta" "$primers_fasta" "$metadata" "$tmp_records" "$tmp_sidecar" "$tmp_meta" 2> "$tmp_warn"; then
+					if [ -s "$tmp_warn" ]; then
+						cat "$tmp_warn" >&2
+					fi
+					rm -f "$tmp_records" "$tmp_sidecar" "$tmp_warn" "$tmp_meta"
+					exit 1
 				fi
-				rm -f "$tmp_records" "$tmp_warn" "$tmp_meta"
-				exit 1
-			fi
-			if [ -s "$tmp_warn" ]; then
-				while IFS= read -r warn_line; do
+				if [ -s "$tmp_warn" ]; then
+					while IFS= read -r warn_line; do
 					[ -n "$warn_line" ] || continue
 					if ! grep -F -x -q -- "$warn_line" "$warn_seen_file"; then
 						printf '%s\n' "$warn_line" >> "$warn_seen_file"
@@ -694,21 +729,28 @@ if [ $do_metadata -eq 1 ]; then
 				done < "$tmp_warn"
 			fi
 			grammar_used=$(tr -d '\r\n' < "$tmp_meta")
-			if [ "$grammar_used" = "REPLICATE_WELL_PLATE" ]; then
-				printf '%s\t%s\t%s\t%s\n' "$line_no" "$sample_name" "$key1" "$key2" >> "$fallback_rows_file"
-			fi
-			rm -f "$tmp_warn" "$tmp_meta"
-			record_count=$(grep -c '^>' "$tmp_records" || true)
-			if [ "$record_count" -le 0 ]; then
-				echo "ERROR: Failed to emit demultiplexing FASTA records for Sample_ID '$sample_name' using keys '$key1' and '$key2'"
-				rm -f "$tmp_records"
-				exit 1
-			fi
-			cat "$tmp_records" >> "$staged_output_fasta"
-			rm -f "$tmp_records"
-			expected_records=$(( expected_records + record_count ))
-		done < "$row_info_file"
-		rm -f "$warn_seen_file"
+				if [ "$grammar_used" = "REPLICATE_WELL_PLATE" ]; then
+					printf '%s\t%s\t%s\t%s\n' "$line_no" "$sample_name" "$key1" "$key2" >> "$fallback_rows_file"
+				fi
+				rm -f "$tmp_warn" "$tmp_meta"
+				record_count=$(grep -c '^>' "$tmp_records" || true)
+				sidecar_count=$(wc -l < "$tmp_sidecar")
+				if [ "$record_count" -le 0 ]; then
+					echo "ERROR: Failed to emit demultiplexing FASTA records for Sample_ID '$sample_name' using keys '$key1' and '$key2'"
+					rm -f "$tmp_records" "$tmp_sidecar"
+					exit 1
+				fi
+				if [ "$sidecar_count" -ne "$record_count" ]; then
+					echo "ERROR: replicate_identity.tsv rows ($sidecar_count) do not match demult.fasta records ($record_count) for Sample_ID '$sample_name'" >&2
+					rm -f "$tmp_records" "$tmp_sidecar"
+					exit 1
+				fi
+				cat "$tmp_records" >> "$staged_output_fasta"
+				cat "$tmp_sidecar" >> "$staged_replicate_identity"
+				rm -f "$tmp_records" "$tmp_sidecar"
+				expected_records=$(( expected_records + record_count ))
+			done < "$row_info_file"
+			rm -f "$warn_seen_file"
 
 		#List of samples in the run; preserve current implemented output semantics exactly.
 		cat "$staged_metadata" | cut -f2  | sort | uniq > "$staged_samples"
@@ -717,16 +759,22 @@ if [ $do_metadata -eq 1 ]; then
 		#Check that demult.fasta has exactly the emitted record count (2 lines each)
 		fasta_number=$(wc -l < "$staged_output_fasta")
 		expected=$(( expected_records * 2 ))
-		if [ ! "$fasta_number" -gt 0 ] || [ ! "$fasta_number" -eq "$expected" ]; then
-			echo "ERROR: demult.fasta has $fasta_number lines; expected $expected ($expected_records records × 2 lines)."
-			echo "       Check that selected metadata rows resolve unambiguously against $general_fasta"
-			echo
-			usage
-		fi
+			if [ ! "$fasta_number" -gt 0 ] || [ ! "$fasta_number" -eq "$expected" ]; then
+				echo "ERROR: demult.fasta has $fasta_number lines; expected $expected ($expected_records records × 2 lines)."
+				echo "       Check that selected metadata rows resolve unambiguously against $general_fasta"
+				echo
+				usage
+			fi
+			sidecar_rows=$(wc -l < "$staged_replicate_identity")
+			sidecar_expected=$(( expected_records + 1 ))
+			if [ ! "$sidecar_rows" -eq "$sidecar_expected" ]; then
+				echo "ERROR: replicate_identity.tsv has $sidecar_rows lines; expected $sidecar_expected (header + $expected_records record rows)." >&2
+				exit 1
+			fi
 
-		if ! prompt_replicate_fallback_confirmation "$fallback_rows_file"; then
-			exit 1
-		fi
+			if ! prompt_replicate_fallback_confirmation "$fallback_rows_file"; then
+				exit 1
+			fi
 
 		general_copy_name=$(basename "$general_fasta")
 		if [ ! -e "$SAMPLE_INFO_DIR" ]; then
@@ -751,14 +799,19 @@ if [ $do_metadata -eq 1 ]; then
 			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
 			exit 1
 		fi
-		if ! mv "$staged_output_fasta" "$output_fasta"; then
-			echo "ERROR: Failed to write demult.fasta into $SAMPLE_INFO_DIR" >&2
-			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
-			exit 1
-		fi
-		if ! mv "$staged_samples" "${SAMPLE_INFO_DIR}/samples.txt"; then
-			echo "ERROR: Failed to write samples.txt into $SAMPLE_INFO_DIR" >&2
-			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+			if ! mv "$staged_output_fasta" "$output_fasta"; then
+				echo "ERROR: Failed to write demult.fasta into $SAMPLE_INFO_DIR" >&2
+				rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+				exit 1
+			fi
+			if ! mv "$staged_replicate_identity" "${SAMPLE_INFO_DIR}/replicate_identity.tsv"; then
+				echo "ERROR: Failed to write replicate_identity.tsv into $SAMPLE_INFO_DIR" >&2
+				rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+				exit 1
+			fi
+			if ! mv "$staged_samples" "${SAMPLE_INFO_DIR}/samples.txt"; then
+				echo "ERROR: Failed to write samples.txt into $SAMPLE_INFO_DIR" >&2
+				rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
 			exit 1
 		fi
 		echo "Demultiplexing fasta completed successfully ($expected_records records, $fasta_number lines)"
