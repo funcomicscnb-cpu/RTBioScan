@@ -1155,6 +1155,8 @@ process demultiplexing_hq_reads {
 		LOCK_WAIT=${params.lock_wait_seconds}
 		source "${baseDir}/bin/lib/lock_utils.sh"
 		init_lock_helpers
+		_BASE_DIR="${baseDir}"
+		source "\$_BASE_DIR/bin/lib/sup_fastq_restore.sh"
 
 		# Dorado retry helper is sourced via `process.beforeScript` (see nextflow.config).
 
@@ -1167,37 +1169,10 @@ process demultiplexing_hq_reads {
     if [ "\$DO_DEMUX" -eq 1 ] && [ "\$DEMUX_MODE" = "full" ] && [ -f "\$INDEXES_PATH" ] && [ -f "\$PRIMERS_PATH" ];
 	    then
 			# Copy rolling SUP fastq under lock into the task directory for stable demux input
+			local_fastq="${barcode}_blastreport_sup_annotated_pre.fastq"
 			ROLLING_SUP_FASTQ=""
-			if acquire_lock "\$SUPFASTQ_LOCK"; then
-				_PRUNED_BARRIER="\${STATE_DIR}/${barcode}_pruned_barrier.list"
-				STATE_SUP_GZ="\${STATE_DIR}/blastreport_sup_annotated_pre.fastq.gz"
-				STATE_SUP_FASTQ="\${STATE_DIR}/blastreport_sup_annotated_pre.fastq"
-				if [ -f "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq.gz" ]; then
-					gzip -dc "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq.gz" > ${barcode}_blastreport_sup_annotated_pre.fastq || true
-					ROLLING_SUP_FASTQ="${barcode}_blastreport_sup_annotated_pre.fastq"
-				elif [ -f "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq" ]; then
-					cp "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq" ${barcode}_blastreport_sup_annotated_pre.fastq || true
-					ROLLING_SUP_FASTQ="${barcode}_blastreport_sup_annotated_pre.fastq"
-				fi
-				if [ -n "\$ROLLING_SUP_FASTQ" ] && [ -s "\$ROLLING_SUP_FASTQ" ] && [ -s "\$_PRUNED_BARRIER" ]; then
-					if ! perl ${baseDir}/bin/fastq_filter_ids.pl \
-						"\$ROLLING_SUP_FASTQ" "\$_PRUNED_BARRIER" \
-						"\$ROLLING_SUP_FASTQ.filtered" \
-						"\${STATE_DIR}/${barcode}_sup_barrier_filter_stats.tsv"; then
-						release_lock "\$SUPFASTQ_LOCK"
-						exit 1
-					fi
-					mv "\$ROLLING_SUP_FASTQ.filtered" "\$ROLLING_SUP_FASTQ"
-					if [ -f "\$STATE_SUP_GZ" ]; then
-						gzip -c "\$ROLLING_SUP_FASTQ" > "\${STATE_SUP_GZ}.tmp" && mv "\${STATE_SUP_GZ}.tmp" "\$STATE_SUP_GZ"
-						cp "\$ROLLING_SUP_FASTQ" "\$STATE_SUP_FASTQ" 2>/dev/null || true
-					else
-						cp "\$ROLLING_SUP_FASTQ" "\$STATE_SUP_FASTQ" 2>/dev/null || true
-					fi
-				fi
-				release_lock "\$SUPFASTQ_LOCK"
-			else
-				exit 1
+			if restore_sup_fastq "\$SUPFASTQ_LOCK" "\$STATE_DIR" "${barcode}" "\$local_fastq" "\$_BASE_DIR"; then
+				ROLLING_SUP_FASTQ="\$local_fastq"
 			fi
 
 			if [ -n "\$ROLLING_SUP_FASTQ" ];
@@ -1296,37 +1271,10 @@ process demultiplexing_hq_reads {
 		# -- §3: Primers-only mode (primer-only cutadapt on rolling SUP + HAC reads) --
 elif [ "\$DO_DEMUX" -eq 1 ] && [ "\$DEMUX_MODE" = "primers_only" ] && [ -f "\$PRIMERS_PATH" ];
 	then
+			local_fastq="${barcode}_blastreport_sup_annotated_pre.fastq"
 			ROLLING_SUP_FASTQ=""
-			if acquire_lock "\$SUPFASTQ_LOCK"; then
-				_PRUNED_BARRIER="\${STATE_DIR}/${barcode}_pruned_barrier.list"
-				STATE_SUP_GZ="\${STATE_DIR}/blastreport_sup_annotated_pre.fastq.gz"
-				STATE_SUP_FASTQ="\${STATE_DIR}/blastreport_sup_annotated_pre.fastq"
-				if [ -f "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq.gz" ]; then
-					gzip -dc "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq.gz" > ${barcode}_blastreport_sup_annotated_pre.fastq || true
-					ROLLING_SUP_FASTQ="${barcode}_blastreport_sup_annotated_pre.fastq"
-				elif [ -f "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq" ]; then
-					cp "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq" ${barcode}_blastreport_sup_annotated_pre.fastq || true
-					ROLLING_SUP_FASTQ="${barcode}_blastreport_sup_annotated_pre.fastq"
-				fi
-				if [ -n "\$ROLLING_SUP_FASTQ" ] && [ -s "\$ROLLING_SUP_FASTQ" ] && [ -s "\$_PRUNED_BARRIER" ]; then
-					if ! perl ${baseDir}/bin/fastq_filter_ids.pl \
-						"\$ROLLING_SUP_FASTQ" "\$_PRUNED_BARRIER" \
-						"\$ROLLING_SUP_FASTQ.filtered" \
-						"\${STATE_DIR}/${barcode}_sup_barrier_filter_stats.tsv"; then
-						release_lock "\$SUPFASTQ_LOCK"
-						exit 1
-					fi
-					mv "\$ROLLING_SUP_FASTQ.filtered" "\$ROLLING_SUP_FASTQ"
-					if [ -f "\$STATE_SUP_GZ" ]; then
-						gzip -c "\$ROLLING_SUP_FASTQ" > "\${STATE_SUP_GZ}.tmp" && mv "\${STATE_SUP_GZ}.tmp" "\$STATE_SUP_GZ"
-						cp "\$ROLLING_SUP_FASTQ" "\$STATE_SUP_FASTQ" 2>/dev/null || true
-					else
-						cp "\$ROLLING_SUP_FASTQ" "\$STATE_SUP_FASTQ" 2>/dev/null || true
-					fi
-				fi
-				release_lock "\$SUPFASTQ_LOCK"
-			else
-				exit 1
+			if restore_sup_fastq "\$SUPFASTQ_LOCK" "\$STATE_DIR" "${barcode}" "\$local_fastq" "\$_BASE_DIR"; then
+				ROLLING_SUP_FASTQ="\$local_fastq"
 			fi
 
 			if [ -n "\$ROLLING_SUP_FASTQ" ];
@@ -1457,38 +1405,11 @@ PY
 		}
 
 			mkdir -p "\$STATE_DIR"
+			local_fastq="${barcode}_blastreport_sup_annotated_pre.fastq"
 			ROLLING_SUP_FASTQ=""
-			if acquire_lock "\$SUPFASTQ_LOCK"; then
-				_PRUNED_BARRIER="\${STATE_DIR}/${barcode}_pruned_barrier.list"
-				STATE_SUP_GZ="\${STATE_DIR}/blastreport_sup_annotated_pre.fastq.gz"
-				STATE_SUP_FASTQ="\${STATE_DIR}/blastreport_sup_annotated_pre.fastq"
-				if [ -f "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq.gz" ]; then
-					gzip -dc "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq.gz" > ${barcode}_blastreport_sup_annotated_pre.fastq || true
-					ROLLING_SUP_FASTQ="${barcode}_blastreport_sup_annotated_pre.fastq"
-				elif [ -f "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq" ]; then
-					cp "\${STATE_DIR}/blastreport_sup_annotated_pre.fastq" ${barcode}_blastreport_sup_annotated_pre.fastq || true
-					ROLLING_SUP_FASTQ="${barcode}_blastreport_sup_annotated_pre.fastq"
-				fi
-				if [ -n "\$ROLLING_SUP_FASTQ" ] && [ -s "\$ROLLING_SUP_FASTQ" ] && [ -s "\$_PRUNED_BARRIER" ]; then
-					if ! perl ${baseDir}/bin/fastq_filter_ids.pl \
-						"\$ROLLING_SUP_FASTQ" "\$_PRUNED_BARRIER" \
-						"\$ROLLING_SUP_FASTQ.filtered" \
-						"\${STATE_DIR}/${barcode}_sup_barrier_filter_stats.tsv"; then
-						release_lock "\$SUPFASTQ_LOCK"
-						exit 1
-					fi
-					mv "\$ROLLING_SUP_FASTQ.filtered" "\$ROLLING_SUP_FASTQ"
-					if [ -f "\$STATE_SUP_GZ" ]; then
-						gzip -c "\$ROLLING_SUP_FASTQ" > "\${STATE_SUP_GZ}.tmp" && mv "\${STATE_SUP_GZ}.tmp" "\$STATE_SUP_GZ"
-						cp "\$ROLLING_SUP_FASTQ" "\$STATE_SUP_FASTQ" 2>/dev/null || true
-					else
-						cp "\$ROLLING_SUP_FASTQ" "\$STATE_SUP_FASTQ" 2>/dev/null || true
-					fi
-				fi
-				release_lock "\$SUPFASTQ_LOCK"
-				else
-					exit 1
-				fi
+			if restore_sup_fastq "\$SUPFASTQ_LOCK" "\$STATE_DIR" "${barcode}" "\$local_fastq" "\$_BASE_DIR"; then
+				ROLLING_SUP_FASTQ="\$local_fastq"
+			fi
 
 				if [ -n "\$ROLLING_SUP_FASTQ" ]; then
 					rewrite_fastq "\$ROLLING_SUP_FASTQ" "${barcode}_sup_annotated_demuxoff.fastq" "sup"
