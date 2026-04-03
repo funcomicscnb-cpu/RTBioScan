@@ -1165,22 +1165,30 @@ process demultiplexing_hq_reads {
 	    ${demuxCfg.toShell()}
     DO_DEMUX=${demuxEnabledInt}
 
-	    # -- §2: Full-demux mode (barcode + primer cutadapt on rolling SUP + HAC reads) --
-    if [ "\$DO_DEMUX" -eq 1 ] && [ "\$DEMUX_MODE" = "full" ] && [ -f "\$INDEXES_PATH" ] && [ -f "\$PRIMERS_PATH" ];
-	    then
-			# Copy rolling SUP fastq under lock into the task directory for stable demux input
-			local_fastq="${barcode}_blastreport_sup_annotated_pre.fastq"
+		restore_rolling_sup_fastq() {
+			local local_fastq="${barcode}_blastreport_sup_annotated_pre.fastq"
 			ROLLING_SUP_FASTQ=""
 			if restore_sup_fastq "\$SUPFASTQ_LOCK" "\$STATE_DIR" "${barcode}" "\$local_fastq" "\$_BASE_DIR"; then
 				ROLLING_SUP_FASTQ="\$local_fastq"
 			fi
+		}
+
+		load_demux_target_arrays() {
+			_p_targets="${params.targets}"
+			IFS='|' read -ra _TARGETS <<< "\$_p_targets"
+			_p_min_read_lengths="${params.min_read_lengths}"
+			IFS='|' read -ra _MIN_LENS <<< "\$_p_min_read_lengths"
+		}
+
+	    # -- §2: Full-demux mode (barcode + primer cutadapt on rolling SUP + HAC reads) --
+    if [ "\$DO_DEMUX" -eq 1 ] && [ "\$DEMUX_MODE" = "full" ] && [ -f "\$INDEXES_PATH" ] && [ -f "\$PRIMERS_PATH" ];
+	    then
+			# Copy rolling SUP fastq under lock into the task directory for stable demux input
+			restore_rolling_sup_fastq
 
 			if [ -n "\$ROLLING_SUP_FASTQ" ];
 			then
-				_p_targets="${params.targets}"
-				IFS='|' read -ra _TARGETS  <<< "\$_p_targets"
-				_p_min_read_lengths="${params.min_read_lengths}"
-				IFS='|' read -ra _MIN_LENS <<< "\$_p_min_read_lengths"
+				load_demux_target_arrays
 				for _i in "\${!_TARGETS[@]}"; do
 					_t="\${_TARGETS[\$_i]}"
 					_ml="\${_MIN_LENS[\$_i]}"
@@ -1220,10 +1228,7 @@ process demultiplexing_hq_reads {
 			fi
 		
 		
-			_p_targets="${params.targets}"
-			IFS='|' read -ra _TARGETS  <<< "\$_p_targets"
-			_p_min_read_lengths="${params.min_read_lengths}"
-			IFS='|' read -ra _MIN_LENS <<< "\$_p_min_read_lengths"
+			load_demux_target_arrays
 			for _i in "\${!_TARGETS[@]}"; do
 				_t="\${_TARGETS[\$_i]}"
 				_ml="\${_MIN_LENS[\$_i]}"
@@ -1268,21 +1273,14 @@ process demultiplexing_hq_reads {
 				cat ${barcode}_hac_annotated_no_adapter.fastq >> ${barcode}_hac_sup_annotated_clean.fastq
 			fi
 		
-		# -- §3: Primers-only mode (primer-only cutadapt on rolling SUP + HAC reads) --
+	# -- §3: Primers-only mode (primer-only cutadapt on rolling SUP + HAC reads) --
 elif [ "\$DO_DEMUX" -eq 1 ] && [ "\$DEMUX_MODE" = "primers_only" ] && [ -f "\$PRIMERS_PATH" ];
 	then
-			local_fastq="${barcode}_blastreport_sup_annotated_pre.fastq"
-			ROLLING_SUP_FASTQ=""
-			if restore_sup_fastq "\$SUPFASTQ_LOCK" "\$STATE_DIR" "${barcode}" "\$local_fastq" "\$_BASE_DIR"; then
-				ROLLING_SUP_FASTQ="\$local_fastq"
-			fi
+			restore_rolling_sup_fastq
 
 			if [ -n "\$ROLLING_SUP_FASTQ" ];
 			then
-				_p_targets="${params.targets}"
-				IFS='|' read -ra _TARGETS  <<< "\$_p_targets"
-				_p_min_read_lengths="${params.min_read_lengths}"
-				IFS='|' read -ra _MIN_LENS <<< "\$_p_min_read_lengths"
+				load_demux_target_arrays
 				for _i in "\${!_TARGETS[@]}"; do
 					_t="\${_TARGETS[\$_i]}"
 					_ml="\${_MIN_LENS[\$_i]}"
@@ -1316,10 +1314,7 @@ elif [ "\$DO_DEMUX" -eq 1 ] && [ "\$DEMUX_MODE" = "primers_only" ] && [ -f "\$PR
 				fi
 			fi
 
-			_p_targets="${params.targets}"
-			IFS='|' read -ra _TARGETS  <<< "\$_p_targets"
-			_p_min_read_lengths="${params.min_read_lengths}"
-			IFS='|' read -ra _MIN_LENS <<< "\$_p_min_read_lengths"
+			load_demux_target_arrays
 			for _i in "\${!_TARGETS[@]}"; do
 				_t="\${_TARGETS[\$_i]}"
 				_ml="\${_MIN_LENS[\$_i]}"
@@ -1405,11 +1400,7 @@ PY
 		}
 
 			mkdir -p "\$STATE_DIR"
-			local_fastq="${barcode}_blastreport_sup_annotated_pre.fastq"
-			ROLLING_SUP_FASTQ=""
-			if restore_sup_fastq "\$SUPFASTQ_LOCK" "\$STATE_DIR" "${barcode}" "\$local_fastq" "\$_BASE_DIR"; then
-				ROLLING_SUP_FASTQ="\$local_fastq"
-			fi
+			restore_rolling_sup_fastq
 
 				if [ -n "\$ROLLING_SUP_FASTQ" ]; then
 					rewrite_fastq "\$ROLLING_SUP_FASTQ" "${barcode}_sup_annotated_demuxoff.fastq" "sup"
