@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import subprocess
 
@@ -8,6 +9,99 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MAIN_NF = REPO_ROOT / "main.nf"
 CHANNEL_UTILS = REPO_ROOT / "lib" / "ChannelUtils.groovy"
 SUP_PATH_HELPER = REPO_ROOT / "bin" / "blast_sup_path.sh"
+METADATA_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "metadata"
+
+
+def _make_nextflow_shim(
+    tmp_path: Path,
+    *,
+    config_stdout: str = "params.targets = 'COI|ITS2|EXTRA'\n",
+    config_exit: int = 0,
+    run_stdout: str = "",
+    run_stderr: str = "NEXTFLOW_RUN_SENTINEL\n",
+    run_exit: int = 86,
+) -> tuple[dict[str, str], Path]:
+    shim_dir = tmp_path / "nextflow-shim"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    log_path = tmp_path / "nextflow_calls.log"
+    shim_path = shim_dir / "nextflow"
+    shim_path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "{\n"
+        "  printf 'PWD\\t%s\\n' \"$PWD\"\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf 'ARG\\t%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  printf 'END\\n'\n"
+        "} >> \"$NEXTFLOW_SHIM_LOG\"\n"
+        "subcmd=''\n"
+        "for arg in \"$@\"; do\n"
+        "  case \"$arg\" in\n"
+        "    config|run)\n"
+        "      subcmd=\"$arg\"\n"
+        "      break\n"
+        "      ;;\n"
+        "  esac\n"
+        "done\n"
+        "case \"$subcmd\" in\n"
+        "  config)\n"
+        "    printf '%s' \"${NEXTFLOW_SHIM_CONFIG_STDOUT:-}\"\n"
+        "    exit \"${NEXTFLOW_SHIM_CONFIG_EXIT:-0}\"\n"
+        "    ;;\n"
+        "  run)\n"
+        "    printf '%s' \"${NEXTFLOW_SHIM_RUN_STDOUT:-}\"\n"
+        "    printf '%s' \"${NEXTFLOW_SHIM_RUN_STDERR:-}\" >&2\n"
+        "    exit \"${NEXTFLOW_SHIM_RUN_EXIT:-0}\"\n"
+        "    ;;\n"
+        "esac\n"
+        "echo 'unexpected nextflow invocation' >&2\n"
+        "exit 98\n",
+        encoding="utf-8",
+    )
+    shim_path.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{shim_dir}:{env['PATH']}"
+    env["NEXTFLOW_SHIM_LOG"] = str(log_path)
+    env["NEXTFLOW_SHIM_CONFIG_STDOUT"] = config_stdout
+    env["NEXTFLOW_SHIM_CONFIG_EXIT"] = str(config_exit)
+    env["NEXTFLOW_SHIM_RUN_STDOUT"] = run_stdout
+    env["NEXTFLOW_SHIM_RUN_STDERR"] = run_stderr
+    env["NEXTFLOW_SHIM_RUN_EXIT"] = str(run_exit)
+    return env, log_path
+
+
+def _read_nextflow_invocations(log_path: Path) -> list[tuple[str, list[str]]]:
+    invocations: list[tuple[str, list[str]]] = []
+    if not log_path.exists():
+        return invocations
+    pwd = ""
+    args: list[str] = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if line == "END":
+            invocations.append((pwd, args))
+            pwd = ""
+            args = []
+            continue
+        kind, value = line.split("\t", 1)
+        if kind == "PWD":
+            pwd = value
+        elif kind == "ARG":
+            args.append(value)
+    return invocations
+
+
+def _metadata_fixture_args(run_id: str = "TestRun") -> list[str]:
+    return [
+        "--run_id",
+        run_id,
+        "--metadata",
+        str(METADATA_FIXTURES / "pipeline_info.tsv"),
+        "--general_fasta",
+        str(METADATA_FIXTURES / "general.fasta"),
+        "--primers_fasta",
+        str(METADATA_FIXTURES / "primers.fasta"),
+    ]
 
 
 def _normalize_bool_like_main(value, default=False):
@@ -132,6 +226,684 @@ def test_rtbioscan_prefers_explicit_primers_fasta_for_primer_indexes() -> None:
     assert 'if [[ -n "$primers_fasta" ]]; then' in text
     assert 'nf_args+=(--primer_indexes "$primers_fasta")' in text
     assert 'nf_args+=(--primer_indexes "results/sample_info/$run_id/primers.fasta")' in text
+
+
+def test_rtbioscan_examples_and_help_describe_config_derived_targets_for_metadata_paths() -> None:
+    text = (REPO_ROOT / "RTBioScan.sh").read_text(encoding="utf-8")
+    assert '--targets <list>' in text
+    assert "Optional pipe-separated marker targets; overrides" in text
+    assert "config-derived params.targets and is forwarded to" in text
+    assert "When --do_metadata / --feeder rely on config-derived params.targets" in text
+    assert "-profile test   -c conf/file.config   -C conf/file.config" in text
+    assert 'ERROR: explicit wrapper-level --targets is required when using --do_metadata or --feeder.' not in text
+    assert 'Profile/config-derived targets do not satisfy this metadata setup requirement.' not in text
+
+
+def test_usage_doc_lists_current_sample_info_artifacts_with_presence_tolerant_sidecars() -> None:
+    text = (REPO_ROOT / "docs" / "usage.md").read_text(encoding="utf-8")
+    assert "samples.txt             ← canonical 7-field compatibility projection" in text
+    assert "{run_id}_metadata.txt   ← run-filtered metadata TSV rows" in text
+    assert "replicate_roster.tsv    ← replicate-level roster, when present" in text
+    assert "replicate_identity.tsv  ← collapse/track identity bridge, when present" in text
+    assert "Writes the canonical 7-field compatibility projection" in text
+    assert "Writes `results/sample_info/{run_id}/{run_id}_metadata.txt` as the run-filtered metadata TSV rows." in text
+    assert (
+        "Writes `results/sample_info/{run_id}/replicate_roster.tsv`, when present, and "
+        "`results/sample_info/{run_id}/replicate_identity.tsv`, when present." in text
+    )
+
+
+def test_rtbioscan_has_config_target_resolution_helper_and_exact_command_layout() -> None:
+    text = (REPO_ROOT / "RTBioScan.sh").read_text(encoding="utf-8")
+    assert "resolve_targets_from_config_or_die()" in text
+    assert "partition_nextflow_args()" in text
+    assert "build_normalized_nextflow_run_cmd()" in text
+    assert 'cd "$SCRIPT_DIR"' in text
+    assert "_config_cmd+=(config -flat)" in text
+    assert 'NORMALIZED_NEXTFLOW_RUN_CMD+=(run main.nf)' in text
+    assert '_config_cmd+=(main.nf)' in text
+    assert 'NEXTFLOW_GLOBAL_ARGS+=("$_opt" "$_value")' in text
+    assert 'NEXTFLOW_CONFIG_CMD_ARGS+=("$_opt" "$_value")' in text
+    assert 'NEXTFLOW_RUN_ARGS+=("$_opt" "$_value")' in text
+    assert '[[ -n "$resolved_targets" ]] && meta_args+=(--targets "$resolved_targets")' in text
+    assert '[[ -n "$resolved_targets" ]] && feeder_args+=(--targets "$resolved_targets")' in text
+    assert 'die_attached_config_selector "-profile"' in text
+    assert 'die_attached_config_selector "-c"' in text
+    assert 'die_attached_config_selector "-config"' in text
+    assert 'die_attached_config_selector "-C"' in text
+    assert 'die_attached_config_selector "-config-ignore-includes"' in text
+    assert "config-affecting Nextflow option '$_opt' is missing its required value." in text
+    assert "ERROR: unable to resolve params.targets from CLI --targets or the effective Nextflow config stack." in text
+    assert "ERROR: failed to resolve params.targets via 'nextflow config -flat'; check profile/config arguments and config files." in text
+    assert "ERROR: resolved params.targets from the effective Nextflow config stack is invalid; targets must be pipe-separated tokens without whitespace." in text
+
+
+def test_rtbioscan_do_metadata_uses_config_derived_targets(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    env, log_path = _make_nextflow_shim(
+        tmp_path,
+        config_stdout="params.targets = 'ITS2|COI'\n",
+        run_stderr="NEXTFLOW_RUN_SENTINEL\n",
+        run_exit=86,
+    )
+    result = subprocess.run(
+        ["bash", str(script), "--do_metadata", *_metadata_fixture_args(), "-profile", "test"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    text = result.stdout + result.stderr
+    assert result.returncode == 86
+    assert "ERROR: unable to resolve params.targets" not in text
+    assert "Targets: ITS2|COI" in result.stdout
+    assert "==> [RTBioScan] Metadata setup complete." in result.stdout
+    assert (tmp_path / "results" / "sample_info" / "TestRun" / "demult.fasta").exists()
+    invocations = _read_nextflow_invocations(log_path)
+    assert [args for _, args in invocations if "config" in args]
+
+
+def test_rtbioscan_do_metadata_empty_targets_fail_in_feeder_metadata_path(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    fixtures = REPO_ROOT / "tests" / "fixtures" / "metadata"
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--do_metadata",
+            "--run_id",
+            "TestRun",
+            "--targets",
+            "",
+            "--metadata",
+            str(fixtures / "pipeline_info.tsv"),
+            "--general_fasta",
+            str(fixtures / "general.fasta"),
+            "--primers_fasta",
+            str(fixtures / "primers.fasta"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert "ERROR: explicit wrapper-level --targets must not be empty when using RTBioScan.sh." in text
+    assert "ERROR: no valid targets were provided for metadata resolution" not in text
+    assert "WARNING: --do_metadata is using the implicit default --targets" not in text
+    assert "==> [RTBioScan] Setting up results/sample_info/TestRun/ for run 'TestRun' ..." not in text
+    assert not (tmp_path / "results" / "sample_info" / "TestRun").exists()
+
+
+def test_rtbioscan_pipeline_only_empty_targets_fail_before_pipeline_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--targets", "", "-profile", "test"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert "ERROR: explicit wrapper-level --targets must not be empty when using RTBioScan.sh." in text
+    assert "==> [RTBioScan] Starting pipeline ..." not in text
+
+
+def test_rtbioscan_pipeline_only_whitespace_targets_fail_before_pipeline_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--targets", "   ", "-profile", "test"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert "ERROR: explicit wrapper-level --targets must not be empty when using RTBioScan.sh." in text
+    assert "==> [RTBioScan] Starting pipeline ..." not in text
+
+
+def test_rtbioscan_pipeline_only_targets_with_internal_whitespace_fail_before_pipeline_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--targets", "CO I|ITS2", "-profile", "test"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert (
+        "ERROR: explicit wrapper-level --targets contains invalid marker names; "
+        "targets must be pipe-separated tokens without whitespace."
+    ) in text
+    assert "==> [RTBioScan] Starting pipeline ..." not in text
+
+
+def test_rtbioscan_pipeline_only_targets_with_surrounding_token_whitespace_fail_before_pipeline_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--targets", " COI | ITS2 ", "-profile", "test"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert (
+        "ERROR: explicit wrapper-level --targets contains invalid marker names; "
+        "targets must be pipe-separated tokens without whitespace."
+    ) in text
+    assert "==> [RTBioScan] Starting pipeline ..." not in text
+
+
+def test_rtbioscan_pipeline_only_targets_with_empty_separator_slot_fail_before_pipeline_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--targets", "COI||ITS2", "-profile", "test"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert (
+        "ERROR: explicit wrapper-level --targets contains invalid marker names; "
+        "targets must be pipe-separated tokens without whitespace."
+    ) in text
+    assert "==> [RTBioScan] Starting pipeline ..." not in text
+
+
+def test_rtbioscan_pipeline_only_targets_with_trailing_empty_separator_slot_fail_before_pipeline_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--targets", "COI|", "-profile", "test"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert (
+        "ERROR: explicit wrapper-level --targets contains invalid marker names; "
+        "targets must be pipe-separated tokens without whitespace."
+    ) in text
+    assert "==> [RTBioScan] Starting pipeline ..." not in text
+
+
+def test_rtbioscan_do_metadata_whitespace_targets_fail_before_metadata_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    fixtures = REPO_ROOT / "tests" / "fixtures" / "metadata"
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--do_metadata",
+            "--run_id",
+            "TestRun",
+            "--targets",
+            "   ",
+            "--metadata",
+            str(fixtures / "pipeline_info.tsv"),
+            "--general_fasta",
+            str(fixtures / "general.fasta"),
+            "--primers_fasta",
+            str(fixtures / "primers.fasta"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert "ERROR: explicit wrapper-level --targets must not be empty when using RTBioScan.sh." in text
+    assert "==> [RTBioScan] Setting up results/sample_info/TestRun/ for run 'TestRun' ..." not in text
+    assert "ERROR: no valid targets were provided for metadata resolution" not in text
+    assert not (tmp_path / "results" / "sample_info" / "TestRun").exists()
+
+
+def test_rtbioscan_do_metadata_targets_with_internal_whitespace_fail_before_metadata_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    fixtures = REPO_ROOT / "tests" / "fixtures" / "metadata"
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--do_metadata",
+            "--run_id",
+            "TestRun",
+            "--targets",
+            "COI|ITS 2",
+            "--metadata",
+            str(fixtures / "pipeline_info.tsv"),
+            "--general_fasta",
+            str(fixtures / "general.fasta"),
+            "--primers_fasta",
+            str(fixtures / "primers.fasta"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert (
+        "ERROR: explicit wrapper-level --targets contains invalid marker names; "
+        "targets must be pipe-separated tokens without whitespace."
+    ) in text
+    assert "==> [RTBioScan] Setting up results/sample_info/TestRun/ for run 'TestRun' ..." not in text
+    assert "ERROR: no valid targets were provided for metadata resolution" not in text
+    assert not (tmp_path / "results" / "sample_info" / "TestRun").exists()
+
+
+def test_rtbioscan_do_metadata_targets_with_surrounding_token_whitespace_fail_before_metadata_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    fixtures = REPO_ROOT / "tests" / "fixtures" / "metadata"
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--do_metadata",
+            "--run_id",
+            "TestRun",
+            "--targets",
+            " COI | ITS2 ",
+            "--metadata",
+            str(fixtures / "pipeline_info.tsv"),
+            "--general_fasta",
+            str(fixtures / "general.fasta"),
+            "--primers_fasta",
+            str(fixtures / "primers.fasta"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert (
+        "ERROR: explicit wrapper-level --targets contains invalid marker names; "
+        "targets must be pipe-separated tokens without whitespace."
+    ) in text
+    assert "==> [RTBioScan] Setting up results/sample_info/TestRun/ for run 'TestRun' ..." not in text
+    assert "ERROR: no valid targets were provided for metadata resolution" not in text
+    assert not (tmp_path / "results" / "sample_info" / "TestRun").exists()
+
+
+def test_rtbioscan_do_metadata_targets_with_empty_separator_slot_fail_before_metadata_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    fixtures = REPO_ROOT / "tests" / "fixtures" / "metadata"
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--do_metadata",
+            "--run_id",
+            "TestRun",
+            "--targets",
+            "COI||ITS2",
+            "--metadata",
+            str(fixtures / "pipeline_info.tsv"),
+            "--general_fasta",
+            str(fixtures / "general.fasta"),
+            "--primers_fasta",
+            str(fixtures / "primers.fasta"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert (
+        "ERROR: explicit wrapper-level --targets contains invalid marker names; "
+        "targets must be pipe-separated tokens without whitespace."
+    ) in text
+    assert "==> [RTBioScan] Setting up results/sample_info/TestRun/ for run 'TestRun' ..." not in text
+    assert "ERROR: no valid targets were provided for metadata resolution" not in text
+    assert not (tmp_path / "results" / "sample_info" / "TestRun").exists()
+
+
+def test_rtbioscan_do_metadata_targets_with_trailing_empty_separator_slot_fail_before_metadata_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    fixtures = REPO_ROOT / "tests" / "fixtures" / "metadata"
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--do_metadata",
+            "--run_id",
+            "TestRun",
+            "--targets",
+            "COI|",
+            "--metadata",
+            str(fixtures / "pipeline_info.tsv"),
+            "--general_fasta",
+            str(fixtures / "general.fasta"),
+            "--primers_fasta",
+            str(fixtures / "primers.fasta"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert (
+        "ERROR: explicit wrapper-level --targets contains invalid marker names; "
+        "targets must be pipe-separated tokens without whitespace."
+    ) in text
+    assert "==> [RTBioScan] Setting up results/sample_info/TestRun/ for run 'TestRun' ..." not in text
+    assert "ERROR: no valid targets were provided for metadata resolution" not in text
+    assert not (tmp_path / "results" / "sample_info" / "TestRun").exists()
+
+
+def test_rtbioscan_feeder_uses_config_derived_targets(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    feeder_log = REPO_ROOT / "results" / "feeder.log"
+    original_log = feeder_log.read_text(encoding="utf-8") if feeder_log.exists() else None
+    env, _ = _make_nextflow_shim(
+        tmp_path,
+        config_stdout="params.targets = 'ITS2|COI'\n",
+        run_stderr="NEXTFLOW_RUN_SENTINEL\n",
+        run_exit=86,
+    )
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                str(script),
+                "--feeder",
+                "--run_id",
+                "MyRun",
+                "--input_folder",
+                str(input_dir),
+                "--sleep_time",
+                "1",
+                "-profile",
+                "test",
+            ],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        text = result.stdout + result.stderr
+        assert result.returncode == 86
+        assert "ERROR: unable to resolve params.targets" not in text
+        assert "==> [RTBioScan] Feeder started" in result.stdout
+        assert feeder_log.exists()
+        assert "Targets: ITS2|COI" in feeder_log.read_text(encoding="utf-8")
+    finally:
+        if original_log is None:
+            if feeder_log.exists():
+                feeder_log.unlink()
+        else:
+            feeder_log.parent.mkdir(parents=True, exist_ok=True)
+            feeder_log.write_text(original_log, encoding="utf-8")
+
+
+def test_rtbioscan_feeder_empty_targets_fail_before_feeder_and_pipeline_start(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--feeder",
+            "--run_id",
+            "MyRun",
+            "--input_folder",
+            str(input_dir),
+            "--targets",
+            "",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    text = result.stdout + result.stderr
+    assert "ERROR: explicit wrapper-level --targets must not be empty when using RTBioScan.sh." in text
+    assert "==> [RTBioScan] Starting POD5 feeder" not in text
+    assert "==> [RTBioScan] Starting pipeline ..." not in text
+    assert not (tmp_path / "results" / "pod5" / "MyRun").exists()
+
+
+def test_rtbioscan_core_arg_errors_precede_target_resolution_failures(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+
+    missing_run = subprocess.run(
+        ["bash", str(script), "--do_metadata"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert missing_run.returncode != 0
+    assert "--run_id is required with --feeder / --do_metadata" in missing_run.stderr
+    assert "unable to resolve params.targets" not in missing_run.stderr
+
+    missing_input = subprocess.run(
+        ["bash", str(script), "--feeder", "--run_id", "MyRun"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert missing_input.returncode != 0
+    assert "--feeder requires --input_folder" in missing_input.stderr
+    assert "unable to resolve params.targets" not in missing_input.stderr
+
+
+def test_rtbioscan_uses_resolved_targets_in_meta_and_feeder_args() -> None:
+    text = (REPO_ROOT / "RTBioScan.sh").read_text(encoding="utf-8")
+    assert '[[ -n "$resolved_targets" ]] && meta_args+=(--targets "$resolved_targets")' in text
+    assert '[[ -n "$resolved_targets" ]] && feeder_args+=(--targets "$resolved_targets")' in text
+    assert 'if [[ $targets_explicit -eq 0 ]]; then' in text
+    assert 'resolve_targets_from_config_or_die' in text
+
+
+def test_rtbioscan_captures_nextflow_config_and_run_argv_with_correct_grouping_and_order(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    env, log_path = _make_nextflow_shim(
+        tmp_path,
+        config_stdout="params.targets = 'ITS2|COI'\n",
+        run_stderr="NEXTFLOW_RUN_SENTINEL\n",
+        run_exit=86,
+    )
+    cfg_one = tmp_path / "one.config"
+    cfg_two = tmp_path / "two.config"
+    cfg_one.write_text("params.foo = 'one'\n", encoding="utf-8")
+    cfg_two.write_text("params.bar = 'two'\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--do_metadata",
+            *_metadata_fixture_args(),
+            "-C",
+            str(cfg_one),
+            "-c",
+            str(cfg_two),
+            "-config-ignore-includes",
+            "-profile",
+            "test",
+            "--watch",
+            "false",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 86
+    invocations = _read_nextflow_invocations(log_path)
+    config_invocations = [(pwd, args) for pwd, args in invocations if "config" in args]
+    assert len(config_invocations) == 1
+    pwd, args = config_invocations[0]
+    assert pwd == str(REPO_ROOT)
+    assert args == [
+        "-C",
+        str(cfg_one),
+        "-c",
+        str(cfg_two),
+        "-config-ignore-includes",
+        "config",
+        "-flat",
+        "-profile",
+        "test",
+        "main.nf",
+    ]
+    run_invocations = [(pwd, args) for pwd, args in invocations if "run" in args]
+    assert len(run_invocations) == 1
+    run_pwd, run_args = run_invocations[0]
+    assert run_pwd == str(REPO_ROOT)
+    assert run_args[:6] == [
+        "-C",
+        str(cfg_one),
+        "-c",
+        str(cfg_two),
+        "-config-ignore-includes",
+        "run",
+    ]
+    assert run_args[6] == "main.nf"
+    assert run_args[7:] == [
+        "-profile",
+        "test",
+        "--watch",
+        "false",
+        "-name",
+        "TestRun",
+        "--run_id",
+        "TestRun",
+        "--reads",
+        "results/pod5/TestRun/reads_rt_round_pod5/*pod5",
+        "--ori_dir",
+        "results/pod5/TestRun/ori_round_pod5/",
+        "--indexes",
+        "results/sample_info/TestRun/demult.fasta",
+        "--primer_indexes",
+        str(METADATA_FIXTURES / "primers.fasta"),
+    ]
+    assert "-C" not in run_args[7:]
+    assert "-c" not in run_args[7:]
+    assert "-config-ignore-includes" not in run_args[7:]
+
+
+def test_rtbioscan_do_metadata_fails_when_config_has_no_targets(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    env, _ = _make_nextflow_shim(tmp_path, config_stdout="params.other = 'value'\n")
+    result = subprocess.run(
+        ["bash", str(script), "--do_metadata", "--run_id", "TestRun", "-profile", "test"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    text = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "ERROR: unable to resolve params.targets from CLI --targets or the effective Nextflow config stack." in text
+    assert "==> [RTBioScan] Setting up results/sample_info/TestRun/" not in text
+
+
+def test_rtbioscan_do_metadata_fails_when_config_targets_are_invalid(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    env, _ = _make_nextflow_shim(tmp_path, config_stdout="params.targets = 'CO I|ITS2'\n")
+    result = subprocess.run(
+        ["bash", str(script), "--do_metadata", "--run_id", "TestRun", "-profile", "test"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    text = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "ERROR: resolved params.targets from the effective Nextflow config stack is invalid; targets must be pipe-separated tokens without whitespace." in text
+    assert (
+        "ERROR: explicit wrapper-level --targets contains invalid marker names; "
+        "targets must be pipe-separated tokens without whitespace."
+    ) not in text
+    assert "==> [RTBioScan] Setting up results/sample_info/TestRun/" not in text
+
+
+def test_rtbioscan_do_metadata_fails_when_nextflow_config_command_fails(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    env, _ = _make_nextflow_shim(tmp_path, config_exit=7, run_exit=0, run_stderr="")
+    result = subprocess.run(
+        ["bash", str(script), "--do_metadata", "--run_id", "TestRun", "-profile", "test"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    text = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "ERROR: failed to resolve params.targets via 'nextflow config -flat'; check profile/config arguments and config files." in text
+    assert "==> [RTBioScan] Setting up results/sample_info/TestRun/" not in text
+
+
+def test_rtbioscan_do_metadata_fails_when_config_selector_is_missing_its_value(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--do_metadata", "--run_id", "TestRun", "-profile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    text = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "ERROR: config-affecting Nextflow option '-profile' is missing its required value." in text
+    assert "==> [RTBioScan] Setting up results/sample_info/TestRun/" not in text
+
+
+def test_rtbioscan_do_metadata_rejects_attached_form_selector_when_config_lookup_is_needed(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--do_metadata", "--run_id", "TestRun", "-profile=test"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    text = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "ERROR: config-affecting Nextflow option '-profile' must use the separate-token form in RTBioScan.sh." in text
+    assert "==> [RTBioScan] Setting up results/sample_info/TestRun/" not in text
+
+
+def test_rtbioscan_do_metadata_with_explicit_targets_short_circuits_config_lookup_for_attached_forms(tmp_path: Path) -> None:
+    script = REPO_ROOT / "RTBioScan.sh"
+    env, log_path = _make_nextflow_shim(
+        tmp_path,
+        config_stdout="params.targets = 'SHOULD_NOT_BE_USED'\n",
+        run_stderr="NEXTFLOW_RUN_SENTINEL\n",
+        run_exit=86,
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--do_metadata",
+            "--targets",
+            "ITS2|COI",
+            *_metadata_fixture_args(),
+            "-profile=test",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    text = result.stdout + result.stderr
+    assert result.returncode == 86
+    assert "ERROR: config-affecting Nextflow option '-profile' must use the separate-token form in RTBioScan.sh." not in text
+    assert "Targets: ITS2|COI" in result.stdout
+    invocations = _read_nextflow_invocations(log_path)
+    assert not [args for _, args in invocations if "config" in args]
+    run_invocations = [args for _, args in invocations if "run" in args]
+    assert len(run_invocations) == 1
+    assert "-profile=test" in run_invocations[0]
 
 
 def test_rtbioscan_supports_temp_only_cleanup_modes() -> None:
