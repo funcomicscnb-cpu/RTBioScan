@@ -5100,6 +5100,145 @@ process getting_run_summary {
 		echo "WARN: skipping plot signature commit because one or more plot outputs were not copied" 1>&2
 		return 1
 	}
+	run_plot_with_sig() {
+		RUN_PLOT_WITH_SIG_RSCRIPT_OK=0
+		local plot_sig="\$1"
+		local plot_key="\$2"
+		local run_msg="\$3"
+		local skip_msg="\$4"
+		local success_msg="\$5"
+		shift 5
+		local current_section=""
+		local token=""
+		local seen_check=0
+		local seen_rscript=0
+		local seen_copy=0
+		local check_outputs=()
+		local rscript_items=()
+		local copy_args=()
+		local rscript_path=""
+		local rscript_args=()
+		local i=0
+		while [ "\$#" -gt 0 ]; do
+			token="\$1"
+			shift
+			case "\$token" in
+				--check)
+					if [ "\$seen_check" -eq 1 ]; then
+						echo "ERROR: run_plot_with_sig duplicate --check marker" 1>&2
+						exit 1
+					fi
+					if [ "\$seen_rscript" -eq 1 ] || [ "\$seen_copy" -eq 1 ]; then
+						echo "ERROR: run_plot_with_sig marker out of order: --check" 1>&2
+						exit 1
+					fi
+					seen_check=1
+					current_section="check"
+					;;
+				--rscript)
+					if [ "\$seen_check" -ne 1 ]; then
+						echo "ERROR: run_plot_with_sig missing --check before --rscript" 1>&2
+						exit 1
+					fi
+					if [ "\$seen_rscript" -eq 1 ]; then
+						echo "ERROR: run_plot_with_sig duplicate --rscript marker" 1>&2
+						exit 1
+					fi
+					if [ "\$seen_copy" -eq 1 ]; then
+						echo "ERROR: run_plot_with_sig marker out of order: --rscript" 1>&2
+						exit 1
+					fi
+					seen_rscript=1
+					current_section="rscript"
+					;;
+				--copy)
+					if [ "\$seen_check" -ne 1 ] || [ "\$seen_rscript" -ne 1 ]; then
+						echo "ERROR: run_plot_with_sig missing earlier sections before --copy" 1>&2
+						exit 1
+					fi
+					if [ "\$seen_copy" -eq 1 ]; then
+						echo "ERROR: run_plot_with_sig duplicate --copy marker" 1>&2
+						exit 1
+					fi
+					seen_copy=1
+					current_section="copy"
+					;;
+				--*)
+					echo "ERROR: run_plot_with_sig invalid marker '\$token'" 1>&2
+					exit 1
+					;;
+				*)
+					case "\$current_section" in
+						check)
+							check_outputs+=("\$token")
+							;;
+						rscript)
+							rscript_items+=("\$token")
+							;;
+						copy)
+							copy_args+=("\$token")
+							;;
+						*)
+							echo "ERROR: run_plot_with_sig payload before --check marker" 1>&2
+							exit 1
+							;;
+					esac
+					;;
+			esac
+		done
+		if [ "\$seen_check" -ne 1 ]; then
+			echo "ERROR: run_plot_with_sig missing --check marker" 1>&2
+			exit 1
+		fi
+		if [ "\$seen_rscript" -ne 1 ]; then
+			echo "ERROR: run_plot_with_sig missing --rscript marker" 1>&2
+			exit 1
+		fi
+		if [ "\$seen_copy" -ne 1 ]; then
+			echo "ERROR: run_plot_with_sig missing --copy marker" 1>&2
+			exit 1
+		fi
+		if [ "\${#check_outputs[@]}" -eq 0 ]; then
+			echo "ERROR: run_plot_with_sig empty --check section" 1>&2
+			exit 1
+		fi
+		if [ "\${#rscript_items[@]}" -eq 0 ]; then
+			echo "ERROR: run_plot_with_sig missing R script path after --rscript" 1>&2
+			exit 1
+		fi
+		rscript_path="\${rscript_items[0]}"
+		if [ -z "\$rscript_path" ]; then
+			echo "ERROR: run_plot_with_sig missing R script path after --rscript" 1>&2
+			exit 1
+		fi
+		i=1
+		while [ "\$i" -lt "\${#rscript_items[@]}" ]; do
+			rscript_args+=("\${rscript_items[\$i]}")
+			i=\$((i + 1))
+		done
+		if [ "\${#copy_args[@]}" -eq 0 ]; then
+			echo "ERROR: run_plot_with_sig empty --copy section" 1>&2
+			exit 1
+		fi
+		if [ \$((\${#copy_args[@]} % 2)) -ne 0 ]; then
+			echo "ERROR: run_plot_with_sig odd number of --copy arguments" 1>&2
+			exit 1
+		fi
+		if bash ${baseDir}/bin/plot_sig.sh check "\$plot_sig" "\$plot_key" "\${check_outputs[@]}"; then
+			echo "\$run_msg" 1>&2
+			if Rscript "\$rscript_path" "\${rscript_args[@]}"; then
+				RUN_PLOT_WITH_SIG_RSCRIPT_OK=1
+				if copy_plot_outputs_and_commit "\$plot_sig" "\$plot_key" "\${copy_args[@]}"; then
+					if [ -n "\$success_msg" ]; then
+						echo "\$success_msg" 1>&2
+					fi
+				fi
+			fi
+		else
+			echo "\$skip_msg" 1>&2
+		fi
+		return 0
+	}
 	PLOT_SIG_DIR="${ongoingStateDir}/_state/plot_sigs"
 	mkdir -p "\$PLOT_SIG_DIR"
 		# -- §2: Rolling report + metadata ledger update (append_reports.pl) --
@@ -5144,83 +5283,77 @@ process getting_run_summary {
 		# -- §3: R plot generation (time-series, treemaps, circle trees) --
 		_plot_key="Time_reads|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_reads_time_rpt.txt\")"
 		_plot_sig="\$PLOT_SIG_DIR/Time_reads.sig"
-		if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
-				"${ongoingStateDir}/_state/${barcode}_reads_time.png" \
-				"${ongoingStateDir}/_state/${barcode}_reads_time.pdf"; then
-			echo "INFO: running plot Time_reads.R" 1>&2
-			if Rscript ${baseDir}/bin/Time_reads.R ${ongoingStateDir}/_state/${barcode}_reads_time_rpt.txt;
-			then
-				if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-					${barcode}_reads_time.png ${ongoingStateDir}/_state/${barcode}_reads_time.png \
-					${barcode}_reads_time.pdf ${ongoingStateDir}/_state/${barcode}_reads_time.pdf; then
-					echo "Creating production Vs time plot" 1>&2
-				fi
-			fi
-		else
-			echo "INFO: skipping plot Time_reads.R (signature unchanged)" 1>&2
-		fi
+		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+			"INFO: running plot Time_reads.R" \
+			"INFO: skipping plot Time_reads.R (signature unchanged)" \
+			"Creating production Vs time plot" \
+			--check \
+			"${ongoingStateDir}/_state/${barcode}_reads_time.png" \
+			"${ongoingStateDir}/_state/${barcode}_reads_time.pdf" \
+			--rscript \
+			"${baseDir}/bin/Time_reads.R" \
+			"${ongoingStateDir}/_state/${barcode}_reads_time_rpt.txt" \
+			--copy \
+			"${barcode}_reads_time.png" "${ongoingStateDir}/_state/${barcode}_reads_time.png" \
+			"${barcode}_reads_time.pdf" "${ongoingStateDir}/_state/${barcode}_reads_time.pdf"
 	if [ -f ${ongoingStateDir}/_state/${barcode}_reads_cumulative_rpt.txt ];
 	then
 		_plot_key="Time_reads_cumulative|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_reads_cumulative_rpt.txt\")"
 		_plot_sig="\$PLOT_SIG_DIR/Time_reads_cumulative.sig"
-		if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
-				"${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.png" \
-				"${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.pdf"; then
-			echo "INFO: running plot Time_reads_cumulative.R" 1>&2
-			if Rscript ${baseDir}/bin/Time_reads_cumulative.R ${ongoingStateDir}/_state/${barcode}_reads_cumulative_rpt.txt;
-			then
-				if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-					${barcode}_reads_cumulative_log.png ${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.png \
-					${barcode}_reads_cumulative_log.pdf ${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.pdf; then
-					echo "Creating cumulative reads plot" 1>&2
-				fi
-			fi
-		else
-			echo "INFO: skipping plot Time_reads_cumulative.R (signature unchanged)" 1>&2
-		fi
+		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+			"INFO: running plot Time_reads_cumulative.R" \
+			"INFO: skipping plot Time_reads_cumulative.R (signature unchanged)" \
+			"Creating cumulative reads plot" \
+			--check \
+			"${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.png" \
+			"${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.pdf" \
+			--rscript \
+			"${baseDir}/bin/Time_reads_cumulative.R" \
+			"${ongoingStateDir}/_state/${barcode}_reads_cumulative_rpt.txt" \
+			--copy \
+			"${barcode}_reads_cumulative_log.png" "${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.png" \
+			"${barcode}_reads_cumulative_log.pdf" "${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.pdf"
 	fi
 		_plot_key="Treemap_abundance_species|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_viridiplantae_treemap_rpt.txt\")"
 		_plot_sig="\$PLOT_SIG_DIR/Treemap_abundance_species.sig"
-		if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.pdf" \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.pdf"; then
-			echo "INFO: running plot Treemap_abundance_species.R" 1>&2
-			if Rscript ${baseDir}/bin/Treemap_abundance_species.R ${ongoingStateDir}/_state/${barcode}_otu_tax_spc_metazoa_treemap_rpt.txt ${ongoingStateDir}/_state/${barcode}_otu_tax_spc_viridiplantae_treemap_rpt.txt;
-			then
-				if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-					${barcode}_otu_tax_spc_COI_treemap.png ${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.png \
-					${barcode}_otu_tax_spc_ITS_treemap.png ${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.png \
-					${barcode}_otu_tax_spc_COI_treemap.pdf ${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.pdf \
-					${barcode}_otu_tax_spc_ITS_treemap.pdf ${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.pdf; then
-					echo "Creating otu_tax Vs time plot" 1>&2
-				fi
-			fi
-		else
-			echo "INFO: skipping plot Treemap_abundance_species.R (signature unchanged)" 1>&2
-		fi
+		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+			"INFO: running plot Treemap_abundance_species.R" \
+			"INFO: skipping plot Treemap_abundance_species.R (signature unchanged)" \
+			"Creating otu_tax Vs time plot" \
+			--check \
+			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.png" \
+			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.png" \
+			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.pdf" \
+			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.pdf" \
+			--rscript \
+			"${baseDir}/bin/Treemap_abundance_species.R" \
+			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_metazoa_treemap_rpt.txt" \
+			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_viridiplantae_treemap_rpt.txt" \
+			--copy \
+			"${barcode}_otu_tax_spc_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.png" \
+			"${barcode}_otu_tax_spc_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.png" \
+			"${barcode}_otu_tax_spc_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.pdf" \
+			"${barcode}_otu_tax_spc_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.pdf"
 			_plot_key="Treemap_abundance_genus|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_viridiplantae_treemap_rpt.txt\")"
 			_plot_sig="\$PLOT_SIG_DIR/Treemap_abundance_genus.sig"
-			if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
-					"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.png" \
-					"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.png" \
-					"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.pdf" \
-					"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.pdf"; then
-				echo "INFO: running plot Treemap_abundance_genus.R" 1>&2
-			if Rscript ${baseDir}/bin/Treemap_abundance_genus.R ${ongoingStateDir}/_state/${barcode}_otu_tax_gns_metazoa_treemap_rpt.txt ${ongoingStateDir}/_state/${barcode}_otu_tax_gns_viridiplantae_treemap_rpt.txt;
-			then
-				if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-					${barcode}_otu_tax_gns_COI_treemap.png ${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.png \
-					${barcode}_otu_tax_gns_ITS_treemap.png ${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.png \
-					${barcode}_otu_tax_gns_COI_treemap.pdf ${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.pdf \
-					${barcode}_otu_tax_gns_ITS_treemap.pdf ${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.pdf; then
-					echo "Creating otu_tax Vs time plot" 1>&2
-				fi
-			fi
-			else
-				echo "INFO: skipping plot Treemap_abundance_genus.R (signature unchanged)" 1>&2
-			fi
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+				"INFO: running plot Treemap_abundance_genus.R" \
+				"INFO: skipping plot Treemap_abundance_genus.R (signature unchanged)" \
+				"Creating otu_tax Vs time plot" \
+				--check \
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.png" \
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.png" \
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.pdf" \
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.pdf" \
+				--rscript \
+				"${baseDir}/bin/Treemap_abundance_genus.R" \
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_metazoa_treemap_rpt.txt" \
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_viridiplantae_treemap_rpt.txt" \
+				--copy \
+				"${barcode}_otu_tax_gns_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.png" \
+				"${barcode}_otu_tax_gns_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.png" \
+				"${barcode}_otu_tax_gns_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.pdf" \
+				"${barcode}_otu_tax_gns_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.pdf"
 			perl ${baseDir}/bin/assignments_circle_tree_prep.pl \
 				--mode otu \
 				--blast "${blast_otu_pretax_rpt}" \
@@ -5261,44 +5394,43 @@ process getting_run_summary {
 			fi
 			_plot_key="Time_taxonomy_otu|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_time_rpt.txt\")"
 			_plot_sig="\$PLOT_SIG_DIR/Time_taxonomy_otu.sig"
-			if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+				"INFO: running plot Time_taxonomy_otu.R" \
+				"INFO: skipping plot Time_taxonomy_otu.R (signature unchanged)" \
+				"Creating otu_tax Vs time plot" \
+				--check \
 				"${ongoingStateDir}/_state/${barcode}_otu_tax_time.png" \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_time.pdf"; then
-			echo "INFO: running plot Time_taxonomy_otu.R" 1>&2
-			if Rscript ${baseDir}/bin/Time_taxonomy_otu.R ${ongoingStateDir}/_state/${barcode}_otu_tax_time_rpt.txt;
-			then
-				if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-					${barcode}_otu_tax_time.png ${ongoingStateDir}/_state/${barcode}_otu_tax_time.png \
-					${barcode}_otu_tax_time.pdf ${ongoingStateDir}/_state/${barcode}_otu_tax_time.pdf; then
-					echo "Creating otu_tax Vs time plot" 1>&2
-				fi
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_time.pdf" \
+				--rscript \
+				"${baseDir}/bin/Time_taxonomy_otu.R" \
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_time_rpt.txt" \
+				--copy \
+				"${barcode}_otu_tax_time.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_time.png" \
+				"${barcode}_otu_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_time.pdf"
+			if [ "\$RUN_PLOT_WITH_SIG_RSCRIPT_OK" -eq 1 ]; then
 				# Optional additional plot produced by Time_taxonomy_otu.R when basecalling-model rows exist.
 				try_asset_copy ${barcode}_otu_tax_time_basecalling.png ${ongoingStateDir}/_state/${barcode}_otu_tax_time_basecalling.png || true
 			fi
-		else
-			echo "INFO: skipping plot Time_taxonomy_otu.R (signature unchanged)" 1>&2
-		fi
 		_plot_key="Treemap_consensus_abundance_species|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_viridiplantae_treemap_rpt.txt\")"
 		_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_species.sig"
-		if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.pdf" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.pdf"; then
-			echo "INFO: running plot Treemap_consensus_abundance_species.R" 1>&2
-			if Rscript ${baseDir}/bin/Treemap_consensus_abundance_species.R ${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_metazoa_treemap_rpt.txt ${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_viridiplantae_treemap_rpt.txt;
-			then
-				if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-					${barcode}_consensus_tax_spc_COI_treemap.png ${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.png \
-					${barcode}_consensus_tax_spc_ITS_treemap.png ${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.png \
-					${barcode}_consensus_tax_spc_COI_treemap.pdf ${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.pdf \
-					${barcode}_consensus_tax_spc_ITS_treemap.pdf ${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.pdf; then
-					echo "Creating consensus_tax Vs time plot" 1>&2
-				fi
-			fi
-			else
-				echo "INFO: skipping plot Treemap_consensus_abundance_species.R (signature unchanged)" 1>&2
-			fi
+		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+			"INFO: running plot Treemap_consensus_abundance_species.R" \
+			"INFO: skipping plot Treemap_consensus_abundance_species.R (signature unchanged)" \
+			"Creating consensus_tax Vs time plot" \
+			--check \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.png" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.png" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.pdf" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.pdf" \
+			--rscript \
+			"${baseDir}/bin/Treemap_consensus_abundance_species.R" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_metazoa_treemap_rpt.txt" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_viridiplantae_treemap_rpt.txt" \
+			--copy \
+			"${barcode}_consensus_tax_spc_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.png" \
+			"${barcode}_consensus_tax_spc_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.png" \
+			"${barcode}_consensus_tax_spc_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.pdf" \
+			"${barcode}_consensus_tax_spc_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.pdf"
 			perl ${baseDir}/bin/assignments_circle_tree_prep.pl \
 				--mode consensus \
 				--blast "${blast_consensus_tax}" \
@@ -5338,155 +5470,144 @@ process getting_run_summary {
 			if [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_metazoa_treemap_rpt.txt ] || [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_viridiplantae_treemap_rpt.txt ]; then
 				_plot_key="Treemap_consensus_abundance_species_consolidated|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_viridiplantae_treemap_rpt.txt\")"
 				_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_species_consolidated.sig"
-			if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
-					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.png" \
-					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.png" \
-					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.pdf" \
-					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.pdf"; then
-				echo "INFO: running plot Treemap_consensus_abundance_species_consolidated.R" 1>&2
-				if Rscript ${baseDir}/bin/Treemap_consensus_abundance_species_consolidated.R ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_metazoa_treemap_rpt.txt ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_viridiplantae_treemap_rpt.txt;
-				then
-					if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-						${barcode}_consensus_consolidated_tax_spc_COI_treemap.png ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.png \
-						${barcode}_consensus_consolidated_tax_spc_ITS_treemap.png ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.png \
-						${barcode}_consensus_consolidated_tax_spc_COI_treemap.pdf ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.pdf \
-						${barcode}_consensus_consolidated_tax_spc_ITS_treemap.pdf ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.pdf; then
-						echo "Creating consolidated consensus species treemap plots" 1>&2
-					fi
-				fi
-			else
-				echo "INFO: skipping plot Treemap_consensus_abundance_species_consolidated.R (signature unchanged)" 1>&2
-			fi
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+				"INFO: running plot Treemap_consensus_abundance_species_consolidated.R" \
+				"INFO: skipping plot Treemap_consensus_abundance_species_consolidated.R (signature unchanged)" \
+				"Creating consolidated consensus species treemap plots" \
+				--check \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.png" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.png" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.pdf" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.pdf" \
+				--rscript \
+				"${baseDir}/bin/Treemap_consensus_abundance_species_consolidated.R" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_metazoa_treemap_rpt.txt" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_viridiplantae_treemap_rpt.txt" \
+				--copy \
+				"${barcode}_consensus_consolidated_tax_spc_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.png" \
+				"${barcode}_consensus_consolidated_tax_spc_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.png" \
+				"${barcode}_consensus_consolidated_tax_spc_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.pdf" \
+				"${barcode}_consensus_consolidated_tax_spc_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.pdf"
 		fi
 		_plot_key="Treemap_consensus_abundance_genus|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_viridiplantae_treemap_rpt.txt\")"
 		_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_genus.sig"
-		if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.pdf" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.pdf"; then
-			echo "INFO: running plot Treemap_consensus_abundance_genus.R" 1>&2
-			if Rscript ${baseDir}/bin/Treemap_consensus_abundance_genus.R ${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_metazoa_treemap_rpt.txt ${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_viridiplantae_treemap_rpt.txt;
-			then
-				if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-					${barcode}_consensus_tax_gns_COI_treemap.png ${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.png \
-					${barcode}_consensus_tax_gns_ITS_treemap.png ${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.png \
-					${barcode}_consensus_tax_gns_COI_treemap.pdf ${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.pdf \
-					${barcode}_consensus_tax_gns_ITS_treemap.pdf ${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.pdf; then
-					echo "Creating consensus_tax Vs time plot" 1>&2
-				fi
-			fi
-		else
-			echo "INFO: skipping plot Treemap_consensus_abundance_genus.R (signature unchanged)" 1>&2
-		fi
+		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+			"INFO: running plot Treemap_consensus_abundance_genus.R" \
+			"INFO: skipping plot Treemap_consensus_abundance_genus.R (signature unchanged)" \
+			"Creating consensus_tax Vs time plot" \
+			--check \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.png" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.png" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.pdf" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.pdf" \
+			--rscript \
+			"${baseDir}/bin/Treemap_consensus_abundance_genus.R" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_metazoa_treemap_rpt.txt" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_viridiplantae_treemap_rpt.txt" \
+			--copy \
+			"${barcode}_consensus_tax_gns_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.png" \
+			"${barcode}_consensus_tax_gns_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.png" \
+			"${barcode}_consensus_tax_gns_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.pdf" \
+			"${barcode}_consensus_tax_gns_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.pdf"
 		if [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_metazoa_treemap_rpt.txt ] || [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_viridiplantae_treemap_rpt.txt ]; then
 			_plot_key="Treemap_consensus_abundance_genus_consolidated|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_viridiplantae_treemap_rpt.txt\")"
 			_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_genus_consolidated.sig"
-			if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
-					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.png" \
-					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.png" \
-					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.pdf" \
-					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.pdf"; then
-				echo "INFO: running plot Treemap_consensus_abundance_genus_consolidated.R" 1>&2
-				if Rscript ${baseDir}/bin/Treemap_consensus_abundance_genus_consolidated.R ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_metazoa_treemap_rpt.txt ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_viridiplantae_treemap_rpt.txt;
-				then
-					if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-						${barcode}_consensus_consolidated_tax_gns_COI_treemap.png ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.png \
-						${barcode}_consensus_consolidated_tax_gns_ITS_treemap.png ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.png \
-						${barcode}_consensus_consolidated_tax_gns_COI_treemap.pdf ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.pdf \
-						${barcode}_consensus_consolidated_tax_gns_ITS_treemap.pdf ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.pdf; then
-						echo "Creating consolidated consensus genus treemap plots" 1>&2
-					fi
-				fi
-			else
-				echo "INFO: skipping plot Treemap_consensus_abundance_genus_consolidated.R (signature unchanged)" 1>&2
-			fi
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+				"INFO: running plot Treemap_consensus_abundance_genus_consolidated.R" \
+				"INFO: skipping plot Treemap_consensus_abundance_genus_consolidated.R (signature unchanged)" \
+				"Creating consolidated consensus genus treemap plots" \
+				--check \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.png" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.png" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.pdf" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.pdf" \
+				--rscript \
+				"${baseDir}/bin/Treemap_consensus_abundance_genus_consolidated.R" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_metazoa_treemap_rpt.txt" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_viridiplantae_treemap_rpt.txt" \
+				--copy \
+				"${barcode}_consensus_consolidated_tax_gns_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.png" \
+				"${barcode}_consensus_consolidated_tax_gns_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.png" \
+				"${barcode}_consensus_consolidated_tax_gns_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.pdf" \
+				"${barcode}_consensus_consolidated_tax_gns_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.pdf"
 		fi
 		_plot_key="Time_taxonomy_consensus|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_time_rpt.txt\")"
 		_plot_sig="\$PLOT_SIG_DIR/Time_taxonomy_consensus.sig"
-		if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_tax_time.png" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_tax_time.pdf"; then
-			echo "INFO: running plot Time_taxonomy_consensus.R" 1>&2
-			if Rscript ${baseDir}/bin/Time_taxonomy_consensus.R ${ongoingStateDir}/_state/${barcode}_consensus_tax_time_rpt.txt;
-			then
-				if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-					${barcode}_consensus_tax_time.png ${ongoingStateDir}/_state/${barcode}_consensus_tax_time.png \
-					${barcode}_consensus_tax_time.pdf ${ongoingStateDir}/_state/${barcode}_consensus_tax_time.pdf; then
-					echo "Creating otu_consensus Vs time plot" 1>&2
-				fi
-			fi
-		else
-			echo "INFO: skipping plot Time_taxonomy_consensus.R (signature unchanged)" 1>&2
-		fi
+		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+			"INFO: running plot Time_taxonomy_consensus.R" \
+			"INFO: skipping plot Time_taxonomy_consensus.R (signature unchanged)" \
+			"Creating otu_consensus Vs time plot" \
+			--check \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_time.png" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_time.pdf" \
+			--rscript \
+			"${baseDir}/bin/Time_taxonomy_consensus.R" \
+			"${ongoingStateDir}/_state/${barcode}_consensus_tax_time_rpt.txt" \
+			--copy \
+			"${barcode}_consensus_tax_time.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_time.png" \
+			"${barcode}_consensus_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_time.pdf"
 			if [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt ] \
 				&& awk 'NR>1{found=1; exit} END{exit !found}' ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt; then
 			_plot_key="Time_taxonomy_consensus_consolidated|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt\")"
 			_plot_sig="\$PLOT_SIG_DIR/Time_taxonomy_consensus_consolidated.sig"
-			if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
-					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.png" \
-					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.pdf"; then
-				echo "INFO: running plot Time_taxonomy_consensus_consolidated.R" 1>&2
-				if Rscript ${baseDir}/bin/Time_taxonomy_consensus_consolidated.R ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt;
-				then
-					if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-						${barcode}_consensus_consolidated_tax_time.png ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.png \
-						${barcode}_consensus_consolidated_tax_time.pdf ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.pdf; then
-						echo "Creating consolidated consensus time plot" 1>&2
-					fi
-				fi
-			else
-				echo "INFO: skipping plot Time_taxonomy_consensus_consolidated.R (signature unchanged)" 1>&2
-			fi
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+				"INFO: running plot Time_taxonomy_consensus_consolidated.R" \
+				"INFO: skipping plot Time_taxonomy_consensus_consolidated.R (signature unchanged)" \
+				"Creating consolidated consensus time plot" \
+				--check \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.png" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.pdf" \
+				--rscript \
+				"${baseDir}/bin/Time_taxonomy_consensus_consolidated.R" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt" \
+				--copy \
+				"${barcode}_consensus_consolidated_tax_time.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.png" \
+				"${barcode}_consensus_consolidated_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.pdf"
 		fi
 		if [ -f ${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt ] \
 				&& awk 'NR>1{found=1; exit} END{exit !found}' ${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt; then
 			_plot_key="Time_taxonomy_otu_frozen|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt\")"
 			_plot_sig="\$PLOT_SIG_DIR/Time_taxonomy_otu_frozen.sig"
-			if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
-					"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.png" \
-					"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.pdf"; then
-				echo "INFO: running plot Time_taxonomy_otu_frozen.R" 1>&2
-				if Rscript ${baseDir}/bin/Time_taxonomy_otu_frozen.R ${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt;
-				then
-					if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-						${barcode}_otu_frozen_tax_time.png ${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.png \
-						${barcode}_otu_frozen_tax_time.pdf ${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.pdf; then
-						echo "Creating frozen OTU time plot" 1>&2
-					fi
-				fi
-			else
-				echo "INFO: skipping plot Time_taxonomy_otu_frozen.R (signature unchanged)" 1>&2
-			fi
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+				"INFO: running plot Time_taxonomy_otu_frozen.R" \
+				"INFO: skipping plot Time_taxonomy_otu_frozen.R (signature unchanged)" \
+				"Creating frozen OTU time plot" \
+				--check \
+				"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.png" \
+				"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.pdf" \
+				--rscript \
+				"${baseDir}/bin/Time_taxonomy_otu_frozen.R" \
+				"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt" \
+				--copy \
+				"${barcode}_otu_frozen_tax_time.png" "${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.png" \
+				"${barcode}_otu_frozen_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.pdf"
 		fi
 			# -- §4: Demux-specific plots (Read_counts, Read_info_quality) --
 			if [ "\$GENERATE_DEMUX_REPORTS" -eq 1 ]; then
 				bash ${baseDir}/bin/demult_summary.sh ${barcode}_demult_rpt.txt ${barcode}
 				_plot_key="Read_counts|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt\")"
 				_plot_sig="\$PLOT_SIG_DIR/Read_counts.sig"
-				if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
+					run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+						"INFO: running plot Read_counts.R" \
+						"INFO: skipping plot Read_counts.R (signature unchanged)" \
+						"Creating demultiplex read count plots" \
+						--check \
 						"${ongoingStateDir}/_state/${barcode}_reads_per_barcode.png" \
 						"${ongoingStateDir}/_state/${barcode}_reads_per_sample_log.png" \
 						"${ongoingStateDir}/_state/${barcode}_reads_per_sample.png" \
 						"${ongoingStateDir}/_state/${barcode}_reads_per_barcode.pdf" \
 						"${ongoingStateDir}/_state/${barcode}_reads_per_sample_log.pdf" \
-						"${ongoingStateDir}/_state/${barcode}_reads_per_sample.pdf"; then
-					echo "INFO: running plot Read_counts.R" 1>&2
-					if Rscript ${baseDir}/bin/Read_counts.R ${barcode}_summary_demult_rpt.txt;
-					then
-						if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-							${barcode}_reads_per_barcode.png ${ongoingStateDir}/_state/${barcode}_reads_per_barcode.png \
-							${barcode}_reads_per_sample_log.png ${ongoingStateDir}/_state/${barcode}_reads_per_sample_log.png \
-							${barcode}_reads_per_sample.png ${ongoingStateDir}/_state/${barcode}_reads_per_sample.png \
-							${barcode}_reads_per_barcode.pdf ${ongoingStateDir}/_state/${barcode}_reads_per_barcode.pdf \
-							${barcode}_reads_per_sample_log.pdf ${ongoingStateDir}/_state/${barcode}_reads_per_sample_log.pdf \
-							${barcode}_reads_per_sample.pdf ${ongoingStateDir}/_state/${barcode}_reads_per_sample.pdf; then
-							echo "Creating demultiplex read count plots" 1>&2
-						fi
-					fi
-				else
-					echo "INFO: skipping plot Read_counts.R (signature unchanged)" 1>&2
-				fi
+						"${ongoingStateDir}/_state/${barcode}_reads_per_sample.pdf" \
+						--rscript \
+						"${baseDir}/bin/Read_counts.R" \
+						"${barcode}_summary_demult_rpt.txt" \
+						--copy \
+						"${barcode}_reads_per_barcode.png" "${ongoingStateDir}/_state/${barcode}_reads_per_barcode.png" \
+						"${barcode}_reads_per_sample_log.png" "${ongoingStateDir}/_state/${barcode}_reads_per_sample_log.png" \
+						"${barcode}_reads_per_sample.png" "${ongoingStateDir}/_state/${barcode}_reads_per_sample.png" \
+					"${barcode}_reads_per_barcode.pdf" "${ongoingStateDir}/_state/${barcode}_reads_per_barcode.pdf" \
+					"${barcode}_reads_per_sample_log.pdf" "${ongoingStateDir}/_state/${barcode}_reads_per_sample_log.pdf" \
+					"${barcode}_reads_per_sample.pdf" "${ongoingStateDir}/_state/${barcode}_reads_per_sample.pdf"
 				else
 					echo "Skipping demultiplex-specific summaries (demultiplex_mode=\${DEMUX_MODE})" 1>&2
 				fi
@@ -5503,29 +5624,27 @@ process getting_run_summary {
 				fi
 				_plot_key="Read_info_quality|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_read_info_rpt.txt\")"
 				_plot_sig="\$PLOT_SIG_DIR/Read_info_quality.sig"
-			if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" \
+				run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+					"INFO: running plot Read_info_quality.R" \
+					"INFO: skipping plot Read_info_quality.R (signature unchanged)" \
+					"Creating reads Vs time plot" \
+					--check \
 					"${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.png" \
 					"${ongoingStateDir}/_state/${barcode}_violin_length_read_info.png" \
 					"${ongoingStateDir}/_state/${barcode}_density_read_info.png" \
 					"${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.pdf" \
 					"${ongoingStateDir}/_state/${barcode}_violin_length_read_info.pdf" \
-					"${ongoingStateDir}/_state/${barcode}_density_read_info.pdf"; then
-				echo "INFO: running plot Read_info_quality.R" 1>&2
-				if Rscript ${baseDir}/bin/Read_info_quality.R ${ongoingStateDir}/_state/${barcode}_read_info_rpt.txt;
-				then
-					if copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-						${barcode}_violin_quality_read_info.png ${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.png \
-						${barcode}_violin_length_read_info.png ${ongoingStateDir}/_state/${barcode}_violin_length_read_info.png \
-						${barcode}_density_read_info.png ${ongoingStateDir}/_state/${barcode}_density_read_info.png \
-						${barcode}_violin_quality_read_info.pdf ${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.pdf \
-						${barcode}_violin_length_read_info.pdf ${ongoingStateDir}/_state/${barcode}_violin_length_read_info.pdf \
-						${barcode}_density_read_info.pdf ${ongoingStateDir}/_state/${barcode}_density_read_info.pdf; then
-						echo "Creating reads Vs time plot" 1>&2
-					fi
-				fi
-			else
-				echo "INFO: skipping plot Read_info_quality.R (signature unchanged)" 1>&2
-			fi
+					"${ongoingStateDir}/_state/${barcode}_density_read_info.pdf" \
+					--rscript \
+					"${baseDir}/bin/Read_info_quality.R" \
+					"${ongoingStateDir}/_state/${barcode}_read_info_rpt.txt" \
+					--copy \
+					"${barcode}_violin_quality_read_info.png" "${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.png" \
+					"${barcode}_violin_length_read_info.png" "${ongoingStateDir}/_state/${barcode}_violin_length_read_info.png" \
+					"${barcode}_density_read_info.png" "${ongoingStateDir}/_state/${barcode}_density_read_info.png" \
+				"${barcode}_violin_quality_read_info.pdf" "${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.pdf" \
+				"${barcode}_violin_length_read_info.pdf" "${ongoingStateDir}/_state/${barcode}_violin_length_read_info.pdf" \
+				"${barcode}_density_read_info.pdf" "${ongoingStateDir}/_state/${barcode}_density_read_info.pdf"
 
 		# -- §5: HTML report assembly (round JSON, history append, render) --
 		# Incremental HTML report update (best-effort, never fails the round).
