@@ -1483,8 +1483,10 @@ process _reporting_hq_demultiplexing {
 	RESTART_TOKEN="${restartTokenForCache}"
 		
 
-	if ! perl ${baseDir}/bin/reporting_demultiplexing.pl ${hac_sup_annotated_clean_fastq} ${params.outdir}/ongoing ${round_barcode} ${barcode}; then
-		printf 'read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\tsubsample\treplicate\n' > ${barcode}_demult_rpt.txt
+	if ! RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${params.replicate_mode}" \
+		RTBIOSCAN_DEMULT_MODE="${demuxCfg.mode}" \
+		perl ${baseDir}/bin/reporting_demultiplexing.pl ${hac_sup_annotated_clean_fastq} ${params.outdir}/ongoing ${round_barcode} ${barcode}; then
+		printf 'read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\tsubsample\treplicate\tidentity_scope\tidentity_value\n' > ${barcode}_demult_rpt.txt
 	fi
 		mkdir -p ${ongoingStateDir}/${round_barcode}/
 		cp -f ${barcode}_demult_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_demult_rpt.txt 2>/dev/null || true
@@ -2193,7 +2195,7 @@ process _reporting_OTU_definition {
 	_p_targets="${params.targets}"
 	IFS='|' read -ra _TARGETS <<< "\$_p_targets"
 	if ! perl ${baseDir}/bin/reporting_otu_definition.pl ${otu_clstr} ${demult} ${round_barcode} ${barcode} "\${_TARGETS[@]}"; then
-		printf 'read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\tsubsample\treplicate\tOTU_id\tOTU_role\n' > ${barcode}_otu_def_rpt.txt
+		printf 'read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\tsubsample\treplicate\tidentity_scope\tidentity_value\tOTU_id\tOTU_role\n' > ${barcode}_otu_def_rpt.txt
 		printf 'otu_id\tread_id\n' > ${barcode}_otu_members_round.tsv
 		printf 'otu_id\tsize\n' > ${barcode}_otu_sizes_round.tsv
 	fi
