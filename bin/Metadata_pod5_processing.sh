@@ -106,6 +106,10 @@ rollback_metadata_commit() {
 		"${sample_info_dir}/demult.fasta" \
 		"${sample_info_dir}/replicate_identity.tsv" \
 		"${sample_info_dir}/replicate_roster.tsv" \
+		"${sample_info_dir}/track_demult.fasta" \
+		"${sample_info_dir}/track_roster.tsv" \
+		"${sample_info_dir}/track_active_units.txt" \
+		"${sample_info_dir}/track_identity.tsv" \
 		"${sample_info_dir}/samples.txt" \
 		"${sample_info_dir}/${general_copy}" \
 		"${sample_info_dir}/primers.fasta"
@@ -237,7 +241,791 @@ select_and_validate_metadata_rows() {
 				printf "%s %s %s %s %s %s %s\n", sample_id, pipeline_id, replicate, well, plate, run, demult_id >> samples_compat_rows
 				selected_count++
 			}
-		' "$metadata_path" > "$selected_out"
+	' "$metadata_path" > "$selected_out"
+}
+
+emit_track_demult_records_index() {
+	local demult_fasta="$1"
+	local out_path="$2"
+	awk '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		function flush_record() {
+			if (header == "") return
+			record_ordinal++
+			printf "%s\t%s\t%s\n", record_ordinal, header, sequence
+		}
+		BEGIN {
+			header = ""
+			sequence = ""
+		}
+		/^>/ {
+			flush_record()
+			header = trim_cr(substr($0, 2))
+			sequence = ""
+			next
+		}
+		{
+			sequence = sequence trim_cr($0)
+		}
+		END {
+			flush_record()
+		}
+	' "$demult_fasta" > "$out_path"
+}
+
+emit_track_identity_index() {
+	local replicate_identity_path="$1"
+	local out_path="$2"
+	awk '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		function rename_header(name) {
+			return (name == "replicate_id" ? "track_id" : name)
+		}
+		BEGIN {
+			FS = "\t"
+			OFS = "\t"
+		}
+		NR == 1 {
+			printf "%s", "emitted_demult_ordinal"
+			for (i = 1; i <= NF; i++) {
+				printf "%s%s", OFS, rename_header(trim_cr($i))
+			}
+			printf "\n"
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			row_ordinal++
+			printf "%d", row_ordinal
+			for (i = 1; i <= NF; i++) {
+				printf "%s%s", OFS, $i
+			}
+			printf "\n"
+		}
+	' "$replicate_identity_path" > "$out_path"
+}
+
+emit_track_roster_identity_lines() {
+	local indexed_identity_path="$1"
+	local out_path="$2"
+	awk '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		BEGIN {
+			FS = "\t"
+			OFS = "\t"
+		}
+		NR == 1 {
+			for (i = 1; i <= NF; i++) {
+				header_idx[trim_cr($i)] = i
+			}
+			if (!("track_id" in header_idx) || !("metadata_line_no" in header_idx)) {
+				print "ERROR: track identity helper is missing required columns track_id and metadata_line_no" > "/dev/stderr"
+				exit 1
+			}
+			print "track_id", "metadata_line_no"
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			key = $(header_idx["track_id"]) SUBSEP $(header_idx["metadata_line_no"])
+			if (!(key in seen)) {
+				seen[key] = 1
+				print $(header_idx["track_id"]), $(header_idx["metadata_line_no"])
+			}
+		}
+	' "$indexed_identity_path" > "$out_path"
+}
+
+emit_track_identity_views() {
+	local demult_records_path="$1"
+	local indexed_identity_path="$2"
+	local first_out="$3"
+	local final_out="$4"
+	awk -v first_out="$first_out" -v final_out="$final_out" '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		function fatal(message) {
+			print message > "/dev/stderr"
+			exit 1
+		}
+		function add_source_line(key, line, seen_key) {
+			if (line == "" || line == first_metadata_line[key]) return
+			seen_key = key SUBSEP line
+			if (!(seen_key in source_seen)) {
+				source_seen[seen_key] = 1
+				source_lines[key, ++source_count[key]] = line + 0
+			}
+		}
+		function add_detail_token(key, token) {
+			if (token != "") detail_tokens[key, token] = 1
+		}
+		function build_source_list(key,    n, i, j, tmp, out, local_lines) {
+			n = source_count[key]
+			if (n == 0) return ""
+			for (i = 1; i <= n; i++) local_lines[i] = source_lines[key, i]
+			for (i = 1; i <= n; i++) {
+				for (j = i + 1; j <= n; j++) {
+					if ((local_lines[j] + 0) < (local_lines[i] + 0)) {
+						tmp = local_lines[i]
+						local_lines[i] = local_lines[j]
+						local_lines[j] = tmp
+					}
+				}
+			}
+			out = ""
+			for (i = 1; i <= n; i++) {
+				out = out (i == 1 ? "" : ",") local_lines[i]
+				delete local_lines[i]
+			}
+			return out
+		}
+		function build_detail(key,    token_order, token_count, i, token, out) {
+			if (status[key] == "unique") return ""
+			if (status[key] == "exact_duplicate_collapsed") return "later_rows_match_operational_fields"
+			token_count = split("sequence_mismatch|sample_id_mismatch|track_id_mismatch|replicate_number_mismatch|marker_id_mismatch|unit_suffix_mismatch|unit_id_collapse_mismatch|demult_id_metadata_mismatch", token_order, /\|/)
+			out = ""
+			for (i = 1; i <= token_count; i++) {
+				token = token_order[i]
+				if (detail_tokens[key, token]) out = out (out == "" ? "" : "|") token
+			}
+			return out
+		}
+		FNR == NR {
+			record_ordinal = $1 + 0
+			demult_header[record_ordinal] = $2
+			demult_sequence[record_ordinal] = $3
+			if (record_ordinal > demult_record_count) demult_record_count = record_ordinal
+			next
+		}
+		FNR == 1 {
+			FS = "\t"
+			OFS = "\t"
+			for (i = 1; i <= NF; i++) {
+				header_idx[trim_cr($i)] = i
+			}
+			required_count = split("emitted_demult_ordinal|sample_id|track_id|replicate_number|marker_id|matched_general_fasta_header|matched_general_fasta_record_index|suffix_resolution_mode|unit_suffix_current|unit_id_collapse|unit_id_track|demult_id_metadata|lookup_key_primary|lookup_key_fallback|lookup_grammar_used|metadata_line_no", required_fields, /\|/)
+			for (i = 1; i <= required_count; i++) {
+				if (!(required_fields[i] in header_idx)) fatal("ERROR: track identity index is missing required column " required_fields[i])
+			}
+			print "emitted_demult_ordinal", "sample_id", "track_id", "replicate_number", "marker_id", "matched_general_fasta_header", "matched_general_fasta_record_index", "suffix_resolution_mode", "unit_suffix_current", "unit_id_collapse", "unit_id_track", "demult_id_metadata", "lookup_key_primary", "lookup_key_fallback", "lookup_grammar_used", "metadata_line_no" > first_out
+			print "sample_id", "track_id", "replicate_number", "marker_id", "matched_general_fasta_header", "matched_general_fasta_record_index", "suffix_resolution_mode", "unit_suffix_current", "unit_id_collapse", "unit_id_track", "demult_id_metadata", "lookup_key_primary", "lookup_key_fallback", "lookup_grammar_used", "metadata_line_no", "track_duplicate_status", "track_duplicate_detail", "track_duplicate_source_metadata_lines" > final_out
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			unit_key = $(header_idx["unit_id_track"])
+			emitted_ordinal = $(header_idx["emitted_demult_ordinal"]) + 0
+			metadata_line = $(header_idx["metadata_line_no"])
+			current_sequence = demult_sequence[emitted_ordinal]
+			current_collapse = $(header_idx["unit_id_collapse"])
+			if (unit_key == "") fatal("ERROR: track identity index has an empty unit_id_track")
+			if (emitted_ordinal < 1 || emitted_ordinal > demult_record_count) fatal("ERROR: emitted demult ordinal " emitted_ordinal " is out of bounds for unit_id_track " unit_key)
+			if (!(emitted_ordinal in demult_header)) fatal("ERROR: missing demult.fasta record for emitted demult ordinal " emitted_ordinal)
+			if (demult_header[emitted_ordinal] != current_collapse) fatal("ERROR: demult.fasta record " emitted_ordinal " header " demult_header[emitted_ordinal] " does not match replicate_identity unit_id_collapse " current_collapse)
+
+			if (!(unit_key in seen_units)) {
+				seen_units[unit_key] = 1
+				order[++order_count] = unit_key
+				status[unit_key] = "unique"
+				first_metadata_line[unit_key] = metadata_line
+				first_fields[unit_key, "emitted_demult_ordinal"] = emitted_ordinal
+				first_fields[unit_key, "sample_id"] = $(header_idx["sample_id"])
+				first_fields[unit_key, "track_id"] = $(header_idx["track_id"])
+				first_fields[unit_key, "replicate_number"] = $(header_idx["replicate_number"])
+				first_fields[unit_key, "marker_id"] = $(header_idx["marker_id"])
+				first_fields[unit_key, "matched_general_fasta_header"] = $(header_idx["matched_general_fasta_header"])
+				first_fields[unit_key, "matched_general_fasta_record_index"] = $(header_idx["matched_general_fasta_record_index"])
+				first_fields[unit_key, "suffix_resolution_mode"] = $(header_idx["suffix_resolution_mode"])
+				first_fields[unit_key, "unit_suffix_current"] = $(header_idx["unit_suffix_current"])
+				first_fields[unit_key, "unit_id_collapse"] = current_collapse
+				first_fields[unit_key, "unit_id_track"] = unit_key
+				first_fields[unit_key, "demult_id_metadata"] = $(header_idx["demult_id_metadata"])
+				first_fields[unit_key, "lookup_key_primary"] = $(header_idx["lookup_key_primary"])
+				first_fields[unit_key, "lookup_key_fallback"] = $(header_idx["lookup_key_fallback"])
+				first_fields[unit_key, "lookup_grammar_used"] = $(header_idx["lookup_grammar_used"])
+				first_fields[unit_key, "metadata_line_no"] = metadata_line
+				base_fields[unit_key, "sequence"] = current_sequence
+				base_fields[unit_key, "sample_id"] = $(header_idx["sample_id"])
+				base_fields[unit_key, "track_id"] = $(header_idx["track_id"])
+				base_fields[unit_key, "replicate_number"] = $(header_idx["replicate_number"])
+				base_fields[unit_key, "marker_id"] = $(header_idx["marker_id"])
+				base_fields[unit_key, "unit_suffix_current"] = $(header_idx["unit_suffix_current"])
+				base_fields[unit_key, "unit_id_collapse"] = current_collapse
+				base_fields[unit_key, "demult_id_metadata"] = $(header_idx["demult_id_metadata"])
+				next
+			}
+
+			add_source_line(unit_key, metadata_line)
+			mismatch = 0
+			if (current_sequence != base_fields[unit_key, "sequence"]) {
+				add_detail_token(unit_key, "sequence_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx["sample_id"]) != base_fields[unit_key, "sample_id"]) {
+				add_detail_token(unit_key, "sample_id_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx["track_id"]) != base_fields[unit_key, "track_id"]) {
+				add_detail_token(unit_key, "track_id_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx["replicate_number"]) != base_fields[unit_key, "replicate_number"]) {
+				add_detail_token(unit_key, "replicate_number_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx["marker_id"]) != base_fields[unit_key, "marker_id"]) {
+				add_detail_token(unit_key, "marker_id_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx["unit_suffix_current"]) != base_fields[unit_key, "unit_suffix_current"]) {
+				add_detail_token(unit_key, "unit_suffix_mismatch")
+				mismatch = 1
+			}
+			if (current_collapse != base_fields[unit_key, "unit_id_collapse"]) {
+				add_detail_token(unit_key, "unit_id_collapse_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx["demult_id_metadata"]) != base_fields[unit_key, "demult_id_metadata"]) {
+				add_detail_token(unit_key, "demult_id_metadata_mismatch")
+				mismatch = 1
+			}
+
+			if (mismatch) {
+				status[unit_key] = "conflicting_duplicate_present"
+			} else if (status[unit_key] == "unique") {
+				status[unit_key] = "exact_duplicate_collapsed"
+			}
+		}
+		END {
+			for (i = 1; i <= order_count; i++) {
+				unit_key = order[i]
+				detail = build_detail(unit_key)
+				source_metadata_lines = build_source_list(unit_key)
+				print first_fields[unit_key, "emitted_demult_ordinal"], first_fields[unit_key, "sample_id"], first_fields[unit_key, "track_id"], first_fields[unit_key, "replicate_number"], first_fields[unit_key, "marker_id"], first_fields[unit_key, "matched_general_fasta_header"], first_fields[unit_key, "matched_general_fasta_record_index"], first_fields[unit_key, "suffix_resolution_mode"], first_fields[unit_key, "unit_suffix_current"], first_fields[unit_key, "unit_id_collapse"], first_fields[unit_key, "unit_id_track"], first_fields[unit_key, "demult_id_metadata"], first_fields[unit_key, "lookup_key_primary"], first_fields[unit_key, "lookup_key_fallback"], first_fields[unit_key, "lookup_grammar_used"], first_fields[unit_key, "metadata_line_no"] > first_out
+				print first_fields[unit_key, "sample_id"], first_fields[unit_key, "track_id"], first_fields[unit_key, "replicate_number"], first_fields[unit_key, "marker_id"], first_fields[unit_key, "matched_general_fasta_header"], first_fields[unit_key, "matched_general_fasta_record_index"], first_fields[unit_key, "suffix_resolution_mode"], first_fields[unit_key, "unit_suffix_current"], first_fields[unit_key, "unit_id_collapse"], first_fields[unit_key, "unit_id_track"], first_fields[unit_key, "demult_id_metadata"], first_fields[unit_key, "lookup_key_primary"], first_fields[unit_key, "lookup_key_fallback"], first_fields[unit_key, "lookup_grammar_used"], first_fields[unit_key, "metadata_line_no"], status[unit_key], detail, source_metadata_lines > final_out
+			}
+		}
+	' "$demult_records_path" "$indexed_identity_path"
+}
+
+emit_track_demult_view() {
+	local demult_records_path="$1"
+	local first_identity_path="$2"
+	local out_path="$3"
+	awk -v out_path="$out_path" '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		function fatal(message) {
+			print message > "/dev/stderr"
+			exit 1
+		}
+		FNR == NR {
+			record_ordinal = $1 + 0
+			demult_sequence[record_ordinal] = $3
+			next
+		}
+		FNR == 1 {
+			FS = "\t"
+			for (i = 1; i <= NF; i++) {
+				header_idx[trim_cr($i)] = i
+			}
+			if (!("emitted_demult_ordinal" in header_idx) || !("unit_id_track" in header_idx)) {
+				fatal("ERROR: track identity first helper is missing required columns")
+			}
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			emitted_ordinal = $(header_idx["emitted_demult_ordinal"]) + 0
+			unit_key = $(header_idx["unit_id_track"])
+			if (!(emitted_ordinal in demult_sequence)) fatal("ERROR: Missing demult sequence for emitted demult ordinal " emitted_ordinal)
+			if (unit_key == "") fatal("ERROR: track identity first helper has an empty unit_id_track")
+			printf ">%s\n%s\n", unit_key, demult_sequence[emitted_ordinal] >> out_path
+		}
+	' "$demult_records_path" "$first_identity_path"
+}
+
+emit_track_active_units_view() {
+	local first_identity_path="$1"
+	local out_path="$2"
+	awk -v out_path="$out_path" '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		NR == 1 {
+			FS = "\t"
+			for (i = 1; i <= NF; i++) {
+				header_idx[trim_cr($i)] = i
+			}
+			if (!("unit_id_track" in header_idx)) {
+				print "ERROR: track identity first helper is missing unit_id_track" > "/dev/stderr"
+				exit 1
+			}
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			print $(header_idx["unit_id_track"]) >> out_path
+		}
+	' "$first_identity_path"
+}
+
+emit_track_roster_view() {
+	local replicate_roster_path="$1"
+	local roster_identity_lines_path="$2"
+	local out_path="$3"
+	awk -v out_path="$out_path" '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		function fatal(message) {
+			print message > "/dev/stderr"
+			exit 1
+		}
+		function add_source_line(key, line, seen_key) {
+			if (line == "" || line == first_metadata_line[key]) return
+			seen_key = key SUBSEP line
+			if (!(seen_key in source_seen)) {
+				source_seen[seen_key] = 1
+				source_lines[key, ++source_count[key]] = line + 0
+			}
+		}
+		function add_detail_token(key, token) {
+			if (token != "") detail_tokens[key, token] = 1
+		}
+		function build_source_list(key,    n, i, j, tmp, out, local_lines) {
+			n = source_count[key]
+			if (n == 0) return ""
+			for (i = 1; i <= n; i++) local_lines[i] = source_lines[key, i]
+			for (i = 1; i <= n; i++) {
+				for (j = i + 1; j <= n; j++) {
+					if ((local_lines[j] + 0) < (local_lines[i] + 0)) {
+						tmp = local_lines[i]
+						local_lines[i] = local_lines[j]
+						local_lines[j] = tmp
+					}
+				}
+			}
+			out = ""
+			for (i = 1; i <= n; i++) {
+				out = out (i == 1 ? "" : ",") local_lines[i]
+				delete local_lines[i]
+			}
+			return out
+		}
+		function build_detail(key,    token_order, token_count, i, token, out) {
+			if (status[key] == "unique") return ""
+			if (status[key] == "exact_duplicate_collapsed") return "later_rows_match_operational_fields"
+			token_count = split("sample_id_mismatch|replicate_number_mismatch|well_mismatch|plate_mismatch|run_id_mismatch|demult_id_metadata_mismatch", token_order, /\|/)
+			out = ""
+			for (i = 1; i <= token_count; i++) {
+				token = token_order[i]
+				if (detail_tokens[key, token]) out = out (out == "" ? "" : "|") token
+			}
+			return out
+		}
+		FNR == NR {
+			if (FNR == 1) {
+				FS = "\t"
+				for (i = 1; i <= NF; i++) {
+					header_idx_helper[trim_cr($i)] = i
+				}
+				if (!("track_id" in header_idx_helper) || !("metadata_line_no" in header_idx_helper)) {
+					fatal("ERROR: track roster identity lines helper is missing required columns")
+				}
+				next
+			}
+			$NF = trim_cr($NF)
+			track_key = $(header_idx_helper["track_id"])
+			metadata_line = $(header_idx_helper["metadata_line_no"])
+			if (!(track_key in first_metadata_line)) {
+				first_metadata_line[track_key] = metadata_line
+			} else {
+				add_source_line(track_key, metadata_line)
+			}
+			next
+		}
+		FNR == 1 {
+			FS = "\t"
+			OFS = "\t"
+			for (i = 1; i <= NF; i++) {
+				header_idx_roster[trim_cr($i)] = i
+			}
+			required_count = split("sample_id|replicate_id|replicate_number|well|plate|run_id|demult_id_metadata", required_fields, /\|/)
+			for (i = 1; i <= required_count; i++) {
+				if (!(required_fields[i] in header_idx_roster)) fatal("ERROR: replicate_roster.tsv is missing required column " required_fields[i])
+			}
+			print "sample_id", "track_id", "replicate_number", "well", "plate", "run_id", "demult_id_metadata", "metadata_line_no_first", "track_duplicate_status", "track_duplicate_detail", "track_duplicate_source_metadata_lines" > out_path
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			track_key = $(header_idx_roster["replicate_id"])
+			if (track_key == "") fatal("ERROR: replicate_roster.tsv has an empty replicate_id")
+			if (!(track_key in seen_tracks)) {
+				seen_tracks[track_key] = 1
+				order[++order_count] = track_key
+				status[track_key] = "unique"
+				first_fields[track_key, "sample_id"] = $(header_idx_roster["sample_id"])
+				first_fields[track_key, "track_id"] = track_key
+				first_fields[track_key, "replicate_number"] = $(header_idx_roster["replicate_number"])
+				first_fields[track_key, "well"] = $(header_idx_roster["well"])
+				first_fields[track_key, "plate"] = $(header_idx_roster["plate"])
+				first_fields[track_key, "run_id"] = $(header_idx_roster["run_id"])
+				first_fields[track_key, "demult_id_metadata"] = $(header_idx_roster["demult_id_metadata"])
+				base_fields[track_key, "sample_id"] = $(header_idx_roster["sample_id"])
+				base_fields[track_key, "replicate_number"] = $(header_idx_roster["replicate_number"])
+				base_fields[track_key, "well"] = $(header_idx_roster["well"])
+				base_fields[track_key, "plate"] = $(header_idx_roster["plate"])
+				base_fields[track_key, "run_id"] = $(header_idx_roster["run_id"])
+				base_fields[track_key, "demult_id_metadata"] = $(header_idx_roster["demult_id_metadata"])
+				next
+			}
+
+			mismatch = 0
+			if ($(header_idx_roster["sample_id"]) != base_fields[track_key, "sample_id"]) {
+				add_detail_token(track_key, "sample_id_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx_roster["replicate_number"]) != base_fields[track_key, "replicate_number"]) {
+				add_detail_token(track_key, "replicate_number_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx_roster["well"]) != base_fields[track_key, "well"]) {
+				add_detail_token(track_key, "well_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx_roster["plate"]) != base_fields[track_key, "plate"]) {
+				add_detail_token(track_key, "plate_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx_roster["run_id"]) != base_fields[track_key, "run_id"]) {
+				add_detail_token(track_key, "run_id_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx_roster["demult_id_metadata"]) != base_fields[track_key, "demult_id_metadata"]) {
+				add_detail_token(track_key, "demult_id_metadata_mismatch")
+				mismatch = 1
+			}
+			if (mismatch) {
+				status[track_key] = "conflicting_duplicate_present"
+			} else if (status[track_key] == "unique") {
+				status[track_key] = "exact_duplicate_collapsed"
+			}
+		}
+		END {
+			for (i = 1; i <= order_count; i++) {
+				track_key = order[i]
+				if (!(track_key in first_metadata_line)) fatal("ERROR: Missing metadata line provenance for track_id " track_key)
+				print first_fields[track_key, "sample_id"], first_fields[track_key, "track_id"], first_fields[track_key, "replicate_number"], first_fields[track_key, "well"], first_fields[track_key, "plate"], first_fields[track_key, "run_id"], first_fields[track_key, "demult_id_metadata"], first_metadata_line[track_key], status[track_key], build_detail(track_key), build_source_list(track_key) > out_path
+			}
+		}
+	' "$roster_identity_lines_path" "$replicate_roster_path"
+}
+
+validate_track_artifacts() {
+	local staged_replicate_identity="$1"
+	local demult_records_path="$2"
+	local first_identity_path="$3"
+	local track_demult_path="$4"
+	local track_active_units_path="$5"
+	local track_identity_path="$6"
+	local track_roster_path="$7"
+	local identity_rows
+	local demult_record_count
+	local track_demult_lines
+	local track_demult_record_count
+	local track_active_count
+	local track_identity_rows
+
+	identity_rows=$(( $(wc -l < "$staged_replicate_identity") - 1 ))
+	demult_record_count=$(wc -l < "$demult_records_path")
+	if [ "$identity_rows" -ne "$demult_record_count" ]; then
+		echo "ERROR: replicate_identity.tsv data rows ($identity_rows) do not match demult.fasta records ($demult_record_count) before track artifact derivation." >&2
+		exit 1
+	fi
+
+	if ! awk -v max_ordinal="$demult_record_count" '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		NR == 1 {
+			FS = "\t"
+			for (i = 1; i <= NF; i++) {
+				header_idx[trim_cr($i)] = i
+			}
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			ordinal = $(header_idx["emitted_demult_ordinal"]) + 0
+			if (ordinal < 1 || ordinal > max_ordinal) exit 1
+			if (seen[ordinal]++) exit 1
+		}
+	' "$first_identity_path"; then
+		echo "ERROR: track_identity_first.tsv has invalid emitted demult ordinals." >&2
+		exit 1
+	fi
+
+	track_demult_lines=$(wc -l < "$track_demult_path")
+	if [ "$identity_rows" -gt 0 ] && { [ "$track_demult_lines" -le 0 ] || [ $(( track_demult_lines % 2 )) -ne 0 ]; }; then
+		echo "ERROR: track_demult.fasta must contain a positive even number of lines when replicate_identity.tsv has data." >&2
+		exit 1
+	fi
+	track_demult_record_count=$(grep -c '^>' "$track_demult_path" || true)
+	track_active_count=$(wc -l < "$track_active_units_path")
+	track_identity_rows=$(( $(wc -l < "$track_identity_path") - 1 ))
+
+	if [ "$track_demult_record_count" -ne "$track_active_count" ]; then
+		echo "ERROR: track_demult.fasta records ($track_demult_record_count) do not match track_active_units.txt lines ($track_active_count)." >&2
+		exit 1
+	fi
+	if [ "$track_demult_record_count" -ne "$track_identity_rows" ]; then
+		echo "ERROR: track_demult.fasta records ($track_demult_record_count) do not match track_identity.tsv rows ($track_identity_rows)." >&2
+		exit 1
+	fi
+
+	if ! awk '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		/^>/ {
+			header = trim_cr(substr($0, 2))
+			if (header == "") exit 1
+			if (seen[header]++) exit 1
+		}
+	' "$track_demult_path"; then
+		echo "ERROR: track_demult.fasta contains empty or duplicate headers." >&2
+		exit 1
+	fi
+
+	if ! awk '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		{
+			value = trim_cr($0)
+			if (value == "") exit 1
+			if (seen[value]++) exit 1
+		}
+	' "$track_active_units_path"; then
+		echo "ERROR: track_active_units.txt contains empty or duplicate values." >&2
+		exit 1
+	fi
+
+	if ! awk '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		NR == 1 {
+			FS = "\t"
+			for (i = 1; i <= NF; i++) {
+				header_idx[trim_cr($i)] = i
+			}
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			value = $(header_idx["track_id"])
+			if (value == "") exit 1
+			if (seen[value]++) exit 1
+		}
+	' "$track_roster_path"; then
+		echo "ERROR: track_roster.tsv contains empty or duplicate track_id values." >&2
+		exit 1
+	fi
+
+	if ! awk '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		NR == 1 {
+			FS = "\t"
+			for (i = 1; i <= NF; i++) {
+				header_idx[trim_cr($i)] = i
+			}
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			value = $(header_idx["unit_id_track"])
+			if (value == "") exit 1
+			if (seen[value]++) exit 1
+		}
+	' "$track_identity_path"; then
+		echo "ERROR: track_identity.tsv contains empty or duplicate unit_id_track values." >&2
+		exit 1
+	fi
+
+	if ! awk '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		FNR == NR {
+			if ($0 ~ /^>/) headers[++header_count] = trim_cr(substr($0, 2))
+			next
+		}
+		{
+			values[++value_count] = trim_cr($0)
+		}
+		END {
+			if (header_count != value_count) exit 1
+			for (i = 1; i <= header_count; i++) {
+				if (headers[i] != values[i]) exit 1
+			}
+			exit 0
+		}
+	' "$track_demult_path" "$track_active_units_path"; then
+		echo "ERROR: track_active_units.txt does not match track_demult.fasta headers in order." >&2
+		exit 1
+	fi
+
+	if ! awk '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		FNR == NR {
+			if ($0 ~ /^>/) headers[++header_count] = trim_cr(substr($0, 2))
+			next
+		}
+		FNR == 1 {
+			FS = "\t"
+			for (i = 1; i <= NF; i++) {
+				header_idx[trim_cr($i)] = i
+			}
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			values[++value_count] = $(header_idx["unit_id_track"])
+		}
+		END {
+			if (header_count != value_count) exit 1
+			for (i = 1; i <= header_count; i++) {
+				if (headers[i] != values[i]) exit 1
+			}
+			exit 0
+		}
+	' "$track_demult_path" "$track_identity_path"; then
+		echo "ERROR: track_identity.tsv unit_id_track values do not match track_demult.fasta headers in order." >&2
+		exit 1
+	fi
+
+	if ! awk '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		NR == FNR {
+			if (FNR == 1) {
+				FS = "\t"
+				for (i = 1; i <= NF; i++) header_idx_identity[trim_cr($i)] = i
+				next
+			}
+			$NF = trim_cr($NF)
+			identity_tracks[$(header_idx_identity["track_id"])] = 1
+			next
+		}
+		FNR == 1 {
+			FS = "\t"
+			for (i = 1; i <= NF; i++) header_idx_roster[trim_cr($i)] = i
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			roster_tracks[$(header_idx_roster["track_id"])] = 1
+		}
+		END {
+			for (track_id in identity_tracks) {
+				if (!(track_id in roster_tracks)) exit 1
+			}
+			for (track_id in roster_tracks) {
+				if (!(track_id in identity_tracks)) exit 1
+			}
+			exit 0
+		}
+	' "$track_identity_path" "$track_roster_path"; then
+		echo "ERROR: track_identity.tsv and track_roster.tsv do not contain the same distinct track_id set." >&2
+		exit 1
+	fi
+}
+
+emit_track_view_warnings() {
+	local scope="$1"
+	local key_column="$2"
+	local input_path="$3"
+	awk -v scope="$scope" -v key_column="$key_column" '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		NR == 1 {
+			FS = "\t"
+			for (i = 1; i <= NF; i++) {
+				header_idx[trim_cr($i)] = i
+			}
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			status = $(header_idx["track_duplicate_status"])
+			if (status == "unique") next
+			detail = $(header_idx["track_duplicate_detail"])
+			source_lines = $(header_idx["track_duplicate_source_metadata_lines"])
+			if (detail == "") detail = "<none>"
+			if (source_lines == "") source_lines = "<none>"
+			printf "WARN: %s %s '\''%s'\'' final_status=%s detail=%s source_metadata_lines=%s\n", scope, key_column, $(header_idx[key_column]), status, detail, source_lines > "/dev/stderr"
+		}
+	' "$input_path"
+}
+
+derive_track_artifacts() {
+	local staged_output_fasta="$1"
+	local staged_replicate_identity="$2"
+	local staged_replicate_roster="$3"
+	local staged_track_demult="$4"
+	local staged_track_roster="$5"
+	local staged_track_active_units="$6"
+	local staged_track_identity="$7"
+	local track_demult_records="${metadata_stage_dir}/track_demult_records.tsv"
+	local track_identity_indexed="${metadata_stage_dir}/track_identity_indexed.tsv"
+	local track_identity_first="${metadata_stage_dir}/track_identity_first.tsv"
+	local track_roster_identity_lines="${metadata_stage_dir}/track_roster_identity_lines.tsv"
+
+	emit_track_demult_records_index "$staged_output_fasta" "$track_demult_records"
+	emit_track_identity_index "$staged_replicate_identity" "$track_identity_indexed"
+	emit_track_roster_identity_lines "$track_identity_indexed" "$track_roster_identity_lines"
+	emit_track_identity_views "$track_demult_records" "$track_identity_indexed" "$track_identity_first" "$staged_track_identity"
+	: > "$staged_track_demult"
+	: > "$staged_track_active_units"
+	emit_track_demult_view "$track_demult_records" "$track_identity_first" "$staged_track_demult"
+	emit_track_active_units_view "$track_identity_first" "$staged_track_active_units"
+	emit_track_roster_view "$staged_replicate_roster" "$track_roster_identity_lines" "$staged_track_roster"
+	validate_track_artifacts "$staged_replicate_identity" "$track_demult_records" "$track_identity_first" "$staged_track_demult" "$staged_track_active_units" "$staged_track_identity" "$staged_track_roster"
+	emit_track_view_warnings "track_identity" "unit_id_track" "$staged_track_identity"
+	emit_track_view_warnings "track_roster" "track_id" "$staged_track_roster"
 }
 
 # Resolve one metadata row into one or more demultiplexing FASTA records.
@@ -739,6 +1527,10 @@ if [ $do_metadata -eq 1 ]; then
 				staged_output_fasta="${metadata_stage_dir}/demult.fasta"
 				staged_replicate_identity="${metadata_stage_dir}/replicate_identity.tsv"
 				staged_replicate_roster="${metadata_stage_dir}/replicate_roster.tsv"
+				staged_track_demult="${metadata_stage_dir}/track_demult.fasta"
+				staged_track_roster="${metadata_stage_dir}/track_roster.tsv"
+				staged_track_active_units="${metadata_stage_dir}/track_active_units.txt"
+				staged_track_identity="${metadata_stage_dir}/track_identity.tsv"
 				staged_samples="${metadata_stage_dir}/samples.txt"
 				warn_seen_file="${metadata_stage_dir}/.demult_warn_seen"
 				: > "$row_info_file"
@@ -845,6 +1637,9 @@ if [ $do_metadata -eq 1 ]; then
 					echo "ERROR: replicate_roster.tsv has $replicate_roster_lines lines; expected $replicate_roster_expected (header + $samples_number roster rows)." >&2
 					exit 1
 				fi
+			if ! derive_track_artifacts "$staged_output_fasta" "$staged_replicate_identity" "$staged_replicate_roster" "$staged_track_demult" "$staged_track_roster" "$staged_track_active_units" "$staged_track_identity"; then
+				exit 1
+			fi
 
 		general_copy_name=$(basename "$general_fasta")
 		if [ ! -e "$SAMPLE_INFO_DIR" ]; then
@@ -887,6 +1682,26 @@ if [ $do_metadata -eq 1 ]; then
 				if ! mv "$staged_samples" "${SAMPLE_INFO_DIR}/samples.txt"; then
 					echo "ERROR: Failed to write samples.txt into $SAMPLE_INFO_DIR" >&2
 					rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+			exit 1
+		fi
+		if ! mv "$staged_track_demult" "${SAMPLE_INFO_DIR}/track_demult.fasta"; then
+			echo "ERROR: Failed to write track_demult.fasta into $SAMPLE_INFO_DIR" >&2
+			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+			exit 1
+		fi
+		if ! mv "$staged_track_roster" "${SAMPLE_INFO_DIR}/track_roster.tsv"; then
+			echo "ERROR: Failed to write track_roster.tsv into $SAMPLE_INFO_DIR" >&2
+			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+			exit 1
+		fi
+		if ! mv "$staged_track_active_units" "${SAMPLE_INFO_DIR}/track_active_units.txt"; then
+			echo "ERROR: Failed to write track_active_units.txt into $SAMPLE_INFO_DIR" >&2
+			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+			exit 1
+		fi
+		if ! mv "$staged_track_identity" "${SAMPLE_INFO_DIR}/track_identity.tsv"; then
+			echo "ERROR: Failed to write track_identity.tsv into $SAMPLE_INFO_DIR" >&2
+			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
 			exit 1
 		fi
 		echo "Demultiplexing fasta completed successfully ($expected_records records, $fasta_number lines)"
