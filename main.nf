@@ -25,6 +25,16 @@ try {
     demuxEnabledForRun = false
 }
 def demuxEnabledInt = demuxEnabledForRun ? 1 : 0
+def fullDemuxBranchWillRun = demuxEnabledForRun &&
+    demuxCfg.mode == 'full' &&
+    isRegularFilePath(demuxCfg.indexes) &&
+    isRegularFilePath(demuxCfg.primers)
+if ((params.replicate_mode?.toString()?.trim()?.toLowerCase() ?: 'collapse') == 'track' && fullDemuxBranchWillRun) {
+    def trackArtifacts = getTrackArtifactPaths()
+    requireTrackArtifactPath(trackArtifacts.trackRoster, 'track_roster.tsv', 'when entering the full-demux branch')
+    requireTrackArtifactPath(trackArtifacts.trackActiveUnits, 'track_active_units.txt', 'when entering the full-demux branch')
+    requireTrackArtifactPath(trackArtifacts.trackIdentity, 'track_identity.tsv', 'when entering the full-demux branch')
+}
 
 custom_runName = params.name
 run_name = params.name
@@ -328,6 +338,14 @@ if ( !params.containsKey('make_round_tar') || params.make_round_tar == null ) {
 def _runId        = params.run_id?.toString()?.trim() ?: ""
 def podBaseDir    = _runId ? "${workflow.launchDir}/results/pod5/${_runId}"         : "${workflow.launchDir}/results/pod5"
 def sampleInfoDir = _runId ? "${workflow.launchDir}/results/sample_info/${_runId}" : "${workflow.launchDir}/results/sample_info"
+if ( !params.containsKey('replicate_mode') || params.replicate_mode == null ) {
+    params.replicate_mode = 'collapse'
+}
+def _replicateModeCanonical = params.replicate_mode.toString().trim().toLowerCase()
+if (!(_replicateModeCanonical in ['collapse', 'track'])) {
+    exit 1, "Invalid --replicate_mode '${params.replicate_mode}'. Allowed values: collapse, track"
+}
+params.replicate_mode = _replicateModeCanonical
 // Optional "species/genus of interest" inputs (used for filtering which taxa appear in plots/tables).
 // Keep defaults defined to avoid Nextflow "Access to undefined parameter" warnings.
 if ( !params.containsKey('metazoa_spc_basics') ) {
@@ -6739,6 +6757,29 @@ boolean hasFastaHeader(def path) {
     headerFound
 }
 
+boolean isRegularFilePath(def path) {
+    if (!path) return false
+    new File(path.toString()).isFile()
+}
+
+Map getTrackArtifactPaths() {
+    def runId = params.run_id?.toString()?.trim() ?: ""
+    def resolvedSampleInfoDir = runId ? "${workflow.launchDir}/results/sample_info/${runId}" : "${workflow.launchDir}/results/sample_info"
+    [
+        sampleInfoDir: resolvedSampleInfoDir,
+        trackIdx: "${resolvedSampleInfoDir}/track_demult.fasta",
+        trackRoster: "${resolvedSampleInfoDir}/track_roster.tsv",
+        trackActiveUnits: "${resolvedSampleInfoDir}/track_active_units.txt",
+        trackIdentity: "${resolvedSampleInfoDir}/track_identity.tsv",
+    ]
+}
+
+void requireTrackArtifactPath(def path, String artifactName, String context) {
+    if (!isRegularFilePath(path)) {
+        exit 1, "Track replicate mode requires ${artifactName} at ${path} ${context}"
+    }
+}
+
 DemuxConfig getDemuxConfig() {
     // Always resolve to absolute so INDEXES_PATH/PRIMERS_PATH are correct when
     // used inside process scripts (which run from a work/ subdirectory).
@@ -6747,17 +6788,28 @@ DemuxConfig getDemuxConfig() {
         def s = p.toString()
         s.startsWith('/') ? s : new File(System.getProperty("user.dir"), s).canonicalPath
     }
+    def trackArtifacts = getTrackArtifactPaths()
+    def replicateMode = params.replicate_mode?.toString()?.trim()?.toLowerCase() ?: 'collapse'
     def mode = params.demultiplex_mode?.toString()?.toLowerCase()
-    if (mode in ['on', 'true'])
-        return new DemuxConfig(true, 'full', absPath(params.indexes?.toString()), absPath(params.primer_indexes?.toString()))
+    def idx = absPath(params.indexes?.toString())
+    def pri = absPath(params.primer_indexes?.toString())
+    def trackIdx = absPath(trackArtifacts.trackIdx)
+    if (mode in ['on', 'true']) {
+        if (replicateMode == 'track') {
+            requireTrackArtifactPath(trackIdx, 'track_demult.fasta', "before full demultiplexing can use ${trackIdx}")
+        }
+        return new DemuxConfig(true, 'full', replicateMode == 'track' ? trackIdx : idx, pri)
+    }
     if (mode in ['primers_only', 'primers-only', 'primer_only', 'primer-only'])
         return new DemuxConfig(true, 'primers_only', null, absPath(params.primer_indexes?.toString()))
     if (mode in ['off', 'false'])
         return new DemuxConfig(false, 'off', null, null)
-    def idx = absPath(params.indexes?.toString())
-    def pri = absPath(params.primer_indexes?.toString())
-    def enabled = hasFastaHeader(idx) && hasFastaHeader(pri)
-    return new DemuxConfig(enabled, enabled ? 'full' : 'off', idx, pri)
+    if (replicateMode == 'track' && hasFastaHeader(pri)) {
+        requireTrackArtifactPath(trackIdx, 'track_demult.fasta', "before auto full demultiplexing can use ${trackIdx}")
+    }
+    def effectiveIdx = replicateMode == 'track' ? trackIdx : idx
+    def enabled = hasFastaHeader(effectiveIdx) && hasFastaHeader(pri)
+    return new DemuxConfig(enabled, enabled ? 'full' : 'off', effectiveIdx, pri)
 }
 
 // OTU identity normalizer — converts percent or decimal to plain decimal string (moved from §5).
