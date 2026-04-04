@@ -3311,10 +3311,7 @@ process blast_OTU_pretax {
 			printf 'pool_after_dedup\t%s\n' "\$pool_after" >> "\$ROLLING_POOL_STATS"
 			_t_rolling_pool_update_end=\$(date +%s)
 			append_process_timing "rolling_pool_update" "\$_t_rolling_pool_update_start" "\$_t_rolling_pool_update_end"
-			# -- §6: Unified prune application (C1, size-streak, blast-unassigned) --
 			_t_prune_apply_start=\$(date +%s)
-					# Build one canonical per-round prune list and apply it once to the rolling pool.
-					# Sources: C1/frozen-consolidated, size-streak, consensus-dropped.
 					PRUNE_CUMULATIVE_POOL_ALL="${pruneCumulativePoolAll ? '1' : '0'}"
 					PRUNE_UNASSIGNED_DROP_READS="${(pruneUnassignedClusters && pruneUnassignedDropReads) ? 1 : 0}"
 					OTU_PRUNE_POLICY="${otuPruneFrozenPolicyCanonical}"
@@ -3335,6 +3332,10 @@ process blast_OTU_pretax {
 					: > "\$ROUND_PRUNE_IDS"
 					: > "\$ROUND_PRUNE_STATS"
 					: > "\$ROUND_PRUNE_APPLY_STATS"
+					if [ "${params.replicate_mode}" = "track" ] && [ -n "${otuPruneSamplesFileValue}" ]; then
+						echo "ERROR: --otu_prune_samples_file is not supported in track mode; prune must use track_active_units.txt" 1>&2
+						exit 1
+					fi
 
 					if awk -v t="\$FORCE_PRUNE_MAX_MB" 'BEGIN{exit !(t>0)}'; then
 						if [ -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ]; then
@@ -3364,10 +3365,16 @@ process blast_OTU_pretax {
 							C1_SAMPLES_FILE="${otuPruneSamplesFileValue}"
 							if [ -z "\$C1_SAMPLES_FILE" ]; then
 								C1_SAMPLES_FILE="${sampleInfoDir}/samples.txt"
+								if [ "${params.replicate_mode}" = "track" ]; then
+									C1_SAMPLES_FILE="${sampleInfoDir}/track_active_units.txt"
+								fi
 							fi
 							if [ ! -f "\$C1_SAMPLES_FILE" ]; then
 								C1_SAMPLES_FILE=""
 							fi
+							RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${params.replicate_mode}" \
+							RTBIOSCAN_TRACK_ACTIVE_UNITS="${sampleInfoDir}/track_active_units.txt" \
+							RTBIOSCAN_TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv" \
 							${baseDir}/bin/otu_c1_prune_ids.sh \
 								"until_consolidated" \
 								"\${STATE_DIR}/qced_reads_hq_accumulated.fasta" \
@@ -3931,10 +3938,16 @@ process consensus {
 		append_process_timing "prelaunch_decision_gate" "\$_t_prelaunch_decision_gate_start" "\$_t_prelaunch_decision_gate_end"
 		if [ "\$_CONS_HAS_READS" -eq 1 ] || [ "\$_CONS_HAS_CACHE" -eq 1 ]; then
 			_t_prelaunch_sample_mode_detect_start=\$(timing_now_ms)
+			RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${params.replicate_mode}"
+			export RTBIOSCAN_EFFECTIVE_IDENTITY_MODE
+			CONSENSUS_DEFAULT_SAMPLES="${sampleInfoDir}/samples.txt"
+			if [ "${params.replicate_mode}" = "track" ]; then
+				CONSENSUS_DEFAULT_SAMPLES="${sampleInfoDir}/track_active_units.txt"
+			fi
 				if ! bash ${baseDir}/bin/detect_consensus_sample_mode.sh \
 					blast_report_annotated.txt \
 					samples.txt \
-					"${sampleInfoDir}/samples.txt" \
+					"\$CONSENSUS_DEFAULT_SAMPLES" \
 					> "\$CONSENSUS_MODE_TSV"; then
 				echo "ERROR: failed to determine consensus sample mode" 1>&2
 				exit 1
@@ -3980,6 +3993,8 @@ process consensus {
 		_t_consensus_script_exec_start=\$(timing_now_ms)
 		if [ "\$_CONS_HAS_READS" -eq 1 ] || [ "\$_CONS_HAS_CACHE" -eq 1 ]; then
 			# Consensus script: pass clustering identity so vsearch clustering is configurable.
+			RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${params.replicate_mode}" \
+			RTBIOSCAN_TRACK_ACTIVE_UNITS="${sampleInfoDir}/track_active_units.txt" \
 			CONSENSUS_CACHE_STATE_ROOT="\$CONSENSUS_CACHE_STATE_ROOT" \
 			CONSENSUS_CACHE_SYNC_SCRIPT="\$CONSENSUS_CACHE_SYNC_SCRIPT" \
 			CONSENSUS_ZERO_EMIT_POLICY="${consensusZeroEmitPolicyCanonical}" \
