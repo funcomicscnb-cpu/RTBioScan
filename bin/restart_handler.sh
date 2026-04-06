@@ -51,6 +51,8 @@ wipe_dir_contents() {
     if (( ${#items[@]} )); then
         rm -rf "${items[@]}"
     fi
+    # Parser-state transaction artifacts are excluded explicitly; do not rely on hidden-dir glob omission.
+    rm -rf "$dir/.parser_state_txn" 2>/dev/null || true
 }
 
 if [ "$MODE" = "reset" ]; then
@@ -67,6 +69,7 @@ fi
 mkdir -p "$ONGOING"
 wipe_dir_contents "$ONGOING"
 mkdir -p "$ONGOING_STATE"
+rm -rf "$ONGOING_STATE/.parser_state_txn" 2>/dev/null || true
 
 restore_from_root() {
     local root="$1"
@@ -110,6 +113,8 @@ restore_from_root() {
         cp -f "${root}/done_pod5.txt" "${ONGOING_STATE}/done_pod5.txt"
     fi
 
+    rm -rf "${ONGOING_STATE}/.parser_state_txn" 2>/dev/null || true
+
     [ "$restored" -eq 1 ]
 }
 
@@ -151,6 +156,7 @@ if [ -d "$ONGOING_STATE/Consensus" ]; then
     mkdir -p "$ONGOING/Consensus"
     cp -R "$ONGOING_STATE/Consensus/." "$ONGOING/Consensus/" 2>/dev/null || true
 fi
+rm -rf "$ONGOING_STATE/.parser_state_txn" "$ONGOING/.parser_state_txn" 2>/dev/null || true
 
 {
     printf 'mode=%s\n' "$MODE"
