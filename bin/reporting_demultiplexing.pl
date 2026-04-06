@@ -1,129 +1,112 @@
 #!/usr/bin/perl
 
+use strict;
+use warnings;
 use FindBin;
-require "$FindBin::Bin/lib/sample_label.pl";
 
+require "$FindBin::Bin/reporting_identity_contract.pl";
+require "$FindBin::Bin/reporting_contract_sidecar.pl";
 
-$fastq_file = $ARGV[0];
-$results_dir = $ARGV[1];
-$round_dir=$ARGV[2];
-$barcode_pipeline=$ARGV[3];
+my $fastq_file = $ARGV[0];
+my $results_dir = $ARGV[1];
+my $round_dir = $ARGV[2];
+my $barcode_pipeline = $ARGV[3];
 
-$report_file=$barcode_pipeline."_demult_rpt.txt";
-$identity_mode = lc($ENV{"RTBIOSCAN_EFFECTIVE_IDENTITY_MODE"} || 'collapse');
-$demux_mode = lc($ENV{"RTBIOSCAN_DEMULT_MODE"} || 'off');
+my $report_file = $barcode_pipeline . "_demult_rpt.txt";
+my $sidecar_file = $barcode_pipeline . "_demult_rpt.contract.tsv";
+my $context = lc($ENV{"RTBIOSCAN_DEMUX_IDENTITY_CONTEXT"} || '');
+die "ERROR: RTBIOSCAN_DEMUX_IDENTITY_CONTEXT is required\n" if $context eq '';
 
-sub extract_keyed_token {
-	my ($header, $key) = @_;
-	return '' if !defined $header || !defined $key || $key eq '';
-	if ($header =~ /(?:^|\|)\Q$key\E=([^|\s]*)/) {
-		return defined($1) ? $1 : '';
+sub ensure_dirs {
+	if (!-d "single_exp") {
+		system "mkdir -p single_exp/fastq/hac";
+		system "mkdir -p single_exp/fastq/sup";
+		system "mkdir -p single_exp/fastq/fast";
+		system "mkdir -p $results_dir/single_exp/fastq/hac";
+		system "mkdir -p $results_dir/single_exp/fastq/sup";
+		system "mkdir -p $results_dir/single_exp/fastq/fast";
+		system "mkdir -p $results_dir/single_exp/fasta/hac";
+		system "mkdir -p $results_dir/single_exp/fasta/sup";
+		system "mkdir -p $results_dir/single_exp/fasta/fast";
 	}
-	return '';
 }
 
-sub derive_identity_fields {
-	my ($header, $legacy_sample) = @_;
-	my $adapter = extract_keyed_token($header, 'adapter');
-	my $adapter_norm = SampleLabel::normalize_sample_label(
-		(defined($adapter) && $adapter ne '') ? $adapter : 'no_adapter'
-	);
+ensure_dirs();
 
-	if ($demux_mode eq 'primers_only' && $adapter ne '' && $adapter_norm ne 'no_adapter') {
-		return ('primer', $adapter);
+open my $out_fh, '>', $report_file or die "I couldn't open $report_file\n";
+print $out_fh ReportingContractSidecar::canonical_header('demult_rpt'), "\n";
+
+my %fastq_files;
+my %fasta_files;
+my $row_count = 0;
+
+if (-e $fastq_file && -s $fastq_file) {
+	open my $in_fh, '<', $fastq_file or die "I couldn't open $fastq_file\n";
+	while (1) {
+		my $h = <$in_fh>;
+		last unless defined $h;
+		my $seq = <$in_fh>;
+		my $plus = <$in_fh>;
+		my $qual = <$in_fh>;
+		die "ERROR: malformed FASTQ record in $fastq_file\n"
+			if !defined $seq || !defined $plus || !defined $qual;
+
+		my $parsed = ReportingIdentityContract::parse_header($h, $context);
+		die "ERROR: unrecognized or context-incompatible annotated read header: $h"
+			if !$parsed;
+
+		print $out_fh join(
+			"\t",
+			$parsed->{read_id},
+			$parsed->{barcode_by_homology},
+			$parsed->{basecalling_model},
+			$parsed->{sample},
+			$parsed->{platform},
+			$parsed->{sampling_method},
+			$parsed->{subsample},
+			$parsed->{replicate},
+			$parsed->{identity_scope},
+			$parsed->{identity_value},
+		), "\n";
+		$row_count++;
+
+		push @{$fastq_files{$parsed->{basecalling_model}}{$parsed->{sample}}}, $h . $seq . $plus . $qual;
+		(my $fasta_header = $h) =~ s/^\@/>/;
+		chomp $seq;
+		push @{$fasta_files{$parsed->{basecalling_model}}{$parsed->{sample}}}, $fasta_header . $seq . "\n";
 	}
-	if ($demux_mode eq 'full' && $identity_mode eq 'track' && $adapter ne '' && $adapter_norm ne 'no_adapter') {
-		return ('unit', $adapter);
-	}
-	if ($demux_mode eq 'full' && defined($legacy_sample) && $legacy_sample ne '' && $legacy_sample ne 'no_adapter') {
-		return ('sample', $legacy_sample);
-	}
-	if ($adapter_norm eq 'no_adapter' || $demux_mode eq 'off') {
-		return ('unknown', 'no_adapter');
-	}
-	return ('unknown', 'unknown');
+	close $in_fh;
 }
 
-# Use single_exp instead of demultiplexed and mirror structure
-if(!-d "single_exp")
-{
-	system "mkdir -p single_exp/fastq/hac";
-	system "mkdir -p single_exp/fastq/sup";
-	system "mkdir -p $results_dir/single_exp/fastq/hac";
-	system "mkdir -p $results_dir/single_exp/fastq/sup";
-	system "mkdir -p $results_dir/single_exp/fasta/hac";
-	system "mkdir -p $results_dir/single_exp/fasta/sup";
-}
+close $out_fh;
 
-open OUT_FILE, ">$report_file" or die "I couldn't open $report_file\n";
-print OUT_FILE "read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\tsubsample\treplicate\tidentity_scope\tidentity_value\n";
-open FILE, $fastq_file or die "I couldn't open $fastq_file\n";
+for my $model (keys %fastq_files) {
+	for my $sample (keys %{$fastq_files{$model}}) {
+		my $round_fastq = "single_exp/fastq/$model/${barcode_pipeline}_${sample}_${model}.fastq";
+		open my $fq_fh, '>', $round_fastq or die "I couldn't open $round_fastq\n";
+		print {$fq_fh} @{$fastq_files{$model}{$sample}};
+		close $fq_fh;
 
-# Parse FASTQ in 4-line blocks to avoid misclassifying sequence/quality lines as headers
-while (1) {
-    my $h = <FILE>;
-    last unless defined $h;
-    my $seq = <FILE> // last;
-    my $plus = <FILE> // last;
-    my $qual = <FILE> // last;
+		my $round_fasta = "$results_dir/single_exp/fasta/$model/${barcode_pipeline}_${sample}_${model}.fasta";
+		open my $fa_fh, '>', $round_fasta or die "I couldn't open $round_fasta\n";
+		print {$fa_fh} @{$fasta_files{$model}{$sample}};
+		close $fa_fh;
 
-	chomp($h);
-	my ($read_id,$barcode_1,$model,$sample,$platform,$sampling_method,$subsample,$replicate);
-	my ($identity_scope, $identity_value);
-
-    if ($h =~ /^\@(\S+)\|(\S+)\|(\S+)\|barcode\=\|adapter\=(\S+)$/) {
-        $read_id=$1; $barcode_1=$2; $model=$3; $sample=$4;
-        $model = ($model =~ /hac/) ? 'hac' : $model;
-        $sample = SampleLabel::normalize_sample_label($sample);
-        if($sample eq 'no_adapter') {
-            ($platform,$sampling_method,$subsample,$replicate) = ('unknown','unknown','unknown','unknown');
-        } else {
-            my @tr=split(/_/,$sample);
-            ($platform,$sampling_method,$subsample,$replicate) = (@tr[0..3]);
-        }
-    } elsif ($h =~ /^\@(\S+)(?:\|(\S+))?(?:\|(\S+))?$/) {
-        $read_id=$1; $barcode_1=defined($2)?$2:'NA'; $model=defined($3)?$3:'hac';
-        $sample='no_adapter'; ($platform,$sampling_method,$subsample,$replicate)=('unknown','unknown','unknown','unknown');
-        $sample = SampleLabel::normalize_sample_label($sample);
-	} else {
-		# Unrecognized header; skip this record
-		next;
-	}
-
-	($identity_scope, $identity_value) = derive_identity_fields($h, $sample);
-
-	print OUT_FILE "$read_id\t$barcode_1\t$model\t$sample\t$platform\t$sampling_method\t$subsample\t$replicate\t$identity_scope\t$identity_value\n";
-
-    # Collect fastq and fasta outputs
-    push @{$fastq_files{"$model"}{"$sample"}}, "$h\n$seq$plus$qual";
-    $h =~ s/^\@/>/;
-    chomp($seq);
-    push @{$fasta_files{"$model"}{"$sample"}}, "$h\n$seq\n";
-}
-close FILE;
-close OUT_FILE;
-
-
-foreach $model(keys(%fastq_files))
-{
-	foreach $each_sample(keys(%{$fastq_files{$model}}))
-	{
-		open OUT_FILE, ">single_exp/fastq/$model/$barcode_pipeline\_$each_sample\_$model\.fastq" or die "I couldn't open single_exp/fastq/$model/$barcode_pipeline\_$each_sample\_$model\.fastq\n";
-		print OUT_FILE @{$fastq_files{$model}{$each_sample}};
-		close OUT_FILE;
-		open OUT_FILE, ">$results_dir/single_exp/fasta/$model/$barcode_pipeline\_$each_sample\_$model\.fasta" or die "I couldn't open $results_dir/single_exp/fasta/$model/$barcode_pipeline\_$each_sample\_$model\.fasta\n";
-		print OUT_FILE @{$fasta_files{$model}{$each_sample}};
-		close OUT_FILE;
-		
-#		system "gzip -N single_exp/$model/$barcode_pipeline\_$each_sample\_$model\.fastq";
-		
-		if(!-f "$results_dir/single_exp/fastq/$model/$each_sample\_$model\.fastq.gz")
-		{
-			system "gzip -c single_exp/fastq/$model/$barcode_pipeline\_$each_sample\_$model\.fastq > $results_dir/single_exp/fastq/$model/$each_sample\_$model\.fastq.gz";
-		}else
-		{
-			system "gzip -c single_exp/fastq/$model/$barcode_pipeline\_$each_sample\_$model\.fastq >> $results_dir/single_exp/fastq/$model/$each_sample\_$model\.fastq.gz";
+		my $rolling_gz = "$results_dir/single_exp/fastq/$model/${sample}_${model}.fastq.gz";
+		if (!-f $rolling_gz) {
+			system "gzip -c $round_fastq > $rolling_gz";
+		} else {
+			system "gzip -c $round_fastq >> $rolling_gz";
 		}
-		system "rm single_exp/fastq/$model/$barcode_pipeline\_$each_sample\_$model\.fastq";
+		system "rm $round_fastq";
 	}
 }
+
+ReportingContractSidecar::write_sidecar_from_report(
+	report_kind => 'demult_rpt',
+	context => $context,
+	report_path => $report_file,
+	sidecar_path => $sidecar_file,
+);
+
+exit 0;

@@ -9,7 +9,9 @@
 
 // Compute demultiplexing enablement once and reuse it everywhere.
 // This avoids mismatches where params.demultiplex_mode='auto' or 'on' but the files are missing/empty.
+def replicateModeCanonical = getReplicateModeCanonical()
 def demuxCfg = getDemuxConfig()
+def demuxIdentityContext = getDemuxIdentityContext(demuxCfg)
 def demuxEnabledForRun = false
 try {
     def idxOk = hasFastaHeader(demuxCfg.indexes)
@@ -29,7 +31,7 @@ def fullDemuxBranchWillRun = demuxEnabledForRun &&
     demuxCfg.mode == 'full' &&
     isRegularFilePath(demuxCfg.indexes) &&
     isRegularFilePath(demuxCfg.primers)
-if ((params.replicate_mode?.toString()?.trim()?.toLowerCase() ?: 'collapse') == 'track' && fullDemuxBranchWillRun) {
+if (replicateModeCanonical == 'track' && fullDemuxBranchWillRun) {
     def trackArtifacts = getTrackArtifactPaths()
     requireTrackArtifactPath(trackArtifacts.trackRoster, 'track_roster.tsv', 'when entering the full-demux branch')
     requireTrackArtifactPath(trackArtifacts.trackActiveUnits, 'track_active_units.txt', 'when entering the full-demux branch')
@@ -338,14 +340,7 @@ if ( !params.containsKey('make_round_tar') || params.make_round_tar == null ) {
 def _runId        = params.run_id?.toString()?.trim() ?: ""
 def podBaseDir    = _runId ? "${workflow.launchDir}/results/pod5/${_runId}"         : "${workflow.launchDir}/results/pod5"
 def sampleInfoDir = _runId ? "${workflow.launchDir}/results/sample_info/${_runId}" : "${workflow.launchDir}/results/sample_info"
-if ( !params.containsKey('replicate_mode') || params.replicate_mode == null ) {
-    params.replicate_mode = 'collapse'
-}
-def _replicateModeCanonical = params.replicate_mode.toString().trim().toLowerCase()
-if (!(_replicateModeCanonical in ['collapse', 'track'])) {
-    exit 1, "Invalid --replicate_mode '${params.replicate_mode}'. Allowed values: collapse, track"
-}
-params.replicate_mode = _replicateModeCanonical
+validateSampleInfoInventory(demuxIdentityContext)
 // Optional "species/genus of interest" inputs (used for filtering which taxa appear in plots/tables).
 // Keep defaults defined to avoid Nextflow "Access to undefined parameter" warnings.
 if ( !params.containsKey('metazoa_spc_basics') ) {
@@ -603,7 +598,7 @@ Channel.from(summary.collect{ [it.key, it.value] })
 	
 // Get fast sequences, identify their kingdom and select the pairs target, kingdom to be kept for further analysis
 // ============================================================
-// STAGE B — FAST PRE-FILTER (fast_on_target_detection)
+// STAGE A — FAST PRE-FILTER (fast_on_target_detection)
 // ============================================================
 process fast_on_target_detection {
 	// Reserve only 1 CPU for scheduling so this task does not starve downstream processes.
@@ -1093,7 +1088,7 @@ process hac_basecalling {
 hq_reads_report_with_fast_control = ChannelUtils.strictRoundJoin(hq_reads_report, fast_control)
 
 // ============================================================
-// STAGE C — REPORTING (_reporting_hac_basecalling)
+// STAGE D — REPORTING (_reporting_hac_basecalling)
 // ============================================================
 process _reporting_hac_basecalling {
 
@@ -1473,6 +1468,7 @@ process _reporting_hq_demultiplexing {
     output:
 	tuple val(barcode), val(round_barcode), file("${barcode}_demult_rpt.txt") into demult_control
     tuple val(barcode), val(round_barcode), file("${barcode}_demult_rpt.txt") into demult_rpt_summary
+    tuple val(barcode), val(round_barcode), file("${barcode}_demult_rpt.contract.tsv") into demult_rpt_sidecar_summary
     
 	script:
 
@@ -1483,13 +1479,12 @@ process _reporting_hq_demultiplexing {
 	RESTART_TOKEN="${restartTokenForCache}"
 		
 
-	if ! RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${params.replicate_mode}" \
-		RTBIOSCAN_DEMULT_MODE="${demuxCfg.mode}" \
-		perl ${baseDir}/bin/reporting_demultiplexing.pl ${hac_sup_annotated_clean_fastq} ${params.outdir}/ongoing ${round_barcode} ${barcode}; then
-		printf 'read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\tsubsample\treplicate\tidentity_scope\tidentity_value\n' > ${barcode}_demult_rpt.txt
-	fi
-		mkdir -p ${ongoingStateDir}/${round_barcode}/
-		cp -f ${barcode}_demult_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_demult_rpt.txt 2>/dev/null || true
+	export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
+	export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
+	perl ${baseDir}/bin/reporting_demultiplexing.pl ${hac_sup_annotated_clean_fastq} ${params.outdir}/ongoing ${round_barcode} ${barcode}
+	mkdir -p ${ongoingStateDir}/${round_barcode}/
+	cp -f ${barcode}_demult_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_demult_rpt.txt 2>/dev/null || true
+	cp -f ${barcode}_demult_rpt.contract.tsv ${ongoingStateDir}/${round_barcode}/${barcode}_demult_rpt.contract.tsv 2>/dev/null || true
 	
 	
 	"""	
@@ -2170,7 +2165,7 @@ process OTU_definition {
 otu_def_reporting_inputs = ChannelUtils.strictRoundJoin(report_otu, demult_control)
 
 // ============================================================
-// STAGE F — REPORTING (_reporting_OTU_definition)
+// STAGE G — REPORTING (_reporting_OTU_definition)
 // ============================================================
 process _reporting_OTU_definition {
   maxForks maxForksReportingVal
@@ -2179,6 +2174,7 @@ process _reporting_OTU_definition {
     tuple val(barcode), val(round_barcode), file(otu_clstr), file(demult) from otu_def_reporting_inputs
   output:
     tuple val(barcode), val(round_barcode), file("${barcode}_otu_def_rpt.txt"), file("${barcode}_otu_members_round.tsv"), file("${barcode}_otu_sizes_round.tsv") into otu_def_rpt_summary, otu_def_rpt_summary_for_blast
+    tuple val(barcode), val(round_barcode), file("${barcode}_otu_def_rpt.contract.tsv") into otu_def_rpt_sidecar_summary
     script:
 
 	"""
@@ -2194,11 +2190,8 @@ process _reporting_OTU_definition {
 		
 	_p_targets="${params.targets}"
 	IFS='|' read -ra _TARGETS <<< "\$_p_targets"
-	if ! perl ${baseDir}/bin/reporting_otu_definition.pl ${otu_clstr} ${demult} ${round_barcode} ${barcode} "\${_TARGETS[@]}"; then
-		printf 'read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\tsubsample\treplicate\tidentity_scope\tidentity_value\tOTU_id\tOTU_role\n' > ${barcode}_otu_def_rpt.txt
-		printf 'otu_id\tread_id\n' > ${barcode}_otu_members_round.tsv
-		printf 'otu_id\tsize\n' > ${barcode}_otu_sizes_round.tsv
-	fi
+	export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
+	perl ${baseDir}/bin/reporting_otu_definition.pl ${otu_clstr} ${demult} ${round_barcode} ${barcode} "\${_TARGETS[@]}"
 	[ -f ${barcode}_otu_members_round.tsv ] || printf 'otu_id\tread_id\n' > ${barcode}_otu_members_round.tsv
 	[ -f ${barcode}_otu_sizes_round.tsv ] || printf 'otu_id\tsize\n' > ${barcode}_otu_sizes_round.tsv
 	mkdir -p ${ongoingStateDir}/${round_barcode}
@@ -2225,22 +2218,13 @@ process _reporting_OTU_definition {
 	fi
 	if cp ${barcode}_otu_def_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_otu_def_rpt.txt
 	then
-		if [ ! -f ${ongoingStateDir}/_state/${barcode}_otu_def_rpt.txt ];
-		then
-			mkdir -p ${ongoingStateDir}/_state
-			cp ${barcode}_otu_def_rpt.txt ${ongoingStateDir}/_state/${barcode}_otu_def_rpt.txt
-		else
-			# Append without failing on header-only files.
-			tail -n +2 ${barcode}_otu_def_rpt.txt >> ${ongoingStateDir}/_state/${barcode}_otu_def_rpt.txt 2>/dev/null || true
-			echo "Updated cumulative ${barcode}_otu_def_rpt.txt in _state" 1>&2
-		fi
+		cp ${barcode}_otu_def_rpt.contract.tsv ${ongoingStateDir}/${round_barcode}/${barcode}_otu_def_rpt.contract.tsv 2>/dev/null || true
 	fi
 	cp "\$OTU_MEMBERS_CANONICAL" ${ongoingStateDir}/${round_barcode}/otu_members.tsv 2>/dev/null || true
 	cp "\$OTU_SIZES_CANONICAL" ${ongoingStateDir}/${round_barcode}/otu_sizes.tsv 2>/dev/null || true
 	cp ${barcode}_otu_members_round.tsv ${ongoingStateDir}/${round_barcode}/otu_members_round.tsv 2>/dev/null || true
 	cp ${barcode}_otu_sizes_round.tsv ${ongoingStateDir}/${round_barcode}/otu_sizes_round.tsv 2>/dev/null || true
 	cp "\$OTU_MEMBERS_CANONICAL_STATS" ${ongoingStateDir}/${round_barcode}/otu_members_stats.tsv 2>/dev/null || true
-	mkdir -p ${ongoingStateDir}/_state
 	_canon_members_state="${ongoingStateDir}/_state/${barcode}_otu_members.tsv"
 	_canon_sizes_state="${ongoingStateDir}/_state/${barcode}_otu_sizes.tsv"
 	_canon_stats_state="${ongoingStateDir}/_state/${barcode}_otu_members_stats_last.tsv"
@@ -2321,7 +2305,7 @@ blast_pretax_inputs = ChannelUtils.strictRoundJoinAll([
 ], 'blast_pretax_inputs')
 
 // ============================================================
-// STAGE G — TAXONOMIC ASSIGNMENT / BLAST (blast_OTU_pretax)
+// STAGE H — TAXONOMIC ASSIGNMENT / BLAST (blast_OTU_pretax)
 // ============================================================
 process blast_OTU_pretax {
 	cpus { params.blast_threads }
@@ -3334,7 +3318,7 @@ process blast_OTU_pretax {
 					: > "\$ROUND_PRUNE_IDS"
 					: > "\$ROUND_PRUNE_STATS"
 					: > "\$ROUND_PRUNE_APPLY_STATS"
-					if [ "${params.replicate_mode}" = "track" ] && [ -n "${otuPruneSamplesFileValue}" ]; then
+					if [ "${replicateModeCanonical}" = "track" ] && [ -n "${otuPruneSamplesFileValue}" ]; then
 						echo "ERROR: --otu_prune_samples_file is not supported in track mode; prune must use track_active_units.txt" 1>&2
 						exit 1
 					fi
@@ -3367,14 +3351,14 @@ process blast_OTU_pretax {
 							C1_SAMPLES_FILE="${otuPruneSamplesFileValue}"
 							if [ -z "\$C1_SAMPLES_FILE" ]; then
 								C1_SAMPLES_FILE="${sampleInfoDir}/samples.txt"
-								if [ "${params.replicate_mode}" = "track" ]; then
+								if [ "${replicateModeCanonical}" = "track" ]; then
 									C1_SAMPLES_FILE="${sampleInfoDir}/track_active_units.txt"
 								fi
 							fi
 							if [ ! -f "\$C1_SAMPLES_FILE" ]; then
 								C1_SAMPLES_FILE=""
 							fi
-							RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${params.replicate_mode}" \
+							RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${replicateModeCanonical}" \
 							RTBIOSCAN_TRACK_ACTIVE_UNITS="${sampleInfoDir}/track_active_units.txt" \
 							RTBIOSCAN_TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv" \
 							${baseDir}/bin/otu_c1_prune_ids.sh \
@@ -3601,7 +3585,7 @@ process blast_OTU_pretax {
 report_blast_inputs = ChannelUtils.strictRoundJoin(report_blast, hac_read_control)
 
 // ============================================================
-// STAGE G — REPORTING (_reporting_blast_pretax)
+// STAGE I — REPORTING (_reporting_blast_pretax)
 // ============================================================
 process _reporting_blast_pretax {
   maxForks maxForksReportingVal
@@ -3639,13 +3623,12 @@ process _reporting_blast_pretax {
 
 		# Helper: run noadapter blast reporting when a noadapter report exists
 		run_noadapter_report() {
-			if [ -s ${blast_report_noadapter} ]; then
+			if [ -f ${blast_report_noadapter} ] && awk 'NR>1{exit 0} END{exit 1}' ${blast_report_noadapter}; then
 				cp ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt ${barcode}_noadapter_read_info_rpt.txt
-				if perl ${baseDir}/bin/reporting_blast_otu.pl ${barcode}_round_sup.tsv ${blast_read} ${blast_report_noadapter} ${barcode}_noadapter_read_info_rpt.txt ${barcode}_noadapter; then
-					mv ${barcode}_noadapter_blast_otu_pretax_rpt.txt ${barcode}_blast_otu_noadapter_rpt.txt
-				else
-					printf '%s\n' "\$BLAST_HEADER" > ${barcode}_blast_otu_noadapter_rpt.txt
-				fi
+				export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
+				export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
+				perl ${baseDir}/bin/reporting_blast_otu.pl ${barcode}_round_sup.tsv ${blast_read} ${blast_report_noadapter} ${barcode}_noadapter_read_info_rpt.txt ${barcode}_noadapter
+				mv ${barcode}_noadapter_blast_otu_pretax_rpt.txt ${barcode}_blast_otu_noadapter_rpt.txt
 				rm -f ${barcode}_noadapter_read_info_rpt.txt
 			else
 				printf '%s\n' "\$BLAST_HEADER" > ${barcode}_blast_otu_noadapter_rpt.txt
@@ -3660,15 +3643,13 @@ process _reporting_blast_pretax {
 			_rpt_state="${ongoingStateDir}/_state/${barcode}_read_info_rpt.txt"
 			_rpt_round="${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt"
 			[ -f "\$_rpt_round" ] || cp "\$_rpt_state" "\$_rpt_round" 2>/dev/null || : > "\$_rpt_round"
-			if ! perl ${baseDir}/bin/reporting_blast_otu.pl ${barcode}_round_sup.tsv ${blast_read} ${blast_report_otu} "\$_rpt_round" ${barcode}; then
-				printf '%s\n' "\$BLAST_HEADER" > ${barcode}_blast_otu_pretax_rpt.txt
-				cp -f "\$_rpt_round" ${barcode}_read_info_rpt.txt 2>/dev/null || : > ${barcode}_read_info_rpt.txt
-			else
-				# Persist read info for downstream qscore/consensus tracking.
+			export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
+			export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
+			perl ${baseDir}/bin/reporting_blast_otu.pl ${barcode}_round_sup.tsv ${blast_read} ${blast_report_otu} "\$_rpt_round" ${barcode}
+			# Persist read info for downstream qscore/consensus tracking.
 			# _state/ accumulation is handled solely by append_reports.pl; do NOT cp -f
 			# here or it overwrites historical data, breaking cumulative read counts.
-				cp -f ${barcode}_read_info_rpt.txt "\$_rpt_round" 2>/dev/null || true
-			fi
+			cp -f ${barcode}_read_info_rpt.txt "\$_rpt_round" 2>/dev/null || true
 			if [ ! -f ${barcode}_blast_otu_pretax_rpt.txt ]; then
 				printf '%s\n' "\$BLAST_HEADER" > ${barcode}_blast_otu_pretax_rpt.txt
 			fi
@@ -3755,7 +3736,7 @@ process _reporting_blast_pretax {
 consensus_inputs = ChannelUtils.strictRoundJoin(fastq_qced_consensus, blast2consensus)
 
 // ============================================================
-// STAGE H — CONSENSUS GENERATION (consensus)
+// STAGE J — CONSENSUS GENERATION (consensus)
 // ============================================================
 process consensus {
 	// Must be schedulable even when the next POD5 has already entered `fast_on_target_detection`
@@ -3940,10 +3921,10 @@ process consensus {
 		append_process_timing "prelaunch_decision_gate" "\$_t_prelaunch_decision_gate_start" "\$_t_prelaunch_decision_gate_end"
 		if [ "\$_CONS_HAS_READS" -eq 1 ] || [ "\$_CONS_HAS_CACHE" -eq 1 ]; then
 			_t_prelaunch_sample_mode_detect_start=\$(timing_now_ms)
-			RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${params.replicate_mode}"
+			RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${replicateModeCanonical}"
 			export RTBIOSCAN_EFFECTIVE_IDENTITY_MODE
 			CONSENSUS_DEFAULT_SAMPLES="${sampleInfoDir}/samples.txt"
-			if [ "${params.replicate_mode}" = "track" ]; then
+			if [ "${replicateModeCanonical}" = "track" ]; then
 				CONSENSUS_DEFAULT_SAMPLES="${sampleInfoDir}/track_active_units.txt"
 			fi
 				if ! bash ${baseDir}/bin/detect_consensus_sample_mode.sh \
@@ -3995,7 +3976,7 @@ process consensus {
 		_t_consensus_script_exec_start=\$(timing_now_ms)
 		if [ "\$_CONS_HAS_READS" -eq 1 ] || [ "\$_CONS_HAS_CACHE" -eq 1 ]; then
 			# Consensus script: pass clustering identity so vsearch clustering is configurable.
-			RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${params.replicate_mode}" \
+			RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${replicateModeCanonical}" \
 			RTBIOSCAN_TRACK_ACTIVE_UNITS="${sampleInfoDir}/track_active_units.txt" \
 			CONSENSUS_CACHE_STATE_ROOT="\$CONSENSUS_CACHE_STATE_ROOT" \
 			CONSENSUS_CACHE_SYNC_SCRIPT="\$CONSENSUS_CACHE_SYNC_SCRIPT" \
@@ -4867,7 +4848,7 @@ process consensus {
 }
 
 // ============================================================
-// STAGE H — REPORTING (_reporting_consensus_tax)
+// STAGE K — REPORTING (_reporting_consensus_tax)
 // ============================================================
 process _reporting_consensus_tax {
   maxForks maxForksReportingVal
@@ -4933,7 +4914,9 @@ getting_run_summary_inputs = ChannelUtils.strictRoundJoinAll([
 	blst_rpt_summary,
 	cons_rpt_summary,
 	otu_def_rpt_summary,
+	otu_def_rpt_sidecar_summary,
 	demult_rpt_summary,
+	demult_rpt_sidecar_summary,
 	target_rpt_summary,
 	reports_blast,
 ], 'getting_run_summary_inputs')
@@ -4941,13 +4924,13 @@ getting_run_summary_with_path = ChannelUtils.strictRoundJoin(getting_run_summary
 
 
 // ============================================================
-// STAGE I — RUN SUMMARY (getting_run_summary)
+// STAGE L — RUN SUMMARY (getting_run_summary)
 // ============================================================
 process getting_run_summary {
     maxForks maxForksReportingVal
     publishDir "${ongoingResultsStateDir}/", mode: 'copy', overwrite: true
 	input:
-	tuple val(barcode), val(round_barcode), file(blast_otu_pretax_rpt), file(read_info_rpt), file(blast_otu_noadapter_rpt), file(blast_filter_stats), file(blast_consensus_tax), file(consensus_round_provenance), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round), file(demult_rpt), file(on_target_rpt), file(summary), file(summary_otu), val(read_path) from getting_run_summary_with_path
+	tuple val(barcode), val(round_barcode), file(blast_otu_pretax_rpt), file(read_info_rpt), file(blast_otu_noadapter_rpt), file(blast_filter_stats), file(blast_consensus_tax), file(consensus_round_provenance), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round), file(otu_def_rpt_sidecar), file(demult_rpt), file(demult_rpt_sidecar), file(on_target_rpt), file(summary), file(summary_otu), val(read_path) from getting_run_summary_with_path
     output:
 		tuple val(barcode), val(round_barcode) into complete_round_ch	
 		/*file("${barcode}_read_info_rpt.txt")
@@ -5186,8 +5169,6 @@ process getting_run_summary {
 		fi
 		return 0
 	}
-	PLOT_SIG_DIR="${ongoingStateDir}/_state/plot_sigs"
-	mkdir -p "\$PLOT_SIG_DIR"
 		# -- §2: Rolling report + metadata ledger update (append_reports.pl) --
 		READ_PATH="${read_path}"
 		# Use a per-state ledger inside the state dir for plotting/reporting inputs.
@@ -5196,15 +5177,27 @@ process getting_run_summary {
 		# many hours before the current run).
 		LEDGER_PATH="${ongoingStateDir}/_state/${barcode}_reads_time_rpt.txt"
 		METADATA_LEDGER="${podBaseDir}/metadata/${barcode}_reads_time_rpt.txt"
-		if [ ! -f "\$LEDGER_PATH" ]; then
-			mkdir -p "\$(dirname \"\$LEDGER_PATH\")"
-			printf "run_id\ttime\tdata\treads\n" > "\$LEDGER_PATH"
+			export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
+			perl ${baseDir}/bin/reporting_parser_state_preflight.pl \
+				${ongoingStateDir}/_state \
+			${barcode} \
+			full_reports \
+			"${demuxIdentityContext}" \
+			${demult_rpt} \
+			${demult_rpt_sidecar} \
+			${otu_def_rpt} \
+			${otu_def_rpt_sidecar}
+			if [ ! -f "\$LEDGER_PATH" ]; then
+				mkdir -p "\$(dirname \"\$LEDGER_PATH\")"
+				printf "run_id\ttime\tdata\treads\n" > "\$LEDGER_PATH"
 			# Best-effort restore for the same state only: if restart_mode=restore and the
 			# metadata ledger exists, seed the state ledger from it.
-			if [ "${params.restart_mode}" = "restore" ] && [ -f "\$METADATA_LEDGER" ]; then
-				cp -f "\$METADATA_LEDGER" "\$LEDGER_PATH" || true
-			fi
-		fi
+				if [ "${params.restart_mode}" = "restore" ] && [ -f "\$METADATA_LEDGER" ]; then
+						cp -f "\$METADATA_LEDGER" "\$LEDGER_PATH" || true
+					fi
+				fi
+			PLOT_SIG_DIR="${ongoingStateDir}/_state/plot_sigs"
+			mkdir -p "\$PLOT_SIG_DIR"
 			
 			# Append rolling summaries. Optional species/genus pre-classification is used (when provided)
 			# to restrict which taxa are shown in tables/plots. `min_reads_sample` controls the display threshold.
@@ -5531,7 +5524,9 @@ process getting_run_summary {
 		fi
 			# -- §4: Demux-specific plots (Read_counts, Read_info_quality) --
 			if [ "\$GENERATE_DEMUX_REPORTS" -eq 1 ]; then
-				bash ${baseDir}/bin/demult_summary.sh ${barcode}_demult_rpt.txt ${barcode}
+				cp "${ongoingStateDir}/_state/${barcode}_demult_rpt.txt" "${barcode}_demult_rpt_cumulative.txt"
+				bash ${baseDir}/bin/demult_summary.sh ${barcode}_demult_rpt_cumulative.txt ${barcode}
+				cp "${barcode}_summary_demult_rpt.txt" "${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt"
 				_plot_key="Read_counts|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt\")"
 				_plot_sig="\$PLOT_SIG_DIR/Read_counts.sig"
 					run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
@@ -5860,7 +5855,7 @@ complete_round_with_path = ChannelUtils.strictRoundJoin(complete_round_ch, close
 
 
 // ============================================================
-// STAGE J — STATE FINALIZATION · round boundary (backup_update_and_clean)
+// STAGE M — STATE FINALIZATION · round boundary (backup_update_and_clean)
 // ============================================================
 process backup_update_and_clean {
 	cache false
@@ -5905,6 +5900,8 @@ process backup_update_and_clean {
 					# Copy rolling tables/plots to the "ongoing" results area.
 					mkdir -p "\$ONGOING_FINAL"
 					mkdir -p "\$STATE_TMP"
+					# Explicitly exclude parser-state transaction artifacts from published state snapshots.
+					rm -rf "\$ONGOING_FINAL/.parser_state_txn" "\$CURRENT_TEMP_ROOT/.parser_state_txn" "\$CURRENT_ROOT/.parser_state_txn" 2>/dev/null || true
 					rpts=( "\$STATE_TMP"/*_rpt.txt )
 					rpts_plain=()
 					for rpt in "\${rpts[@]}"; do
@@ -6150,6 +6147,7 @@ process backup_update_and_clean {
 		# -- §7: Post-lock heavy copies + disk-pressure cleanup --
 		mkdir -p "\$CURRENT_TEMP_ROOT/plots" "\$CURRENT_TEMP_ROOT/sequences"
 		mkdir -p "\$CURRENT_ROOT/plots"       "\$CURRENT_ROOT/sequences"
+		rm -rf "\$CURRENT_TEMP_ROOT/.parser_state_txn" "\$CURRENT_ROOT/.parser_state_txn" 2>/dev/null || true
 
 			pngs=( "\$ROUND_TMP"/*.png )
 			if (( \${#pngs[@]} )); then
@@ -6791,10 +6789,86 @@ Map getTrackArtifactPaths() {
     ]
 }
 
+Map getSampleInfoArtifactPaths() {
+	def trackArtifacts = getTrackArtifactPaths()
+	def sampleInfoDir = trackArtifacts.sampleInfoDir
+	[
+		sampleInfoDir: sampleInfoDir,
+		demult: "${sampleInfoDir}/demult.fasta",
+		replicateIdentity: "${sampleInfoDir}/replicate_identity.tsv",
+		replicateRoster: "${sampleInfoDir}/replicate_roster.tsv",
+		samples: "${sampleInfoDir}/samples.txt",
+		primers: "${sampleInfoDir}/primers.fasta",
+		trackDemult: trackArtifacts.trackIdx,
+		trackRoster: trackArtifacts.trackRoster,
+		trackActiveUnits: trackArtifacts.trackActiveUnits,
+		trackIdentity: trackArtifacts.trackIdentity,
+	]
+}
+
 void requireTrackArtifactPath(def path, String artifactName, String context) {
     if (!isRegularFilePath(path)) {
         exit 1, "Track replicate mode requires ${artifactName} at ${path} ${context}"
     }
+}
+
+void requireSampleInfoFile(def path, String artifactName, String context) {
+	if (!isRegularFilePath(path)) {
+		exit 1, "Demux context ${context} requires ${artifactName} at ${path}"
+	}
+}
+
+void requireSampleInfoFasta(def path, String artifactName, String context) {
+	if (!hasFastaHeader(path)) {
+		exit 1, "Demux context ${context} requires non-empty FASTA ${artifactName} at ${path}"
+	}
+}
+
+String getDemuxIdentityContext(DemuxConfig demuxCfg) {
+	def replicateMode = getReplicateModeCanonical()
+	if (replicateMode == 'track' && demuxCfg.mode == 'primers_only') {
+		exit 1, "replicate_mode=track is incompatible with demultiplex_mode=primers_only"
+	}
+	if (replicateMode == 'track' && demuxCfg.mode == 'off') {
+		exit 1, "replicate_mode=track cannot resolve to demultiplex_mode=off"
+	}
+	if (replicateMode == 'track' && demuxCfg.mode == 'full') {
+		return 'full_track'
+	}
+	if (demuxCfg.mode == 'full') {
+		return 'full_collapse'
+	}
+	if (demuxCfg.mode == 'primers_only') {
+		return 'primers_only'
+	}
+	return 'off'
+}
+
+void validateSampleInfoInventory(String demuxIdentityContext) {
+	def artifacts = getSampleInfoArtifactPaths()
+	switch (demuxIdentityContext) {
+		case 'full_collapse':
+			requireSampleInfoFasta(artifacts.demult, 'demult.fasta', demuxIdentityContext)
+			requireSampleInfoFile(artifacts.replicateIdentity, 'replicate_identity.tsv', demuxIdentityContext)
+			requireSampleInfoFile(artifacts.replicateRoster, 'replicate_roster.tsv', demuxIdentityContext)
+			requireSampleInfoFile(artifacts.samples, 'samples.txt', demuxIdentityContext)
+			requireSampleInfoFasta(artifacts.primers, 'primers.fasta', demuxIdentityContext)
+			break
+		case 'primers_only':
+			requireSampleInfoFile(artifacts.samples, 'samples.txt', demuxIdentityContext)
+			requireSampleInfoFasta(artifacts.primers, 'primers.fasta', demuxIdentityContext)
+			break
+		case 'full_track':
+			requireSampleInfoFasta(artifacts.trackDemult, 'track_demult.fasta', demuxIdentityContext)
+			requireSampleInfoFile(artifacts.trackRoster, 'track_roster.tsv', demuxIdentityContext)
+			requireSampleInfoFile(artifacts.trackActiveUnits, 'track_active_units.txt', demuxIdentityContext)
+			requireSampleInfoFile(artifacts.trackIdentity, 'track_identity.tsv', demuxIdentityContext)
+			break
+		case 'off':
+			break
+		default:
+			exit 1, "Unsupported demux identity context '${demuxIdentityContext}'"
+	}
 }
 
 DemuxConfig getDemuxConfig() {
@@ -6806,7 +6880,7 @@ DemuxConfig getDemuxConfig() {
         s.startsWith('/') ? s : new File(System.getProperty("user.dir"), s).canonicalPath
     }
     def trackArtifacts = getTrackArtifactPaths()
-    def replicateMode = params.replicate_mode?.toString()?.trim()?.toLowerCase() ?: 'collapse'
+    def replicateMode = getReplicateModeCanonical()
     def mode = params.demultiplex_mode?.toString()?.toLowerCase()
     def idx = absPath(params.indexes?.toString())
     def pri = absPath(params.primer_indexes?.toString())
@@ -6817,16 +6891,42 @@ DemuxConfig getDemuxConfig() {
         }
         return new DemuxConfig(true, 'full', replicateMode == 'track' ? trackIdx : idx, pri)
     }
-    if (mode in ['primers_only', 'primers-only', 'primer_only', 'primer-only'])
+    if (mode in ['primers_only', 'primers-only', 'primer_only', 'primer-only']) {
+        if (replicateMode == 'track') {
+            exit 1, "replicate_mode=track is incompatible with demultiplex_mode=primers_only"
+        }
         return new DemuxConfig(true, 'primers_only', null, absPath(params.primer_indexes?.toString()))
-    if (mode in ['off', 'false'])
+    }
+    if (mode in ['off', 'false']) {
+        if (replicateMode == 'track') {
+            exit 1, "replicate_mode=track cannot use demultiplex_mode=off"
+        }
         return new DemuxConfig(false, 'off', null, null)
+    }
     if (replicateMode == 'track' && hasFastaHeader(pri)) {
         requireTrackArtifactPath(trackIdx, 'track_demult.fasta', "before auto full demultiplexing can use ${trackIdx}")
     }
     def effectiveIdx = replicateMode == 'track' ? trackIdx : idx
     def enabled = hasFastaHeader(effectiveIdx) && hasFastaHeader(pri)
+    if (replicateMode == 'track' && !enabled) {
+        exit 1, "replicate_mode=track cannot resolve to demultiplex_mode=off"
+    }
     return new DemuxConfig(enabled, enabled ? 'full' : 'off', effectiveIdx, pri)
+}
+
+String getReplicateModeCanonical() {
+    if (!params.containsKey('replicate_mode')) {
+        return 'collapse'
+    }
+    def replicateModeRaw = params.replicate_mode
+    if (replicateModeRaw == null) {
+        return 'collapse'
+    }
+    def replicateModeCanonical = replicateModeRaw.toString().trim().toLowerCase()
+    if (!(replicateModeCanonical in ['collapse', 'track'])) {
+        exit 1, "Invalid --replicate_mode '${replicateModeRaw}'. Allowed values: collapse, track"
+    }
+    return replicateModeCanonical
 }
 
 // OTU identity normalizer — converts percent or decimal to plain decimal string (moved from §5).

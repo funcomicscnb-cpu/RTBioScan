@@ -1,18 +1,25 @@
 #!/usr/bin/perl
 
+use strict;
+use warnings;
+use FindBin;
 
-$clstr_file = $ARGV[0];
-		$demultiplex_qc_report_file = $ARGV[1];
-$round_dir=$ARGV[2];
-$barcode_pipeline=$ARGV[3];
+require "$FindBin::Bin/reporting_contract_sidecar.pl";
+
+my $clstr_file = $ARGV[0];
+my $demultiplex_qc_report_file = $ARGV[1];
+my $round_dir = $ARGV[2];
+my $barcode_pipeline = $ARGV[3];
 my @allowed_targets = @ARGV[4..$#ARGV];
 
-$report_file=$barcode_pipeline."_otu_def_rpt.txt";
-$round_members_file=$barcode_pipeline."_otu_members_round.tsv";
-$round_sizes_file=$barcode_pipeline."_otu_sizes_round.tsv";
-$"="\t";
+my $report_file = $barcode_pipeline . "_otu_def_rpt.txt";
+my $sidecar_file = $barcode_pipeline . "_otu_def_rpt.contract.tsv";
+my $round_members_file = $barcode_pipeline . "_otu_members_round.tsv";
+my $round_sizes_file = $barcode_pipeline . "_otu_sizes_round.tsv";
+my $context = lc($ENV{"RTBIOSCAN_DEMUX_IDENTITY_CONTEXT"} || '');
+die "ERROR: RTBIOSCAN_DEMUX_IDENTITY_CONTEXT is required\n" if $context eq '';
 
-my %allowed_target = ();
+my %allowed_target;
 for my $t (@allowed_targets) {
 	next if !defined $t;
 	$t =~ s/^\s+|\s+$//g;
@@ -28,7 +35,7 @@ sub is_allowed_target_token {
 	return 0 if !defined $tok;
 	$tok =~ s/^\s+|\s+$//g;
 	return 0 if $tok eq '' || uc($tok) eq 'NA';
-	return 0 unless scalar(keys %allowed_target);
+	return 0 unless $has_allowed_targets;
 	return exists $allowed_target{uc($tok)} ? 1 : 0;
 }
 
@@ -56,102 +63,103 @@ sub first_allowed_target {
 	return ('', $seen, $seen ? 1 : 0);
 }
 
-$header_flag=1;
-open FILE, $demultiplex_qc_report_file or die "I couldn't open $demultiplex_qc_report_file\n";
-while(<FILE>)
-{
-	chomp;
-	
-	if ($header_flag)
-	{
-		
-		@header_array=split/\t/;
-		for($i=0;$i<@header_array;$i++)
-		{
-			$header{$header_array[$i]}=$i;
+my %read_line;
+my $header_flag = 1;
+my %header;
+my $header_line = ReportingContractSidecar::canonical_header('otu_def_rpt');
+open my $demux_fh, '<', $demultiplex_qc_report_file or die "I couldn't open $demultiplex_qc_report_file\n";
+while (my $line = <$demux_fh>) {
+	chomp $line;
+	$line =~ s/\r$//;
+	my @tr = split /\t/, $line, -1;
+	if ($header_flag) {
+		for (my $i = 0; $i < @tr; $i++) {
+			$header{$tr[$i]} = $i;
 		}
-#		$header_line="@header_array[0..3]\t$header_array[5]";
-		$header_line="@header_array[0..7]\tidentity_scope\tidentity_value";
-		$header_flag=0;
-	}else
-	{
-		@tr=split/\t/;
-		my $read_id_raw = $tr[$header{"read_id"}];
-		my $identity_scope = exists($header{"identity_scope"}) ? $tr[$header{"identity_scope"}] : 'unknown';
-		my $identity_value = exists($header{"identity_value"}) ? $tr[$header{"identity_value"}] : 'unknown';
-		if (!defined($identity_scope) || $identity_scope eq '') { $identity_scope = 'unknown'; }
-		if (!defined($identity_value) || $identity_value eq '') { $identity_value = 'unknown'; }
-		my ($read_id_base) = split /\|/, $read_id_raw;
-		# Demultiplex report may include marker/barcode tokens in read_id.
-		# Use base UUID as key so it matches OTU member IDs.
-		if (!exists $read_line{$read_id_base}) {
-			$read_line{$read_id_base}="@tr[0..7]\t$identity_scope\t$identity_value";
-		}
+		$header_flag = 0;
+		next;
+	}
+	my $read_id_raw = $tr[$header{"read_id"}];
+	my $identity_scope = exists($header{"identity_scope"}) ? $tr[$header{"identity_scope"}] : 'unknown';
+	my $identity_value = exists($header{"identity_value"}) ? $tr[$header{"identity_value"}] : 'unknown';
+	$identity_scope = 'unknown' if !defined($identity_scope) || $identity_scope eq '';
+	$identity_value = 'unknown' if !defined($identity_value) || $identity_value eq '';
+	my ($read_id_base) = split /\|/, $read_id_raw;
+	if (!exists $read_line{$read_id_base}) {
+		$read_line{$read_id_base} = join("\t", @tr[0..7], $identity_scope, $identity_value);
 	}
 }
+close $demux_fh;
 
+open my $out_fh, '>', $report_file or die "I couldn't open $report_file\n";
+print $out_fh $header_line, "\n";
 
-open OUT_FILE, ">$report_file" or die "I couldn't open $report_file\n";
+my %round_members;
+my %round_otu_size;
+my $marker_seen = 0;
+my $marker_allowed = 0;
+my $marker_rejected = 0;
+my $otu = 0;
 
-print OUT_FILE $header_line."\tOTU_id\tOTU_role\n";
-
-open FILE, $clstr_file or die "I couldn't open $clstr_file\n";
-$marker_seen = 0;
-$marker_allowed = 0;
-$marker_rejected = 0;
-my %round_members = ();
-my %round_otu_size = ();
-while(<FILE>)
-{
-	if(/\>Cluster (\d+)/)
-	{
-		$otu=$1;
+if (-e $clstr_file && -s $clstr_file) {
+	open my $clstr_fh, '<', $clstr_file or die "I couldn't open $clstr_file\n";
+	while (my $line = <$clstr_fh>) {
+		if ($line =~ /\>Cluster (\d+)/) {
+			$otu = $1;
+			next;
+		}
+		next if $line !~ /\>(\S+)\.\.\.(?: (\S))?/;
+		my $full_id = $1;
+		my @parts = split /\|/, $full_id;
+		my $read_id = $parts[0];
+		my @scan_tokens = ();
+		if ($#parts >= 1) {
+			@scan_tokens = @parts[1..$#parts];
+		}
+		my ($target, $seen_marker, $rejected_marker) = first_allowed_target(@scan_tokens);
+		my $role = (defined($2) && $2 eq '*') ? 'REPRESENTATIVE' : 'MEMBER';
+		my $line_out = exists($read_line{$read_id}) ? $read_line{$read_id} : join("\t", $read_id, 'NA', 'hac', 'no_adapter', 'unknown', 'unknown', 'unknown', 'unknown', 'unknown', 'unknown');
+		my $otu_id = "OTUB_$otu";
+		if ($seen_marker) {
+			$marker_seen++;
+			if ($target ne '') {
+				$marker_allowed++;
+				$otu_id .= "-$target";
+			} elsif ($rejected_marker) {
+				$marker_rejected++;
+			}
+		}
+		print $out_fh $line_out, "\t", $otu_id, "\t", $role, "\n";
+		my $pair = $otu_id . "\t" . $read_id;
+		if (!exists $round_members{$pair}) {
+			$round_members{$pair} = 1;
+			$round_otu_size{$otu_id}++;
+		}
 	}
-		elsif(/\>(\S+)\.\.\.(?: (\S))?/)
-		{
-			my $full_id=$1;
-			my @parts=split /\|/, $full_id;
-			$read_id = $parts[0];
-			my @scan_tokens = ();
-			if ($#parts >= 1) {
-				@scan_tokens = @parts[1..$#parts];
-			}
-			my ($target, $seen_marker, $rejected_marker) = first_allowed_target(@scan_tokens);
-				$role = (defined($2) && $2 eq '*') ? 'REPRESENTATIVE' : 'MEMBER';
-					$line = exists($read_line{$read_id}) ? $read_line{$read_id} : "$read_id\tNA\thac\tno_adapter\tunknown\tunknown\tunknown\tunknown\tunknown\tunknown";
-					my $otu_id = "OTUB_$otu";
-					if ($seen_marker) {
-						$marker_seen++;
-						if ($target ne '') {
-							$marker_allowed++;
-							$otu_id = $otu_id . "-" . $target;
-						} elsif ($rejected_marker) {
-							$marker_rejected++;
-						}
-					}
-					print OUT_FILE $line."\t$otu_id\t$role\n";
-					my $pair = $otu_id."\t".$read_id;
-					if (!exists $round_members{$pair}) {
-						$round_members{$pair}=1;
-						$round_otu_size{$otu_id}++;
-					}
-				}
-			}
-close FILE;
-close OUT_FILE;
+	close $clstr_fh;
+}
+close $out_fh;
 
-open ROUND_MEM, ">$round_members_file" or die "I couldn't open $round_members_file\n";
-print ROUND_MEM "otu_id\tread_id\n";
+open my $members_fh, '>', $round_members_file or die "I couldn't open $round_members_file\n";
+print $members_fh "otu_id\tread_id\n";
 for my $pair (sort keys %round_members) {
-	print ROUND_MEM $pair."\n";
+	print $members_fh $pair, "\n";
 }
-close ROUND_MEM;
+close $members_fh;
 
-open ROUND_SIZE, ">$round_sizes_file" or die "I couldn't open $round_sizes_file\n";
-print ROUND_SIZE "otu_id\tsize\n";
+open my $sizes_fh, '>', $round_sizes_file or die "I couldn't open $round_sizes_file\n";
+print $sizes_fh "otu_id\tsize\n";
 for my $otu_id (sort keys %round_otu_size) {
-	print ROUND_SIZE $otu_id."\t".$round_otu_size{$otu_id}."\n";
+	print $sizes_fh $otu_id, "\t", $round_otu_size{$otu_id}, "\n";
 }
-close ROUND_SIZE;
+close $sizes_fh;
+
+ReportingContractSidecar::write_sidecar_from_report(
+	report_kind => 'otu_def_rpt',
+	context => $context,
+	report_path => $report_file,
+	sidecar_path => $sidecar_file,
+);
 
 print STDERR "INFO: otu_marker_tokens seen=$marker_seen allowed=$marker_allowed rejected=$marker_rejected\n";
+exit 0;

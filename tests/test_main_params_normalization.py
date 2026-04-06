@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import re
 import subprocess
 
 import pytest
@@ -10,6 +11,377 @@ MAIN_NF = REPO_ROOT / "main.nf"
 CHANNEL_UTILS = REPO_ROOT / "lib" / "ChannelUtils.groovy"
 SUP_PATH_HELPER = REPO_ROOT / "bin" / "blast_sup_path.sh"
 METADATA_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "metadata"
+
+
+def _mask_quoted_shell_text(text: str) -> str:
+    """Mask quoted shell text while preserving string length and quote positions."""
+    def is_escaped(idx: int) -> bool:
+        backslashes = 0
+        j = idx - 1
+        while j >= 0 and text[j] == "\\":
+            backslashes += 1
+            j -= 1
+        return (backslashes % 2) == 1
+
+    masked: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote is None:
+            masked.append(ch)
+            if ch in {"'", '"'} and not is_escaped(i):
+                quote = ch
+            i += 1
+            continue
+
+        if quote == "'":
+            if ch == "'":
+                masked.append(ch)
+                quote = None
+            else:
+                masked.append(" ")
+            i += 1
+            continue
+
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] in {'"', "\\", "$", "`"}:
+            masked.extend((" ", " "))
+            i += 2
+            continue
+        if ch == '"':
+            masked.append(ch)
+            quote = None
+        else:
+            masked.append(" ")
+        i += 1
+    return "".join(masked)
+
+
+_INLINE_SHELL_WS = " \t\r\f\v"
+_SHELL_ASSIGNMENT_NAME = r'[A-Za-z_][A-Za-z0-9_]*'
+_SHELL_SIMPLE_ASSIGNMENT = (
+    rf'{_SHELL_ASSIGNMENT_NAME}=(?:'
+    r'[^\s"\']*'
+    r'|"[^"]*"'
+    r"|'[^']*'"
+    r')'
+)
+_SHELL_ONE_OR_MORE_ASSIGNMENTS = rf'(?:{_SHELL_SIMPLE_ASSIGNMENT}\s+)+'
+_CP_MV_PREFIX_PATTERN = "(?:" + "|".join((
+    "",
+    _SHELL_ONE_OR_MORE_ASSIGNMENTS,
+    r'command\s+',
+    rf'{_SHELL_ONE_OR_MORE_ASSIGNMENTS}command\s+',
+    rf'env\s+(?:{_SHELL_SIMPLE_ASSIGNMENT}\s+)*',
+    rf'{_SHELL_ONE_OR_MORE_ASSIGNMENTS}env\s+(?:{_SHELL_SIMPLE_ASSIGNMENT}\s+)*',
+    rf'command\s+env\s+(?:{_SHELL_SIMPLE_ASSIGNMENT}\s+)*',
+    rf'{_SHELL_ONE_OR_MORE_ASSIGNMENTS}command\s+env\s+(?:{_SHELL_SIMPLE_ASSIGNMENT}\s+)*',
+)) + ")"
+_FORBIDDEN_DEMULT_DEST_FORMS = (
+    '${demult_rpt}',
+    '"${demult_rpt}"',
+    '${barcode}_demult_rpt.txt',
+    '"${barcode}_demult_rpt.txt"',
+    '"$barcode"_demult_rpt.txt',
+    '${barcode}"_demult_rpt.txt"',
+    '$barcode"_demult_rpt.txt"',
+    '"${barcode}"_demult_rpt.txt',
+    '"$barcode""_demult_rpt.txt"',
+)
+_FORBIDDEN_DEMULT_DEST_PATTERN = "(?:" + "|".join(
+    re.escape(dest) for dest in _FORBIDDEN_DEMULT_DEST_FORMS
+) + ")"
+_FORBIDDEN_DEMULT_COMMAND_END = (
+    r'(?:'
+    r'(?=\s*(?:$|[\n;|)}]|&&|\|\||\||(?:[0-9]*)?(?:>>?|<)|[0-9]*<&|[0-9]*>&))'
+    r'|(?=\s+#)'
+    r')'
+)
+_FORBIDDEN_DEMULT_WRITE_PATTERNS = (
+    re.compile(rf'^{_CP_MV_PREFIX_PATTERN}cp\b.*?\s+{_FORBIDDEN_DEMULT_DEST_PATTERN}{_FORBIDDEN_DEMULT_COMMAND_END}'),
+    re.compile(rf'^{_CP_MV_PREFIX_PATTERN}mv\b.*?\s+{_FORBIDDEN_DEMULT_DEST_PATTERN}{_FORBIDDEN_DEMULT_COMMAND_END}'),
+    re.compile(rf'^cat\b.*?(?:[0-9]*)>\s*{_FORBIDDEN_DEMULT_DEST_PATTERN}{_FORBIDDEN_DEMULT_COMMAND_END}'),
+    re.compile(rf'^.*?(?<!>)(?:[0-9]*)>\s*{_FORBIDDEN_DEMULT_DEST_PATTERN}{_FORBIDDEN_DEMULT_COMMAND_END}'),
+    re.compile(rf'^.*?(?:[0-9]*)>>\s*{_FORBIDDEN_DEMULT_DEST_PATTERN}{_FORBIDDEN_DEMULT_COMMAND_END}'),
+)
+
+
+def _skip_inline_shell_whitespace(text: str, idx: int) -> int:
+    while idx < len(text) and text[idx] in _INLINE_SHELL_WS:
+        idx += 1
+    return idx
+
+
+def _is_escaped_shell_char(text: str, idx: int) -> bool:
+    backslashes = 0
+    j = idx - 1
+    while j >= 0 and text[j] == "\\":
+        backslashes += 1
+        j -= 1
+    return (backslashes % 2) == 1
+
+
+def _is_shell_word_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _match_shell_word(text: str, idx: int, word: str) -> bool:
+    end = idx + len(word)
+    return (
+        text.startswith(word, idx)
+        and (idx == 0 or not _is_shell_word_char(text[idx - 1]))
+        and (end == len(text) or not _is_shell_word_char(text[end]))
+    )
+
+
+def _looks_like_shell_command_token(text: str, idx: int) -> bool:
+    return idx < len(text) and text[idx] not in (_INLINE_SHELL_WS + "\n;&|)}")
+
+
+def _consume_typed_shell_nesting(text: str, idx: int, stack: list[str]) -> int | None:
+    if text.startswith("${", idx):
+        stack.append("${")
+        return idx + 2
+    if text.startswith("$(", idx):
+        stack.append("$(")
+        return idx + 2
+    if text[idx] == "`" and not _is_escaped_shell_char(text, idx):
+        if stack and stack[-1] == "`":
+            stack.pop()
+        else:
+            stack.append("`")
+        return idx + 1
+    if stack:
+        if text[idx] == "}" and stack[-1] == "${":
+            stack.pop()
+            return idx + 1
+        if text[idx] == ")" and stack[-1] == "$(":
+            stack.pop()
+            return idx + 1
+    return None
+
+
+def _is_top_level_inline_comment_start(text: str, idx: int, *, span_start: int | None = None) -> bool:
+    if text[idx] != "#" or _is_escaped_shell_char(text, idx):
+        return False
+    if span_start is not None and idx == span_start:
+        return True
+    if idx == 0:
+        return True
+    prev = text[idx - 1]
+    if prev in (_INLINE_SHELL_WS + "\n;|"):
+        return True
+    return idx >= 2 and text[idx - 2:idx] == "&&"
+
+
+def _skip_top_level_inline_comment(text: str, idx: int) -> int:
+    while idx < len(text) and text[idx] != "\n":
+        idx += 1
+    return idx
+
+
+def _find_masked_shell_command_starts(text: str) -> list[int]:
+    starts: list[int] = []
+    idx = 0
+    expect_command_start = True
+    pending_case_in = False
+    in_case_patterns = False
+    nesting_stack: list[str] = []
+
+    while idx < len(text):
+        consumed = _consume_typed_shell_nesting(text, idx, nesting_stack)
+        if consumed is not None:
+            idx = consumed
+            continue
+
+        at_top_level = not nesting_stack
+        if at_top_level and _is_top_level_inline_comment_start(text, idx):
+            idx = _skip_top_level_inline_comment(text, idx)
+            continue
+
+        if pending_case_in:
+            if not at_top_level:
+                idx += 1
+                continue
+            if text[idx] in (_INLINE_SHELL_WS + "\n"):
+                idx += 1
+                continue
+            if _match_shell_word(text, idx, "in"):
+                word_end = idx + len("in")
+                if word_end == len(text) or text[word_end] in (_INLINE_SHELL_WS + "\n"):
+                    pending_case_in = False
+                    in_case_patterns = True
+                    expect_command_start = False
+                    idx = word_end
+                    continue
+            if text.startswith("&&", idx) or text.startswith("||", idx):
+                pending_case_in = False
+                idx += 2
+                expect_command_start = True
+                continue
+            if text[idx] == "|":
+                pending_case_in = False
+                idx += 1
+                expect_command_start = True
+                continue
+            if text[idx] == ";":
+                pending_case_in = False
+                if idx + 1 < len(text) and text[idx + 1] == ";":
+                    idx += 2
+                    in_case_patterns = True
+                else:
+                    idx += 1
+                expect_command_start = True
+                continue
+            idx += 1
+            continue
+
+        if in_case_patterns:
+            if not at_top_level:
+                idx += 1
+                continue
+            if text[idx] in (_INLINE_SHELL_WS + "\n"):
+                idx += 1
+                continue
+            if _match_shell_word(text, idx, "esac"):
+                word_end = idx + len("esac")
+                if word_end == len(text) or not _is_shell_word_char(text[word_end]):
+                    idx = word_end
+                    in_case_patterns = False
+                    expect_command_start = False
+                    continue
+            if text[idx] == ")":
+                next_idx = _skip_inline_shell_whitespace(text, idx + 1)
+                if next_idx > idx + 1 and _looks_like_shell_command_token(text, next_idx):
+                    idx = next_idx
+                    in_case_patterns = False
+                    expect_command_start = True
+                    continue
+            idx += 1
+            continue
+
+        if expect_command_start:
+            if not at_top_level:
+                idx += 1
+                continue
+            idx = _skip_inline_shell_whitespace(text, idx)
+            if idx >= len(text):
+                break
+            if text[idx] == "\n":
+                idx += 1
+                expect_command_start = True
+                continue
+            if text.startswith("&&", idx) or text.startswith("||", idx):
+                idx += 2
+                expect_command_start = True
+                continue
+            if text[idx] == "|":
+                idx += 1
+                expect_command_start = True
+                continue
+            if text[idx] == ";":
+                if idx + 1 < len(text) and text[idx + 1] == ";":
+                    idx += 2
+                    in_case_patterns = True
+                else:
+                    idx += 1
+                expect_command_start = True
+                continue
+            if _match_shell_word(text, idx, "then"):
+                word_end = idx + len("then")
+                if word_end < len(text) and text[word_end] in _INLINE_SHELL_WS:
+                    idx = word_end
+                    expect_command_start = True
+                    continue
+            if _match_shell_word(text, idx, "do"):
+                word_end = idx + len("do")
+                if word_end < len(text) and text[word_end] in _INLINE_SHELL_WS:
+                    idx = word_end
+                    expect_command_start = True
+                    continue
+            if text[idx] == "(":
+                next_idx = _skip_inline_shell_whitespace(text, idx + 1)
+                if _looks_like_shell_command_token(text, next_idx):
+                    idx += 1
+                    expect_command_start = True
+                    continue
+            if text[idx] == "{":
+                if idx + 1 < len(text) and text[idx + 1] in _INLINE_SHELL_WS:
+                    idx += 1
+                    expect_command_start = True
+                    continue
+            if text[idx] == "}":
+                idx += 1
+                expect_command_start = False
+                continue
+
+            starts.append(idx)
+            pending_case_in = _match_shell_word(text, idx, "case")
+            expect_command_start = False
+            idx += 1
+            continue
+
+        if not at_top_level:
+            idx += 1
+            continue
+        if text[idx] == "\n":
+            idx += 1
+            expect_command_start = True
+            continue
+        if text.startswith("&&", idx) or text.startswith("||", idx):
+            idx += 2
+            expect_command_start = True
+            continue
+        if text[idx] == "|":
+            idx += 1
+            expect_command_start = True
+            continue
+        if text[idx] == ";":
+            if idx + 1 < len(text) and text[idx + 1] == ";":
+                idx += 2
+                in_case_patterns = True
+            else:
+                idx += 1
+            expect_command_start = True
+            continue
+        idx += 1
+
+    return starts
+
+
+def _find_masked_shell_command_end(text: str, start: int) -> int:
+    nesting_stack: list[str] = []
+    idx = start
+    while idx < len(text):
+        consumed = _consume_typed_shell_nesting(text, idx, nesting_stack)
+        if consumed is not None:
+            idx = consumed
+            continue
+        if nesting_stack:
+            idx += 1
+            continue
+        if text[idx] == "\n":
+            return idx
+        if _is_top_level_inline_comment_start(text, idx, span_start=start):
+            return idx
+        if text.startswith("&&", idx) or text.startswith("||", idx):
+            return idx
+        if text[idx] == ";":
+            return idx
+        if text[idx] == "|":
+            return idx
+        idx += 1
+    return len(text)
+
+
+def _has_forbidden_demult_write(shell_text: str) -> bool:
+    masked_text = _mask_quoted_shell_text(shell_text)
+    for start in _find_masked_shell_command_starts(masked_text):
+        end = _find_masked_shell_command_end(masked_text, start)
+        command_raw = shell_text[start:end]
+        if any(pattern.search(command_raw) for pattern in _FORBIDDEN_DEMULT_WRITE_PATTERNS):
+            return True
+    return False
 
 
 def _make_nextflow_shim(
@@ -1807,7 +2179,7 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'getting_run_summary_with_path = ChannelUtils.strictRoundJoin(getting_run_summary_inputs, get_summary_ch)' in text
     assert 'complete_round_with_path = ChannelUtils.strictRoundJoin(complete_round_ch, close_round_ch)' in text
     assert 'tuple env(barcode), env(round_barcode), val(read_path) into close_round_ch, get_summary_ch' in fast_block
-    assert 'tuple val(barcode), val(round_barcode), file(blast_otu_pretax_rpt), file(read_info_rpt), file(blast_otu_noadapter_rpt), file(blast_filter_stats), file(blast_consensus_tax), file(consensus_round_provenance), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round), file(demult_rpt), file(on_target_rpt), file(summary), file(summary_otu), val(read_path) from getting_run_summary_with_path' in summary_block
+    assert 'tuple val(barcode), val(round_barcode), file(blast_otu_pretax_rpt), file(read_info_rpt), file(blast_otu_noadapter_rpt), file(blast_filter_stats), file(blast_consensus_tax), file(consensus_round_provenance), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round), file(otu_def_rpt_sidecar), file(demult_rpt), file(demult_rpt_sidecar), file(on_target_rpt), file(summary), file(summary_otu), val(read_path) from getting_run_summary_with_path' in summary_block
     assert 'val(read_path) from get_summary_ch' not in summary_block
     assert 'tuple val(barcode), val(round_barcode), val(read_path) from complete_round_with_path' in backup_block
     assert 'val(read_path) from close_round_ch' not in backup_block
@@ -1831,6 +2203,10 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'WARN: active_prune_candidates.pl failed (rc=\\$active_prune_rc)' in summary_block
     assert 'report_sample_read_counts_plots.sh \\' in summary_block
     assert 'perl ${baseDir}/bin/report_round_json.pl \\' in summary_block
+    assert 'cp "${ongoingStateDir}/_state/${barcode}_demult_rpt.txt" "${barcode}_demult_rpt_cumulative.txt"' in summary_block
+    assert 'bash ${baseDir}/bin/demult_summary.sh ${barcode}_demult_rpt_cumulative.txt ${barcode}' in summary_block
+    assert 'cp "${barcode}_summary_demult_rpt.txt" "${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt"' in summary_block
+    assert '--demult "${demult_rpt}" \\' in summary_block
     assert '--schema-version "1.4" \\' in summary_block
     assert '--otu-sizes-round "${otu_sizes_round}" \\' in summary_block
     assert '--otu-size-streak "\\$ROUND_DIR/${barcode}_otu_size_streak.tsv" \\' in summary_block
@@ -1855,6 +2231,76 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert '--state-out "\\$REPORT_STATE_JSON" \\' in summary_block
     assert '--state-url "report_state.json" \\' in summary_block
     assert '--run-id-filter "${run_name}" \\' in summary_block
+    cumulative_stage_idx = summary_block.index('cp "${ongoingStateDir}/_state/${barcode}_demult_rpt.txt" "${barcode}_demult_rpt_cumulative.txt"')
+    demult_summary_idx = summary_block.index('bash ${baseDir}/bin/demult_summary.sh ${barcode}_demult_rpt_cumulative.txt ${barcode}')
+    summary_copy_idx = summary_block.index('cp "${barcode}_summary_demult_rpt.txt" "${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt"')
+    read_counts_idx = summary_block.index('_plot_key="Read_counts|')
+    sample_assets_idx = summary_block.index('report_sample_read_counts_plots.sh \\')
+    round_json_idx = summary_block.index('--demult "${demult_rpt}" \\')
+    cumulative_stage_cmd = 'cp "${ongoingStateDir}/_state/${barcode}_demult_rpt.txt" "${barcode}_demult_rpt_cumulative.txt"'
+    post_stage_block = summary_block[cumulative_stage_idx:round_json_idx]
+    post_stage_suffix = post_stage_block[len(cumulative_stage_cmd):]
+    post_stage_suffix = re.sub(r'\\\s*\n\s*', ' ', post_stage_suffix)
+    assert not _has_forbidden_demult_write(post_stage_suffix), post_stage_suffix
+    assert cumulative_stage_idx < demult_summary_idx < summary_copy_idx < read_counts_idx < sample_assets_idx
+    assert round_json_idx > cumulative_stage_idx
+
+
+def test_forbidden_demult_write_scanner_shell_position_regression() -> None:
+    preserved_matches = (
+        '{ cp tmp "${demult_rpt}"; }',
+        '(cp tmp "${demult_rpt}")',
+        'case x in y) cp tmp "${demult_rpt}" ;; esac',
+        'case x\nin\n  y) cp tmp "${demult_rpt}" ;;\nesac',
+        'case $(foo | bar) in y) cp tmp "${demult_rpt}" ;; esac',
+        'case `foo && bar` in y) mv tmp "${barcode}_demult_rpt.txt" ;; esac',
+        'case $(foo `bar | baz`) in y) cp tmp "${demult_rpt}" ;; esac',
+        'case x in y) echo ok ;; z) cp tmp "${demult_rpt}" ;; esac',
+        'if true; then cp tmp "${demult_rpt}"; fi',
+        'FOO=1 cp tmp "${demult_rpt}"',
+        'FOO="a b" cp tmp "${demult_rpt}"',
+        "FOO='a b' cp tmp \"${demult_rpt}\"",
+        'command cp tmp "${demult_rpt}"',
+        'FOO=1 command cp tmp "${demult_rpt}"',
+        'env VAR=1 mv tmp "${barcode}_demult_rpt.txt"',
+        'env VAR="a b" mv tmp "${barcode}_demult_rpt.txt"',
+        'FOO=1 env VAR=1 cp tmp "${demult_rpt}"',
+        'command env VAR=1 cp tmp "${demult_rpt}"',
+        'FOO=1 command env VAR=1 cp tmp "${demult_rpt}"',
+        'printf ${foo} > "${demult_rpt}"',
+        'printf ${var#pat} > "${demult_rpt}"',
+        'printf ${var##pat} > "${demult_rpt}"',
+        'echo $(cat x) > "${demult_rpt}"',
+        'echo $(cat a | cat b) > "${demult_rpt}"',
+        'printf $(foo; bar) > "${demult_rpt}"',
+        'cp ${src} "${demult_rpt}"',
+        'mv $(cat src) "${demult_rpt}"',
+        'mv $(foo && bar) "${demult_rpt}"',
+        'mv `foo && bar` "${demult_rpt}"',
+        'echo `foo | bar` > "${barcode}_demult_rpt.txt"',
+        'echo \\# not-comment > "${demult_rpt}"',
+        'printf x 1>> "${barcode}_demult_rpt.txt"',
+    )
+    rejected_non_matches = (
+        '# cp tmp "${demult_rpt}"',
+        'echo ok # ; cp tmp "${demult_rpt}"',
+        'echo ok # && cp tmp "${demult_rpt}"',
+        'echo { cp tmp "${demult_rpt}"',
+        'echo ( cp tmp "${demult_rpt}"',
+        'echo x) cp tmp "${demult_rpt}"',
+        'echo ${foo} cp tmp "${demult_rpt}"',
+        'echo then cp tmp "${demult_rpt}"',
+        'echo "(cp tmp ${demult_rpt})"',
+        'echo "{ cp tmp ${demult_rpt} }"',
+        'case x in y) echo ok ;; esac; echo x) cp tmp "${demult_rpt}"',
+        'cp "${demult_rpt}" backup.tsv',
+    )
+
+    for shell_text in preserved_matches:
+        assert _has_forbidden_demult_write(shell_text), shell_text
+
+    for shell_text in rejected_non_matches:
+        assert not _has_forbidden_demult_write(shell_text), shell_text
 
 
 def test_main_nf_prune_apply_ordering_regression() -> None:
