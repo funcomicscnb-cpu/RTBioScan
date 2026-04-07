@@ -5650,8 +5650,18 @@ process getting_run_summary {
 				--out-dir "\$REPORT_ASSET_OUTDIR" \
 				>/dev/null || true
 				REPORT_SAMPLE_ROSTER_ARG=""
-				if [ -s "${params.outdir}/sample_info/${run_name}/samples.txt" ]; then
+				REPORT_IDENTITY_MODE_ARG=""
+				if [ "${replicateModeCanonical}" = "track" ]; then
+					_TRACK_ROSTER="${params.outdir}/sample_info/${run_name}/track_roster.tsv"
+					if [ ! -r "\$_TRACK_ROSTER" ]; then
+						echo "ERROR: identity-mode=track requires track_roster.tsv but it is missing or unreadable: \$_TRACK_ROSTER" >&2
+						exit 1
+					fi
+					REPORT_SAMPLE_ROSTER_ARG="--sample-roster \$_TRACK_ROSTER"
+					REPORT_IDENTITY_MODE_ARG="--identity-mode track"
+				elif [ -s "${params.outdir}/sample_info/${run_name}/samples.txt" ]; then
 					REPORT_SAMPLE_ROSTER_ARG="--sample-roster ${params.outdir}/sample_info/${run_name}/samples.txt"
+					REPORT_IDENTITY_MODE_ARG="--identity-mode collapse"
 				fi
 				perl ${baseDir}/bin/report_round_json.pl \
 				--run-id "${run_name}" \
@@ -5701,7 +5711,8 @@ process getting_run_summary {
 					--sample-fig-list "\$REPORT_SAMPLE_FIG_LIST" \
 					\$REPORT_SAMPLE_ROSTER_ARG \
 					--sample-fig-dir "\$REPORT_SAMPLE_ASSET_DIR" \
-					--sample-fig-url-prefix "\$REPORT_SAMPLE_FIG_URL_PREFIX"
+					--sample-fig-url-prefix "\$REPORT_SAMPLE_FIG_URL_PREFIX" \
+					\$REPORT_IDENTITY_MODE_ARG
 		round_json_rc=\$?
 		if [ "\$round_json_rc" -ne 0 ]; then
 			echo "WARN: report_round_json.pl failed (rc=\$round_json_rc)" 1>&2
