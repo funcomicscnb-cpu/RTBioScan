@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Current State &#8212; {{RUN_NAME}}</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:"IBM Plex Sans","Segoe UI",Arial,sans-serif;background:linear-gradient(180deg,#f7f8f4 0%,#eef1e8 100%);color:#1b2417;margin:0;min-height:100vh}
+.wrap{max-width:860px;margin:0 auto;padding:32px 24px}
+header{border-bottom:2px solid #cfd7c9;padding-bottom:18px;margin-bottom:26px}
+.brand{font-size:.78rem;color:#8a9b85;letter-spacing:.04em;text-transform:uppercase;margin:0 0 6px}
+h1{color:#2c6e49;font-size:1.55rem;margin:0 0 12px}
+.browse{display:inline-block;color:#3b7f5f;text-decoration:none;border:1px solid #cfd7c9;padding:6px 16px;border-radius:6px;background:#fff;font-size:14px;font-weight:500;margin-bottom:12px}
+.browse:hover{text-decoration:underline;background:#f4f8f2}
+.subtitle{color:#4d5b48;font-size:.92rem;margin:0}
+h2{color:#2c6e49;font-size:1.05rem;border-bottom:1px solid #e4e9e0;padding-bottom:3px;margin:26px 0 10px}
+table{width:100%;border-collapse:collapse;font-size:.875rem;margin-bottom:16px}
+th{text-align:left;background:#e8f0e4;padding:8px 12px;color:#2a3624;border-bottom:2px solid #cad2bf;font-size:.82rem;text-transform:uppercase;letter-spacing:.03em}
+td{padding:8px 12px;border-bottom:1px solid #edf1ea;vertical-align:top;line-height:1.45}
+tr:last-child td{border-bottom:none}
+td:first-child{font-family:"IBM Plex Mono","Courier New",monospace;white-space:nowrap;color:#2c6e49;font-size:.83rem}
+.note{background:#f0f4ec;border-left:3px solid #3b7f5f;padding:12px 16px;border-radius:0 4px 4px 0;font-size:.875rem;margin:16px 0}
+.note ul{margin:8px 0 0;padding-left:20px}
+.note li{margin:4px 0}
+code{background:#e8f0e4;padding:1px 5px;border-radius:3px;font-family:"IBM Plex Mono","Courier New",monospace;font-size:.82em}
+footer{margin-top:40px;font-size:.78rem;color:#8a9b85;border-top:1px solid #dde5d7;padding-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="brand">RTBioScan &#183; Run {{RUN_NAME}} &#183; State {{STATE_ID}}</p>
+    <h1>Current State</h1>
+    <a class="browse" href="../../../report_html/runs/{{RUN_NAME}}/report.html">&#128202; Run Report</a>
+    <a class="browse" href="./">&#128193; Browse directory</a>
+    <p class="subtitle">Latest published results for run <strong>{{RUN_NAME}}</strong> (state ID: <code>{{STATE_ID}}</code>). Updated at the end of every processing round.</p>
+  </header>
+
+  <main>
+    <h2>Directory structure</h2>
+    <p style="font-size:.875rem;color:#4d5b48;margin:0 0 10px">All outputs are organised into three subdirectories. There are no loose files at the top level (aside from this README).</p>
+    <table>
+      <thead><tr><th>Directory</th><th>Contents</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>plots/</td>
+          <td>Visualisation plots regenerated each round. Contains circle-tree, treemap, taxonomy accumulation, read density, and quality violin images in PNG format.</td>
+        </tr>
+        <tr>
+          <td>sequences/</td>
+          <td>Sequence outputs. Contains <code>Consensus/</code>, where each subdirectory is named after an OTU key (e.g. <code>OTUB_42-COI-sample_1/</code>) and holds the merged consensus FASTA and the supporting reads used in the multiple sequence alignment.</td>
+        </tr>
+        <tr>
+          <td>tables/</td>
+          <td>All tabular report files. Includes cumulative BLAST and read-info reports, OTU definition and frozen-OTU state tables, demultiplexing and on-target reports, treemap data, taxonomy time-series tables, and internal state tracking files (OTU hashes, frozen members, seen read IDs). See below for key file patterns.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Key files in tables/</h2>
+    <p style="font-size:.875rem;color:#4d5b48;margin:0 0 10px">Files with <code>.gz</code> extension are gzip-compressed; use <code>zcat</code>, <code>gzip -d</code>, or any gzip-aware tool.</p>
+    <table>
+      <thead><tr><th>File pattern</th><th>Contents</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>*_blast_otu_pretax_rpt.txt</td>
+          <td>Cumulative BLAST OTU pre-taxonomy report. Maps each read to its best BLAST hit and OTU assignment. Columns: read ID, barcode, model, sample, hit ID, taxid, alignment length, percent identity, OTU ID, and full taxonomy (kingdom through species).</td>
+        </tr>
+        <tr>
+          <td>*_read_info_rpt.txt.gz</td>
+          <td>Cumulative read info table. One row per read with: read ID, sequence length, mean Q-score, basecalling model, barcode, marker, sample, and on-target status.</td>
+        </tr>
+        <tr>
+          <td>*_otu_def_rpt.txt.gz</td>
+          <td>OTU definition report. Cluster membership, OTU sizes per round, taxonomy assignments, and frozen/active status for every OTU cluster.</td>
+        </tr>
+        <tr>
+          <td>*_blast_consensus_tax_*.txt</td>
+          <td>Consensus sequence taxonomy assignments (all, representative, and consolidated variants). One row per consensus sequence with BLAST-derived taxonomy at family, genus, and species level.</td>
+        </tr>
+        <tr>
+          <td>*_on_target_rpt.txt.gz</td>
+          <td>On-target read tracking. Records which reads passed the marker-specific length and quality filters and were classified as on-target for COI or ITS2.</td>
+        </tr>
+        <tr>
+          <td>*_demult_rpt.txt.gz</td>
+          <td>Demultiplexing report. Read-to-sample assignment results including barcode match scores and primer identification.</td>
+        </tr>
+        <tr>
+          <td>*_treemap_*_rpt.txt</td>
+          <td>Data tables backing each treemap plot. Contain OTU or consensus read counts by taxonomy, split by marker and taxonomic group.</td>
+        </tr>
+        <tr>
+          <td>*_tax_time_rpt.txt</td>
+          <td>Taxonomy accumulation tables (OTU, consensus, frozen OTU, and consolidated variants). One row per round with cumulative species/genus counts.</td>
+        </tr>
+        <tr>
+          <td>otu_frozen_*.tsv / otu_seen_*.tsv</td>
+          <td>Internal OTU state files: frozen cluster membership, representative sequences, promotion history, and seen-hash index. Used for pipeline restart and restore.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="note">
+      <strong>Notes</strong>
+      <ul>
+        <li>This directory is the <em>published</em> snapshot. The live working copy (including the internal <code>_state/</code> directory) lives under <code>temp/ongoing/state/{{STATE_ID}}/</code>.</li>
+        <li>Plots and tables are regenerated each round and always reflect the latest completed round.</li>
+        <li>To restore a previous state, use <code>restart_mode = restore</code> before restarting the pipeline.</li>
+      </ul>
+    </div>
+  </main>
+
+  <footer>Generated by RTBioScan &middot; run {{RUN_NAME}} &middot; state {{STATE_ID}}</footer>
+</div>
+</body>
+</html>

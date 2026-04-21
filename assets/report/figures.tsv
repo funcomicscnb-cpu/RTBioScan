@@ -1,0 +1,25 @@
+# id	filename	title	description	section	order
+reads_time	{barcode}_reads_time.png	Reads vs Time	Total reads over time	Global Overview	10
+reads_cumulative_log	{barcode}_reads_cumulative_log.png	Cumulative Reads (log)	Cumulative read growth	Global Overview	20
+read_quality_violin	{barcode}_violin_quality_read_info.png	Read Quality (violin)	Read quality distribution	Read QC / FAST	30
+read_length_violin	{barcode}_violin_length_read_info.png	Read Length (violin)	Read length distribution	Read QC / FAST	40
+read_density	{barcode}_density_read_info.png	Read Density	Read length density	Read QC / FAST	50
+demux_reads_barcode	{barcode}_reads_per_barcode.png	Reads per Barcode	Demultiplex read counts	Demultiplexing	60
+demux_reads_sample	{barcode}_reads_per_sample.png	Reads per Sample	Demultiplex read counts	Demultiplexing	70
+demux_reads_sample_log	{barcode}_reads_per_sample_log.png	Reads per Sample (log)	Demultiplex read counts (log)	Demultiplexing	80
+otu_tax_time	{barcode}_otu_tax_time.png	OTU Taxonomy Over Time	OTU taxonomy trends	OTU Definition	90
+otu_frozen_tax_time	{barcode}_otu_frozen_tax_time.png	Frozen OTU Taxonomy Over Time	Frozen OTU taxonomy trends	OTU Definition	92
+consensus_tax_time	{barcode}_consensus_tax_time.png	Consensus Taxonomy Over Time	Consensus taxonomy trends	Consensus	100
+consensus_consolidated_tax_time	{barcode}_consensus_consolidated_tax_time.png	Consolidated Consensus Taxonomy Over Time	Consolidated consensus taxonomy trends	Consensus	102
+otu_spc_treemap_coi	{barcode}_otu_tax_spc_COI_treemap.png	OTU Species Treemap (COI)	Species abundance (OTU)	OTU Definition	110
+otu_spc_treemap_its	{barcode}_otu_tax_spc_ITS_treemap.png	OTU Species Treemap (ITS2)	Species abundance (OTU)	OTU Definition	120
+otu_gns_treemap_coi	{barcode}_otu_tax_gns_COI_treemap.png	OTU Genus Treemap (COI)	Genus abundance (OTU)	OTU Definition	115
+otu_gns_treemap_its	{barcode}_otu_tax_gns_ITS_treemap.png	OTU Genus Treemap (ITS2)	Genus abundance (OTU)	OTU Definition	125
+otu_circle_tree_coi	{barcode}_otu_circle_tree_COI.png	OTU Fan Cladogram (COI)	Weight: reads in OTUs	OTU Definition	118
+otu_circle_tree_its	{barcode}_otu_circle_tree_ITS.png	OTU Fan Cladogram (ITS2)	Weight: reads in OTUs	OTU Definition	128
+cons_spc_treemap_coi	{barcode}_consensus_tax_spc_COI_treemap.png	Consensus Species Treemap (COI)	Species abundance (consensus)	Consensus	130
+cons_spc_treemap_its	{barcode}_consensus_tax_spc_ITS_treemap.png	Consensus Species Treemap (ITS2)	Species abundance (consensus)	Consensus	140
+cons_gns_treemap_coi	{barcode}_consensus_tax_gns_COI_treemap.png	Consensus Genus Treemap (COI)	Genus abundance (consensus)	Consensus	135
+cons_gns_treemap_its	{barcode}_consensus_tax_gns_ITS_treemap.png	Consensus Genus Treemap (ITS2)	Genus abundance (consensus)	Consensus	145
+cons_circle_tree_coi	{barcode}_consensus_circle_tree_COI.png	Consensus Fan Cladogram (COI)	Weight: consensus count	Consensus	138
+cons_circle_tree_its	{barcode}_consensus_circle_tree_ITS.png	Consensus Fan Cladogram (ITS2)	Weight: consensus count	Consensus	148

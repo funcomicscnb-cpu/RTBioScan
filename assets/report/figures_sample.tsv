@@ -1,0 +1,4 @@
+# id	filename	title	description	section	order
+sample_reads_per_barcode	{sample_id}_reads_per_barcode.png	Reads per Barcode (sample)	Demultiplex read counts for this sample	Demultiplexing	10
+sample_reads_per_sample	{sample_id}_reads_per_sample.png	Reads per Sample (sample)	Demultiplex read counts for this sample	Demultiplexing	20
+sample_reads_per_sample_log	{sample_id}_reads_per_sample_log.png	Reads per Sample (log, sample)	Demultiplex read counts (log) for this sample	Demultiplexing	30

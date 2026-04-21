@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Run Config &#8212; {{RUN_NAME}}</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:"IBM Plex Sans","Segoe UI",Arial,sans-serif;background:linear-gradient(180deg,#f7f8f4 0%,#eef1e8 100%);color:#1b2417;margin:0;min-height:100vh}
+.wrap{max-width:940px;margin:0 auto;padding:32px 24px}
+header{border-bottom:2px solid #cfd7c9;padding-bottom:18px;margin-bottom:26px}
+.brand{font-size:.78rem;color:#8a9b85;letter-spacing:.04em;text-transform:uppercase;margin:0 0 6px}
+h1{color:#2c6e49;font-size:1.55rem;margin:0 0 12px}
+.browse{display:inline-block;color:#3b7f5f;text-decoration:none;border:1px solid #cfd7c9;padding:6px 16px;border-radius:6px;background:#fff;font-size:14px;font-weight:500;margin-bottom:12px;margin-right:8px}
+.browse:hover{text-decoration:underline;background:#f4f8f2}
+.subtitle{color:#4d5b48;font-size:.92rem;margin:0}
+h2{color:#2c6e49;font-size:1.05rem;border-bottom:1px solid #e4e9e0;padding-bottom:3px;margin:28px 0 12px}
+h3{color:#2c6e49;font-size:.95rem;margin:18px 0 8px}
+p{font-size:.88rem;color:#3a4635;margin:0 0 10px;line-height:1.55}
+table{width:100%;border-collapse:collapse;font-size:.875rem;margin-bottom:12px}
+th{text-align:left;background:#e8f0e4;padding:8px 12px;color:#2a3624;border-bottom:2px solid #cad2bf;font-size:.82rem;text-transform:uppercase;letter-spacing:.03em}
+td{padding:8px 12px;border-bottom:1px solid #edf1ea;vertical-align:top;line-height:1.45}
+tr:last-child td{border-bottom:none}
+td:first-child{font-family:"IBM Plex Mono","Courier New",monospace;white-space:nowrap;font-size:.83rem}
+.user-set-row{background:#f0f8f2}
+.user-set-row td:first-child{color:#2c6e49}
+.user-badge{display:inline-block;font-family:"IBM Plex Sans","Segoe UI",Arial,sans-serif;font-size:.68rem;background:#cde8d6;color:#1d5932;border-radius:3px;padding:1px 5px;vertical-align:middle;margin-left:5px;font-weight:600;letter-spacing:.02em}
+.note{background:#f0f4ec;border-left:3px solid #3b7f5f;padding:12px 16px;border-radius:0 4px 4px 0;font-size:.875rem;margin:16px 0}
+.note ul{margin:8px 0 0;padding-left:20px}
+.note li{margin:4px 0}
+code{background:#e8f0e4;padding:1px 5px;border-radius:3px;font-family:"IBM Plex Mono","Courier New",monospace;font-size:.82em}
+.conf-block{background:#f7fbf4;border:1px solid #cfd7c9;border-radius:6px;padding:14px 16px;font-family:"IBM Plex Mono","Courier New",monospace;font-size:.8rem;margin:10px 0;white-space:pre;overflow-x:auto;line-height:1.5;color:#1b2417;max-height:420px;overflow-y:auto}
+.cmd-block{background:#1b2417;color:#c8e6c9;border-radius:6px;padding:14px 16px;font-family:"IBM Plex Mono","Courier New",monospace;font-size:.8rem;margin:10px 0;white-space:pre-wrap;word-break:break-all;line-height:1.55}
+.usage-block{background:#f7fbf4;border:1px solid #cfd7c9;border-radius:6px;padding:14px 16px;font-family:"IBM Plex Mono","Courier New",monospace;font-size:.8rem;margin:10px 0;white-space:pre;overflow-x:auto;line-height:1.5}
+.stat-row{display:flex;gap:24px;flex-wrap:wrap;margin:10px 0 16px}
+.stat{background:#fff;border:1px solid #cad2bf;border-radius:8px;padding:10px 18px;text-align:center;min-width:110px}
+.stat-val{font-size:1.4rem;font-weight:700;color:#2c6e49}
+.stat-lbl{font-size:.72rem;color:#6b7a63;text-transform:uppercase;letter-spacing:.04em}
+details{border:1px solid #dde5d7;border-radius:6px;margin:6px 0;overflow:hidden}
+details[open]{border-color:#b5cbb5}
+summary{background:#e8f0e4;padding:9px 14px;cursor:pointer;font-size:.88rem;font-weight:600;color:#2a3624;list-style:none;user-select:none}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"▶ ";font-size:.7rem;color:#3b7f5f;margin-right:4px}
+details[open] summary::before{content:"▼ "}
+.ref-table{margin:0;border-radius:0}
+.ref-table th{background:#f0f4ec;font-size:.8rem}
+.ref-table td{font-size:.84rem}
+.download-conf{display:inline-flex;align-items:center;gap:6px;background:#2c6e49;color:#fff;text-decoration:none;border-radius:6px;padding:7px 16px;font-size:14px;font-weight:600;margin:4px 0 14px}
+.download-conf:hover{background:#245c3c}
+footer{margin-top:40px;font-size:.78rem;color:#8a9b85;border-top:1px solid #dde5d7;padding-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="brand">RTBioScan &#183; Run {{RUN_NAME}} &#183; State {{STATE_ID}}</p>
+    <h1>Run Configuration</h1>
+    <a class="browse" href="../../report_html/runs/{{RUN_NAME}}/report.html">&#128202; Run Report</a>
+    <a class="browse" href="./">&#128193; Browse directory</a>
+    <p class="subtitle">Auto-generated parameter snapshot for run <strong>{{RUN_NAME}}</strong>. Use this file to reproduce or adapt the run.</p>
+  </header>
+
+  <main>
+
+    <!-- ── Stats ──────────────────────────────────────────────────────────── -->
+    <div class="stat-row">
+      <div class="stat"><div class="stat-val">{{USER_COUNT}}</div><div class="stat-lbl">CLI params</div></div>
+      <div class="stat"><div class="stat-val">{{ALL_COUNT}}</div><div class="stat-lbl">Total params</div></div>
+    </div>
+
+    <!-- ── Config file ────────────────────────────────────────────────────── -->
+    <h2>Configuration file</h2>
+    <p>
+      The file <code>{{CONF_FILENAME}}</code> captures every pipeline parameter — both those you
+      supplied on the command line and the defaults that were active during this run. Passing this
+      file to a future invocation makes the run fully reproducible even if pipeline defaults change.
+    </p>
+    <a class="download-conf" href="{{CONF_RELATIVE_PATH}}" download>&#8659; Download {{CONF_FILENAME}}</a>
+    <pre class="conf-block">{{CONF_CONTENT}}</pre>
+
+    <!-- ── How to reuse ───────────────────────────────────────────────────── -->
+    <h2>How to use this file for future runs</h2>
+    <p>Pass <code>-c</code> to Nextflow to load the configuration file, then override only what needs
+    to change for the new run (e.g. new reads path, new run ID):</p>
+    <pre class="usage-block">./RTBioScan.sh \
+  -c results/{{RUN_NAME}}_config/{{CONF_FILENAME}} \
+  --run_id NEW_RUN_ID \
+  --reads "results/pod5/NEW_RUN_ID/reads_rt_round_pod5/*.pod5" \
+  -profile &lt;your_profile&gt; -resume</pre>
+
+    <p>Or directly with Nextflow:</p>
+    <pre class="usage-block">NXF_VER=22.10.8 nextflow run main.nf \
+  -c results/{{RUN_NAME}}_config/{{CONF_FILENAME}} \
+  -name NEW_RUN_ID \
+  --run_id NEW_RUN_ID \
+  --reads "results/pod5/NEW_RUN_ID/reads_rt_round_pod5/*.pod5" \
+  -profile &lt;your_profile&gt; -resume</pre>
+
+    <div class="note">
+      <strong>Tips</strong>
+      <ul>
+        <li>Parameters in the <code>params&#160;{&#160;}</code> block override Nextflow profile defaults. CLI flags override everything.</li>
+        <li>Always update <code>reads</code>, <code>ori_dir</code>, <code>indexes</code>, <code>primer_indexes</code>, and <code>run_id</code> when starting a new run.</li>
+        <li>Set <code>restart_mode = "off"</code> (or remove the line) for a fresh start; use <code>restart_mode = "restore"</code> to resume from a saved state.</li>
+        <li>Database paths (<code>blast_db_specs</code>, <code>blast_filter_db</code>, <code>blast_taxdb</code>) are absolute — verify they are accessible on the target machine.</li>
+      </ul>
+    </div>
+
+    <!-- ── CLI command ────────────────────────────────────────────────────── -->
+    <h2>Command used for this run</h2>
+    <p>The exact Nextflow invocation that generated this run (recorded at launch time):</p>
+    <pre class="cmd-block">{{RUN_COMMAND}}</pre>
+
+    <!-- ── User-defined params ────────────────────────────────────────────── -->
+    <h2>User-defined options <span style="font-weight:400;font-size:.82rem;color:#6b7a63">({{USER_COUNT}} parameters set explicitly on the command line)</span></h2>
+    <p>These parameters were passed explicitly on the command line and may differ from the pipeline defaults.
+    They are the primary levers for customising the run.</p>
+    <table>
+      <thead><tr><th>Parameter</th><th>Value used</th><th>Description</th></tr></thead>
+      <tbody>
+        {{USER_PARAMS_ROWS}}
+      </tbody>
+    </table>
+
+    <!-- ── Parameter reference ────────────────────────────────────────────── -->
+    <h2>Parameter reference</h2>
+    <p>All documented parameters grouped by category. Parameters marked
+    <span class="user-badge">user-set</span> were supplied in this run.
+    Click a category to expand.</p>
+
+    {{REF_SECTIONS}}
+
+  </main>
+
+  <footer>Generated by RTBioScan &middot; run {{RUN_NAME}} &middot; state {{STATE_ID}}</footer>
+</div>
+</body>
+</html>

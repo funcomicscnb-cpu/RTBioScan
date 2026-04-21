@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sample Info &#8212; {{RUN_NAME}}</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:"IBM Plex Sans","Segoe UI",Arial,sans-serif;background:linear-gradient(180deg,#f7f8f4 0%,#eef1e8 100%);color:#1b2417;margin:0;min-height:100vh}
+.wrap{max-width:860px;margin:0 auto;padding:32px 24px}
+header{border-bottom:2px solid #cfd7c9;padding-bottom:18px;margin-bottom:26px}
+.brand{font-size:.78rem;color:#8a9b85;letter-spacing:.04em;text-transform:uppercase;margin:0 0 6px}
+h1{color:#2c6e49;font-size:1.55rem;margin:0 0 12px}
+.browse{display:inline-block;color:#3b7f5f;text-decoration:none;border:1px solid #cfd7c9;padding:6px 16px;border-radius:6px;background:#fff;font-size:14px;font-weight:500;margin-bottom:12px}
+.browse:hover{text-decoration:underline;background:#f4f8f2}
+.subtitle{color:#4d5b48;font-size:.92rem;margin:0}
+h2{color:#2c6e49;font-size:1.05rem;border-bottom:1px solid #e4e9e0;padding-bottom:3px;margin:26px 0 10px}
+table{width:100%;border-collapse:collapse;font-size:.875rem;margin-bottom:16px}
+th{text-align:left;background:#e8f0e4;padding:8px 12px;color:#2a3624;border-bottom:2px solid #cad2bf;font-size:.82rem;text-transform:uppercase;letter-spacing:.03em}
+td{padding:8px 12px;border-bottom:1px solid #edf1ea;vertical-align:top;line-height:1.45}
+tr:last-child td{border-bottom:none}
+td:first-child{font-family:"IBM Plex Mono","Courier New",monospace;white-space:nowrap;color:#2c6e49;font-size:.83rem}
+.note{background:#f0f4ec;border-left:3px solid #3b7f5f;padding:12px 16px;border-radius:0 4px 4px 0;font-size:.875rem;margin:16px 0}
+.note ul{margin:8px 0 0;padding-left:20px}
+.note li{margin:4px 0}
+code{background:#e8f0e4;padding:1px 5px;border-radius:3px;font-family:"IBM Plex Mono","Courier New",monospace;font-size:.82em}
+.format-block{background:#f7fbf4;border:1px solid #cfd7c9;border-radius:4px;padding:10px 14px;font-family:"IBM Plex Mono","Courier New",monospace;font-size:.82rem;margin:8px 0 0;white-space:pre;overflow-x:auto}
+footer{margin-top:40px;font-size:.78rem;color:#8a9b85;border-top:1px solid #dde5d7;padding-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="brand">RTBioScan &#183; Run {{RUN_NAME}}</p>
+    <h1>Sample Info</h1>
+    <a class="browse" href="../../report_html/runs/{{RUN_NAME}}/report.html">&#128202; Run Report</a>
+    <a class="browse" href="./">&#128193; Browse directory</a>
+    <p class="subtitle">Demultiplexing index files and sample metadata for run <strong>{{RUN_NAME}}</strong>. Populated at run start and does not change during processing.</p>
+  </header>
+
+  <main>
+    <h2>Files</h2>
+    <table>
+      <thead><tr><th>File</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>demult.fasta</td>
+          <td>
+            Collapse-mode operational demultiplex FASTA. Each entry defines one <code>unit_id_collapse</code> barcode identity with combined forward + reverse primer constraints for the current pipeline demultiplexer in <code>auto</code> and <code>on</code> modes.
+            <div class="format-block">&gt;unit_id_collapse
+fwd_primer;min_overlap=N...rev_primer;min_overlap=N</div>
+          </td>
+        </tr>
+        <tr>
+          <td>primers.fasta</td>
+          <td>Standalone marker primer sequences (COI, ITS2). Used in <code>primers_only</code> mode to identify the target marker without sample-level demultiplexing, and as a reference for on-target filtering.</td>
+        </tr>
+        <tr>
+          <td>samples.txt</td>
+          <td>
+            Canonical 7-field whitespace-delimited compatibility roster used by existing runtime and reporting consumers. Each line is projected as <code>Sample_ID Pipeline_ID Replicate Well Plate Run demult_id</code>. Kept for backward compatibility; not the forward replicate-aware contract.
+          </td>
+        </tr>
+        <tr>
+          <td>replicate_roster.tsv</td>
+          <td>
+            Explicit replicate-level roster for future consumers, when present. Columns: <code>sample_id</code>, <code>replicate_id</code>, <code>replicate_number</code>, <code>well</code>, <code>plate</code>, <code>run_id</code>, <code>demult_id_metadata</code>.
+          </td>
+        </tr>
+        <tr>
+          <td>replicate_identity.tsv</td>
+          <td>
+            Transition/lookup table, when present, linking <code>sample_id</code> and <code>replicate_id</code> to current collapse-mode and future track-mode unit identities via <code>unit_id_collapse</code> and <code>unit_id_track</code>.
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="note">
+      <strong>Demultiplexing modes</strong> &mdash; controlled by <code>demultiplex_mode</code> in the run config:
+      <ul>
+        <li><code>auto</code> &mdash; use <code>demult.fasta</code> if present, otherwise fall back to primer-only identification.</li>
+        <li><code>on</code> &mdash; always apply full barcode demultiplexing with <code>demult.fasta</code>.</li>
+        <li><code>primers_only</code> &mdash; identify marker (COI/ITS2) via <code>primers.fasta</code> without sample assignment.</li>
+        <li><code>off</code> &mdash; skip demultiplexing; all reads processed as a single pool (<code>no_adapter</code>).</li>
+      </ul>
+    </div>
+  </main>
+
+  <footer>Generated by RTBioScan &middot; run {{RUN_NAME}}</footer>
+</div>
+</body>
+</html>

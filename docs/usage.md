@@ -1,6 +1,6 @@
 # RTBioScan: Usage
 
-> **Docs:** [Index](README.md) · [Installation](installation.md) · **Usage** · [Output](output.md) · [Report Schema](report_schema.md) · [Pipeline Design](pipeline.md) · [Performance Backlog](performance_pr_backlog.md)
+> **Docs:** [Index](README.md) · [Installation](installation.md) · **Usage** · [Output](output.md) · [Report Schema](report_schema.md) · [Pipeline Overview](pipeline.md)
 
 ## Table of contents
 [back to Top](#rtbioscan-usage)
@@ -19,12 +19,12 @@
   * [Running the voucher workflow](#running-the-voucher-workflow)
   * [Exporting sequences for database submission](#exporting-sequences-for-database-submission)
 * [Running the pipeline](#running-the-pipeline)
+* [Input file formats](#input-file-formats)
 * [Main arguments](#main-arguments)
   * [`-name`](#-name)
   * [`-profile`](#-profile)
   * [`--run_id`](#--run_id)
   * [`--reads`](#--reads)
-  * [`--reads_rt`](#--reads_rt)
 * [Database parameters](#database-parameters)
   * [`--blast_db_specs`](#--blast_db_specs)
   * [`--blast_filter_db`](#--blast_filter_db)
@@ -39,12 +39,12 @@
 * [Other command line parameters](#other-command-line-parameters)
   * [General settings](#general-settings)
   * [Basecalling and read filtering](#basecalling-and-read-filtering)
-  * [OTU definition (`OTU_definition`)](#otu-definition-otu_definition)
-  * [BLAST (`blast_OTU_pretax`)](#blast-blast_otu_pretax)
-  * [Consensus (`consensus`)](#consensus-consensus)
+  * [OTU definition](#otu-definition)
+  * [Taxonomic assignment](#taxonomic-assignment)
+  * [Consensus generation](#consensus-generation)
   * [Process concurrency](#process-concurrency)
-  * [HTML report (`getting_run_summary`)](#html-report-getting_run_summary)
-  * [OTU membership exports (`_reporting_OTU_definition`)](#otu-membership-exports-_reporting_otu_definition)
+  * [HTML report and summaries](#html-report-and-summaries)
+  * [OTU membership exports](#otu-membership-exports)
 
 
 ## Introduction
@@ -99,12 +99,27 @@ NXF_OPTS='-Xms1g -Xmx4g'
   -profile docker -resume
 ```
 
+**Independent parameter reruns on the same prepared input data**:
+```bash
+./RTBioScan.sh --run_id MY_RUN -name MY_RUN_params_A -profile docker --outdir results_params_A
+./RTBioScan.sh --run_id MY_RUN -name MY_RUN_params_B -profile docker --outdir results_params_B
+```
+
+Use this pattern only when you intentionally want to reuse the same `results/pod5/<run_id>/` and `results/sample_info/<run_id>/` inputs. For fully independent wrapper-driven runs, use a different `--run_id` for each run and make sure the metadata TSV contains matching rows for each `run_id`.
+
 **Batch mode** — no feeder, process all POD5s and exit:
 ```bash
 ./RTBioScan.sh \
   --serve --serve-open \
   -profile docker --run_mode batch \
   --reads "/path/to/pod5/chunks/*.pod5"
+```
+
+**View results from a previous run** — server only, no pipeline:
+```bash
+./RTBioScan.sh --view --serve-open
+# or point at a specific output directory:
+./RTBioScan.sh --view --serve-dir /path/to/results --serve-open
 ```
 
 ### RTBioScan.sh options reference
@@ -132,14 +147,31 @@ NXF_OPTS='-Xms1g -Xmx4g'
 
 | Option | Default | Description |
 |---|---|---|
-| `--serve` | off | Start the HTTP report server alongside the pipeline. |
-| `--serve-port <n>` | `8000` | Port for the HTTP server. |
+| `--serve` | off | Start the HTTP report server alongside the pipeline. If the report does not exist yet, the server stays up and waits for the first generated `report_html/report.html`. |
+| `--view` | off | Start the report server for an existing output directory and wait — no pipeline or feeder is started. Useful for browsing results from a previous run. Incompatible with `--feeder`, `--do_metadata`, and pipeline pass-through arguments. Exits when the server stops (Ctrl-C). |
+| `--serve-port <n>` | `8000` | Port for the HTTP server. If the port is busy, the next free port up to 8099 is chosen automatically (unless `--serve-port` is set explicitly). |
 | `--serve-host <addr>` | `127.0.0.1` | Bind address. |
-| `--serve-open` | off | Open `report.html` in the default browser on start. |
-| `--serve-open-all` | off | Open all per-run reports in the browser on start. |
-| `--serve-open-last <n>` | — | Open the last N per-run reports in the browser on start. |
+| `--serve-open` | off | Open `report_html/report.html` in the default browser on start. |
+| `--serve-open-all` | off | Open all per-run reports in the browser on start. Does not require `--serve-open`. |
+| `--serve-open-last <n>` | — | Open the last N per-run reports in the browser on start. Does not require `--serve-open`. |
 | `--serve-quiet` | off | Suppress HTTP request logging. |
 | `--serve-dir <dir>` | same as `--outdir`, or `results/` | Directory to serve. |
+
+**Server lifecycle and orphaned-server cleanup:**
+
+Each server started with `--serve` or `--view` is tracked in a registry at `~/.rtbioscan/servers.index` and writes its PID to `<serve-dir>/server.pid`. When a new server is about to start:
+
+- **Same output directory** — any previously running server for that directory is automatically stopped before the new one starts. No prompt.
+- **Different output directory** — if other RTBioScan servers are detected, you are prompted whether to stop them as well. The prompt is skipped and servers are left running in non-interactive environments (no controlling TTY).
+
+The registry is self-healing: stale entries (server process no longer alive) are silently pruned on every startup.
+
+On pipeline exit, a prompt asks whether to stop the server (`Stop report server? [Y/n]`). Answering `N` leaves the server running so you can continue browsing. The server remains in the registry and will be auto-stopped the next time you start a run to the same directory.
+
+To manually stop all running servers:
+```bash
+pkill -f serve_report.sh
+```
 
 **Cleanup options:**
 
@@ -148,8 +180,8 @@ NXF_OPTS='-Xms1g -Xmx4g'
 | `--clean-ref <dir>` | off | Reference launch directory for cleanup discovery. `--clean-all` and `--clean-temp-all` operate on this directory when set; run-specific cleanup searches it first. |
 | `--clean <run_id>` | off | Remove artifacts for one run from the launch directory that owns that run. Discovery order is `--clean-ref`, current working directory, then the pipeline directory, using `.nextflow/history` first and artifact presence second. |
 | `--clean-all` | off | Remove all pipeline run artifacts under the current working directory by default, or under `--clean-ref <dir>` when provided. |
-| `--clean-temp <run_id>` | off | Remove only temporary artifacts for one run from `results/temp/current/state`, `results/temp/ongoing/state`, `results/ongoing/state`, and that run's temp files in `work/` via `nextflow clean -k`, using the same root-discovery order as `--clean`. |
-| `--clean-temp-all` | off | Remove only temporary artifacts for all runs from the current working directory by default, or from `--clean-ref <dir>` when provided, plus temp files in `work/` via `nextflow clean -k`. |
+| `--clean-temp <run_id>` | off | Remove only temporary artifacts for one run from `results/temp/current/state`, `results/temp/ongoing/state`, `results/ongoing/state`, and that run's temp files in `work/` via `nextflow clean -k`, using the same root-discovery order as `--clean`. This preserves Nextflow history/log metadata and may leave per-task `.command*` stubs in `work/`. |
+| `--clean-temp-all` | off | Remove only temporary artifacts for all runs from the current working directory by default, or from `--clean-ref <dir>` when provided, plus all contents of `work/`. |
 | `--dry-run` | off | With any cleanup option, print planned deletions without removing anything. |
 | `-y`, `--yes` | off | Skip the interactive confirmation prompt during cleanup. |
 
@@ -314,7 +346,7 @@ ACGTACGTACGT...
 
 `results/sample_info/{run_id}/primers.fasta` is passed to cutadapt with `-e 0.3 --discard-untrimmed` in a second pass applied only to reads that did not match any barcode (`no_adapter` reads). Reads that match a primer are retained and annotated with the primer name; all others are discarded.
 
-If `demultiplex_mode = 'auto'` (the default), demultiplexing is enabled only when both FASTA files exist and are non-empty. Set `--demultiplex_mode on` to force the full barcode+primer workflow, `--demultiplex_mode primers_only` to trim directly against `primers.fasta` without requiring `demult.fasta` or metadata-derived sample names, or `--demultiplex_mode off` to disable demultiplexing entirely.
+If `demultiplex_mode = 'auto'` (the default), demultiplexing is enabled only when both FASTA files exist and are non-empty. Set `--demultiplex_mode full` to force the full barcode+primer workflow, `--demultiplex_mode primers_only` to trim directly against `primers.fasta` without requiring `demult.fasta` or metadata-derived sample names, or `--demultiplex_mode off` to disable demultiplexing entirely.
 
 ### Batch mode (no feeder)
 [back to Top](#rtbioscan-usage)
@@ -462,13 +494,245 @@ results/        # Reports and analysis outputs (configurable via --outdir)
 .nextflow_log   # Nextflow execution log
 ```
 
+## Input file formats
+[back to Top](#rtbioscan-usage)
+
+This section describes the structure of the external files and directories that RTBioScan reads. Later sections explain the parameters that point at them.
+
+### Sequencing input
+[back to Top](#rtbioscan-usage)
+
+**`--input_folder`** is a directory tree of raw MinKNOW `.pod5` files for feeder-driven runs.
+
+- The feeder searches recursively for files ending in `.pod5`.
+- Files must be readable by the host `pod5` CLI because the feeder calls `pod5 inspect`, `pod5 view`, and `pod5 filter`.
+- Hidden files such as `.*` and `._*` are ignored.
+
+**`--reads`** is a quoted glob that resolves to round POD5 chunks consumed by Nextflow:
+
+```bash
+--reads "/path/to/chunks/*.pod5"
+```
+
+- Each match must be a valid POD5 file.
+- In wrapper-driven realtime runs this normally points to `results/pod5/<run_id>/reads_rt_round_pod5/*.pod5`.
+- In batch mode you can point it at any pre-sliced POD5 chunk set.
+
+### Metadata TSV for `--do_metadata`
+[back to Top](#rtbioscan-usage)
+
+`--metadata` must be a **tab-delimited text file with a header row**. The feeder requires these header names exactly:
+
+- `Sample_ID`
+- `Pipeline_ID`
+- `Replicate`
+- `Well`
+- `Plate`
+- `Run`
+- `demult_id`
+
+Minimal example:
+
+```tsv
+Sample_ID	Pipeline_ID	Replicate	Well	Plate	Run	demult_id
+SampleA	SampleA_r1	1	A1	Plate1	Run42	>A1_Plate1
+SampleA	SampleA_r2	2	A2	Plate1	Run42	>A2_Plate1
+SampleB	SampleB_r1	1	B1	Plate1	Run42	>B1_Plate1
+```
+
+Validation rules enforced by `bin/Metadata_pod5_processing.sh`:
+
+- `Run` must equal the `--run_id` you are preparing.
+- `demult_id` must exactly equal `>{Well}_{Plate}`.
+- `Sample_ID`, `Pipeline_ID`, `Run`, and `demult_id` must not contain whitespace.
+- `Replicate`, `Well`, and `Plate` must not contain whitespace or `_`.
+- Extra columns are allowed and are preserved in the filtered `{run_id}_metadata.txt`, but they are ignored by the metadata-preparation logic.
+
+### Master barcode FASTA for `--general_fasta`
+[back to Top](#rtbioscan-usage)
+
+`--general_fasta` is the master demultiplexing FASTA that `--do_metadata` filters into `results/sample_info/<run_id>/demult.fasta`.
+
+Accepted structure:
+
+- Standard FASTA format.
+- Record headers must match either:
+  - `>{Well}_{Plate}`
+  - `>{Replicate}_{Well}_{Plate}`
+- The sequence is expected to be in the linked-adapter format `LEFT...RIGHT`.
+- Optional `;min_overlap=...` suffixes in either half are tolerated.
+- Duplicate headers are allowed when one barcode key resolves to multiple marker-specific adapters.
+
+Example:
+
+```fasta
+>A1_Plate1
+COI_LEFT...COI_RIGHT
+>A1_Plate1
+ITS2_LEFT...ITS2_RIGHT
+>2_A2_Plate1
+COI_LEFT...COI_RIGHT
+```
+
+During metadata preparation, each matching FASTA record is assigned to a marker by comparing its left/right flanks against the primers FASTA described below.
+
+### Primer FASTA for `--primers_fasta` or `--primer_indexes`
+[back to Top](#rtbioscan-usage)
+
+`--primers_fasta` is used in two places:
+
+- by `--do_metadata` to infer which marker each general FASTA record belongs to
+- at runtime as the second-pass cutadapt input (`--primer_indexes`)
+
+Accepted structure:
+
+- Standard FASTA format.
+- Each header must begin with the marker token before the first underscore, for example `COI_*` or `ITS2_*`.
+- That leading token must match one of the entries in `--targets`.
+- Each sequence is expected to use the linked-primer format `LEFT...RIGHT`.
+
+Example:
+
+```fasta
+>COI_BC.COIv1.BC9.1
+COI_LEFT...COI_RIGHT
+>ITS2_BC.ITS2v1.BC9.1
+ITS2_LEFT...ITS2_RIGHT
+```
+
+### Prepared demultiplex FASTAs for `--indexes` and `--primer_indexes`
+[back to Top](#rtbioscan-usage)
+
+If you skip `--do_metadata` and provide prepared files directly:
+
+**`--indexes` / `demult.fasta`**
+
+- Standard FASTA format.
+- Each header is the sample label that should appear throughout the run.
+- Marker-qualified suffixes such as `_COI` or `_ITS2` are valid and commonly generated by `--do_metadata`.
+
+Example:
+
+```fasta
+>SampleA_COI
+COI_LEFT...COI_RIGHT
+>SampleA_ITS2
+ITS2_LEFT...ITS2_RIGHT
+>SampleB_COI
+COI_LEFT...COI_RIGHT
+```
+
+**`--primer_indexes` / `primers.fasta`**
+
+- Same FASTA grammar as `--primers_fasta` above.
+- Used for second-pass demultiplexing of `no_adapter` reads.
+
+### BLAST and taxonomy inputs
+[back to Top](#rtbioscan-usage)
+
+**`--blast_db_specs`**
+
+- Pipe-separated list of BLAST database prefixes, one per target in `--targets`.
+- Use the database prefix only, without `.nhr`, `.nin`, `.nsq`, etc.
+
+Example:
+
+```text
+db/COInr98_2024Jun_RioNegro_Brazil|db/ITS2nr98_2024Jun_RioNegro_Brazil
+```
+
+**`--blast_filter_db`**
+
+- Prefix of the LAST pre-filter database used by `lastal`.
+- Use the prefix only, not the member files.
+- Keep the full LAST index set together; files such as `.bck`, `.des`, `.prj`, `.sds`, `.ssp`, `.suf`, and `.tis` are part of the database.
+
+**`--blast_taxdb`**
+
+- Directory or prefix containing the BLAST taxdb files `taxdb.btd` and `taxdb.bti`.
+
+**`--nonncbi_memtax`**
+
+- Pipe-separated list of per-marker lookup tables, one per target in `--targets`.
+- Current bundled examples are **headerless tab-delimited tables**.
+- Preserve the same column structure as the bundled files when building replacements.
+
+Example line from the bundled format:
+
+```tsv
+-24604	344250	82593	7088	species
+```
+
+**`--nonncbi_id2lineage_target`**
+
+- Tab-delimited two-column mapping table:
+  - column 1: sequence/database ID
+  - column 2: semicolon-separated lineage string
+
+Example:
+
+```tsv
+-18138	k__Metazoa;p__Arthropoda;c__Insecta;o__Hymenoptera;f__Ichneumonidae;g__Eridolius;s__Eridolius aurifluus
+```
+
+### Optional reporting and pruning tables
+[back to Top](#rtbioscan-usage)
+
+**`--metazoa_spc_basics` / `--viridiplantae_spc_basics`**
+
+- Optional tab-delimited tables with a header row.
+- Bundled XPrize-style format:
+
+```tsv
+species	positive_control	observed	human_related
+Sternarchorhynchus oxyrhynchus	0	1	0
+```
+
+**`--local_metazoa_gns` / `--local_viridiplantae_gns`**
+
+- Optional plain-text genus lists.
+- One genus name per line.
+
+Example:
+
+```text
+Abaeis
+Abana
+Abapeba
+```
+
+**`--otu_prune_samples_file`**
+
+- Optional replacement for the generated `results/sample_info/<run_id>/samples.txt`.
+- Space-delimited, headerless file with one row per active sample unit:
+  - `sample_id`
+  - `replicate_id`
+  - `replicate_number`
+  - `well`
+  - `plate`
+  - `run_id`
+  - `demult_id`
+
+Example:
+
+```text
+SampleA SampleA_r1 1 A1 Plate1 Run42 >A1_Plate1
+SampleA SampleA_r2 2 A2 Plate1 Run42 >A2_Plate1
+SampleB SampleB_r1 1 B1 Plate1 Run42 >B1_Plate1
+```
+
 ## Main arguments
 [back to Top](#rtbioscan-usage)
 
 ### `-name`
 [back to Top](#rtbioscan-usage)
 
-A name for the run. Used to group results in the HTML report and to identify state directories. Appears as the `run_id` throughout outputs.
+Nextflow execution name.
+
+- Used for per-run reports under `results/report_html/runs/<name>/`.
+- Used as the default rolling-state namespace unless `--state_id` is set explicitly.
+- Under `RTBioScan.sh`, this defaults to `--run_id` unless you pass `-name` yourself.
+- Change this when you want multiple analysis executions against the same prepared inputs.
 
 ### `-profile`
 [back to Top](#rtbioscan-usage)
@@ -485,7 +749,7 @@ Available profiles:
 | `debug` | — | Identical to the default profile, adds `$HOSTNAME` logging at the start of each process. |
 | `xprize` | Requires XPrize databases | COI+ITS2 parameter presets for the XPrize/Tumbira deployment (`conf/xprize.config`). Requires XPrize-specific databases in `db/` and species-of-interest lists. |
 | `test` | Requires `db/toDefault/` | Test configuration pointing to `db/toDefault/` databases (`conf/test.config`). Requires those databases to be present; no bundled test data. |
-| `barcoding` | Batch mode | Batch-mode configuration (`conf/barcoding.config`, `watch = false`). Intended for diversity runs from pre-collected POD5 files. Three commented-out parameters (`target_barcode`, `intermediate_quality_score`, `barcoding_quality_score`) are reserved for future use and currently silently ignored. |
+| `barcoding` | Batch mode | Batch-mode configuration (`conf/barcoding.config`, `watch = false`). Intended for diversity runs from pre-collected POD5 files. |
 | `voucher` | Single specimen | Reference sequence generation from a single known individual (`conf/voucher.config`). Tighter clustering (99%), higher consensus depth, pruning disabled. Use with `bin/voucher_export.sh` to format outputs for BOLD/GenBank. |
 
 If `-profile` is not specified, all tools must be installed and available on the `PATH`.
@@ -495,12 +759,18 @@ A good starting point for a custom configuration is to copy `conf/xprize.config`
 ### `--run_id`
 [back to Top](#rtbioscan-usage)
 
-Optional run identifier used by wrapper-driven launches and some state/report helpers.
+Optional RTBioScan data/run identifier used by wrapper-driven launches.
 
 - Default: empty string.
 - `RTBioScan.sh --run_id` forwards this automatically.
-- When set, it is used to derive wrapper defaults such as `results/sample_info/<run_id>/`, `results/pod5/<run_id>/`, and the fallback samples roster used by `--otu_prune_samples_file`.
+- When set, it is used to match metadata rows, derive wrapper defaults such as `results/sample_info/<run_id>/` and `results/pod5/<run_id>/`, and choose the feeder lock namespace.
 - This is distinct from Nextflow `-name`, although many wrapper launches set both to the same value.
+
+Practical rule:
+
+- Same biological run / same metadata rows / same prepared POD5 and sample-info inputs: keep `--run_id` the same.
+- New independent wrapper-driven run namespace: change `--run_id` too, and update the metadata TSV so the new `run_id` exists there.
+- Same `--run_id` but different analysis execution: change `-name` and preferably `--outdir` as well.
 
 ### `--reads`
 [back to Top](#rtbioscan-usage)
@@ -517,18 +787,6 @@ Defaults depend on how you launch the pipeline:
 - `RTBioScan.sh --run_id MY_RUN`: `results/pod5/MY_RUN/reads_rt_round_pod5/*pod5` (auto-injected unless overridden)
 
 In real-time mode (`--run_mode realtime`, the default), the pipeline watches this directory for new files via Nextflow's file-watching mechanism — no extra flags needed. In batch mode (`--run_mode batch`), all matching files are processed and the pipeline exits.
-
-> `--reads_rt` is a deprecated alias for `--reads` kept for backwards compatibility. Use `--reads` in all new configurations.
-
-### `--reads_rt`
-[back to Top](#rtbioscan-usage)
-
-Deprecated realtime-only alias for `--reads`.
-
-- Default: empty string.
-- Only valid with `--run_mode realtime`.
-- If both `--reads` and `--reads_rt` are provided, the pipeline uses `--reads_rt` and logs a warning.
-- Kept only for backwards compatibility; prefer `--reads`.
 
 ## Database parameters
 [back to Top](#rtbioscan-usage)
@@ -606,6 +864,7 @@ Pipe-separated paths to the per-marker memory-taxonomy tables used to adjust BLA
 
 - Default: `db/COInr_2024Jun_metazoa_memtax1.txt|db/ITS2nr_2024Jun_metazoa_memtax1.txt`.
 - Provide one entry per marker; leave an entry empty to skip the table for that marker.
+- Empty entries still count toward the required 1:1 alignment with `--targets`.
 - Paths are resolved relative to the pipeline root.
 
 ### `--nonncbi_id2lineage_target`
@@ -665,6 +924,7 @@ Stable rolling-state namespace under `${outdir}/temp/{ongoing,current}/state/`.
 
 - Default: current run name (`-name` or generated Nextflow run name).
 - Use this when you want multiple Nextflow invocations to reuse the same rolling state even if the run name changes.
+- For independent reruns, do not reuse `--state_id` unless shared rolling state is intentional.
 
 #### `--restart_mode`
 [back to Top](#rtbioscan-usage)
@@ -684,16 +944,6 @@ Force re-applying `--restart_mode` even if a sentinel file indicates it was alre
 
 - Default: `false`.
 - Allowed values: boolean (`true/false`, `1/0`, `yes/no`, `on/off`).
-
-#### `--restart`
-[back to Top](#rtbioscan-usage)
-
-Legacy numeric restart flag kept for backwards compatibility.
-
-- Default: `0`.
-- Only consulted when `--restart_mode off`.
-- Any non-zero value is treated like a legacy request to restore rolling state.
-- Prefer `--restart_mode restore` for current runs.
 
 #### `-resume`
 [back to Top](#rtbioscan-usage)
@@ -788,7 +1038,7 @@ Controls whether barcode/primer demultiplexing is enabled.
 - Default: `auto`.
 - Allowed values:
   - `auto`: enable full demultiplexing only when both `--indexes` and `--primer_indexes` exist and contain FASTA records.
-  - `on`: require full barcode + primer demultiplexing.
+  - `full`: require full barcode + primer demultiplexing.
   - `primers_only`: skip barcode FASTA and trim only against `--primer_indexes`.
   - `off`: disable demultiplexing entirely.
 
@@ -823,6 +1073,7 @@ Pipe-separated list of marker names processed in this run. All per-marker parame
 Pipe-separated list of taxon filters for the fast on-target detection pass, in the same order as `--targets`. A read is classified as on-target only if its fast BLAST hit matches both the marker and the taxon. Leave an entry empty to accept any taxon for that marker.
 
 - Default: `Metazoa|Viridiplantae`.
+- Empty entries still count toward the required 1:1 alignment with `--targets`.
 - Example with a third marker that accepts any taxon: `--target_taxa "Metazoa|Viridiplantae|"`
 
 #### `--on_target_quality_score`
@@ -926,7 +1177,7 @@ Pipe-separated per-marker read-length thresholds, in the same order as `--target
 
 ---
 
-### OTU definition (`OTU_definition`)
+### OTU definition
 [back to Top](#rtbioscan-usage)
 
 #### C1 read archiving
@@ -1118,7 +1369,7 @@ Include sequence hashes in active-pool decision audit output.
 
 ---
 
-### BLAST (`blast_OTU_pretax`)
+### Taxonomic assignment
 [back to Top](#rtbioscan-usage)
 
 #### `--otu_blast_min_members`
@@ -1337,7 +1588,7 @@ Size bounds for OTUs eligible for unassigned-streak pruning.
 
 ---
 
-### Consensus (`consensus`)
+### Consensus generation
 [back to Top](#rtbioscan-usage)
 
 #### `--consensus_id`
@@ -1356,7 +1607,7 @@ Controls what `reads-N` represents in consensus headers and downstream reports:
 - `cluster_total`: `reads-N` equals the sum of all reads merged into the consensus cluster.
 
 Per-round HTML report metrics do not rely on `reads-N` for read-fate attribution.
-`read_fate.consensus_used_reads` is sourced from `consensus_round_provenance.tsv` (exact round-local consensus provenance).
+Public v1 read-fate reporting no longer exposes `read_fate.consensus_used_reads`.
 
 #### `--consensus_min_reads` / `--consensus_max_reads`
 [back to Top](#rtbioscan-usage)
@@ -1505,6 +1756,41 @@ Default: `genus`.
 
 The consolidation lock controls when an OTU can be treated as consolidated and reused from cache in later rounds.
 
+Current consolidation options:
+
+- `lock` mode: the original lock rule. A frozen OTU consolidates only if it has one or more candidate representative clusters that pass the consolidated Q score and minimum-read floor, and the largest non-candidate cluster stays below the configured ratio threshold.
+- `significant_clusters` mode with `fraction` rule: a frozen OTU consolidates if at least one floor-qualified cluster is significant by fraction of the qscore-filtered OTU pool and by fraction relative to the strongest floor-qualified cluster.
+- `significant_clusters` mode with `top_two_gap` rule: a frozen OTU consolidates if its strongest floor-qualified cluster is clearly separated from the strongest remaining qscore-qualified competitor by both ratio and absolute read gap.
+
+Current defaults:
+
+- `--otu_consolidation_lock true`
+- `--otu_consolidation_mode lock`
+- `--otu_lock_small_cluster_ratio 0.1`
+- `--otu_lock_min_consolidated_reads 10`
+- `--otu_lock_min_stable_rounds 1`
+- `--otu_lock_revalidate_every_rounds 0`
+- `--otu_sig_rule fraction`
+- `--otu_sig_min_cluster_reads 10`
+- `--otu_sig_min_cluster_qscore 20`
+- `--otu_sig_min_pool_fraction 0.10`
+- `--otu_sig_min_top_fraction 0.20`
+- `--otu_sig_top2_min_ratio 2.0`
+- `--otu_sig_top2_min_delta_reads 5`
+- `--otu_sig_min_stable_rounds 2`
+
+`significant_clusters` is opt-in. If you do not set `--otu_consolidation_mode significant_clusters`, the `otu_sig_*` options are ignored.
+
+#### `--otu_consolidation_mode`
+[back to Top](#rtbioscan-usage)
+
+Select the OTU consolidation criterion family.
+
+- Allowed values: `lock`, `significant_clusters`
+- Default: `lock`
+
+Use `lock` to preserve the original dominant-cluster lock behavior. Use `significant_clusters` to consolidate a frozen OTU when it contains at least one significant cluster according to the selected `--otu_sig_rule`.
+
 #### `--otu_consolidation_lock`
 [back to Top](#rtbioscan-usage)
 
@@ -1529,6 +1815,8 @@ Minimum read count required for a representative cluster to be considered consol
 Clarification on "consolidated cluster" terminology:
 The lock rule does not require a previously consolidated OTU. In each round, clusters that meet the consolidation thresholds (minimum reads and minimum Q score) are treated as **candidate consolidated clusters** for that decision. The ratio rule compares the largest non-candidate cluster to the smallest candidate cluster in the same round. If no clusters qualify as candidates, the lock rule cannot pass in that round.
 
+This parameter is used only by `--otu_consolidation_mode lock`.
+
 #### `--otu_lock_min_stable_rounds`
 [back to Top](#rtbioscan-usage)
 
@@ -1552,6 +1840,82 @@ Comma/semicolon/space separated OTU keys to remove from prior lock state before 
 
 - Example: `--otu_lock_reset_keys "OTUB_1-COI-no_adapter_1,OTUB_2-ITS2-sampleA"`
 - Reset keys are excluded from previous consolidated key carry-over in the same round.
+
+#### `--otu_sig_rule`
+[back to Top](#rtbioscan-usage)
+
+Select the significance rule used inside `--otu_consolidation_mode significant_clusters`.
+
+- Allowed values: `fraction`, `top_two_gap`
+- Default: `fraction`
+
+Rules:
+
+- `fraction`: require at least one cluster that passes the shared read/Q score floor, the OTU-pool fraction threshold, and the top-cluster fraction threshold.
+- `top_two_gap`: require a strongest floor-qualified cluster whose strongest remaining qscore-qualified competitor is sufficiently weaker by both ratio and absolute read gap.
+
+#### `--otu_sig_min_cluster_reads`
+[back to Top](#rtbioscan-usage)
+
+Minimum read count for a cluster to be considered floor-qualified in `significant_clusters` mode.
+
+- Default: `10`
+
+This floor is shared by both `fraction` and `top_two_gap`.
+
+#### `--otu_sig_min_cluster_qscore`
+[back to Top](#rtbioscan-usage)
+
+Minimum representative qscore for a cluster to be considered qscore-qualified in `significant_clusters` mode.
+
+- Default: inherits `--consensus_consolidated_min_qscore`, which defaults to `20`
+
+This floor is shared by both `fraction` and `top_two_gap`.
+
+#### `--otu_sig_min_pool_fraction`
+[back to Top](#rtbioscan-usage)
+
+Minimum fraction of the qscore-filtered OTU cluster pool that a floor-qualified cluster must represent to count as significant.
+
+- Default: `0.10`
+
+This parameter is used only by `--otu_sig_rule fraction`.
+
+#### `--otu_sig_min_top_fraction`
+[back to Top](#rtbioscan-usage)
+
+Minimum fraction of the strongest floor-qualified cluster that another floor-qualified cluster must represent to count as significant.
+
+- Default: `0.20`
+
+This parameter is used only by `--otu_sig_rule fraction`.
+
+#### `--otu_sig_top2_min_ratio`
+[back to Top](#rtbioscan-usage)
+
+Minimum required ratio between the strongest floor-qualified cluster and the strongest remaining qscore-qualified competitor.
+
+- Default: `2.0`
+
+This parameter is used only by `--otu_sig_rule top_two_gap`.
+
+#### `--otu_sig_top2_min_delta_reads`
+[back to Top](#rtbioscan-usage)
+
+Minimum required read-count gap between the strongest floor-qualified cluster and the strongest remaining qscore-qualified competitor.
+
+- Default: `5`
+
+This parameter is used only by `--otu_sig_rule top_two_gap`.
+
+#### `--otu_sig_min_stable_rounds`
+[back to Top](#rtbioscan-usage)
+
+Minimum number of consecutive rounds that must satisfy the selected significant-cluster rule before an OTU is consolidated.
+
+- Default: `2`
+
+This parameter is used only by `--otu_consolidation_mode significant_clusters`.
 
 #### Consensus assignment depth contract
 [back to Top](#rtbioscan-usage)
@@ -1589,7 +1953,7 @@ Maximum concurrency for `fast_on_target_detection` process scheduling.
 - Allowed values: integer `>= 1`.
 - Keep `1` for strict round-by-round behavior; set `>1` together with `--round_lock_scope dorado_only` to allow overlap after FAST Dorado completes.
 
-#### `--maxforks_core_cpu`
+#### `--maxforks_stateful_core`
 [back to Top](#rtbioscan-usage)
 
 Maximum concurrency for core CPU-heavy OTU/BLAST stages (`OTU_definition`, `blast_OTU_pretax`).
@@ -1650,58 +2014,68 @@ Age threshold for reclaiming a stale per-state round lock.
 
 ---
 
-### HTML report (`getting_run_summary`)
+### HTML report and summaries
 [back to Top](#rtbioscan-usage)
 
 #### `--html_report_enabled`
 [back to Top](#rtbioscan-usage)
 
-Enable or disable incremental HTML report rendering (`${params.outdir}/report.html`) plus per-run report copies.
+Enable or disable incremental HTML report rendering (`${params.outdir}/report_html/report.html`) plus per-run report copies.
 
 - Default: `true`.
 - Allowed values: boolean (`true/false`, `1/0`, `yes/no`, `on/off`).
 - Report update order per round is:
   1. collect round JSON (`ongoing/<round_barcode>/round_report.json`)
   2. append/dedupe history (`ongoing/_state/report_history.jsonl`)
-  3. update run index (`${params.outdir}/runs_index.jsonl`)
+  3. update run index (`${params.outdir}/report_html/runs_index.jsonl`)
   4. render HTML:
-     - index: `${params.outdir}/report.html`
-     - run report: `${params.outdir}/runs/<run_id>/report.html`
+     - index: `${params.outdir}/report_html/report.html`
+     - run report: `${params.outdir}/report_html/runs/<run_id>/report.html`
 - History dedupe key is `run_id + barcode + round_barcode` (resume-safe).
 - Missing source TSVs are recorded in `warnings[]`; report generation does not fail the round.
-- Report schema version is `1.4`.
+- Report schema version is `1.6`.
 - `otu.canonical.active` is a unique OTU count (`OTU_id`/`otu_id`), not read rows.
 - `blast.mode` reflects pipeline mode (`off|observe|enforce`); `blast.missing_policy` reports `keep|drop`.
 - HTML rendering sorts rounds by `timestamp_utc` (missing timestamps last), then `round_barcode`, then `barcode`.
-- Renderer also writes `${params.outdir}/report_state.json` (refresh sidecar) after `report.html`.
-- Per-run report also writes `${params.outdir}/runs/<run_id>/report_state.json`.
+- Renderer also writes `${params.outdir}/report_html/report_state.json` (refresh sidecar) after `report.html`.
+- Per-run report also writes `${params.outdir}/report_html/runs/<run_id>/report_state.json`.
 - Sidecar fields are minimal: `schema_version`, `generated_at_utc`, `report_revision`.
 - `report_revision` is a SHA256 hash of `ongoing/_state/report_history.jsonl` content.
-- Report figures are copied into `${params.outdir}/runs/<run_id>/report_assets` from `${params.outdir}/ongoing/_state` using `assets/report/figures.tsv`.
+- Report figures are copied into `${params.outdir}/report_html/runs/<run_id>/report_assets` from `${params.outdir}/ongoing/_state` using `assets/report/figures.tsv`.
 - Sample figure definitions are read from `assets/report/figures_sample.tsv` and attached under each sample panel.
-- Index report (`${params.outdir}/report.html`) is cross-run and does not render a figure gallery.
+- Index report (`${params.outdir}/report_html/report.html`) is cross-run and does not render a figure gallery.
 - Index charts are run-level summaries derived from the latest round (`run_summary` in `run_report.json`).
 - Runs are displayed in pages of 10 (latest updated first).
 - `run_summary_source_round` records the round_barcode used to compute each run summary.
-- Figures are rendered in per-run reports only (`${params.outdir}/runs/<run_id>/report.html`).
+- Figures are rendered in per-run reports under `${params.outdir}/report_html/runs/<run_id>/`, including `report.html` and, in track mode, `report_replicates.html` and `report_replicates_primers.html`.
 - Missing figures in per-run reports are shown as placeholders (not interactive).
-- Per-run reports include two main sections: `Global Overview` and `Sample Details`, with a `Sample Index` navigation block between them.
+- Per-run report navigation exposes `Run Info` (`report.html`) and, in track mode, `Primer Comparison` (`report_replicates.html`) plus `Replicate Comparison` (`report_replicates_primers.html`).
+- All per-run report views share four top-level sections: `Global Overview`, `Sample Details`, `Rounds Info`, and `Additional Info`.
 - Circle tree figures visualize lineage structure for OTU and consensus assignments. OTU circle trees are weighted by reads in OTUs; consensus circle trees are weighted by consensus count.
 - Global section cards use run-level totals across all rounds in the run report history.
 - Sample section cards use per-sample sums across rounds (not run-unique entity counts).
 - Sample section figures are phase-A and currently generated from demultiplex `Read_counts` family only.
-- Sample figure assets are written to `${params.outdir}/runs/<run_id>/report_assets/samples/<sample_id>/`.
+- Sample figure assets are written to `${params.outdir}/report_html/runs/<run_id>/report_assets/samples/<sample_id>/`.
 - Sample labels are normalized early in the pipeline so `no_adapter` and `no_adapter_*` are treated as the same sample in FASTQ headers, reporting TSVs, and reports.
 - Sample identity uses a deterministic, case-sensitive ID derived from the trimmed label.
-- Reads fate chart is a stage-loss partition (later → earlier) and uses `read_fate.*` metrics; when demultiplexing is off, the sample section is hidden and the chart uses `reads.on_target` as the demux base.
-  - `read_fate.blast_seen_reads` / `blast_assigned_reads` / `blast_unassigned_reads` are computed from unique normalized BLAST OTU `read_id` values (`read_id` prefix before `|`).
-  - `blast_assigned_reads` counts reads with numeric `taxid > 0` or non-`Unassigned` family/genus/species; `blast_unassigned_reads` is the remainder.
-  - In demux-on rounds, the chart uses adapter-scoped BLAST fields (`blast_assigned_reads_adapter`, `blast_unassigned_reads_adapter`) to avoid overlap with the `no_adapter` segment.
-  - If `read_fate.blast_assignment_status` is missing, legacy payloads are treated as classified when explicit BLAST assigned/unassigned fields are present.
-  - Empty/whitespace sample labels are excluded from adapter/no_adapter bucket splits; a literal non-empty sample label `unknown` is treated as a regular sample label (adapter bucket unless it matches `no_adapter`).
-  - If adapter demuxed reads are not present in BLAST rows, the chart shows them as `Demuxed adapter not in BLAST` to preserve totals.
-  - If adapter BLAST-seen split fields are missing (legacy payloads), or if unbucketed BLAST-seen reads are present, the chart emits a warning and cannot separate `Demuxed adapter not in BLAST` from adapter BLAST-unassigned.
-- The Runs table is driven by `${params.outdir}/runs_index.jsonl` and links to per-run reports.
+- Reads fate charts use the fixed public v1 marker-split contract in `read_fate`.
+  - The chart is rendered directly from stored `chart_*` fields, not reconstructed client-side from legacy adapter/no-adapter fields.
+  - The fixed category order is:
+    1. `BLAST-assigned COI`
+    2. `BLAST-assigned ITS2`
+    3. `BLAST-unassigned COI`
+    4. `BLAST-unassigned ITS2`
+    5. `BLAST skipped COI`
+    6. `BLAST skipped ITS2`
+    7. `On-target not demultiplexed`
+    8. `Off-target`
+  - `read_fate.blast_seen_reads`, `blast_assigned_reads`, and `blast_unassigned_reads` are based on unique normalized BLAST OTU `read_id` values.
+  - `read_fate.demux_total_reads` and `read_fate.no_adapter_reads` are based on unique normalized demultiplexed `read_id` values.
+  - `read_fate.blast_seen_reads_unbucketed` means merged BLAST reads whose final bucket state is `unresolved` or `conflict`.
+  - When `read_fate.marker_split_status = invalid`, marker-aware raw fields and all `chart_*` fields are null and TSV exports write `N/A` for read-fate cells.
+  - Retained stage-level totals may still be populated on invalid rounds/runs as diagnostics only.
+  - One invalid round nulls the run/index read-fate chart.
+- The Runs table is driven by `${params.outdir}/report_html/runs_index.jsonl` and links to per-run reports.
 - Run status uses a time-based cadence: Fresh (≤1.5×), Aging (1.5–3×), Stale (>3×) relative to the last two updates (or start→first round).
 - Per-run reports include an "OTU Assignments (Latest Round)" table with Species/Genus/Family tabs, sorted by supporting reads, paginated in 10-row pages (top 200 per level).
 Note: run reports are easiest to browse over HTTP, but with the default empty `--html_report_url_prefix` they use relative links rather than root-absolute paths.
@@ -1709,11 +2083,11 @@ Note: run reports are easiest to browse over HTTP, but with the default empty `-
 #### `--html_report_auto_refresh`
 [back to Top](#rtbioscan-usage)
 
-Enable browser-side auto-refresh polling for `report.html`.
+Enable browser-side auto-refresh polling for `report_html/report.html`.
 
 - Default: `true`.
 - Allowed values: boolean (`true/false`, `1/0`, `yes/no`, `on/off`).
-- Polling compares `report_state.json.report_revision`; page reload occurs only when revision changes.
+- Polling compares `report_html/report_state.json.report_revision`; page reload occurs only when revision changes.
 - If polling fails (common with `file://`), report remains usable and a passive warning is shown.
 
 #### `--html_report_refresh_seconds`
@@ -1785,10 +2159,10 @@ Optional local genus lists used by reporting scripts for XPrize-style taxon high
 
 Auto-refresh works best when the report is served over HTTP (not `file://`).
 
-The easiest way is to add `--serve --serve-open` to your `RTBioScan.sh` command — the server starts alongside the pipeline and stops when it exits. The report is served at:
+The easiest way is to add `--serve --serve-open` to your `RTBioScan.sh` command — the server starts alongside the pipeline, waits for the first generated report if needed, and stops when the pipeline exits. The report is served at:
 
 ```
-http://127.0.0.1:8000/report.html
+http://127.0.0.1:8000/report_html/report.html
 ```
 
 To open all per-run reports on start:
@@ -1811,6 +2185,12 @@ To use a custom port or outdir:
 
 ```bash
 bash bin/serve_report.sh --dir results --port 8000 --open --quiet
+```
+
+To start serving before `report_html/report.html` exists, add `--wait-for-report`:
+
+```bash
+bash bin/serve_report.sh --dir results --port 8000 --wait-for-report --open --quiet
 ```
 
 Makefile shortcuts:
@@ -1839,7 +2219,7 @@ Notes:
 
 ---
 
-### OTU membership exports (`_reporting_OTU_definition`)
+### OTU membership exports
 [back to Top](#rtbioscan-usage)
 
 #### Canonical OTU membership export (Phase A)

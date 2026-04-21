@@ -1,0 +1,46 @@
+name: rtbioscan
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  # ── Core languages ──────────────────────────────────────────────────────────
+  - python >=3.8
+  - perl >=5.26
+
+  # ── Bioinformatics tools ─────────────────────────────────────────────────────
+  # Sequence alignment and clustering
+  - blast >=2.12        # blastn, makeblastdb, blastdbcmd
+  - cd-hit >=4.8        # cd-hit-est for OTU clustering
+  - vsearch >=2.21      # consensus + chimera filtering
+  - seqtk >=1.3         # FASTA/Q manipulation
+  - samtools >=1.15     # SAM/BAM → FASTQ conversion (dorado output)
+  # Taxonomy
+  - taxonkit >=0.13     # NCBI lineage lookup
+  # Read processing
+  - cutadapt >=4.0      # adapter trimming / demultiplexing
+
+  # ── Perl non-core modules ───────────────────────────────────────────────────
+  - perl-time-piece     # used in bin/append_reports.pl
+  - perl-time-hires     # used in bin/otu_refine_blastreport_annotate.pl
+  - perl-digest-md5     # used in hash-map and OTU scripts
+
+  # ── R base ─────────────────────────────────────────────────────────────────
+  - r-base >=4.2
+
+  # ── R CRAN packages ─────────────────────────────────────────────────────────
+  - r-ggplot2 >=3.4     # all visualisation scripts
+  - r-dplyr >=1.1       # Time_* plots
+  - r-tidyr >=1.3       # Read_counts / Read_info_quality
+  - r-ggrepel >=0.9     # Time_* label repulsion
+  - r-treemapify >=2.5  # Treemap_* plots (optional fallback handled in script)
+
+  # ── R Bioconductor packages ──────────────────────────────────────────────────
+  - bioconductor-biostrings >=2.68   # Consensus_simple.R
+  - bioconductor-decipher >=2.28     # Consensus_simple.R consensus calling
+  - bioconductor-muscle >=3.40       # Consensus_simple.R / Consensus_simple.sh
+
+  # ── Python pip packages ──────────────────────────────────────────────────────
+  - pip
+  - pip:
+    - pod5 >=0.3   # ONT POD5 file inspection (pod5 inspect summary)

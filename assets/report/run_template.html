@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>__REPORT_TITLE__</title>
+  <style>
+__REPORT_STYLE__
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="top">
+      <div class="report-nav">
+        <a id="report-index-link" href="report.html">Back to index</a>
+      </div>
+      <h1>__REPORT_TITLE__</h1>
+      <p>Last update: <strong>__GENERATED_AT__</strong></p>
+      <p id="run-name" class="run-name"></p>
+      <div id="run-links" class="run-links"></div>
+    </header>
+
+    <section id="global-overview">
+      <h2>Global Overview</h2>
+      <nav class="section-nav" aria-label="Jump to section">
+        <a href="#sample-details-section">Sample Details</a>
+        <a href="#runs-info-section">Rounds Info</a>
+        <a href="#figures-section">Additional Info</a>
+      </nav>
+      <section id="summary-section">
+        <section class="cards" id="summary-cards"></section>
+      </section>
+    </section>
+    <section id="sample-details-section">
+      <h2>Sample Details</h2>
+      <nav class="section-nav" aria-label="Jump to section">
+        <a href="#global-overview">Global Overview</a>
+        <a href="#runs-info-section">Rounds Info</a>
+        <a href="#figures-section">Additional Info</a>
+      </nav>
+      <nav id="sample-index" aria-label="Sample index"></nav>
+      <div id="sample-details"></div>
+    </section>
+    <section id="runs-info-section">
+      <h2>Rounds Info</h2>
+      <nav class="section-nav" aria-label="Jump to section">
+        <a href="#global-overview">Global Overview</a>
+        <a href="#sample-details-section">Sample Details</a>
+        <a href="#figures-section">Additional Info</a>
+      </nav>
+      <section class="charts" id="charts"></section>
+      <div class="table-wrap">
+        <table id="runs-table">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="run-index-pager" class="run-index-pager"></div>
+    </section>
+    <section id="figures-section">
+      <h2>Additional Info</h2>
+      <nav class="section-nav" aria-label="Jump to section">
+        <a href="#global-overview">Global Overview</a>
+        <a href="#sample-details-section">Sample Details</a>
+        <a href="#runs-info-section">Rounds Info</a>
+      </nav>
+      <div class="figures-grid" id="figures"></div>
+    </section>
+    <section id="warnings-section">
+      <h2>Warnings</h2>
+      <ul id="warnings"></ul>
+    </section>
+  </main>
+  <div id="figure-modal" class="figure-modal" aria-hidden="true">
+    <div class="figure-modal-content" role="dialog" aria-modal="true" aria-labelledby="figure-modal-title" aria-describedby="figure-modal-caption">
+      <button class="figure-modal-close" type="button" aria-label="Close">×</button>
+      <h3 id="figure-modal-title">Figure</h3>
+      <img id="figure-modal-img" alt="">
+      <p id="figure-modal-caption"></p>
+    </div>
+  </div>
+  <script>
+    window.REPORT_PAYLOAD = __PAYLOAD_JSON__;
+    window.REPORT_META = __REPORT_META_JSON__;
+__REPORT_SCRIPT__
+  </script>
+</body>
+</html>
