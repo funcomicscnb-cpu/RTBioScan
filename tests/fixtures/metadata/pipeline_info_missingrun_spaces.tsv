@@ -1,0 +1,4 @@
+Sample_ID	Pipeline_ID	Replicate	Well	Plate	Description	Run	demult_id
+SampleA	SampleA_r1	1	A1	TestPlate	alpha words here	TestRun	>A1_TestPlate
+SampleA	SampleA_r2	2	A2	TestPlate	beta words here	TestRun	>A2_TestPlate
+SampleB	SampleB_r1	1	B1	TestPlate	gamma words here	OtherRun	>B1_TestPlate

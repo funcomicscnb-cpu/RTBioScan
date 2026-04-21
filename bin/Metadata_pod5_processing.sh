@@ -1,5 +1,12 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/lib/stale_lock_utils.sh"
+FEEDER_LOCK_STALE_TTL_SECONDS=21600
+feeder_lock_owned=0
+GLOBAL_LEDGER_LOCK_STALE_TTL_SECONDS=300
+global_ledger_lock_owned=0
+
 # Initialize variables
 num_reads="200000"
 input_folder=""
@@ -79,6 +86,16 @@ done
 
 # Create directory if it does not already exist.
 ensure_dir() { [ -d "$1" ] || mkdir -p "$1"; }
+
+current_host_id() {
+	if [ -n "${HOSTNAME:-}" ]; then
+		printf '%s\n' "$HOSTNAME"
+	elif command -v hostname >/dev/null 2>&1; then
+		hostname 2>/dev/null || printf 'unknown\n'
+	else
+		printf 'unknown\n'
+	fi
+}
 
 validate_explicit_targets() {
 	local raw_targets="$1"
@@ -370,6 +387,15 @@ emit_track_identity_views() {
 		function add_detail_token(key, token) {
 			if (token != "") detail_tokens[key, token] = 1
 		}
+		function build_conflict_detail(key,    token_order, token_count, i, token, out) {
+			token_count = split("sequence_mismatch|sample_id_mismatch|track_id_mismatch|replicate_number_mismatch|marker_id_mismatch|unit_suffix_mismatch|unit_id_collapse_mismatch|demult_id_metadata_mismatch|matched_general_fasta_header_mismatch|matched_general_fasta_record_index_mismatch|lookup_key_primary_mismatch|lookup_key_fallback_mismatch|lookup_grammar_used_mismatch", token_order, /\|/)
+			out = ""
+			for (i = 1; i <= token_count; i++) {
+				token = token_order[i]
+				if (detail_tokens[key, token]) out = out (out == "" ? "" : "|") token
+			}
+			return out
+		}
 		function build_source_list(key,    n, i, j, tmp, out, local_lines) {
 			n = source_count[key]
 			if (n == 0) return ""
@@ -393,13 +419,7 @@ emit_track_identity_views() {
 		function build_detail(key,    token_order, token_count, i, token, out) {
 			if (status[key] == "unique") return ""
 			if (status[key] == "exact_duplicate_collapsed") return "later_rows_match_operational_fields"
-			token_count = split("sequence_mismatch|sample_id_mismatch|track_id_mismatch|replicate_number_mismatch|marker_id_mismatch|unit_suffix_mismatch|unit_id_collapse_mismatch|demult_id_metadata_mismatch", token_order, /\|/)
-			out = ""
-			for (i = 1; i <= token_count; i++) {
-				token = token_order[i]
-				if (detail_tokens[key, token]) out = out (out == "" ? "" : "|") token
-			}
-			return out
+			return build_conflict_detail(key)
 		}
 		FNR == NR {
 			record_ordinal = $1 + 0
@@ -463,6 +483,11 @@ emit_track_identity_views() {
 				base_fields[unit_key, "unit_suffix_current"] = $(header_idx["unit_suffix_current"])
 				base_fields[unit_key, "unit_id_collapse"] = current_collapse
 				base_fields[unit_key, "demult_id_metadata"] = $(header_idx["demult_id_metadata"])
+				base_fields[unit_key, "matched_general_fasta_header"] = $(header_idx["matched_general_fasta_header"])
+				base_fields[unit_key, "matched_general_fasta_record_index"] = $(header_idx["matched_general_fasta_record_index"])
+				base_fields[unit_key, "lookup_key_primary"] = $(header_idx["lookup_key_primary"])
+				base_fields[unit_key, "lookup_key_fallback"] = $(header_idx["lookup_key_fallback"])
+				base_fields[unit_key, "lookup_grammar_used"] = $(header_idx["lookup_grammar_used"])
 				next
 			}
 
@@ -500,9 +525,29 @@ emit_track_identity_views() {
 				add_detail_token(unit_key, "demult_id_metadata_mismatch")
 				mismatch = 1
 			}
+			if ($(header_idx["matched_general_fasta_header"]) != base_fields[unit_key, "matched_general_fasta_header"]) {
+				add_detail_token(unit_key, "matched_general_fasta_header_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx["matched_general_fasta_record_index"]) != base_fields[unit_key, "matched_general_fasta_record_index"]) {
+				add_detail_token(unit_key, "matched_general_fasta_record_index_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx["lookup_key_primary"]) != base_fields[unit_key, "lookup_key_primary"]) {
+				add_detail_token(unit_key, "lookup_key_primary_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx["lookup_key_fallback"]) != base_fields[unit_key, "lookup_key_fallback"]) {
+				add_detail_token(unit_key, "lookup_key_fallback_mismatch")
+				mismatch = 1
+			}
+			if ($(header_idx["lookup_grammar_used"]) != base_fields[unit_key, "lookup_grammar_used"]) {
+				add_detail_token(unit_key, "lookup_grammar_used_mismatch")
+				mismatch = 1
+			}
 
 			if (mismatch) {
-				status[unit_key] = "conflicting_duplicate_present"
+				fatal("ERROR: track identity duplicate conflict for unit_id_track " unit_key " detail=" build_conflict_detail(unit_key))
 			} else if (status[unit_key] == "unique") {
 				status[unit_key] = "exact_duplicate_collapsed"
 			}
@@ -746,6 +791,7 @@ validate_track_artifacts() {
 	local track_active_units_path="$5"
 	local track_identity_path="$6"
 	local track_roster_path="$7"
+	local configured_targets_raw="$8"
 	local identity_rows
 	local demult_record_count
 	local track_demult_lines
@@ -757,7 +803,7 @@ validate_track_artifacts() {
 	demult_record_count=$(wc -l < "$demult_records_path")
 	if [ "$identity_rows" -ne "$demult_record_count" ]; then
 		echo "ERROR: replicate_identity.tsv data rows ($identity_rows) do not match demult.fasta records ($demult_record_count) before track artifact derivation." >&2
-		exit 1
+		return 1
 	fi
 
 	if ! awk -v max_ordinal="$demult_record_count" '
@@ -780,13 +826,13 @@ validate_track_artifacts() {
 		}
 	' "$first_identity_path"; then
 		echo "ERROR: track_identity_first.tsv has invalid emitted demult ordinals." >&2
-		exit 1
+		return 1
 	fi
 
 	track_demult_lines=$(wc -l < "$track_demult_path")
 	if [ "$identity_rows" -gt 0 ] && { [ "$track_demult_lines" -le 0 ] || [ $(( track_demult_lines % 2 )) -ne 0 ]; }; then
 		echo "ERROR: track_demult.fasta must contain a positive even number of lines when replicate_identity.tsv has data." >&2
-		exit 1
+		return 1
 	fi
 	track_demult_record_count=$(grep -c '^>' "$track_demult_path" || true)
 	track_active_count=$(wc -l < "$track_active_units_path")
@@ -794,11 +840,11 @@ validate_track_artifacts() {
 
 	if [ "$track_demult_record_count" -ne "$track_active_count" ]; then
 		echo "ERROR: track_demult.fasta records ($track_demult_record_count) do not match track_active_units.txt lines ($track_active_count)." >&2
-		exit 1
+		return 1
 	fi
 	if [ "$track_demult_record_count" -ne "$track_identity_rows" ]; then
 		echo "ERROR: track_demult.fasta records ($track_demult_record_count) do not match track_identity.tsv rows ($track_identity_rows)." >&2
-		exit 1
+		return 1
 	fi
 
 	if ! awk '
@@ -813,7 +859,7 @@ validate_track_artifacts() {
 		}
 	' "$track_demult_path"; then
 		echo "ERROR: track_demult.fasta contains empty or duplicate headers." >&2
-		exit 1
+		return 1
 	fi
 
 	if ! awk '
@@ -828,7 +874,7 @@ validate_track_artifacts() {
 		}
 	' "$track_active_units_path"; then
 		echo "ERROR: track_active_units.txt contains empty or duplicate values." >&2
-		exit 1
+		return 1
 	fi
 
 	if ! awk '
@@ -851,7 +897,7 @@ validate_track_artifacts() {
 		}
 	' "$track_roster_path"; then
 		echo "ERROR: track_roster.tsv contains empty or duplicate track_id values." >&2
-		exit 1
+		return 1
 	fi
 
 	if ! awk '
@@ -874,7 +920,7 @@ validate_track_artifacts() {
 		}
 	' "$track_identity_path"; then
 		echo "ERROR: track_identity.tsv contains empty or duplicate unit_id_track values." >&2
-		exit 1
+		return 1
 	fi
 
 	if ! awk '
@@ -898,7 +944,7 @@ validate_track_artifacts() {
 		}
 	' "$track_demult_path" "$track_active_units_path"; then
 		echo "ERROR: track_active_units.txt does not match track_demult.fasta headers in order." >&2
-		exit 1
+		return 1
 	fi
 
 	if ! awk '
@@ -930,7 +976,7 @@ validate_track_artifacts() {
 		}
 	' "$track_demult_path" "$track_identity_path"; then
 		echo "ERROR: track_identity.tsv unit_id_track values do not match track_demult.fasta headers in order." >&2
-		exit 1
+		return 1
 	fi
 
 	if ! awk '
@@ -968,7 +1014,87 @@ validate_track_artifacts() {
 		}
 	' "$track_identity_path" "$track_roster_path"; then
 		echo "ERROR: track_identity.tsv and track_roster.tsv do not contain the same distinct track_id set." >&2
-		exit 1
+		return 1
+	fi
+
+	if ! awk -v targets_raw="$configured_targets_raw" '
+		function trim_cr(s) {
+			sub(/\r$/, "", s)
+			return s
+		}
+		function fail(message) {
+			print message > "/dev/stderr"
+			exit 1
+		}
+		BEGIN {
+			target_count = split(targets_raw, targets, /\|/)
+			for (i = 1; i <= target_count; i++) {
+				target = toupper(trim_cr(targets[i]))
+				if (target == "") continue
+				allowed[target] = 1
+				allowed_order[++allowed_order_count] = target
+			}
+			if (allowed_order_count == 0) {
+				fail("ERROR: validate_track_artifacts requires at least one configured target marker")
+			}
+		}
+		NR == 1 {
+			FS = "\t"
+			for (i = 1; i <= NF; i++) {
+				header_idx[trim_cr($i)] = i
+			}
+			required_count = split("sample_id|track_id|marker_id|suffix_resolution_mode|unit_suffix_current|unit_id_collapse|unit_id_track", required_fields, /\|/)
+			for (i = 1; i <= required_count; i++) {
+				if (!(required_fields[i] in header_idx)) {
+					fail("ERROR: track_identity.tsv is missing required semantic column " required_fields[i])
+				}
+			}
+			next
+		}
+		{
+			$NF = trim_cr($NF)
+			sample_id = $(header_idx["sample_id"])
+			track_id = $(header_idx["track_id"])
+			marker_id = toupper($(header_idx["marker_id"]))
+			suffix_mode = $(header_idx["suffix_resolution_mode"])
+			unit_suffix = $(header_idx["unit_suffix_current"])
+			unit_id_collapse = $(header_idx["unit_id_collapse"])
+			unit_id_track = $(header_idx["unit_id_track"])
+			if (suffix_mode != "marker") {
+				fail("ERROR: track_identity.tsv contains non-marker suffix_resolution_mode for unit_id_track " unit_id_track)
+			}
+			if (unit_suffix != marker_id) {
+				fail("ERROR: track_identity.tsv unit_suffix_current does not match marker_id for unit_id_track " unit_id_track)
+			}
+			if (unit_id_track != track_id "_" unit_suffix) {
+				fail("ERROR: track_identity.tsv unit_id_track does not match track_id plus unit_suffix_current for unit_id_track " unit_id_track)
+			}
+			if (unit_id_collapse != sample_id "_" unit_suffix) {
+				fail("ERROR: track_identity.tsv unit_id_collapse does not match sample_id plus unit_suffix_current for unit_id_track " unit_id_track)
+			}
+			if (!(marker_id in allowed)) {
+				fail("ERROR: track_identity.tsv contains unexpected marker_id " marker_id " for track_id " track_id)
+			}
+			pair_key = track_id SUBSEP marker_id
+			if (seen_pair[pair_key]++) {
+				fail("ERROR: track_identity.tsv contains duplicate track_id/marker_id pair " track_id "/" marker_id)
+			}
+			track_seen[track_id] = 1
+			track_marker_seen[pair_key] = 1
+		}
+		END {
+			for (track_id in track_seen) {
+				for (i = 1; i <= allowed_order_count; i++) {
+					marker_id = allowed_order[i]
+					pair_key = track_id SUBSEP marker_id
+					if (!(pair_key in track_marker_seen)) {
+						fail("ERROR: track_identity.tsv is missing required marker_id " marker_id " for track_id " track_id)
+					}
+				}
+			}
+		}
+	' "$track_identity_path"; then
+		return 1
 	fi
 }
 
@@ -1009,27 +1135,48 @@ derive_track_artifacts() {
 	local staged_track_roster="$5"
 	local staged_track_active_units="$6"
 	local staged_track_identity="$7"
+	local configured_targets_raw="$8"
 	local track_demult_records="${metadata_stage_dir}/track_demult_records.tsv"
 	local track_identity_indexed="${metadata_stage_dir}/track_identity_indexed.tsv"
 	local track_identity_first="${metadata_stage_dir}/track_identity_first.tsv"
 	local track_roster_identity_lines="${metadata_stage_dir}/track_roster_identity_lines.tsv"
 
-	emit_track_demult_records_index "$staged_output_fasta" "$track_demult_records"
-	emit_track_identity_index "$staged_replicate_identity" "$track_identity_indexed"
-	emit_track_roster_identity_lines "$track_identity_indexed" "$track_roster_identity_lines"
-	emit_track_identity_views "$track_demult_records" "$track_identity_indexed" "$track_identity_first" "$staged_track_identity"
+	if ! emit_track_demult_records_index "$staged_output_fasta" "$track_demult_records"; then
+		return 1
+	fi
+	if ! emit_track_identity_index "$staged_replicate_identity" "$track_identity_indexed"; then
+		return 1
+	fi
+	if ! emit_track_roster_identity_lines "$track_identity_indexed" "$track_roster_identity_lines"; then
+		return 1
+	fi
+	if ! emit_track_identity_views "$track_demult_records" "$track_identity_indexed" "$track_identity_first" "$staged_track_identity"; then
+		return 1
+	fi
 	: > "$staged_track_demult"
 	: > "$staged_track_active_units"
-	emit_track_demult_view "$track_demult_records" "$track_identity_first" "$staged_track_demult"
-	emit_track_active_units_view "$track_identity_first" "$staged_track_active_units"
-	emit_track_roster_view "$staged_replicate_roster" "$track_roster_identity_lines" "$staged_track_roster"
-	validate_track_artifacts "$staged_replicate_identity" "$track_demult_records" "$track_identity_first" "$staged_track_demult" "$staged_track_active_units" "$staged_track_identity" "$staged_track_roster"
-	emit_track_view_warnings "track_identity" "unit_id_track" "$staged_track_identity"
-	emit_track_view_warnings "track_roster" "track_id" "$staged_track_roster"
+	if ! emit_track_demult_view "$track_demult_records" "$track_identity_first" "$staged_track_demult"; then
+		return 1
+	fi
+	if ! emit_track_active_units_view "$track_identity_first" "$staged_track_active_units"; then
+		return 1
+	fi
+	if ! emit_track_roster_view "$staged_replicate_roster" "$track_roster_identity_lines" "$staged_track_roster"; then
+		return 1
+	fi
+	if ! validate_track_artifacts "$staged_replicate_identity" "$track_demult_records" "$track_identity_first" "$staged_track_demult" "$staged_track_active_units" "$staged_track_identity" "$staged_track_roster" "$configured_targets_raw"; then
+		return 1
+	fi
+	if ! emit_track_view_warnings "track_identity" "unit_id_track" "$staged_track_identity"; then
+		return 1
+	fi
+	if ! emit_track_view_warnings "track_roster" "track_id" "$staged_track_roster"; then
+		return 1
+	fi
 }
 
 # Resolve one metadata row into one or more demultiplexing FASTA records.
-# Usage: resolve_metadata_row <sample_name> <line_no> <replicate_id> <replicate_number> <well> <plate> <demult_id> <general_fasta> <primers_fasta> <targets> <metadata_path> <records_out> <sidecar_out> <meta_out>
+# Usage: resolve_metadata_row <sample_name> <line_no> <replicate_id> <replicate_number> <well> <plate> <demult_id> <general_fasta> <primers_fasta> <targets> <metadata_path> <records_out> <sidecar_out> <meta_out> [track_identity_strict] [primers_used_out]
 resolve_metadata_row() {
 	local sample_name="$1"
 	local line_no="$2"
@@ -1045,6 +1192,8 @@ resolve_metadata_row() {
 	local records_out="${12}"
 	local sidecar_out="${13}"
 	local meta_out="${14}"
+	local track_identity_strict="${15:-0}"
+	local primers_used_out="${16:-}"
 
 	awk \
 		-v sample_name="$sample_name" \
@@ -1060,7 +1209,9 @@ resolve_metadata_row() {
 		-v metadata_path="$metadata_path" \
 		-v records_out="$records_out" \
 		-v sidecar_out="$sidecar_out" \
-		-v meta_out="$meta_out" '
+		-v meta_out="$meta_out" \
+		-v track_identity_strict="$track_identity_strict" \
+		-v primers_used_out="$primers_used_out" '
 		function trim_cr(s) {
 			sub(/\r$/, "", s)
 			return s
@@ -1214,6 +1365,10 @@ resolve_metadata_row() {
 				marker = ""
 				for (p = 1; p <= primer_count; p++) {
 					if (left ~ (primer_left[p] "$") && right ~ ("^" primer_right[p])) {
+						if (!used_primer[p] && primers_used_out != "") {
+							print primer_name[p] > primers_used_out
+							used_primer[p] = 1
+						}
 						marker_label = parse_primer_header(primer_name[p], primer_parts)
 						if (marker_label == "") {
 							fail_row("participating primer header " primer_name[p] " in " primers_fasta " is malformed; expected FAMILY_*")
@@ -1250,6 +1405,9 @@ resolve_metadata_row() {
 						fail_row(active_label " candidate " current_header " did not resolve to a marker")
 					}
 					if (seen_marker[output_suffix]) {
+						if ((track_identity_strict + 0) != 0) {
+							fail_row("Barcode key " active_key " matched multiple sequences for marker " output_suffix " in " fasta "; fallback suffixes are not permitted for track identity artifacts")
+						}
 						print "WARN: Barcode key " active_key " matched multiple sequences for marker " output_suffix " in " fasta "; using fallback suffix for duplicate header " current_header > "/dev/stderr"
 						output_suffix = fallback_suffix(active_key, current_header, i)
 						while (seen_marker[output_suffix]) {
@@ -1423,6 +1581,943 @@ consumed_reads_for_file() {
   echo "$consumed"
 }
 
+feeder_tmp_dir() {
+  printf '%s/tmp\n' "$POD5_BASE"
+}
+
+round_id_counter_file() {
+  printf '%s/next_round_id.count\n' "$metadata"
+}
+
+next_round_output_id() {
+  local counter_file current max_id path filename suffix
+  counter_file="$(round_id_counter_file)"
+  max_id=-1
+
+  for path in \
+    "$done_round"/"${run_id}"_*.pod5 \
+    "$metadata"/"${run_id}"_*_slice.tsv; do
+    [ -e "$path" ] || continue
+    filename=$(basename "$path")
+    case "$filename" in
+      "${run_id}"_*.pod5)
+        suffix="${filename#${run_id}_}"
+        suffix="${suffix%.pod5}"
+        ;;
+      "${run_id}"_*_slice.tsv)
+        suffix="${filename#${run_id}_}"
+        suffix="${suffix%_slice.tsv}"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+    case "$suffix" in
+      ''|*[!0-9]*)
+        continue
+        ;;
+    esac
+    if [ "$suffix" -gt "$max_id" ]; then
+      max_id="$suffix"
+    fi
+  done
+
+  current=$(( max_id + 1 ))
+  if [ -f "$counter_file" ]; then
+    current=$(cat "$counter_file" 2>/dev/null || printf '%s\n' "$current")
+    case "$current" in
+      ''|*[!0-9]*)
+        current=$(( max_id + 1 ))
+        ;;
+    esac
+  fi
+  if [ "$current" -le "$max_id" ]; then
+    current=$(( max_id + 1 ))
+  fi
+
+  printf '%s\n' "$(( current + 1 ))" > "$counter_file"
+  printf '%s\n' "$current"
+}
+
+feeder_lock_dir() {
+  printf '%s/.feeder.lockdir\n' "$metadata"
+}
+
+feeder_lock_meta_file() {
+  printf '%s/meta.env\n' "$(feeder_lock_dir)"
+}
+
+remove_feeder_lock_if_stale() {
+  local lock_dir tmp_lock
+  lock_dir="$(feeder_lock_dir)"
+  tmp_lock="${lock_dir}.stale.$$.$(date +%s 2>/dev/null || echo 0)"
+  if mv "$lock_dir" "$tmp_lock" 2>/dev/null; then
+    rm -rf "$tmp_lock" 2>/dev/null || true
+  else
+    rm -f "$lock_dir/meta.env" 2>/dev/null || true
+    rmdir "$lock_dir" 2>/dev/null || rm -rf "$lock_dir" 2>/dev/null || true
+  fi
+}
+
+release_feeder_lock() {
+	local lock_dir tmp_lock
+	lock_dir="$(feeder_lock_dir)"
+	if [ "${feeder_lock_owned:-0}" -eq 1 ]; then
+    tmp_lock="${lock_dir}.release.$$.$(date +%s 2>/dev/null || echo 0)"
+    if mv "$lock_dir" "$tmp_lock" 2>/dev/null; then
+      rm -rf "$tmp_lock" 2>/dev/null || true
+    else
+      rm -f "$lock_dir/meta.env" 2>/dev/null || true
+      rmdir "$lock_dir" 2>/dev/null || rm -rf "$lock_dir" 2>/dev/null || true
+    fi
+    feeder_lock_owned=0
+	fi
+}
+
+exit_feeder_on_signal() {
+	local exit_code="$1"
+	release_feeder_lock
+	exit "$exit_code"
+}
+
+acquire_feeder_lock_or_die() {
+  local lock_dir lock_meta host reclaim_status started_epoch
+  lock_dir="$(feeder_lock_dir)"
+  lock_meta="$(feeder_lock_meta_file)"
+  host="$(current_host_id)"
+  started_epoch="$(date +%s 2>/dev/null || echo 0)"
+
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    stale_lock_maybe_reclaim \
+      "$lock_dir" \
+      "$lock_meta" \
+      "$host" \
+      "$FEEDER_LOCK_STALE_TTL_SECONDS" \
+      "feeder lock" \
+      remove_feeder_lock_if_stale \
+      1
+    reclaim_status=$?
+    if [ "$reclaim_status" -eq 2 ]; then
+      echo "ERROR: stale_lock_maybe_reclaim rejected feeder lock parameters" >&2
+      exit 1
+    fi
+    if [ "$reclaim_status" -eq 11 ]; then
+      echo "ERROR: unable to reclaim stale feeder lock at $lock_dir" >&2
+      exit 1
+    fi
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+      echo "ERROR: another feeder is already active for run_id '$run_id' (lock: $lock_dir)" >&2
+      exit 1
+    fi
+  fi
+
+  if ! {
+    printf 'pid=%s\n' "$$"
+    printf 'host=%s\n' "$host"
+    printf 'started_epoch=%s\n' "$started_epoch"
+  } > "$lock_meta"; then
+    release_feeder_lock
+    echo "ERROR: failed to write feeder lock metadata at $lock_meta" >&2
+    exit 1
+  fi
+  feeder_lock_owned=1
+}
+
+fullview_cache_meta_file_for() {
+  local file="$1"
+  printf '%s/fullview_%s.meta.env\n' "$metadata" "$file"
+}
+
+progress_committed_for_file() {
+  local file="$1"
+  local progress_reads_file
+  local legacy_progress_file
+  progress_reads_file="$(progress_reads_file_for "$file")"
+  legacy_progress_file="$(legacy_progress_file_for "$file")"
+  [ -f "$progress_reads_file" ] || [ -f "$legacy_progress_file" ]
+}
+
+source_size_bytes() {
+  local path="$1"
+  wc -c < "$path" | tr -d '[:space:]'
+}
+
+env_file_value() {
+  local path="$1"
+  local key="$2"
+  [ -f "$path" ] || return 0
+  awk -F= -v k="$key" '$1 == k { print substr($0, index($0, "=") + 1); exit }' "$path" 2>/dev/null
+}
+
+feeder_log_path() {
+  printf '%s/%s_feeder.log\n' "$metadata" "$run_id"
+}
+
+duplicate_events_path() {
+  printf '%s/duplicate_events.tsv\n' "$metadata"
+}
+
+local_round_commit_ledger_path() {
+  printf '%s/round_commit_ledger.tsv\n' "$metadata"
+}
+
+validate_fail_env_for() {
+  local file="$1"
+  printf '%s/validate_fail_%s.env\n' "$metadata" "$file"
+}
+
+slice_sidecar_path_for_round() {
+  local round_id="$1"
+  printf '%s/%s_slice.tsv\n' "$metadata" "$round_id"
+}
+
+global_slice_completion_path() {
+  printf '%s/slice_completion.tsv\n' "$GLOBAL_LEDGER_DIR"
+}
+
+global_ledger_lock_dir() {
+  printf '%s/.lockdir\n' "$GLOBAL_LEDGER_DIR"
+}
+
+global_ledger_lock_meta_file() {
+  printf '%s/meta.env\n' "$(global_ledger_lock_dir)"
+}
+
+feeder_log_event() {
+  local action="$1"
+  local subject="$2"
+  local fingerprint="${3:-}"
+  local fp_prefix ready_count spool_count now
+
+  [ -n "${metadata:-}" ] || return 0
+  ensure_dir "$metadata"
+  fp_prefix="-"
+  if [ -n "$fingerprint" ]; then
+    fp_prefix=$(printf '%s' "$fingerprint" | cut -c1-8)
+  fi
+  ready_count=$(count_pod5_files "${output_rt:-.}" 2>/dev/null || echo 0)
+  spool_count=$(count_pod5_files "${output_folder:-.}" 2>/dev/null || echo 0)
+  now="$(date +%s 2>/dev/null || echo 0)"
+  printf '%s\t%s\t%s\tR%s/S%s\t%s\n' "$now" "$subject" "$fp_prefix" "$ready_count" "$spool_count" "$action" >> "$(feeder_log_path)" 2>/dev/null || true
+}
+
+record_duplicate_event() {
+  local kind="$1"
+  local subject="$2"
+  local fingerprint="${3:-}"
+  local now
+  now="$(date +%s 2>/dev/null || echo 0)"
+  printf '%s\t%s\t%s\t%s\n' "$now" "$kind" "$subject" "$fingerprint" >> "$(duplicate_events_path)" 2>/dev/null || true
+}
+
+advance_progress_from_staged_ranges() {
+  local progress_tsv="$1"
+  local progress_file_name progress_start_line progress_reads progress_target current_progress
+  [ -f "$progress_tsv" ] || return 0
+  while IFS=$'\t' read -r progress_file_name progress_start_line progress_reads; do
+    [ -n "$progress_file_name" ] || continue
+    case "$progress_reads" in
+      ''|*[!0-9]*)
+        continue
+        ;;
+    esac
+    progress_target="$(progress_reads_file_for "$progress_file_name")"
+    if [ -f "$progress_target" ]; then
+      current_progress="$(cat "$progress_target" 2>/dev/null || echo 0)"
+    else
+      current_progress=0
+    fi
+    case "$current_progress" in
+      ''|*[!0-9]*)
+        current_progress=0
+        ;;
+    esac
+    if [ "$progress_reads" -gt "$current_progress" ]; then
+      printf '%s\n' "$progress_reads" > "$progress_target" || return 1
+    fi
+  done < "$progress_tsv"
+  return 0
+}
+
+_feeder_sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 2>/dev/null | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 -r 2>/dev/null | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+compute_source_fp_from_view() {
+  local per_file_view="$1"
+  [ -f "$per_file_view" ] || return 1
+  awk '{print $1}' "$per_file_view" | _feeder_sha256
+}
+
+write_validate_fail_env() {
+  local fail_env="$1"
+  local fail_count="$2"
+  local fail_size="$3"
+  local fail_mtime="$4"
+  local tmp_env
+  tmp_env="${fail_env}.tmp.$$"
+  if ! {
+    printf 'fail_count=%s\n' "$fail_count"
+    printf 'fail_size=%s\n' "$fail_size"
+    printf 'fail_mtime=%s\n' "$fail_mtime"
+  } > "$tmp_env"; then
+    rm -f "$tmp_env"
+    return 1
+  fi
+  if ! mv "$tmp_env" "$fail_env"; then
+    rm -f "$tmp_env"
+    return 1
+  fi
+  return 0
+}
+
+load_validate_fail_count() {
+  local fail_env="$1"
+  local current_size="$2"
+  local current_mtime="$3"
+  local stored_size stored_mtime stored_count
+
+  [ -f "$fail_env" ] || {
+    printf '0\n'
+    return 0
+  }
+  stored_size="$(env_file_value "$fail_env" 'fail_size')"
+  stored_mtime="$(env_file_value "$fail_env" 'fail_mtime')"
+  stored_count="$(env_file_value "$fail_env" 'fail_count')"
+  case "$stored_count" in
+    ''|*[!0-9]*)
+      stored_count=0
+      ;;
+  esac
+  if [ "$current_size" = "$stored_size" ] && [ "$current_mtime" = "$stored_mtime" ]; then
+    printf '%s\n' "$stored_count"
+  else
+    printf '0\n'
+  fi
+}
+
+remove_global_ledger_lock_if_stale() {
+  local lock_dir
+  lock_dir="$(global_ledger_lock_dir)"
+  rm -f "$lock_dir/meta.env" 2>/dev/null || true
+  rmdir "$lock_dir" 2>/dev/null || rm -rf "$lock_dir" 2>/dev/null || true
+}
+
+release_global_ledger_lock() {
+  local lock_dir
+  lock_dir="$(global_ledger_lock_dir)"
+  if [ "${global_ledger_lock_owned:-0}" -eq 1 ]; then
+    rm -f "$lock_dir/meta.env" 2>/dev/null || true
+    rmdir "$lock_dir" 2>/dev/null || rm -rf "$lock_dir" 2>/dev/null || true
+    global_ledger_lock_owned=0
+  fi
+}
+
+acquire_global_ledger_lock_best_effort() {
+  local timeout_seconds="${1:-10}"
+  local lock_dir lock_meta host started_epoch waited reclaim_status
+
+  ensure_dir "$GLOBAL_LEDGER_DIR"
+  lock_dir="$(global_ledger_lock_dir)"
+  lock_meta="$(global_ledger_lock_meta_file)"
+  host="$(current_host_id)"
+  started_epoch="$(date +%s 2>/dev/null || echo 0)"
+  waited=0
+
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    stale_lock_maybe_reclaim \
+      "$lock_dir" \
+      "$lock_meta" \
+      "$host" \
+      "$GLOBAL_LEDGER_LOCK_STALE_TTL_SECONDS" \
+      "global feeder ledger lock" \
+      remove_global_ledger_lock_if_stale \
+      0
+    reclaim_status=$?
+    if [ "$reclaim_status" -eq 2 ] || [ "$reclaim_status" -eq 11 ]; then
+      echo "WARNING: unable to recover global feeder ledger lock at $lock_dir" >&2
+      return 1
+    fi
+    if mkdir "$lock_dir" 2>/dev/null; then
+      break
+    fi
+    if [ "$waited" -ge "$timeout_seconds" ]; then
+      echo "WARNING: global feeder ledger lock unavailable after ${timeout_seconds}s" >&2
+      return 1
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+
+  global_ledger_lock_owned=1
+  if ! {
+    printf 'pid=%s\n' "$$"
+    printf 'host=%s\n' "$host"
+    printf 'started_epoch=%s\n' "$started_epoch"
+  } > "$lock_meta"; then
+    release_global_ledger_lock
+    echo "WARNING: failed to write global feeder ledger lock metadata at $lock_meta" >&2
+    return 1
+  fi
+  return 0
+}
+
+write_fullview_cache_meta() {
+  local meta_path="$1"
+  local source_size="$2"
+  local source_mtime="$3"
+  local verified_reads="$4"
+  local cache_rows="$5"
+  local source_fp="$6"
+  local tmp_meta
+  tmp_meta="${meta_path}.tmp.$$"
+  if ! {
+    printf 'source_size=%s\n' "$source_size"
+    printf 'source_mtime=%s\n' "$source_mtime"
+    printf 'verified_reads=%s\n' "$verified_reads"
+    printf 'cache_rows=%s\n' "$cache_rows"
+    if [ -n "$source_fp" ]; then
+      printf 'source_fp=%s\n' "$source_fp"
+    fi
+  } > "$tmp_meta"; then
+    rm -f "$tmp_meta"
+    return 1
+  fi
+  if ! mv "$tmp_meta" "$meta_path"; then
+    rm -f "$tmp_meta"
+    return 1
+  fi
+  return 0
+}
+
+ensure_source_fp_in_meta() {
+  local file="$1"
+  local per_file_view="$2"
+  local meta_path="$3"
+  local source_size source_mtime verified_reads cache_rows source_fp
+
+  [ -f "$per_file_view" ] || return 1
+  [ -f "$meta_path" ] || return 1
+  source_fp="$(env_file_value "$meta_path" 'source_fp')"
+  if [ -n "$source_fp" ]; then
+    printf '%s\n' "$source_fp"
+    return 0
+  fi
+  source_fp="$(compute_source_fp_from_view "$per_file_view")" || return 1
+  source_size="$(env_file_value "$meta_path" 'source_size')"
+  source_mtime="$(env_file_value "$meta_path" 'source_mtime')"
+  verified_reads="$(env_file_value "$meta_path" 'verified_reads')"
+  cache_rows="$(env_file_value "$meta_path" 'cache_rows')"
+  if ! write_fullview_cache_meta "$meta_path" "$source_size" "$source_mtime" "$verified_reads" "$cache_rows" "$source_fp"; then
+    return 1
+  fi
+  feeder_log_event "cache_backfill_fp" "$file" "$source_fp"
+  printf '%s\n' "$source_fp"
+}
+
+compute_source_prefix() {
+  local source_fp="$1"
+  local tsv="$2"
+  local current_run_path="${3:-}"
+  [ -n "$source_fp" ] || {
+    printf '0\n'
+    return 0
+  }
+  [ -f "$tsv" ] || {
+    printf '0\n'
+    return 0
+  }
+  awk -F '\t' -v fp="$source_fp" -v run_path="$current_run_path" \
+    '$2 == fp && (run_path == "" || $6 != run_path) { print $4 "\t" $5 }' "$tsv" \
+    | sort -k1,1n \
+    | awk 'BEGIN{p=0} {s=$1+0; e=$2+0; if (s<=p+1 && e>p) p=e} END{print p}'
+}
+
+slice_fp_exists_in_completion_ledger() {
+  local slice_fp="$1"
+  local ledger_path current_run_path
+  ledger_path="$(global_slice_completion_path)"
+  current_run_path="${RUN_PATH_ABS:-}"
+  [ -n "$slice_fp" ] || return 1
+  [ -f "$ledger_path" ] || return 1
+  awk -F '\t' -v fp="$slice_fp" -v run_path="$current_run_path" '
+    $1 == fp && (run_path == "" || $6 != run_path) { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$ledger_path"
+}
+
+slice_fp_exists_in_local_ledger() {
+  local slice_fp="$1"
+  local ledger_path
+  ledger_path="$(local_round_commit_ledger_path)"
+  [ -n "$slice_fp" ] || return 1
+  [ -f "$ledger_path" ] || return 1
+  awk -F '\t' -v fp="$slice_fp" '$1 == fp { found = 1; exit } END { exit(found ? 0 : 1) }' "$ledger_path"
+}
+
+append_local_round_commit_entry() {
+  local slice_fp="$1"
+  local round_id="$2"
+  printf '%s\t%s\n' "$slice_fp" "$round_id" >> "$(local_round_commit_ledger_path)"
+}
+
+rebuild_local_round_commit_ledger() {
+  local ledger_path tmp_ledger sidecar source_fp round_id
+  ledger_path="$(local_round_commit_ledger_path)"
+  tmp_ledger="${ledger_path}.tmp.$$"
+  : > "$tmp_ledger"
+  for sidecar in "$metadata"/"${run_id}"_*_slice.tsv; do
+    [ -f "$sidecar" ] || continue
+    source_fp="$(awk -F= '/^# slice_fingerprint=/{print $2; exit}' "$sidecar" 2>/dev/null || true)"
+    [ -n "$source_fp" ] || continue
+    round_id="$(basename "$sidecar")"
+    round_id="${round_id%_slice.tsv}"
+    printf '%s\t%s\n' "$source_fp" "$round_id" >> "$tmp_ledger"
+  done
+  mv "$tmp_ledger" "$ledger_path"
+}
+
+startup_validate_round_sidecars() {
+  local repaired_any=0
+  local sidecar round_id round_output_ori round_output_ready round_output_done metadata_output round_missing_progress
+  local line source_fp file_name start_line end_line progress_target local_progress
+
+  for sidecar in "$metadata"/"${run_id}"_*_slice.tsv; do
+    [ -f "$sidecar" ] || continue
+    round_id="$(basename "$sidecar")"
+    round_id="${round_id%_slice.tsv}"
+    round_output_ori="${output_folder}/${round_id}.pod5"
+    round_output_ready="${output_rt}/${round_id}.pod5"
+    round_output_done="${done_round}/${round_id}.pod5"
+    metadata_output="${metadata}/${round_id}_read_info_rpt.txt"
+    round_missing_progress=0
+
+    while IFS= read -r line; do
+      case "$line" in
+        \#*|'')
+          continue
+          ;;
+      esac
+      IFS=$'\t' read -r source_fp file_name start_line end_line <<EOF
+$line
+EOF
+      [ -n "$file_name" ] || continue
+      progress_target="$(progress_reads_file_for "$file_name")"
+      if [ -f "$progress_target" ]; then
+        local_progress="$(cat "$progress_target" 2>/dev/null || echo 0)"
+      else
+        local_progress=0
+      fi
+      case "$local_progress" in
+        ''|*[!0-9]*)
+          local_progress=0
+          ;;
+      esac
+      if [ "$local_progress" -lt "$end_line" ]; then
+        round_missing_progress=1
+        if [ -f "$round_output_ori" ] || [ -f "$round_output_ready" ]; then
+          rm -f "$sidecar" "$round_output_ori" "$round_output_ready" "$metadata_output"
+          feeder_log_event "startup_repair" "$round_id" ""
+          echo "INFO: auto-repaired incomplete round commit for ${round_id}; round will be re-emitted." >&2
+          repaired_any=1
+        else
+          feeder_log_event "startup_fail" "$round_id" ""
+          echo "ERROR: incomplete progress commit for round ${round_id}: source ${file_name} expected through line ${end_line} but local progress is ${local_progress}. Manual repair required." >&2
+          return 1
+        fi
+        break
+      fi
+    done < "$sidecar"
+
+    if [ "$round_missing_progress" -ne 0 ]; then
+      continue
+    fi
+  done
+
+  rebuild_local_round_commit_ledger
+  return 0
+}
+
+startup_cleanup_orphan_rounds() {
+  local pod5_path round_id sidecar_path rpt_path rpt_round_id rpt_sidecar rpt_num
+
+  for pod5_path in \
+    "$output_folder"/"${run_id}"_*.pod5 \
+    "$output_rt"/"${run_id}"_*.pod5; do
+    [ -f "$pod5_path" ] || continue
+    round_id="$(basename "$pod5_path")"
+    round_id="${round_id%.pod5}"
+    sidecar_path="$(slice_sidecar_path_for_round "$round_id")"
+    [ -f "$sidecar_path" ] && continue
+    rm -f \
+      "${output_folder}/${round_id}.pod5" \
+      "${output_rt}/${round_id}.pod5" \
+      "${metadata}/${round_id}_read_info_rpt.txt"
+    feeder_log_event "startup_orphan_cleanup" "$round_id" ""
+    echo "INFO: removed orphan queued round ${round_id} (no sidecar); feeder will re-emit correct slice." >&2
+  done
+
+  for rpt_path in "$metadata"/"${run_id}"_*_read_info_rpt.txt; do
+    [ -f "$rpt_path" ] || continue
+    rpt_round_id="$(basename "$rpt_path")"
+    rpt_round_id="${rpt_round_id%_read_info_rpt.txt}"
+    rpt_num="${rpt_round_id#${run_id}_}"
+    case "$rpt_num" in
+      ''|*[!0-9]*)
+        continue
+        ;;
+    esac
+    rpt_sidecar="$(slice_sidecar_path_for_round "$rpt_round_id")"
+    [ -f "$rpt_sidecar" ] && continue
+    [ -f "${output_folder}/${rpt_round_id}.pod5" ] && continue
+    [ -f "${output_rt}/${rpt_round_id}.pod5" ] && continue
+    [ -f "${done_round}/${rpt_round_id}.pod5" ] && continue
+    [ -f "${RESULTS_ROOT}/temp/ongoing/state/${run_id}/${rpt_round_id}/round_report.json" ] && continue
+    rm -f "$rpt_path"
+    feeder_log_event "startup_orphan_metadata_cleanup" "$rpt_round_id" ""
+    echo "INFO: removed metadata-only orphan ${rpt_round_id} (no sidecar, no POD5)." >&2
+  done
+
+  return 0
+}
+
+startup_apply_global_completed_prefixes() {
+  local archived_files archived_full file per_file_view meta_path source_fp local_progress global_prefix progress_target total_reads
+  local ledger_path
+  ledger_path="$(global_slice_completion_path)"
+
+  if ! acquire_global_ledger_lock_best_effort 10; then
+    return 0
+  fi
+  if [ ! -f "$ledger_path" ]; then
+    release_global_ledger_lock
+    return 0
+  fi
+
+  archived_files="$(list_visible_pod5_files "$output_full_pod5")"
+  if [ -n "$archived_files" ]; then
+    while IFS= read -r archived_full; do
+      [ -n "$archived_full" ] || continue
+      file="$(basename "$archived_full")"
+      per_file_view="${metadata}/fullview_${file}.txt"
+      meta_path="$(fullview_cache_meta_file_for "$file")"
+      [ -f "$per_file_view" ] || continue
+      [ -f "$meta_path" ] || continue
+      source_fp="$(ensure_source_fp_in_meta "$file" "$per_file_view" "$meta_path" 2>/dev/null || true)"
+      [ -n "$source_fp" ] || continue
+      global_prefix="$(compute_source_prefix "$source_fp" "$ledger_path" "${RUN_PATH_ABS:-}")"
+      case "$global_prefix" in
+        ''|*[!0-9]*)
+          global_prefix=0
+          ;;
+      esac
+      progress_target="$(progress_reads_file_for "$file")"
+      if [ -f "$progress_target" ]; then
+        local_progress="$(cat "$progress_target" 2>/dev/null || echo 0)"
+      else
+        local_progress=0
+      fi
+      case "$local_progress" in
+        ''|*[!0-9]*)
+          local_progress=0
+          ;;
+      esac
+      total_reads="$(wc -l < "$per_file_view" | tr -d '[:space:]')"
+      if [ "$global_prefix" -gt "$total_reads" ]; then
+        global_prefix="$total_reads"
+      fi
+      if [ "$global_prefix" -gt "$local_progress" ]; then
+        printf '%s\n' "$global_prefix" > "$progress_target"
+        feeder_log_event "startup_sync" "$file" "$source_fp"
+        if [ "$global_prefix" -ge "$total_reads" ]; then
+          record_duplicate_event "global_source_complete" "$file" "$source_fp"
+        fi
+      fi
+    done <<< "$archived_files"
+  fi
+  release_global_ledger_lock
+}
+
+pod5_authoritative_read_count() {
+  local pod5_path="$1"
+  local inspect_output
+  local count
+  inspect_output="$(pod5 inspect summary "$pod5_path" 2>&1)" || return 1
+  count="$(printf '%s\n' "$inspect_output" | sed -n 's/^Found .* batches, \([0-9][0-9]*\) reads$/\1/p' | tail -n 1)"
+  case "$count" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$count"
+}
+
+reads_time_has_file_entry() {
+  local file="$1"
+  [ -f "$reads_time" ] || return 1
+  awk -F '\t' -v target="$file" 'NR > 1 && $5 == target { found = 1; exit } END { exit(found ? 0 : 1) }' "$reads_time"
+}
+
+record_reads_time_for_file() {
+  local file="$1"
+  local pod5_reads="$2"
+  local time
+  local last
+  local cumulative
+  if reads_time_has_file_entry "$file"; then
+    return 0
+  fi
+  time=$(pod5_mtime_epoch "$output_full_pod5/$file")
+  last=$(tail -n 1 "$reads_time" | awk '{print $4}')
+  if [ "$last" = "file" ]; then
+    last=0
+  fi
+  cumulative=$(( last + pod5_reads ))
+  printf '%s\t%s\tsequencing\t%s\t%s\n' "$run_id" "$time" "$cumulative" "$file" >> "$reads_time"
+}
+
+mark_full_pod5_skipped() {
+  local file="$1"
+  local reason="$2"
+  local archived_full="$3"
+  echo
+  echo "WARNING: ${reason}"
+  mv -f "$archived_full" "$output_skipped_pod5/" 2>/dev/null || true
+  touch "${metadata}/skipped_${file}.flag"
+  echo "WARNING: Moved '${file}' to ${output_skipped_pod5}/ and flagged to prevent re-import."
+  echo "WARNING: Continuing round with remaining valid pod5 files."
+  echo
+}
+
+startup_recover_valid_skipped_pod5() {
+  local skipped_path file flag_path dest read_count
+  for skipped_path in "$output_skipped_pod5"/*.pod5; do
+    [ -f "$skipped_path" ] || continue
+    file="$(basename "$skipped_path")"
+    flag_path="${metadata}/skipped_${file}.flag"
+    [ -f "$flag_path" ] || continue
+    if ! read_count="$(pod5_authoritative_read_count "$skipped_path" 2>/dev/null)"; then
+      continue
+    fi
+    dest="${output_full_pod5}/${file}"
+    if [ -e "$dest" ]; then
+      echo "WARN: skipped POD5 ${file} is now readable (${read_count} reads) but ${dest} already exists; leaving skipped copy in place." >&2
+      continue
+    fi
+    if mv -f "$skipped_path" "$dest"; then
+      rm -f "$flag_path"
+      feeder_log_event "skipped_recover" "$file" ""
+      echo "INFO: recovered previously skipped POD5 ${file} (${read_count} reads)." >&2
+    else
+      echo "WARN: failed to recover readable skipped POD5 ${file}; leaving skipped flag in place." >&2
+    fi
+  done
+}
+
+refresh_full_pod5_view() {
+  local out_path tmp_path archived_files archived_full file per_file_view
+  out_path="${metadata}/full_pod5_view.txt"
+  tmp_path="${out_path}.tmp.$$"
+  : > "$tmp_path"
+  archived_files="$(list_visible_pod5_files "$output_full_pod5")"
+  if [ -n "$archived_files" ]; then
+    while IFS= read -r archived_full; do
+      [ -n "$archived_full" ] || continue
+      file=$(basename "$archived_full")
+      per_file_view="${metadata}/fullview_${file}.txt"
+      [ -f "$per_file_view" ] || continue
+      cat "$per_file_view" >> "$tmp_path" || {
+        rm -f "$tmp_path"
+        return 1
+      }
+    done <<< "$archived_files"
+  fi
+  mv "$tmp_path" "$out_path"
+}
+
+ensure_per_file_view_cache() {
+  local archived_full="$1"
+  local file="$2"
+  local original_source="${3:-}"
+  local per_file_view meta_path source_size source_mtime actual_rows authoritative_reads
+  local meta_source_size meta_source_mtime meta_verified_reads meta_cache_rows
+  local tmp_file_pod5 cache_tmp rebuild_attempted recopy_attempted inspect_ok fail_env fail_count source_fp
+
+  per_file_view="${metadata}/fullview_${file}.txt"
+  meta_path="$(fullview_cache_meta_file_for "$file")"
+  fail_env="$(validate_fail_env_for "$file")"
+  rebuild_attempted=0
+  recopy_attempted=0
+
+  while :; do
+    if [ ! -e "$archived_full" ]; then
+      if progress_committed_for_file "$file"; then
+        echo "ERROR: missing archived full pod5 for '${file}' after progress was committed." >&2
+        echo "ERROR: remove the corrupted run state before resuming. Archived=${archived_full}" >&2
+        return 2
+      fi
+      feeder_log_event "validate_retry" "$file" ""
+      return 1
+    fi
+
+    source_size="$(source_size_bytes "$archived_full")"
+    source_mtime="$(pod5_mtime_epoch "$archived_full")"
+    fail_count="$(load_validate_fail_count "$fail_env" "$source_size" "$source_mtime")"
+
+    if [ -f "$per_file_view" ] && [ -f "$meta_path" ]; then
+      meta_source_size="$(env_file_value "$meta_path" 'source_size')"
+      meta_source_mtime="$(env_file_value "$meta_path" 'source_mtime')"
+      meta_verified_reads="$(env_file_value "$meta_path" 'verified_reads')"
+      meta_cache_rows="$(env_file_value "$meta_path" 'cache_rows')"
+      actual_rows="$(wc -l < "$per_file_view" | tr -d '[:space:]')"
+      if [ "$meta_source_size" = "$source_size" ] \
+        && [ "$meta_source_mtime" = "$source_mtime" ] \
+        && [ -n "$meta_verified_reads" ] \
+        && [ "$meta_verified_reads" = "$meta_cache_rows" ] \
+        && [ "$actual_rows" = "$meta_verified_reads" ]; then
+        source_fp="$(ensure_source_fp_in_meta "$file" "$per_file_view" "$meta_path" 2>/dev/null || true)"
+        rm -f "$fail_env"
+        record_reads_time_for_file "$file" "$actual_rows"
+        feeder_log_event "cache_hit" "$file" "$source_fp"
+        return 0
+      fi
+    elif progress_committed_for_file "$file"; then
+      echo "ERROR: missing or incomplete fullview cache state for '${file}' after progress was committed." >&2
+      echo "ERROR: remove the corrupted run state before resuming. Cache=${per_file_view} Meta=${meta_path}" >&2
+      return 2
+    fi
+
+    if [ -f "$per_file_view" ] || [ -f "$meta_path" ]; then
+      if progress_committed_for_file "$file"; then
+        echo "ERROR: detected fullview cache integrity mismatch for '${file}' after progress was committed." >&2
+        echo "ERROR: remove the corrupted run state before resuming. Cache=${per_file_view} Meta=${meta_path}" >&2
+        return 2
+      fi
+      rm -f "$per_file_view" "$meta_path"
+    fi
+
+    authoritative_reads="$(pod5_authoritative_read_count "$archived_full")"
+    inspect_ok=$?
+    if [ "$inspect_ok" -ne 0 ]; then
+      if [ "$recopy_attempted" -eq 0 ] && [ -n "$original_source" ] && [ -r "$original_source" ]; then
+        rm -f "$archived_full"
+        if cp -p "$original_source" "$archived_full" && [ -s "$archived_full" ]; then
+          recopy_attempted=1
+          feeder_log_event "validate_retry" "$file" ""
+          continue
+        fi
+        rm -f "$archived_full"
+      fi
+      fail_count=$(( fail_count + 1 ))
+      write_validate_fail_env "$fail_env" "$fail_count" "$source_size" "$source_mtime" || true
+      feeder_log_event "validate_fail_${fail_count}" "$file" ""
+      if [ "$fail_count" -ge 2 ]; then
+        rm -f "$fail_env"
+        mark_full_pod5_skipped "$file" "pod5 inspect summary failed twice for '${file}' — file is truncated or corrupted." "$archived_full"
+        feeder_log_event "corrupt_skip" "$file" ""
+      fi
+      return 1
+    fi
+
+    tmp_file_pod5="$(feeder_tmp_dir)/tmp_file_pod5_${run_id}_$$.txt"
+    cache_tmp="${per_file_view}.tmp.$$"
+    rm -f "$tmp_file_pod5" "$cache_tmp"
+    pod5 view "$archived_full" --no-header --output "$tmp_file_pod5"
+    if [ ! $? -eq 0 ]; then
+      rm -f "$tmp_file_pod5" "$cache_tmp"
+      if [ "$recopy_attempted" -eq 0 ] && [ -n "$original_source" ] && [ -r "$original_source" ]; then
+        rm -f "$archived_full"
+        if cp -p "$original_source" "$archived_full" && [ -s "$archived_full" ]; then
+          recopy_attempted=1
+          feeder_log_event "validate_retry" "$file" ""
+          continue
+        fi
+        rm -f "$archived_full"
+      fi
+      fail_count=$(( fail_count + 1 ))
+      write_validate_fail_env "$fail_env" "$fail_count" "$source_size" "$source_mtime" || true
+      feeder_log_event "validate_fail_${fail_count}" "$file" ""
+      if [ "$fail_count" -ge 2 ]; then
+        rm -f "$fail_env"
+        mark_full_pod5_skipped "$file" "pod5 view failed twice for '${file}' — file is truncated or corrupted." "$archived_full"
+        feeder_log_event "corrupt_skip" "$file" ""
+      fi
+      return 1
+    fi
+    if [ ! -s "$tmp_file_pod5" ]; then
+      rm -f "$tmp_file_pod5" "$cache_tmp"
+      fail_count=$(( fail_count + 1 ))
+      write_validate_fail_env "$fail_env" "$fail_count" "$source_size" "$source_mtime" || true
+      feeder_log_event "validate_fail_${fail_count}" "$file" ""
+      if [ "$fail_count" -ge 2 ]; then
+        rm -f "$fail_env"
+        mark_full_pod5_skipped "$file" "pod5 view produced no readable rows twice for '${file}'." "$archived_full"
+        feeder_log_event "corrupt_skip" "$file" ""
+      fi
+      return 1
+    fi
+
+    actual_rows="$(wc -l < "$tmp_file_pod5" | tr -d '[:space:]')"
+    if [ "$actual_rows" != "$authoritative_reads" ]; then
+      rm -f "$tmp_file_pod5" "$cache_tmp"
+      if [ "$rebuild_attempted" -eq 0 ]; then
+        rebuild_attempted=1
+        continue
+      fi
+      if [ "$recopy_attempted" -eq 0 ] && [ -n "$original_source" ] && [ -r "$original_source" ]; then
+        rm -f "$archived_full"
+        if cp -p "$original_source" "$archived_full" && [ -s "$archived_full" ]; then
+          recopy_attempted=1
+          rebuild_attempted=0
+          feeder_log_event "validate_retry" "$file" ""
+          continue
+        fi
+        rm -f "$archived_full"
+      fi
+      fail_count=$(( fail_count + 1 ))
+      write_validate_fail_env "$fail_env" "$fail_count" "$source_size" "$source_mtime" || true
+      feeder_log_event "validate_fail_${fail_count}" "$file" ""
+      if [ "$fail_count" -ge 2 ]; then
+        rm -f "$fail_env"
+        mark_full_pod5_skipped "$file" "fullview cache validation failed twice for '${file}': pod5 inspect summary reports ${authoritative_reads} reads but pod5 view produced ${actual_rows} rows." "$archived_full"
+        feeder_log_event "corrupt_skip" "$file" ""
+      fi
+      return 1
+    fi
+
+    if ! cp "$tmp_file_pod5" "$cache_tmp"; then
+      rm -f "$tmp_file_pod5" "$cache_tmp"
+      echo "WARNING: failed to stage per-file pod5 view for '${file}'; skipping cumulative update this cycle."
+      return 1
+    fi
+    source_fp="$(compute_source_fp_from_view "$tmp_file_pod5" 2>/dev/null || true)"
+    if ! write_fullview_cache_meta "$meta_path" "$source_size" "$source_mtime" "$authoritative_reads" "$actual_rows" "$source_fp"; then
+      rm -f "$tmp_file_pod5" "$cache_tmp" "$per_file_view" "$meta_path"
+      echo "WARNING: failed to finalize per-file pod5 view metadata for '${file}'; skipping cumulative update this cycle."
+      return 1
+    fi
+    if ! mv "$cache_tmp" "$per_file_view"; then
+      rm -f "$tmp_file_pod5" "$cache_tmp" "$per_file_view" "$meta_path"
+      echo "WARNING: failed to finalize per-file pod5 view for '${file}'; skipping cumulative update this cycle."
+      return 1
+    fi
+    if ! refresh_full_pod5_view; then
+      echo "WARNING: failed to refresh ${metadata}/full_pod5_view.txt for '${file}'; continuing with validated per-file cache."
+    fi
+    rm -f "$fail_env"
+    record_reads_time_for_file "$file" "$actual_rows"
+    feeder_log_event "import" "$file" "$source_fp"
+    rm -f "$tmp_file_pod5"
+    return 0
+  done
+}
+
 # Check if required variables are set
 #if [ -z "$run_id" ] || [ -z "$input_folder" ]; then
 if [ -z "$run_id" ]; then
@@ -1532,12 +2627,26 @@ if [ $do_metadata -eq 1 ]; then
 				staged_track_active_units="${metadata_stage_dir}/track_active_units.txt"
 				staged_track_identity="${metadata_stage_dir}/track_identity.tsv"
 				staged_samples="${metadata_stage_dir}/samples.txt"
+				staged_primers_names="${metadata_stage_dir}/primers_used.txt"
 				warn_seen_file="${metadata_stage_dir}/.demult_warn_seen"
 				: > "$row_info_file"
 				: > "$replicate_roster_rows_file"
 				: > "$samples_compat_rows_file"
 				: > "$warn_seen_file"
+				metadata_track_identity_strict="${RTBIOSCAN_TRACK_IDENTITY_STRICT:-1}"
+				track_artifacts_optional="${RTBIOSCAN_TRACK_ARTIFACTS_OPTIONAL:-0}"
+				case "$metadata_track_identity_strict" in
+					1|true|TRUE|yes|YES|on|ON) metadata_track_identity_strict=1 ;;
+					0|false|FALSE|no|NO|off|OFF) metadata_track_identity_strict=0 ;;
+					*) metadata_track_identity_strict=1 ;;
+				esac
+				case "$track_artifacts_optional" in
+					1|true|TRUE|yes|YES|on|ON) track_artifacts_optional=1 ;;
+					0|false|FALSE|no|NO|off|OFF) track_artifacts_optional=0 ;;
+					*) track_artifacts_optional=0 ;;
+				esac
 				: > "$staged_output_fasta"
+				: > "$staged_primers_names"
 				printf '%s\n' "sample_id	replicate_id	replicate_number	marker_id	matched_general_fasta_header	matched_general_fasta_record_index	suffix_resolution_mode	unit_suffix_current	unit_id_collapse	unit_id_track	demult_id_metadata	lookup_key_primary	lookup_key_fallback	lookup_grammar_used	metadata_line_no" > "$staged_replicate_identity"
 
 			if ! select_and_validate_metadata_rows "$metadata" "$run_id" "$staged_metadata" "$row_info_file" "$replicate_roster_rows_file" "$samples_compat_rows_file"; then
@@ -1566,13 +2675,15 @@ if [ $do_metadata -eq 1 ]; then
 				tmp_sidecar="${metadata_stage_dir}/.demult_match.sidecar"
 				tmp_warn="${metadata_stage_dir}/.demult_match.warn"
 				tmp_meta="${metadata_stage_dir}/.demult_match.meta"
+				tmp_primers="${metadata_stage_dir}/.demult_match.primers"
 				: > "$tmp_meta"
 				: > "$tmp_sidecar"
-				if ! resolve_metadata_row "$sample_name" "$line_no" "$replicate_id" "$replicate" "$well" "$plate" "$demult_id" "$general_fasta" "$primers_fasta" "$targets" "$metadata" "$tmp_records" "$tmp_sidecar" "$tmp_meta" 2> "$tmp_warn"; then
+				: > "$tmp_primers"
+				if ! resolve_metadata_row "$sample_name" "$line_no" "$replicate_id" "$replicate" "$well" "$plate" "$demult_id" "$general_fasta" "$primers_fasta" "$targets" "$metadata" "$tmp_records" "$tmp_sidecar" "$tmp_meta" "$metadata_track_identity_strict" "$tmp_primers" 2> "$tmp_warn"; then
 					if [ -s "$tmp_warn" ]; then
 						cat "$tmp_warn" >&2
 					fi
-					rm -f "$tmp_records" "$tmp_sidecar" "$tmp_warn" "$tmp_meta"
+					rm -f "$tmp_records" "$tmp_sidecar" "$tmp_warn" "$tmp_meta" "$tmp_primers"
 					exit 1
 				fi
 				if [ -s "$tmp_warn" ]; then
@@ -1590,17 +2701,18 @@ if [ $do_metadata -eq 1 ]; then
 				sidecar_count=$(wc -l < "$tmp_sidecar")
 				if [ "$record_count" -le 0 ]; then
 					echo "ERROR: Failed to emit demultiplexing FASTA records for Sample_ID '$sample_name' using keys '$key1' and '$key2'"
-					rm -f "$tmp_records" "$tmp_sidecar"
+					rm -f "$tmp_records" "$tmp_sidecar" "$tmp_primers"
 					exit 1
 				fi
 				if [ "$sidecar_count" -ne "$record_count" ]; then
 					echo "ERROR: replicate_identity.tsv rows ($sidecar_count) do not match demult.fasta records ($record_count) for Sample_ID '$sample_name'" >&2
-					rm -f "$tmp_records" "$tmp_sidecar"
+					rm -f "$tmp_records" "$tmp_sidecar" "$tmp_primers"
 					exit 1
 				fi
 				cat "$tmp_records" >> "$staged_output_fasta"
 				cat "$tmp_sidecar" >> "$staged_replicate_identity"
-				rm -f "$tmp_records" "$tmp_sidecar"
+				cat "$tmp_primers" >> "$staged_primers_names"
+				rm -f "$tmp_records" "$tmp_sidecar" "$tmp_primers"
 				expected_records=$(( expected_records + record_count ))
 			done < "$row_info_file"
 			rm -f "$warn_seen_file"
@@ -1637,9 +2749,22 @@ if [ $do_metadata -eq 1 ]; then
 					echo "ERROR: replicate_roster.tsv has $replicate_roster_lines lines; expected $replicate_roster_expected (header + $samples_number roster rows)." >&2
 					exit 1
 				fi
-			if ! derive_track_artifacts "$staged_output_fasta" "$staged_replicate_identity" "$staged_replicate_roster" "$staged_track_demult" "$staged_track_roster" "$staged_track_active_units" "$staged_track_identity"; then
-				exit 1
+			track_artifacts_error="${metadata_stage_dir}/track_artifacts.err"
+			if [ "$track_artifacts_optional" -eq 1 ]; then
+				if ! derive_track_artifacts "$staged_output_fasta" "$staged_replicate_identity" "$staged_replicate_roster" "$staged_track_demult" "$staged_track_roster" "$staged_track_active_units" "$staged_track_identity" "$targets" 2> "$track_artifacts_error"; then
+					if [ -s "$track_artifacts_error" ]; then
+						head -n 1 "$track_artifacts_error" | sed 's/^/WARN: optional track artifact derivation skipped: /' >&2
+					else
+						echo "WARN: optional track artifact derivation skipped." >&2
+					fi
+					rm -f "$staged_track_demult" "$staged_track_roster" "$staged_track_active_units" "$staged_track_identity"
+				fi
+			else
+				if ! derive_track_artifacts "$staged_output_fasta" "$staged_replicate_identity" "$staged_replicate_roster" "$staged_track_demult" "$staged_track_roster" "$staged_track_active_units" "$staged_track_identity" "$targets"; then
+					exit 1
+				fi
 			fi
+			rm -f "$track_artifacts_error"
 
 		general_copy_name=$(basename "$general_fasta")
 		if [ ! -e "$SAMPLE_INFO_DIR" ]; then
@@ -1654,8 +2779,16 @@ if [ $do_metadata -eq 1 ]; then
 			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
 			exit 1
 		fi
-		if ! cp "$primers_fasta" "${SAMPLE_INFO_DIR}/primers.fasta"; then
-			echo "ERROR: Failed to copy primers fasta into $SAMPLE_INFO_DIR" >&2
+		if ! awk \
+				-v lf="$staged_primers_names" \
+				'FILENAME==lf{sub(/\r$/,"");used[$0]=1;next} {sub(/\r$/,"")} /^>/{p=(substr($0,2) in used);if(p)print;next} p{print}' \
+				"$staged_primers_names" "$primers_fasta" > "${SAMPLE_INFO_DIR}/primers.fasta"; then
+			echo "ERROR: Failed to extract run-specific primers into $SAMPLE_INFO_DIR" >&2
+			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+			exit 1
+		fi
+		if [ "$(grep -c '^>' "${SAMPLE_INFO_DIR}/primers.fasta" || true)" -eq 0 ]; then
+			echo "ERROR: No primer entries matched run metadata; primers.fasta is empty" >&2
 			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
 			exit 1
 		fi
@@ -1684,25 +2817,33 @@ if [ $do_metadata -eq 1 ]; then
 					rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
 			exit 1
 		fi
-		if ! mv "$staged_track_demult" "${SAMPLE_INFO_DIR}/track_demult.fasta"; then
-			echo "ERROR: Failed to write track_demult.fasta into $SAMPLE_INFO_DIR" >&2
-			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
-			exit 1
+		if [ -e "$staged_track_demult" ]; then
+			if ! mv "$staged_track_demult" "${SAMPLE_INFO_DIR}/track_demult.fasta"; then
+				echo "ERROR: Failed to write track_demult.fasta into $SAMPLE_INFO_DIR" >&2
+				rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+				exit 1
+			fi
 		fi
-		if ! mv "$staged_track_roster" "${SAMPLE_INFO_DIR}/track_roster.tsv"; then
-			echo "ERROR: Failed to write track_roster.tsv into $SAMPLE_INFO_DIR" >&2
-			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
-			exit 1
+		if [ -e "$staged_track_roster" ]; then
+			if ! mv "$staged_track_roster" "${SAMPLE_INFO_DIR}/track_roster.tsv"; then
+				echo "ERROR: Failed to write track_roster.tsv into $SAMPLE_INFO_DIR" >&2
+				rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+				exit 1
+			fi
 		fi
-		if ! mv "$staged_track_active_units" "${SAMPLE_INFO_DIR}/track_active_units.txt"; then
-			echo "ERROR: Failed to write track_active_units.txt into $SAMPLE_INFO_DIR" >&2
-			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
-			exit 1
+		if [ -e "$staged_track_active_units" ]; then
+			if ! mv "$staged_track_active_units" "${SAMPLE_INFO_DIR}/track_active_units.txt"; then
+				echo "ERROR: Failed to write track_active_units.txt into $SAMPLE_INFO_DIR" >&2
+				rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+				exit 1
+			fi
 		fi
-		if ! mv "$staged_track_identity" "${SAMPLE_INFO_DIR}/track_identity.tsv"; then
-			echo "ERROR: Failed to write track_identity.tsv into $SAMPLE_INFO_DIR" >&2
-			rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
-			exit 1
+		if [ -e "$staged_track_identity" ]; then
+			if ! mv "$staged_track_identity" "${SAMPLE_INFO_DIR}/track_identity.tsv"; then
+				echo "ERROR: Failed to write track_identity.tsv into $SAMPLE_INFO_DIR" >&2
+				rollback_metadata_commit "$SAMPLE_INFO_DIR" "$run_id" "$general_copy_name"
+				exit 1
+			fi
 		fi
 		echo "Demultiplexing fasta completed successfully ($expected_records records, $fasta_number lines)"
 		echo
@@ -1735,6 +2876,14 @@ output_skipped_pod5="${POD5_BASE}/skipped_pod5"
 for _d in "$POD5_BASE" "$output_full_pod5" "$output_folder" "$output_rt" "$done_round" "$metadata" "$output_skipped_pod5"; do
     ensure_dir "$_d"
 done
+RESULTS_ROOT="$(cd "$(dirname "$(dirname "$POD5_BASE")")" && pwd -P)"
+GLOBAL_LEDGER_DIR="${RESULTS_ROOT}/temp/_global/feeder_dedup"
+RUN_PATH_ABS="$(cd "$POD5_BASE" && pwd -P)"
+trap 'release_feeder_lock' EXIT
+trap 'exit_feeder_on_signal 130' INT
+trap 'exit_feeder_on_signal 143' TERM
+trap 'exit_feeder_on_signal 129' HUP
+acquire_feeder_lock_or_die
 
 
 
@@ -1746,8 +2895,16 @@ if [ ! -s "$reads_time" ]; then
 	echo -e "run_id\ttime\tdata\treads\tfile" > $reads_time
 fi
 
+startup_recover_valid_skipped_pod5
+startup_cleanup_orphan_rounds
+startup_apply_global_completed_prefixes
+if ! startup_validate_round_sidecars; then
+	exit 1
+fi
+
 
 for ((;;));do
+	startup_recover_valid_skipped_pod5
 	if [ ! -e $input_folder ];then 
 		#To add here mail or message to warn something is not working:
 		echo "Warning!!!!!!!!!"
@@ -1788,8 +2945,8 @@ for ((;;));do
 	round=0
 	counter=0
 	breaking=0
-	if [ -e "${POD5_BASE}/tmp_file_pod5" ];then rm "${POD5_BASE}/tmp_file_pod5";fi
-	if [ -e "${POD5_BASE}/la" ];then rm "${POD5_BASE}/la";fi
+	ensure_dir "$(feeder_tmp_dir)"
+	rm -f "${POD5_BASE}/tmp_file_pod5" "${POD5_BASE}/la" "${POD5_BASE}/tmp_read_info_rpt.txt" "${POD5_BASE}/tmp_round_progress.tsv"
 
     # Global throttle: allow prefetching 1 in spool while 1 is in ready.
     # First, if ready is empty and spool has backlog, promote exactly one.
@@ -1856,31 +3013,20 @@ for ((;;));do
 					echo "WARNING: $full_file failed to copy (possibly still being written); skipping this file and continuing with remaining files."
 					continue
 				fi
-			fi
-
-			if [ ! -f "$per_file_view" ]; then
-				pod5 view "$output_full_pod5/$file" --no-header --output "${POD5_BASE}/tmp_file_pod5"
-				if [ ! $? -eq 0 ]; then
-					rm -f "${POD5_BASE}/tmp_file_pod5"
-					echo
-					echo "WARNING: pod5 view failed for '${file}' — file is truncated or corrupted."
-					mv -f "$output_full_pod5/$file" "$output_skipped_pod5/" 2>/dev/null || true
-					touch "${metadata}/skipped_${file}.flag"
-					echo "WARNING: Moved '${file}' to ${output_skipped_pod5}/ and flagged to prevent re-import."
-					echo "WARNING: Continuing round with remaining valid pod5 files."
-					echo
+				if [ ! -s "$output_full_pod5/$file" ]; then
+					rm -f "$output_full_pod5/$file"
+					echo "WARNING: $file archived as zero-byte; skipping this iteration."
 					continue
 				fi
-				cp "${POD5_BASE}/tmp_file_pod5" "$per_file_view"
-				cat "${POD5_BASE}/tmp_file_pod5" >> "${metadata}/full_pod5_view.txt"
+			fi
 
-				time=$(stat -f %SB -t %s "$output_full_pod5/$file")
-				last=$(tail -n1 $reads_time| awk '{print $4}')
-				if [ "$last" == "file" ];then last=0;fi
-				pod5_reads=$(wc -l < "${POD5_BASE}/tmp_file_pod5")
-				cumulative=$(( last + pod5_reads ))
-				echo -e "${run_id}\t${time}\tsequencing\t${cumulative}\t${file}" >> $reads_time
-				rm -f "${POD5_BASE}/tmp_file_pod5"
+			ensure_per_file_view_cache "$output_full_pod5/$file" "$file" "$full_file"
+			cache_status=$?
+			if [ "$cache_status" -eq 1 ]; then
+				continue
+			fi
+			if [ "$cache_status" -eq 2 ]; then
+				exit 1
 			fi
 		done <<< "$full_files"
 
@@ -1889,9 +3035,9 @@ for ((;;));do
 		else
 			archived_files=$(list_visible_pod5_files "$output_full_pod5")
 			if [ -n "$archived_files" ]; then
-				tmp_read_info="${POD5_BASE}/tmp_read_info_rpt.txt"
-				tmp_round_ids="${POD5_BASE}/la"
-				tmp_progress="${POD5_BASE}/tmp_round_progress.tsv"
+				tmp_read_info="$(feeder_tmp_dir)/tmp_read_info_${run_id}_$$.tsv"
+				tmp_round_ids="$(feeder_tmp_dir)/tmp_round_ids_${run_id}_$$.txt"
+				tmp_progress="$(feeder_tmp_dir)/tmp_round_progress_${run_id}_$$.tsv"
 				: > "$tmp_read_info"
 				: > "$tmp_round_ids"
 				: > "$tmp_progress"
@@ -1926,7 +3072,7 @@ for ((;;));do
 
 					sed -n "${start_line},${end_line}p" "$per_file_view" >> "$tmp_read_info"
 					sed -n "${start_line},${end_line}p" "$per_file_view" | awk '{print $1}' >> "$tmp_round_ids"
-					printf '%s\t%s\n' "$file" "$end_line" >> "$tmp_progress"
+					printf '%s\t%s\t%s\n' "$file" "$start_line" "$end_line" >> "$tmp_progress"
 					round_inputs+=("$archived_full")
 					if [ -z "$round_header" ]; then
 						round_header=$(pod5 view "$archived_full" | head -1)
@@ -1943,29 +3089,154 @@ for ((;;));do
 					if [ "$ready_count" -gt 1 ] || [ "$spool_count" -gt 0 ]; then
 						echo "Backpressure (pre-filter): ready=${ready_count} spool=${spool_count}; stopping round creation"
 					else
-						out_id=$(ls ${metadata}/${run_id}_*_read_info_rpt.txt 2>/dev/null | wc -l | tr -d ' ')
-						round_output="${output_folder}/${run_id}_${out_id}.pod5"
+						id_count=$(wc -l < "$tmp_round_ids")
+						read_info_count=$(wc -l < "$tmp_read_info")
+						round_inputs_missing=0
+						for round_input in "${round_inputs[@]}"; do
+							if [ ! -f "$round_input" ]; then
+								echo "WARNING: round input disappeared before pod5 filter: $round_input"
+								round_inputs_missing=1
+							fi
+						done
+						if [ ! -s "$tmp_round_ids" ]; then
+							echo "WARNING: skipping round creation because staged round IDs are missing or empty."
+						elif [ "$id_count" -ne "$read_info_count" ]; then
+							echo "WARNING: skipping round creation because staged read rows (${read_info_count}) do not match staged IDs (${id_count})."
+						elif [ "${#round_inputs[@]}" -eq 0 ]; then
+							echo "WARNING: skipping round creation because no source pod5 inputs were staged."
+						elif [ "$round_inputs_missing" -ne 0 ]; then
+							echo "WARNING: skipping round creation because one or more staged pod5 inputs disappeared."
+						else
+						slice_fp="$( _feeder_sha256 < "$tmp_round_ids" 2>/dev/null || true )"
+						if [ -z "$slice_fp" ]; then
+							echo "WARNING: failed to hash staged round IDs; round emission aborted."
+						elif slice_fp_exists_in_local_ledger "$slice_fp"; then
+							echo "WARNING: skipping duplicate local round slice"
+							record_duplicate_event "local_slice_duplicate" "${run_id}_duplicate" "$slice_fp"
+							feeder_log_event "local_dup_skip" "${run_id}_duplicate" "$slice_fp"
+							if ! advance_progress_from_staged_ranges "$tmp_progress"; then
+								echo "WARNING: failed to advance local progress for duplicate local round slice."
+							fi
+						else
+						global_duplicate=0
+						global_check_ok=0
+						if acquire_global_ledger_lock_best_effort 10; then
+							global_check_ok=1
+							if slice_fp_exists_in_completion_ledger "$slice_fp"; then
+								global_duplicate=1
+							fi
+							release_global_ledger_lock
+						fi
+						if [ "$global_check_ok" -ne 1 ]; then
+							echo "WARNING: deferring round emission because the global feeder ledger lock is unavailable; no round ID was reserved."
+							feeder_log_event "global_lock_defer" "${run_id}_duplicate" "$slice_fp"
+						elif [ "$global_duplicate" -eq 1 ]; then
+							echo "WARNING: skipping globally completed round slice"
+							record_duplicate_event "global_slice_duplicate" "${run_id}_duplicate" "$slice_fp"
+							feeder_log_event "global_dup_skip" "${run_id}_duplicate" "$slice_fp"
+							if ! advance_progress_from_staged_ranges "$tmp_progress"; then
+								echo "WARNING: failed to advance local progress for duplicate global round slice."
+							fi
+						else
+						out_id=$(next_round_output_id)
+						round_id="${run_id}_${out_id}"
+						round_output="${output_folder}/${round_id}.pod5"
+						rm -f "$round_output"
 						if ! pod5 filter "${round_inputs[@]}" --ids "$tmp_round_ids" --output "$round_output"; then
-							echo "pod5 filter didn't work properly"
+							echo "WARNING: pod5 filter failed for round ${round_id}; round emission aborted."
 							rm -f "$round_output"
 						else
-							printf '%s\n' "$round_header" > "${metadata}/${run_id}_${out_id}_read_info_rpt.txt"
-							cat "$tmp_read_info" >> "${metadata}/${run_id}_${out_id}_read_info_rpt.txt"
-							while IFS=$'\t' read -r progress_file_name progress_reads; do
-								[ -n "$progress_file_name" ] || continue
-								printf '%s\n' "$progress_reads" > "$(progress_reads_file_for "$progress_file_name")"
-							done < "$tmp_progress"
-							echo "Created a new pod5 in ${round_output}"
-							ready_count=$(count_pod5_files "${output_rt}")
-							if [ "$ready_count" -eq 0 ]; then
-								mv "$round_output" "${output_rt}/"
+							metadata_output="${metadata}/${round_id}_read_info_rpt.txt"
+							metadata_tmp="${metadata_output}.tmp.$$"
+							sidecar_output="$(slice_sidecar_path_for_round "$round_id")"
+							sidecar_tmp="${sidecar_output}.tmp.$$"
+							rm -f "$metadata_tmp"
+							if ! { printf '%s\n' "$round_header" > "$metadata_tmp" && cat "$tmp_read_info" >> "$metadata_tmp"; }; then
+								echo "WARNING: failed to stage round metadata for ${round_id}; round emission aborted."
+								rm -f "$round_output" "$metadata_tmp" "$sidecar_tmp" "$sidecar_output"
+							else
+								rm -f "$sidecar_tmp"
+								{
+									printf '# slice_fingerprint=%s\n' "$slice_fp"
+									printf '# read_count=%s\n' "$id_count"
+									printf '# commit_timestamp=%s\n' "$(date +%s 2>/dev/null || echo 0)"
+									while IFS=$'\t' read -r progress_file_name progress_start_line progress_reads; do
+										[ -n "$progress_file_name" ] || continue
+										per_file_view="${metadata}/fullview_${progress_file_name}.txt"
+										meta_path="$(fullview_cache_meta_file_for "$progress_file_name")"
+										source_fp="$(ensure_source_fp_in_meta "$progress_file_name" "$per_file_view" "$meta_path" 2>/dev/null || true)"
+										[ -n "$source_fp" ] || source_fp="-"
+										printf '%s\t%s\t%s\t%s\n' "$source_fp" "$progress_file_name" "$progress_start_line" "$progress_reads"
+									done < "$tmp_progress"
+								} > "$sidecar_tmp"
+								if ! mv "$sidecar_tmp" "$sidecar_output"; then
+									echo "WARNING: failed to finalize slice sidecar for ${round_id}; round emission aborted."
+									rm -f "$round_output" "$metadata_tmp" "$sidecar_tmp" "$sidecar_output"
+								else
+								progress_update_ok=1
+								declare -a progress_targets=()
+								declare -a progress_backups=()
+								declare -a progress_existed=()
+								while IFS=$'\t' read -r progress_file_name progress_start_line progress_reads; do
+									[ -n "$progress_file_name" ] || continue
+									progress_target="$(progress_reads_file_for "$progress_file_name")"
+									progress_backup="${progress_target}.bak.$$"
+									rm -f "$progress_backup"
+									if [ -f "$progress_target" ]; then
+										if ! cp "$progress_target" "$progress_backup"; then
+											echo "WARNING: failed to back up progress file before round commit: $progress_target"
+											progress_update_ok=0
+											break
+										fi
+										progress_existed+=("1")
+									else
+										progress_existed+=("0")
+									fi
+									progress_targets+=("$progress_target")
+									progress_backups+=("$progress_backup")
+									if ! printf '%s\n' "$progress_reads" > "$progress_target"; then
+										echo "WARNING: failed to update progress file during round commit: $progress_target"
+										progress_update_ok=0
+										break
+									fi
+								done < "$tmp_progress"
+
+								if [ "$progress_update_ok" -eq 1 ] && ! mv "$metadata_tmp" "$metadata_output"; then
+									echo "WARNING: failed to finalize round metadata for ${round_id}; round emission aborted."
+									progress_update_ok=0
+								fi
+
+								if [ "$progress_update_ok" -ne 1 ]; then
+									for progress_idx in "${!progress_targets[@]}"; do
+										progress_target="${progress_targets[$progress_idx]}"
+										progress_backup="${progress_backups[$progress_idx]}"
+										progress_had_value="${progress_existed[$progress_idx]}"
+										if [ "$progress_had_value" = "1" ] && [ -f "$progress_backup" ]; then
+											cp "$progress_backup" "$progress_target" 2>/dev/null || true
+										elif [ "$progress_had_value" = "0" ]; then
+											rm -f "$progress_target"
+										fi
+									done
+									rm -f "$round_output" "$metadata_tmp" "$metadata_output" "$sidecar_output" "$sidecar_tmp"
+								else
+									echo "Created a new pod5 in ${round_output}"
+									append_local_round_commit_entry "$slice_fp" "$round_id" || true
+									feeder_log_event "round_commit" "$round_id" "$slice_fp"
+									publish_pending_round
+								fi
+								for progress_idx in "${!progress_backups[@]}"; do
+									rm -f "${progress_backups[$progress_idx]}"
+								done
+								fi
 							fi
-							publish_pending_round
 						fi
+							fi
+							fi
+						fi
+						fi
+					else
+						echo "Buffered unread reads=${collected_reads}; waiting until ${num_reads} reads are available before emitting next round"
 					fi
-				else
-					echo "Buffered unread reads=${collected_reads}; waiting until ${num_reads} reads are available before emitting next round"
-				fi
 
 				rm -f "$tmp_read_info" "$tmp_round_ids" "$tmp_progress"
 			fi

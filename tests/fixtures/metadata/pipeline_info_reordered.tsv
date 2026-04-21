@@ -1,0 +1,5 @@
+Run	Plate	demult_id	Pipeline_ID	Sample_ID	Replicate	Well	Notes
+TestRun	TestPlate	>A1_TestPlate	SampleA_r1	SampleA	1	A1	alpha
+TestRun	TestPlate	>A2_TestPlate	SampleA_r2	SampleA	2	A2	beta
+TestRun	TestPlate	>B1_TestPlate	SampleB_r1	SampleB	1	B1	gamma
+OtherRun	OtherPlate	>C1_OtherPlate	OtherSample_r1	OtherSample	1	C1	delta

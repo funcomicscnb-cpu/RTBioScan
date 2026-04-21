@@ -1,0 +1,4 @@
+Sample_ID	Pipeline_ID	Replicate	Well	Plate	Run	demult_id
+Sample A	SampleA_r1	1	A1	TestPlate	TestRun	>A1_TestPlate
+SampleA	SampleA_r2	2	A2	TestPlate	TestRun	>A2_TestPlate
+SampleB	SampleB_r1	1	B1	TestPlate	TestRun	>B1_TestPlate

@@ -24,7 +24,7 @@ def _run_metadata(
     tmp_path: Path,
     run_id: str = "TestRun",
     metadata_file: str = "pipeline_info.tsv",
-    general_fasta: str = "general.fasta",
+    general_fasta: str | Path = "general_unique.fasta",
     primers_fasta: str = "primers.fasta",
     targets: str | None = "COI|ITS2",
     env: dict[str, str] | None = None,
@@ -42,11 +42,11 @@ def _run_metadata(
         "--do_metadata",
         "--skip_pod5",
         "--metadata",
-        str(FIXTURES / metadata_file),
+        str(metadata_file if isinstance(metadata_file, Path) else FIXTURES / metadata_file),
         "--general_fasta",
-        str(FIXTURES / general_fasta),
+        str(general_fasta if isinstance(general_fasta, Path) else FIXTURES / general_fasta),
         "--primers_fasta",
-        str(FIXTURES / primers_fasta),
+        str(primers_fasta if isinstance(primers_fasta, Path) else FIXTURES / primers_fasta),
     ]
     if targets is not None:
         cmd.extend(["--targets", targets])
@@ -84,7 +84,7 @@ def test_metadata_generation_happy_path_outputs(tmp_path: Path) -> None:
         ">SampleA_COI",
         ">SampleA_ITS2",
         ">SampleB_COI",
-        ">SampleB_ALT2",
+        ">SampleB_ITS2",
     ]
 
     assert samples_file.read_text(encoding="utf-8").splitlines() == [
@@ -114,8 +114,8 @@ def test_metadata_generation_happy_path_outputs(tmp_path: Path) -> None:
         "lookup_key_fallback\tlookup_grammar_used\tmetadata_line_no"
     )
     rows = [line.split("\t") for line in identity_lines[1:]]
-    assert [row[3] for row in rows] == ["COI", "ITS2", "COI", "ITS2", "COI", "COI"]
-    assert [row[7] for row in rows] == ["COI", "ITS2", "COI", "ITS2", "COI", "ALT2"]
+    assert [row[3] for row in rows] == ["COI", "ITS2", "COI", "ITS2", "COI", "ITS2"]
+    assert [row[7] for row in rows] == ["COI", "ITS2", "COI", "ITS2", "COI", "ITS2"]
     assert [row[12] for row in rows] == [
         "1_A1_TestPlate",
         "1_A1_TestPlate",
@@ -132,9 +132,84 @@ def test_metadata_generation_happy_path_outputs(tmp_path: Path) -> None:
         "WELL_PLATE",
         "WELL_PLATE",
     ]
-    assert rows[-1][6] == "fallback"
-    assert rows[-1][8] == "SampleB_ALT2"
-    assert rows[-1][9] == "SampleB_r1_ALT2"
+    assert all(row[6] == "marker" for row in rows)
+    assert rows[-1][8] == "SampleB_ITS2"
+    assert rows[-1][9] == "SampleB_r1_ITS2"
+
+    primers_file = sample_info / "primers.fasta"
+    assert primers_file.exists(), "primers.fasta not created"
+    primers_text = primers_file.read_text(encoding="utf-8")
+    primers_headers = [l for l in primers_text.splitlines() if l.startswith(">")]
+    assert primers_headers == [
+        ">COI_BC.COIv1.BC9.1",
+        ">COI_BC.COIv1.BC9.2",
+        ">ITS2_BC.ITS2v1.BC9.1",
+    ], f"primers.fasta has wrong entries: {primers_headers}"
+    assert ">COI_BC.COIv1.BC9.3" not in primers_text
+    assert ">ITS2_BC.ITS2v1.UNRELATED" not in primers_text
+
+
+def test_track_metadata_rejects_fallback_suffix_resolution(tmp_path: Path) -> None:
+    result = _run_metadata(tmp_path, general_fasta="general.fasta")
+    assert result.returncode != 0
+    assert "fallback suffixes are not permitted for track identity artifacts" in result.stderr
+
+
+def test_track_identity_exact_duplicate_rows_collapse_with_source_lines(tmp_path: Path) -> None:
+    metadata = tmp_path / "pipeline_info_duplicate.tsv"
+    metadata.write_text(
+        "Sample_ID\tPipeline_ID\tReplicate\tWell\tPlate\tRun\tdemult_id\n"
+        "SampleA\tSampleA_r1\t1\tA1\tTestPlate\tTestRun\t>A1_TestPlate\n"
+        "SampleA\tSampleA_r1\t1\tA1\tTestPlate\tTestRun\t>A1_TestPlate\n",
+        encoding="utf-8",
+    )
+
+    result = _run_metadata(tmp_path, metadata_file=metadata)
+    assert result.returncode == 0, f"Script failed:\n{result.stdout}\n{result.stderr}"
+
+    sample_info = tmp_path / "results" / "sample_info" / "TestRun"
+    track_identity = sample_info / "track_identity.tsv"
+    lines = track_identity.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+    rows = [line.split("\t") for line in lines[1:]]
+    assert [row[9] for row in rows] == ["SampleA_r1_COI", "SampleA_r1_ITS2"]
+    assert all(row[15] == "exact_duplicate_collapsed" for row in rows)
+    assert all(row[17] == "3" for row in rows)
+
+
+def test_track_identity_conflicting_duplicate_unit_fails(tmp_path: Path) -> None:
+    metadata = tmp_path / "pipeline_info_conflict.tsv"
+    metadata.write_text(
+        "Sample_ID\tPipeline_ID\tReplicate\tWell\tPlate\tRun\tdemult_id\n"
+        "SampleA\tShared_r1\t1\tA1\tTestPlate\tTestRun\t>A1_TestPlate\n"
+        "SampleB\tShared_r1\t1\tB1\tTestPlate\tTestRun\t>B1_TestPlate\n",
+        encoding="utf-8",
+    )
+
+    result = _run_metadata(tmp_path, metadata_file=metadata)
+    assert result.returncode != 0
+    assert "track identity duplicate conflict for unit_id_track Shared_r1_COI" in result.stderr
+
+
+def test_track_identity_validation_fails_when_track_is_missing_marker(tmp_path: Path) -> None:
+    general = tmp_path / "general_missing_marker.fasta"
+    general.write_text(
+        ">A1_TestPlate\n"
+        "COI_LEFT...COI_RIGHT\n"
+        ">A1_TestPlate\n"
+        "ITS2_LEFT...ITS2_RIGHT\n"
+        ">2_A2_TestPlate\n"
+        "COI_LEFT...COI_RIGHT\n"
+        ">2_A2_TestPlate\n"
+        "ITS2_LEFT...ITS2_RIGHT\n"
+        ">B1_TestPlate\n"
+        "COI_LEFT...COI_RIGHT\n",
+        encoding="utf-8",
+    )
+
+    result = _run_metadata(tmp_path, general_fasta=general)
+    assert result.returncode != 0
+    assert "missing required marker_id ITS2 for track_id SampleB_r1" in result.stderr
 
 
 def test_empty_output_fails_validation(tmp_path: Path) -> None:
@@ -344,6 +419,65 @@ def test_feeder_accumulates_reads_across_multiple_full_pod5_files() -> None:
     assert "if [ \"$collected_reads\" -ge \"$num_reads\" ]; then" in text
     assert "pod5 filter \"${round_inputs[@]}\" --ids \"$tmp_round_ids\" --output \"$round_output\"" in text
     assert "Buffered unread reads=${collected_reads}; waiting until ${num_reads} reads are available before emitting next round" in text
+
+
+def test_feeder_uses_run_scoped_temp_files_and_monotonic_round_ids() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "feeder_tmp_dir()" in text
+    assert "round_id_counter_file()" in text
+    assert "next_round_output_id()" in text
+    assert 'tmp_file_pod5="$(feeder_tmp_dir)/tmp_file_pod5_${run_id}_$$.txt"' in text
+    assert 'tmp_read_info="$(feeder_tmp_dir)/tmp_read_info_${run_id}_$$.tsv"' in text
+    assert 'tmp_round_ids="$(feeder_tmp_dir)/tmp_round_ids_${run_id}_$$.txt"' in text
+    assert 'tmp_progress="$(feeder_tmp_dir)/tmp_round_progress_${run_id}_$$.tsv"' in text
+    assert 'id_count=$(wc -l < "$tmp_round_ids")' in text
+    assert 'read_info_count=$(wc -l < "$tmp_read_info")' in text
+    assert 'if [ ! -s "$tmp_round_ids" ]; then' in text
+    assert 'elif [ "$id_count" -ne "$read_info_count" ]; then' in text
+    assert 'out_id=$(next_round_output_id)' in text
+    assert 'metadata_tmp="${metadata_output}.tmp.$$"' in text
+    assert 'progress_update_ok=1' in text
+    assert 'rm -f "$round_output" "$metadata_tmp" "$metadata_output"' in text
+
+
+def test_round_id_floor_uses_committed_state_only() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    func_text = text.split("next_round_output_id() {", 1)[1].split("\n}\n", 1)[0]
+
+    assert '"$output_folder"/"${run_id}"_*.pod5' not in func_text
+    assert '"$output_rt"/"${run_id}"_*.pod5' not in func_text
+    assert '"$done_round"/"${run_id}"_*.pod5' in func_text
+    assert '"$metadata"/"${run_id}"_*_slice.tsv' in func_text
+    assert '"$metadata"/"${run_id}"_*_read_info_rpt.txt' not in func_text
+    assert 'suffix="${suffix%_slice.tsv}"' in func_text
+    assert '"$metadata"/"${run_id}"_*_slice.tsv; do' in func_text
+
+
+def test_global_feeder_dedup_ignores_same_run_path() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    completion_func = text.split("slice_fp_exists_in_completion_ledger() {", 1)[1].split("\n}\n", 1)[0]
+    prefix_func = text.split("compute_source_prefix() {", 1)[1].split("\n}\n", 1)[0]
+    orphan_func = text.split("startup_cleanup_orphan_rounds() {", 1)[1].split("\n}\n", 1)[0]
+
+    assert 'current_run_path="${RUN_PATH_ABS:-}"' in completion_func
+    assert '$1 == fp && (run_path == "" || $6 != run_path)' in completion_func
+    assert 'local current_run_path="${3:-}"' in prefix_func
+    assert '$2 == fp && (run_path == "" || $6 != run_path)' in prefix_func
+    assert 'compute_source_prefix "$source_fp" "$ledger_path" "${RUN_PATH_ABS:-}"' in text
+    assert 'round_report.json' in orphan_func
+
+
+def test_feeder_recovers_readable_skipped_pod5_on_startup() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    func_text = text.split("startup_recover_valid_skipped_pod5() {", 1)[1].split("\n}\n", 1)[0]
+
+    assert 'for skipped_path in "$output_skipped_pod5"/*.pod5; do' in func_text
+    assert 'pod5_authoritative_read_count "$skipped_path"' in func_text
+    assert 'dest="${output_full_pod5}/${file}"' in func_text
+    assert 'mv -f "$skipped_path" "$dest"' in func_text
+    assert 'rm -f "$flag_path"' in func_text
+    assert 'feeder_log_event "skipped_recover" "$file" ""' in func_text
+    assert "startup_recover_valid_skipped_pod5" in text
 
 
 def test_usage_doc_describes_correct_sample_info_artifact_contracts() -> None:
