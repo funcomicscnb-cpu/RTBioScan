@@ -25,7 +25,7 @@ usage() {
 	echo "	input_folder is the folder where the pod5 will be retrieved from - Ideally the folder created from MinKnow as this will search for all the .pod5 in the folder recursively"
 	echo "	--skip_pod5 to skip pod5 loop"
 	echo "  By default metadata creation is skipped, run --do_metadata to do it"
-	echo "	metadata will be used to retrieve the demultiplexing fastas for the pipeline to work, if not defined will search in: $HOME/Tumbira_Final/Metadata/Pipeline_Information.tsv"
+	echo "	--metadata, --general_fasta, and --primers_fasta are required when --do_metadata is set"
     exit 1
 }
 
@@ -2563,8 +2563,8 @@ POD5_BASE="results/pod5/${run_id}"
 if [ $do_metadata -eq 1 ]; then
 	#Checks on the variables existing
 	if [ -z "$metadata" ];then
-		#######This needs to be changed to the actual file
-		metadata="$HOME/Tumbira_Final/Metadata/Pipeline_Information.tsv"		
+		echo "Error: --metadata is required when --do_metadata is set."
+		usage
 	fi
 	if [ ! -e "$metadata" ];then
 		echo
@@ -2573,8 +2573,8 @@ if [ $do_metadata -eq 1 ]; then
 		usage
 	fi
 	if [ -z "$general_fasta" ];then
-		#####Needs to be updated too
-		general_fasta="$HOME/Tumbira_Final/Metadata/demult_general_with_Tucan.fasta"
+		echo "Error: --general_fasta is required when --do_metadata is set."
+		usage
 	fi
 	if [ ! -e "$general_fasta" ];then
 		echo
@@ -2582,8 +2582,8 @@ if [ $do_metadata -eq 1 ]; then
 		usage
 	fi
 	if [ -z "$primers_fasta" ];then
-		#####Needs to be updated too
-		primers_fasta="$HOME/Tumbira_Final/Metadata/demult_primers.fasta"
+		echo "Error: --primers_fasta is required when --do_metadata is set."
+		usage
 	fi
 	if [ ! -e "$primers_fasta" ];then
 		echo

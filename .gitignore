@@ -1,8 +1,19 @@
+# Local installation overrides — not for version control
+conf/local.config
+
+# Dorado binary and models (large binaries)
+bin/dorado/bin/dorado
+bin/dorado/bin/*.metallib
+bin/dorado/bin/dna_*
+
+# Pipeline working files and outputs
 work/
 results/
+db/
 .nextflow/
-.nextflow.log
-.nextflow.log.*
+.nextflow.log*
+
+# Misc
 Consensus/
 __pycache__/
 *.pyc
