@@ -1,0 +1,11 @@
+work/
+results/
+.nextflow/
+.nextflow.log
+.nextflow.log.*
+Consensus/
+__pycache__/
+*.pyc
+.DS_Store
+.codex_backups/
+*.swp
