@@ -28,12 +28,17 @@ GetOptions(
   'targets=s'                    => \$opt{targets},
   'target-taxa=s'                => \$opt{target_taxa},
   'schema-version=s'             => \$opt{schema_version},
+  'timestamp-utc=s'              => \$opt{timestamp_utc},
   'out=s'                        => \$opt{out},
   'read-info=s'                  => \$opt{read_info},
   'on-target=s'                  => \$opt{on_target},
   'demult=s'                     => \$opt{demult},
+  'read-fate-demult=s'           => \$opt{read_fate_demult},
   'otu-def=s'                    => \$opt{otu_def},
   'blast-otu=s'                  => \$opt{blast_otu},
+  'read-fate-blast=s'            => \$opt{read_fate_blast},
+  'blast-unassigned-ids=s'       => \$opt{blast_unassigned_ids},
+  'read-fate-live-current!'      => \$opt{read_fate_live_current},
   'blast-otu-cumulative=s'       => \$opt{blast_otu_cumulative},
   'blast-noadapter=s'            => \$opt{blast_noadapter},
   'otu-sizes-round=s'            => \$opt{otu_sizes_round},
@@ -41,6 +46,7 @@ GetOptions(
   'consensus-round-provenance=s' => \$opt{consensus_round_provenance},
   'summary=s'                    => \$opt{summary},
   'summary-otu=s'                => \$opt{summary_otu},
+  'round-failed-file=s'          => \$opt{round_failed_file},
   'otu-size-streak-stats=s'      => \$opt{otu_size_streak_stats},
   'otu-size-streak=s'            => \$opt{otu_size_streak},
   'otu-size-streak-mode=s'       => \$opt{otu_size_streak_mode},
@@ -68,9 +74,11 @@ GetOptions(
   'fig-url-prefix=s'             => \$opt{fig_url_prefix},
   'sample-fig-list=s'            => \$opt{sample_fig_list},
   'sample-roster=s'              => \$opt{sample_roster},
+  'track-identity=s'             => \$opt{track_identity},
   'identity-mode=s'              => \$opt{identity_mode},
   'sample-fig-dir=s'             => \$opt{sample_fig_dir},
   'sample-fig-url-prefix=s'      => \$opt{sample_fig_url_prefix},
+  'asset-snapshot-policy=s'      => \$opt{asset_snapshot_policy},
 ) or die "invalid arguments\n";
 
 for my $req (qw(run_id barcode round_barcode out)) {
@@ -86,6 +94,10 @@ if ($opt{identity_mode} eq 'track'
 }
 
 my $g_roster_ready = 0;
+our %TRACK_UNIT_METRICS;
+our %TRACK_UNIT_BY_UNIT_ID;
+our %TRACK_UNIT_BY_TRACK_MARKER;
+our %TRACK_ROSTER_BY_TRACK_ID;
 
 my @warnings;
 my %warned;
@@ -136,6 +148,19 @@ sub get_parsed_rows {
 sub warn_once {
   my ($msg) = @_;
   return if !defined $msg || $msg eq '';
+  if ($msg =~ /^missing_or_empty:(.+)$/) {
+    my $path = $1;
+    return if defined $opt{otu_lock_summary} && $opt{otu_lock_summary} ne '' && $path eq $opt{otu_lock_summary};
+    return if defined $opt{otu_members_blastdiag_stats} && $opt{otu_members_blastdiag_stats} ne '' && $path eq $opt{otu_members_blastdiag_stats};
+    return if defined $opt{otu_size_streak} && $opt{otu_size_streak} ne '' && $path eq $opt{otu_size_streak};
+  }
+  if ($msg =~ /^missing_or_empty_data_rows:(.+)$/) {
+    my $path = $1;
+    return if defined $opt{consensus_round_provenance} && $opt{consensus_round_provenance} ne ''
+      && $path eq $opt{consensus_round_provenance};
+  }
+  return if $msg eq 'otu_fate_universe_empty:strict_round';
+  return if $msg =~ /^size_streak_inputs_missing:/;
   return if $warned{$msg}++;
   push @warnings, $msg;
 }
@@ -393,6 +418,15 @@ sub otu_row_qualifies_for_level {
   return $row->{perc_id} >= $threshold ? 1 : 0;
 }
 
+sub is_kingdom_consistent {
+  my ($kingdom, $marker, $tax_map) = @_;
+  return 1 if !defined $tax_map || ref($tax_map) ne 'HASH';
+  my $expected = $tax_map->{$marker};
+  return 1 if !defined $expected || $expected eq '';  # no constraint → keep
+  return 1 if !defined $kingdom  || $kingdom  eq '';  # unknown kingdom → keep
+  return lc($kingdom) eq lc($expected) ? 1 : 0;
+}
+
 sub clone_threshold_tree {
   my ($root) = @_;
   return {} if !defined $root || ref($root) ne 'HASH';
@@ -486,14 +520,26 @@ sub load_kv_tsv {
 sub resolve_reporting_identity {
   my ($label_raw) = @_;
   return $opt{identity_mode} eq 'track'
-    ? SampleLabel::normalize_sample_label($label_raw)
+    ? normalize_track_reporting_identity($label_raw)
     : SampleLabel::normalize_sample_base($label_raw);
+}
+
+sub normalize_track_reporting_identity {
+  my ($label_raw) = @_;
+  my $label = SampleLabel::normalize_sample_label($label_raw);
+  return $label if !defined $label || $label eq '' || $label eq 'unknown';
+  return $label if SampleLabel::is_no_adapter_label($label);
+  my $marker_pattern = SampleLabel::configured_marker_suffix_pattern();
+  $label =~ s/${marker_pattern}$//i if defined $marker_pattern && $marker_pattern ne '';
+  $label =~ s/_(?:COI|ITS)\d*$//i;
+  return trim_text($label);
 }
 
 sub ensure_sample_entry {
   my ($sample_metrics, $label_to_id, $id_to_label, $label_raw) = @_;
   # Normalize to reporting identity: collapse mode strips replicate suffix _N so that
-  # W_eDNA_1_1, W_eDNA_1_2, ... accumulate into W_eDNA_1; track mode preserves full label.
+  # W_eDNA_1_1, W_eDNA_1_2, ... accumulate into W_eDNA_1; track mode preserves the
+  # track unit while dropping only the terminal marker suffix used in demux reports.
   my $label = resolve_reporting_identity($label_raw);
   $label = 'unknown' if !defined $label || $label eq '';
   if ($opt{identity_mode} eq 'track' && $g_roster_ready
@@ -535,7 +581,9 @@ sub ensure_sample_entry {
 # (i.e. the read comes from a non-replicated sample or the base sample itself).
 sub ensure_replicate_sub_entry {
   my ($entry, $raw_label) = @_;
-  my $rep_label = SampleLabel::normalize_sample_label($raw_label);
+  my $rep_label = $opt{identity_mode} eq 'track'
+    ? normalize_track_reporting_identity($raw_label)
+    : SampleLabel::normalize_sample_label($raw_label);
   $rep_label = 'unknown' if !defined $rep_label || $rep_label eq '';
   return undef if $rep_label eq $entry->{label};
   if (!exists $entry->{replicates}{$rep_label}) {
@@ -616,6 +664,196 @@ sub seed_sample_entries_from_roster {
   close $FH;
 }
 
+sub canonical_track_marker_label {
+  my ($raw) = @_;
+  my $marker = canonical_marker_token($raw);
+  if (!defined $marker || $marker eq '') {
+    $marker = marker_from_token($raw);
+  }
+  return trim_text($marker // '');
+}
+
+sub load_track_roster_lookup {
+  my ($path) = @_;
+  my %by_track_id;
+  return \%by_track_id unless defined $path && $path ne '';
+  my $FH = open_cached_text_handle($path);
+  return \%by_track_id if !defined $FH;
+  my $hdr = <$FH>;
+  die "ERROR: track roster '$path' has no header row\n" unless defined $hdr;
+  chomp $hdr;
+  my @cols = split /\t/, $hdr, -1;
+  my %idx;
+  for my $i (0 .. $#cols) {
+    $idx{$cols[$i]} = $i;
+  }
+  my $sample_idx = header_index_fallback(\%idx, 'sample_id');
+  my $track_idx = header_index_fallback(\%idx, 'track_id');
+  my $repnum_idx = header_index_fallback(\%idx, 'replicate_number');
+  die "ERROR: track roster '$path' is missing sample_id, track_id, or replicate_number\n"
+    unless defined $sample_idx && defined $track_idx && defined $repnum_idx;
+  while (my $line = <$FH>) {
+    chomp $line;
+    next if $line =~ /^\s*$/;
+    next if is_repeated_header_line($line, $hdr);
+    my @f = split /\t/, $line, -1;
+    next if $track_idx > $#f;
+    my $track_id = trim_text($f[$track_idx]);
+    next if $track_id eq '';
+    my $sample_id = ($sample_idx <= $#f) ? trim_text($f[$sample_idx]) : '';
+    my $replicate_number = ($repnum_idx <= $#f) ? trim_text($f[$repnum_idx]) : '';
+    if (exists $by_track_id{$track_id}) {
+      my $prev = $by_track_id{$track_id};
+      if (($prev->{sample_id} // '') ne $sample_id
+          || ($prev->{replicate_number} // '') ne $replicate_number) {
+        die "ERROR: track roster '$path' has conflicting rows for track_id '$track_id'\n";
+      }
+      next;
+    }
+    $by_track_id{$track_id} = {
+      sample_id => $sample_id,
+      track_id => $track_id,
+      replicate_number => $replicate_number,
+    };
+  }
+  close $FH;
+  return \%by_track_id;
+}
+
+sub seed_track_unit_metrics_from_identity {
+  my ($identity_path, $roster_path) = @_;
+  %TRACK_UNIT_METRICS = ();
+  %TRACK_UNIT_BY_UNIT_ID = ();
+  %TRACK_UNIT_BY_TRACK_MARKER = ();
+  %TRACK_ROSTER_BY_TRACK_ID = ();
+  return unless defined $identity_path && $identity_path ne '';
+  if (!-e $identity_path || !-s $identity_path) {
+    die "ERROR: --track-identity '$identity_path' is missing or empty\n";
+  }
+  my $roster_ref = load_track_roster_lookup($roster_path);
+  %TRACK_ROSTER_BY_TRACK_ID = %{$roster_ref};
+  my $FH = open_cached_text_handle($identity_path);
+  die "ERROR: cannot open track identity '$identity_path'\n" if !defined $FH;
+  my $hdr = <$FH>;
+  die "ERROR: track identity '$identity_path' has no header row\n" unless defined $hdr;
+  chomp $hdr;
+  my @cols = split /\t/, $hdr, -1;
+  my %idx;
+  for my $i (0 .. $#cols) {
+    $idx{$cols[$i]} = $i;
+  }
+  my $sample_idx = header_index_fallback(\%idx, 'sample_id');
+  my $track_idx = header_index_fallback(\%idx, 'track_id');
+  my $repnum_idx = header_index_fallback(\%idx, 'replicate_number');
+  my $marker_idx = header_index_fallback(\%idx, 'marker_id');
+  my $unit_idx = header_index_fallback(\%idx, 'unit_id_track');
+  die "ERROR: track identity '$identity_path' is missing sample_id, track_id, replicate_number, marker_id, or unit_id_track\n"
+    unless defined $sample_idx && defined $track_idx && defined $repnum_idx && defined $marker_idx && defined $unit_idx;
+  while (my $line = <$FH>) {
+    chomp $line;
+    next if $line =~ /^\s*$/;
+    next if is_repeated_header_line($line, $hdr);
+    my @f = split /\t/, $line, -1;
+    my $unit_id = ($unit_idx <= $#f) ? trim_text($f[$unit_idx]) : '';
+    next if $unit_id eq '';
+    my $track_id = ($track_idx <= $#f) ? trim_text($f[$track_idx]) : '';
+    die "ERROR: track identity '$identity_path' contains empty track_id for unit '$unit_id'\n"
+      if $track_id eq '';
+    my $marker_id = ($marker_idx <= $#f) ? trim_text($f[$marker_idx]) : '';
+    my $marker_label = canonical_track_marker_label($marker_id);
+    my $roster = $TRACK_ROSTER_BY_TRACK_ID{$track_id};
+    die "ERROR: track identity '$identity_path' references track_id '$track_id' that is absent from roster '$roster_path'\n"
+      if !defined $roster;
+    my $sample_label = trim_text($roster->{sample_id});
+    $sample_label = ($sample_idx <= $#f) ? trim_text($f[$sample_idx]) : '' if $sample_label eq '';
+    my $replicate_number = trim_text($roster->{replicate_number});
+    $replicate_number = ($repnum_idx <= $#f) ? trim_text($f[$repnum_idx]) : '' if $replicate_number eq '';
+    my $sample_replicate_label = '';
+    if ($sample_label ne '' && $replicate_number ne '') {
+      $sample_replicate_label = $sample_label . '_' . $replicate_number;
+    } else {
+      $sample_replicate_label = $track_id;
+    }
+    if (exists $TRACK_UNIT_METRICS{$unit_id}) {
+      my $prev = $TRACK_UNIT_METRICS{$unit_id};
+      if (($prev->{track_replicate_id} // '') ne $track_id
+          || ($prev->{track_primer_label} // '') ne $marker_label) {
+        die "ERROR: track identity '$identity_path' has conflicting rows for unit_id_track '$unit_id'\n";
+      }
+      next;
+    }
+    $TRACK_UNIT_METRICS{$unit_id} = {
+      track_unit_id => $unit_id,
+      track_sample_label => $sample_label,
+      track_replicate_id => $track_id,
+      track_replicate_number => ($replicate_number =~ /^\d+$/ ? 0 + $replicate_number : ($replicate_number ne '' ? $replicate_number : undef)),
+      track_replicate_label => $track_id,
+      track_sample_replicate_label => $sample_replicate_label,
+      track_primer_label => $marker_label,
+      reads_demux => undef,
+      reads_demux_by_marker => blank_marker_count_map(),
+      reads_demux_coi => undef,
+      reads_demux_its2 => undef,
+      reads_blast_assigned => undef,
+      otu_active => undef,
+      consensus_emitted => undef,
+      figures => [],
+    };
+    $TRACK_UNIT_BY_UNIT_ID{$unit_id} = $unit_id;
+    if ($marker_label ne '') {
+      if (exists $TRACK_UNIT_BY_TRACK_MARKER{$track_id}{$marker_label}
+          && $TRACK_UNIT_BY_TRACK_MARKER{$track_id}{$marker_label} ne $unit_id) {
+        die "ERROR: track identity '$identity_path' maps track_id '$track_id' and marker '$marker_label' to multiple unit_id_track values\n";
+      }
+      $TRACK_UNIT_BY_TRACK_MARKER{$track_id}{$marker_label} = $unit_id;
+      if ($marker_id ne '') {
+        if (exists $TRACK_UNIT_BY_TRACK_MARKER{$track_id}{$marker_id}
+            && $TRACK_UNIT_BY_TRACK_MARKER{$track_id}{$marker_id} ne $unit_id) {
+          die "ERROR: track identity '$identity_path' maps track_id '$track_id' and marker '$marker_id' to multiple unit_id_track values\n";
+        }
+        $TRACK_UNIT_BY_TRACK_MARKER{$track_id}{$marker_id} = $unit_id;
+      }
+    }
+  }
+  close $FH;
+}
+
+sub resolve_track_unit_metrics_entry {
+  my ($raw_sample, $sample_label, $marker_raw) = @_;
+  return undef if $opt{identity_mode} ne 'track' || !%TRACK_UNIT_METRICS;
+  my $marker_label = canonical_track_marker_label($marker_raw);
+  for my $candidate ($raw_sample, $sample_label) {
+    my $value = trim_text($candidate // '');
+    next if $value eq '';
+    if (exists $TRACK_UNIT_BY_UNIT_ID{$value}) {
+      return $TRACK_UNIT_METRICS{$TRACK_UNIT_BY_UNIT_ID{$value}};
+    }
+  }
+  for my $track_candidate ($sample_label, $raw_sample) {
+    my $track_id = trim_text($track_candidate // '');
+    next if $track_id eq '';
+    next if !exists $TRACK_UNIT_BY_TRACK_MARKER{$track_id};
+    if ($marker_label ne '' && exists $TRACK_UNIT_BY_TRACK_MARKER{$track_id}{$marker_label}) {
+      my $unit_id = $TRACK_UNIT_BY_TRACK_MARKER{$track_id}{$marker_label};
+      return $TRACK_UNIT_METRICS{$unit_id} if exists $TRACK_UNIT_METRICS{$unit_id};
+    }
+  }
+  return undef;
+}
+
+sub add_track_identity_fields {
+  my ($row, $track_entry) = @_;
+  return unless defined $row && ref($row) eq 'HASH';
+  return unless defined $track_entry && ref($track_entry) eq 'HASH';
+  $row->{track_unit_id} = $track_entry->{track_unit_id};
+  $row->{track_sample_label} = $track_entry->{track_sample_label};
+  $row->{track_replicate_id} = $track_entry->{track_replicate_id};
+  $row->{track_replicate_number} = $track_entry->{track_replicate_number};
+  $row->{track_replicate_label} = $track_entry->{track_replicate_label};
+  $row->{track_sample_replicate_label} = $track_entry->{track_sample_replicate_label};
+  $row->{track_primer_label} = $track_entry->{track_primer_label};
+}
+
 sub header_index_fallback {
   my ($idx, @names) = @_;
   for my $name (@names) {
@@ -626,13 +864,12 @@ sub header_index_fallback {
 
 sub count_rows {
   my ($path, $has_header) = @_;
+  return undef unless defined $path && $path ne '';
   if (exists $_parsed_rows{$path}) {
     return undef unless defined $_parsed_rows{$path};
     return scalar @{$_parsed_rows{$path}};
   }
-  return undef unless defined $path && $path ne '';
   if (!-e $path || !-s $path) {
-    warn_once("missing_or_empty:$path");
     return undef;
   }
   my $FH = open_cached_text_handle($path);
@@ -661,6 +898,7 @@ sub count_rows {
 
 sub count_non_na_in_column {
   my ($path, $header_name) = @_;
+  return undef unless defined $path && $path ne '';
   if (exists $_parsed_rows{$path}) {
     return undef unless defined $_parsed_rows{$path};
     my $count = 0;
@@ -670,7 +908,6 @@ sub count_non_na_in_column {
     }
     return $count;
   }
-  return undef unless defined $path && $path ne '';
   if (!-e $path || !-s $path) {
     warn_once("missing_or_empty:$path");
     return undef;
@@ -759,6 +996,7 @@ sub count_value_in_column {
 
 sub count_unique_column_fallback {
   my ($path, @column_names) = @_;
+  return undef unless defined $path && $path ne '';
   if (exists $_parsed_rows{$path}) {
     return undef unless defined $_parsed_rows{$path};
     my $rows = $_parsed_rows{$path};
@@ -782,7 +1020,6 @@ sub count_unique_column_fallback {
     }
     return scalar keys %seen;
   }
-  return undef unless defined $path && $path ne '';
   if (!-e $path || !-s $path) {
     warn_once("missing_or_empty:$path");
     return undef;
@@ -994,7 +1231,11 @@ sub add_read_fate_reason {
 }
 
 sub build_public_marker_split_read_fate {
-  my ($demult_path, $blast_path, $reads_total, $reads_on_target) = @_;
+  my ($demult_path, $blast_path, $blast_unassigned_ids_path, $reads_total, $reads_on_target, $live_current_mode) = @_;
+  my $first_seen_read_fate_mode = (
+    (defined $demult_path && $demult_path =~ /read_fate_demult_first_seen[.]tsv(?:[.]gz)?$/)
+    || (defined $blast_path && $blast_path =~ /read_fate_blast_first_seen[.]tsv(?:[.]gz)?$/)
+  ) ? 1 : 0;
 
   my %read_fate = (
     demux_total_reads => undef,
@@ -1054,6 +1295,7 @@ sub build_public_marker_split_read_fate {
   my $read_level_marker_failure = 0;
   my $demux_bucket_invalid = 0;
   my $missing_global_total = 0;
+  my $first_seen_stage_lag = 0;
 
   if (!defined $demult_path || $demult_path eq '' || !-e $demult_path || !-s $demult_path) {
     $read_fate{marker_split_fatal_counts}{demux_stage_absent}++;
@@ -1187,16 +1429,31 @@ sub build_public_marker_split_read_fate {
             my $rid = normalize_read_id($f[$read_idx]);
             next if $rid eq '';
             $usable_id_rows++;
-            my $st = $blast_reads{$rid} ||= {
-              bucket_labels => {},
-              bucket_unresolved => 0,
-              source_markers => {
-                demult => {},
-                blast => {},
-                sample_label => {},
-              },
-              assigned => 0,
-            };
+            my $st;
+            if ($live_current_mode) {
+              $st = {
+                bucket_labels => {},
+                bucket_unresolved => 0,
+                source_markers => {
+                  demult => {},
+                  blast => {},
+                  sample_label => {},
+                },
+                assigned => 0,
+              };
+              $blast_reads{$rid} = $st;
+            } else {
+              $st = $blast_reads{$rid} ||= {
+                bucket_labels => {},
+                bucket_unresolved => 0,
+                source_markers => {
+                  demult => {},
+                  blast => {},
+                  sample_label => {},
+                },
+                assigned => 0,
+              };
+            }
             my $sample_raw = (defined $sample_idx && $sample_idx <= $#f) ? $f[$sample_idx] : '';
             my $bucket = classify_read_fate_bucket_label($sample_raw);
             if (defined $bucket) {
@@ -1242,6 +1499,54 @@ sub build_public_marker_split_read_fate {
       $read_fate{blast_assigned_reads} = undef;
       $read_fate{blast_unassigned_reads} = undef;
       $read_fate{blast_seen_reads_unbucketed} = undef;
+    }
+  }
+
+  if (defined $blast_unassigned_ids_path && $blast_unassigned_ids_path ne '' && -e $blast_unassigned_ids_path && -s $blast_unassigned_ids_path) {
+    if (open my $UFH, '<', $blast_unassigned_ids_path) {
+      while (my $line = <$UFH>) {
+        chomp $line;
+        next if $line =~ /^\s*$/;
+        my $rid = normalize_read_id($line);
+        next if $rid eq '';
+        next if !$live_current_mode && exists $blast_reads{$rid};
+        next if !$live_current_mode && !exists $demux_reads{$rid};
+        # Live current-run status uses a cumulative unassigned-ID sidecar. If that
+        # sidecar contains an ID that cannot be resolved through demux metadata,
+        # skip it rather than making the whole run-status bar invalid.
+        next if $live_current_mode && !exists $demux_reads{$rid};
+
+        my %bucket_labels = ();
+        my $bucket_unresolved = $live_current_mode ? 1 : 0;
+        my %demult_markers = ();
+        my %sample_label_markers = ();
+        if (exists $demux_reads{$rid}) {
+          %bucket_labels = %{ $demux_reads{$rid}{bucket_labels} || {} };
+          $bucket_unresolved = $demux_reads{$rid}{bucket_unresolved} ? 1 : 0;
+          %demult_markers = %{ $demux_reads{$rid}{source_markers}{demult} || {} };
+          %sample_label_markers = %{ $demux_reads{$rid}{source_markers}{sample_label} || {} };
+        }
+        next if $live_current_mode && !%demult_markers && !%sample_label_markers;
+
+        my $synthetic = {
+          bucket_labels => { %bucket_labels },
+          bucket_unresolved => $bucket_unresolved,
+          source_markers => {
+            demult => { %demult_markers },
+            blast => {},
+            sample_label => { %sample_label_markers },
+          },
+          assigned => 0,
+        };
+        if ($live_current_mode) {
+          $blast_reads{$rid} = $synthetic;
+        } else {
+          $blast_reads{$rid} = $synthetic;
+        }
+      }
+      close $UFH;
+    } else {
+      warn_once("open_failed:$blast_unassigned_ids_path");
     }
   }
 
@@ -1448,8 +1753,12 @@ sub build_public_marker_split_read_fate {
       && defined $read_fate{demux_total_reads} && defined $read_fate{blast_seen_reads}
       && !$missing_global_total) {
     if ($read_fate{blast_seen_reads} > $read_fate{demux_total_reads}) {
-      $read_fate{marker_split_fatal_counts}{invalid_stage_order_blast_seen_gt_demux}++;
-      add_read_fate_reason(\%data_reasons, \%chart_reasons, 'invalid_stage_order_blast_seen_gt_demux');
+      if ($first_seen_read_fate_mode) {
+        $first_seen_stage_lag = 1;
+      } else {
+        $read_fate{marker_split_fatal_counts}{invalid_stage_order_blast_seen_gt_demux}++;
+        add_read_fate_reason(\%data_reasons, \%chart_reasons, 'invalid_stage_order_blast_seen_gt_demux');
+      }
     }
     if (defined $read_fate{blast_assigned_reads} && defined $read_fate{blast_seen_reads}
         && $read_fate{blast_assigned_reads} > $read_fate{blast_seen_reads}) {
@@ -1536,13 +1845,20 @@ sub build_public_marker_split_read_fate {
       && $blast_stage eq 'usable'
       && defined $read_fate{blast_assigned_reads}
       && defined $read_fate{blast_unassigned_reads}) {
-    my %chart_assigned = %{blank_marker_count_map()};
-    my %chart_unassigned = %{blank_marker_count_map()};
-    my %chart_skipped = %{blank_marker_count_map()};
-    for my $marker (@CONFIGURED_MARKERS) {
+    my @chart_markers = @CONFIGURED_MARKERS ? @CONFIGURED_MARKERS : qw(COI ITS2);
+    my %chart_assigned = (COI => 0, ITS2 => 0);
+    my %chart_unassigned = (COI => 0, ITS2 => 0);
+    my %chart_skipped = (COI => 0, ITS2 => 0);
+    for my $marker (@chart_markers) {
       $chart_assigned{$marker} = $marker_splits{blast_assigned_reads}{$marker} // 0;
       $chart_unassigned{$marker} = $marker_splits{blast_unassigned_reads}{$marker} // 0;
-      $chart_skipped{$marker} = ($marker_splits{demux_total_reads}{$marker} // 0) - ($marker_splits{blast_seen_reads}{$marker} // 0);
+      my $raw_skipped = ($marker_splits{demux_total_reads}{$marker} // 0) - ($marker_splits{blast_seen_reads}{$marker} // 0);
+      if ($raw_skipped < 0 && $first_seen_read_fate_mode) {
+        $first_seen_stage_lag = 1;
+        $chart_skipped{$marker} = 0;
+      } else {
+        $chart_skipped{$marker} = $raw_skipped;
+      }
     }
     %chart_values = (
       chart_blast_assigned_coi => $chart_assigned{COI},
@@ -1567,7 +1883,7 @@ sub build_public_marker_split_read_fate {
     }
     my $chart_total = 0;
     $chart_total += $chart_values{$_} for keys %chart_values;
-    if ($chart_total != $reads_total) {
+    if ($chart_total != $reads_total && !$first_seen_stage_lag) {
       $read_fate{marker_split_fatal_counts}{chart_total_mismatch}++;
       add_read_fate_reason(\%data_reasons, \%chart_reasons, 'chart_total_mismatch');
     }
@@ -1600,7 +1916,7 @@ sub build_public_marker_split_read_fate {
 }
 
 sub collect_blast_read_fate_and_sample_metrics {
-  my ($path, $sample_metrics, $label_to_id, $id_to_label) = @_;
+  my ($path, $sample_metrics, $label_to_id, $id_to_label, $track_unit_metrics) = @_;
   my %out = (
     enabled => 0,
     assignment_status => undef,
@@ -1646,6 +1962,7 @@ sub collect_blast_read_fate_and_sample_metrics {
   my $read_idx = header_index_fallback(\%idx, 'read_id');
   my $sample_idx = header_index_fallback(\%idx, 'sample');
   my $otu_idx = header_index_fallback(\%idx, 'otu_id', 'OTU_id');
+  my $marker_idx = header_index_fallback(\%idx, 'barcode_by_homology');
   my $tax_idx = header_index_fallback(\%idx, 'otu_taxid', 'taxid');
   my $family_idx = header_index_fallback(\%idx, 'otu_family', 'family');
   my $genus_idx = header_index_fallback(\%idx, 'otu_genus', 'genus');
@@ -1671,6 +1988,8 @@ sub collect_blast_read_fate_and_sample_metrics {
   my %seen_sample_assigned_read;
   my %seen_rep_otu;
   my %seen_rep_assigned;
+  my %seen_track_unit_otu;
+  my %seen_track_unit_assigned_read;
   $out{assignment_status} = $has_assignment_columns ? 'classified' : 'unknown';
   while (my $line = <$FH>) {
     chomp $line;
@@ -1707,11 +2026,18 @@ sub collect_blast_read_fate_and_sample_metrics {
     }
 
     next unless defined $sample_idx && $sample_idx <= $#f;
-    my $sid = ensure_sample_entry($sample_metrics, $label_to_id, $id_to_label, $f[$sample_idx]);
+    my $raw_sample = $f[$sample_idx];
+    my $sid = ensure_sample_entry($sample_metrics, $label_to_id, $id_to_label, $raw_sample);
     my $entry = $sample_metrics->{$sid};
-    my $rep   = ensure_replicate_sub_entry($entry, $f[$sample_idx]);
+    my $rep   = ensure_replicate_sub_entry($entry, $raw_sample);
+    my $sample_label = defined $entry ? ($entry->{label} // '') : '';
+    my $marker_raw = (defined $marker_idx && $marker_idx <= $#f) ? $f[$marker_idx] : ((defined $otu_idx && $otu_idx <= $#f) ? $f[$otu_idx] : '');
+    my $track_entry = defined $track_unit_metrics ? resolve_track_unit_metrics_entry($raw_sample, $sample_label, $marker_raw) : undef;
     if ($has_assignment_columns) {
       $entry->{reads_blast_assigned} = 0 unless defined $entry->{reads_blast_assigned};
+      if (defined $track_entry) {
+        $track_entry->{reads_blast_assigned} = 0 unless defined $track_entry->{reads_blast_assigned};
+      }
     }
 
     if (defined $otu_idx && $otu_idx <= $#f) {
@@ -1731,6 +2057,14 @@ sub collect_blast_read_fate_and_sample_metrics {
             $seen_rep_otu{$rep_otu_key} = 1;
           }
         }
+        if (defined $track_entry) {
+          $track_entry->{otu_active} = 0 unless defined $track_entry->{otu_active};
+          my $track_otu_key = $track_entry->{track_unit_id} . "\t" . $otu;
+          if (!$seen_track_unit_otu{$track_otu_key}) {
+            $track_entry->{otu_active}++;
+            $seen_track_unit_otu{$track_otu_key} = 1;
+          }
+        }
       }
     }
 
@@ -1746,6 +2080,13 @@ sub collect_blast_read_fate_and_sample_metrics {
         if (!$seen_rep_assigned{$rep_assign_key}) {
           $rep->{reads_blast_assigned}++;
           $seen_rep_assigned{$rep_assign_key} = 1;
+        }
+      }
+      if (defined $track_entry) {
+        my $track_assign_key = $track_entry->{track_unit_id} . "\t" . $rid;
+        if (!$seen_track_unit_assigned_read{$track_assign_key}) {
+          $track_entry->{reads_blast_assigned}++;
+          $seen_track_unit_assigned_read{$track_assign_key} = 1;
         }
       }
     }
@@ -1804,13 +2145,11 @@ sub collect_blast_read_fate_and_sample_metrics {
 
 sub sum_consensus_round_reads {
   my ($path) = @_;
+  return undef unless defined $path && $path ne '';
   if (exists $_parsed_rows{$path}) {
     return undef unless defined $_parsed_rows{$path};
     my $rows = $_parsed_rows{$path};
-    if (!@$rows) {
-      warn_once("missing_or_empty_data_rows:$path");
-      return undef;
-    }
+    return 0 unless @$rows;
     unless (exists $rows->[0]{reads_used_round}) {
       warn_once("missing_column:$path:reads_used_round");
       return undef;
@@ -1833,7 +2172,6 @@ sub sum_consensus_round_reads {
     }
     return $sum;
   }
-  return undef unless defined $path && $path ne '';
   if (!-e $path || !-s $path) {
     warn_once("missing_or_empty:$path");
     return undef;
@@ -1880,15 +2218,64 @@ sub sum_consensus_round_reads {
     }
   }
   close $FH;
-  if ($data_rows == 0) {
-    warn_once("missing_or_empty_data_rows:$path");
-    return undef;
-  }
+  return 0 if $data_rows == 0;
   if (!$has_numeric) {
     warn_once("missing_numeric_reads_used_round:$path");
     return undef;
   }
   return $sum;
+}
+
+# Convert a raw adapter label (e.g. GAG1_COI_1) to a short rep label (rep_1).
+# Falls back to the raw label when no trailing _N suffix is present.
+sub adapter_to_rep_label {
+  my ($raw) = @_;
+  return ($raw =~ /_(\d+)$/) ? "rep_$1" : $raw;
+}
+
+# Convert a { rep_label => count } hash to a sorted [ { label, count }, ... ] arrayref.
+# Returns undef when fewer than 2 distinct labels (nothing to break down).
+sub _rep_reads_array {
+  my ($h) = @_;
+  return undef unless defined $h && scalar(keys %$h) > 1;
+  my @sorted = map { { label => $_, count => $h->{$_} } }
+    sort {
+      my ($na, $nb) = (0, 0);
+      $na = 0 + $1 if $a =~ /_(\d+)$/;
+      $nb = 0 + $1 if $b =~ /_(\d+)$/;
+      $na <=> $nb || $a cmp $b;
+    } keys %$h;
+  return \@sorted;
+}
+
+# Build { OTU_id => { collapsed_sample => { rep_label => count } } } from
+# otu_def rows (current round). Scoped per collapsed sample so that replicates
+# from different samples never mix under the same rep_N label.
+# Only meaningful in collapse mode; returns {} otherwise.
+sub load_otu_replicate_reads {
+  return {} unless $opt{identity_mode} eq 'collapse';
+  return {} unless defined $opt{otu_def} && $opt{otu_def} ne '';
+  my $rows = $_parsed_rows{$opt{otu_def}};
+  return {} unless defined $rows && @$rows;
+  my %map;  # { OTU_id => { collapsed_sample => { rep_label => count } } }
+  for my $row (@$rows) {
+    my $otu = trim_text($row->{OTU_id} // '');
+    next if $otu eq '' || uc($otu) eq 'NA';
+    my $raw = trim_text($row->{sample} // '');
+    next if $raw eq '' || SampleLabel::is_no_adapter_label($raw);
+    my $collapsed = resolve_reporting_identity($raw);
+    next if $collapsed eq '';
+    my $rep = adapter_to_rep_label($raw);
+    $map{$otu}{$collapsed}{$rep}++;
+  }
+  # Drop sample entries with only one distinct replicate label — no breakdown to show.
+  for my $otu (keys %map) {
+    for my $smp (keys %{$map{$otu}}) {
+      delete $map{$otu}{$smp} if scalar(keys %{$map{$otu}{$smp}}) <= 1;
+    }
+    delete $map{$otu} unless %{$map{$otu}};
+  }
+  return \%map;
 }
 
 sub load_otu_sizes_round {
@@ -1938,22 +2325,26 @@ sub load_otu_sizes_round {
 sub collect_otu_assignments_by_level {
   my ($blast_otu_path, $otu_sizes_path, $spec_interest_ref, $spec_interest_enabled, $lock_frozen_ref, $thresholds_by_level) = @_;
   my %by_level = (species => [], genus => [], family => []);
-  return \%by_level if !defined $blast_otu_path || $blast_otu_path eq '' || !-e $blast_otu_path || !-s $blast_otu_path;
+  my %otu_rep_reads;           # { otu => { collapsed_sample => { rep_label => count } } }
+  my %sample_marker_rep_reads; # { collapsed_sample => { marker => { rep_label => count } } }
+  return (\%by_level, \%otu_rep_reads, \%sample_marker_rep_reads) if !defined $blast_otu_path || $blast_otu_path eq '' || !-e $blast_otu_path || !-s $blast_otu_path;
 
   my $size_map = load_otu_sizes_round($otu_sizes_path);
   my %counts_fallback;
   my %best;
   my %otu_seen;
+  my %raw_otu_sample_rep;    # { otu => { raw_sample => count } } — for OTU-level rep breakdown
+  my %raw_sample_marker_rep; # { raw_sample => { marker => count } } — for consensus-level rep breakdown
 
   my $FH = open_cached_text_handle($blast_otu_path);
   if (!defined $FH) {
     warn_once("open_failed:$blast_otu_path");
-    return \%by_level;
+    return (\%by_level, \%otu_rep_reads, \%sample_marker_rep_reads);
   }
   my $header = <$FH>;
   if (!defined $header) {
     close $FH;
-    return \%by_level;
+    return (\%by_level, \%otu_rep_reads, \%sample_marker_rep_reads);
   }
   chomp $header;
   my @cols = split /\t/, $header, -1;
@@ -1972,12 +2363,13 @@ sub collect_otu_assignments_by_level {
   my $family_idx = header_index_fallback(\%idx, 'otu_family');
   my $genus_idx = header_index_fallback(\%idx, 'otu_genus');
   my $species_idx = header_index_fallback(\%idx, 'otu_species');
+  my $kingdom_idx = header_index_fallback(\%idx, 'otu_kingdom');
   my $read_idx = header_index_fallback(\%idx, 'read_id');
 
   if (!defined $otu_idx) {
     warn_once("missing_column:$blast_otu_path:otu_id_or_OTU_id");
     close $FH;
-    return \%by_level;
+    return (\%by_level, \%otu_rep_reads, \%sample_marker_rep_reads);
   }
 
   while (my $line = <$FH>) {
@@ -1988,9 +2380,20 @@ sub collect_otu_assignments_by_level {
     next if $otu_idx > $#f;
     my $otu = trim_text($f[$otu_idx]);
     next if $otu eq '' || uc($otu) eq 'NA';
-    my $sample = SampleLabel::normalize_sample_base(
-      (defined $sample_idx && $sample_idx <= $#f) ? $f[$sample_idx] : '');
+    my $_raw_sample_col = (defined $sample_idx && $sample_idx <= $#f) ? trim_text($f[$sample_idx]) : '';
+    my $sample = resolve_reporting_identity($_raw_sample_col);
     my $marker = (defined $marker_idx && $marker_idx <= $#f) ? marker_from_token($f[$marker_idx]) : marker_from_token($otu);
+    # Accumulate per-OTU-per-raw-sample and per-marker-per-raw-sample counts
+    # for replicate breakdown (collapse mode only).
+    if ($opt{identity_mode} eq 'collapse'
+        && $_raw_sample_col ne ''
+        && !SampleLabel::is_no_adapter_label($_raw_sample_col)) {
+      $raw_otu_sample_rep{$otu}{$_raw_sample_col}++;
+      my $_mk = $marker ne '' ? $marker : 'OTHER';
+      $raw_sample_marker_rep{$_raw_sample_col}{$_mk}++;
+    }
+    my $kingdom = (defined $kingdom_idx && $kingdom_idx <= $#f) ? trim_text($f[$kingdom_idx]) : '';
+    next unless is_kingdom_consistent($kingdom, $marker, $CONFIGURED_TARGET_TAX_MAP);
     my $key = join("\t", $sample, $marker, $otu);
 
     if (!defined $size_map->{$otu}) {
@@ -2045,6 +2448,42 @@ sub collect_otu_assignments_by_level {
   }
   close $FH;
 
+  # Convert raw-sample counts to { otu => { collapsed_sample => { rep_label => count } } }.
+  for my $otu (keys %raw_otu_sample_rep) {
+    for my $raw (keys %{$raw_otu_sample_rep{$otu}}) {
+      my $collapsed = resolve_reporting_identity($raw);
+      next if $collapsed eq '';
+      my $rep = adapter_to_rep_label($raw);
+      $otu_rep_reads{$otu}{$collapsed}{$rep} += $raw_otu_sample_rep{$otu}{$raw};
+    }
+  }
+  # Prune entries with ≤1 distinct replicate label per sample — no breakdown to show.
+  for my $otu (keys %otu_rep_reads) {
+    for my $smp (keys %{$otu_rep_reads{$otu}}) {
+      delete $otu_rep_reads{$otu}{$smp}
+        if scalar(keys %{$otu_rep_reads{$otu}{$smp}}) <= 1;
+    }
+    delete $otu_rep_reads{$otu} unless %{$otu_rep_reads{$otu}};
+  }
+
+  # Build { collapsed_sample => { marker => { rep_label => count } } } for consensus-level breakdown.
+  for my $raw (keys %raw_sample_marker_rep) {
+    my $collapsed = resolve_reporting_identity($raw);
+    next if $collapsed eq '';
+    my $rep = adapter_to_rep_label($raw);
+    for my $mk (keys %{$raw_sample_marker_rep{$raw}}) {
+      $sample_marker_rep_reads{$collapsed}{$mk}{$rep} += $raw_sample_marker_rep{$raw}{$mk};
+    }
+  }
+  # Prune markers where ≤1 distinct rep label exists — no breakdown to show.
+  for my $smp (keys %sample_marker_rep_reads) {
+    for my $mk (keys %{$sample_marker_rep_reads{$smp}}) {
+      delete $sample_marker_rep_reads{$smp}{$mk}
+        if scalar(keys %{$sample_marker_rep_reads{$smp}{$mk}}) <= 1;
+    }
+    delete $sample_marker_rep_reads{$smp} unless %{$sample_marker_rep_reads{$smp}};
+  }
+
   my @rows;
   for my $key (keys %best) {
     my $row = $best{$key};
@@ -2081,6 +2520,8 @@ sub collect_otu_assignments_by_level {
         otu_ids => {},
         reads_total => 0,
         reads_any => 0,
+        frozen_reads_total => 0,
+        frozen_reads_any => 0,
         perc_min => undef,
         perc_max => undef,
         aln_min => undef,
@@ -2090,9 +2531,21 @@ sub collect_otu_assignments_by_level {
       $g->{genus} = $row->{genus} if defined $row->{genus} && (!defined $g->{genus} || $g->{genus} eq '');
       $g->{species} = $row->{species} if defined $row->{species} && (!defined $g->{species} || $g->{species} eq '');
       $g->{otu_ids}{$row->{otu_id}} = 1 if defined $row->{otu_id};
+      if (defined $row->{otu_id} && exists $otu_rep_reads{$row->{otu_id}}) {
+        my $smp = $row->{sample} // '';
+        if (exists $otu_rep_reads{$row->{otu_id}}{$smp}) {
+          my $rmap = $otu_rep_reads{$row->{otu_id}}{$smp};
+          $g->{rep_reads}{$_} += $rmap->{$_} for keys %$rmap;
+        }
+      }
       if (defined $row->{reads}) {
         $g->{reads_total} += $row->{reads};
         $g->{reads_any} = 1;
+        my $lock_key = normalize_lock_otu_key($row->{otu_id});
+        if ($lock_key ne '' && defined $lock_frozen_ref && exists $lock_frozen_ref->{$lock_key}) {
+          $g->{frozen_reads_total} += $row->{reads};
+          $g->{frozen_reads_any} = 1;
+        }
       }
       if (defined $row->{perc_id}) {
         $g->{perc_min} = $row->{perc_id} if !defined $g->{perc_min} || $row->{perc_id} < $g->{perc_min};
@@ -2113,6 +2566,7 @@ sub collect_otu_assignments_by_level {
         next if $key eq '';
         $frozen_otu_n++ if defined $lock_frozen_ref && exists $lock_frozen_ref->{$key};
       }
+      my $_otu_rep_arr = _rep_reads_array($g->{rep_reads});
       my $row_out = {
         taxon => $g->{taxon},
         sample => $g->{sample},
@@ -2122,16 +2576,22 @@ sub collect_otu_assignments_by_level {
         species => ($g->{species} // ($level eq 'species' ? $g->{taxon} : undef)),
         otu_count => $otu_count,
         frozen_otu_count => $frozen_otu_n,
+        frozen_otu_reads_total => ($g->{reads_any} ? $g->{frozen_reads_total} : undef),
         reads_total => ($g->{reads_any} ? $g->{reads_total} : undef),
         perc_id_min => $g->{perc_min},
         perc_id_max => $g->{perc_max},
         aln_length_min => $g->{aln_min},
         aln_length_max => $g->{aln_max},
+        (defined $_otu_rep_arr ? (replicate_reads => $_otu_rep_arr) : ()),
       };
       if ($level eq 'species' && $spec_interest_enabled) {
         $row_out->{species_interest} = (defined $spec_interest_ref && $spec_interest_ref->{$g->{taxon}})
           ? JSON::PP::true
           : JSON::PP::false;
+      }
+      if ($opt{identity_mode} eq 'track') {
+        my $track_entry = resolve_track_unit_metrics_entry($g->{sample}, $g->{sample}, $g->{marker});
+        add_track_identity_fields($row_out, $track_entry);
       }
       push @agg, $row_out;
     }
@@ -2149,7 +2609,7 @@ sub collect_otu_assignments_by_level {
   }
 
   $by_level{species_interest_enabled} = $spec_interest_enabled ? JSON::PP::true : JSON::PP::false;
-  return \%by_level;
+  return (\%by_level, \%otu_rep_reads, \%sample_marker_rep_reads);
 }
 
 sub load_id_set {
@@ -2169,7 +2629,8 @@ sub load_id_set {
 }
 
 sub collect_consensus_assignments_by_level {
-  my ($blast_consensus_path, $spec_interest_ref, $spec_interest_enabled, $consolidated_cons_ref) = @_;
+  my ($blast_consensus_path, $spec_interest_ref, $spec_interest_enabled, $consolidated_cons_ref, $identity_mode, $sample_marker_rep_reads_ref) = @_;
+  $identity_mode //= 'collapse';
   my %by_level = (species => [], genus => [], family => []);
   return \%by_level if !defined $blast_consensus_path || $blast_consensus_path eq '' || !-e $blast_consensus_path || !-s $blast_consensus_path;
 
@@ -2199,6 +2660,7 @@ sub collect_consensus_assignments_by_level {
   my $family_idx = header_index_fallback(\%idx, 'consensus_family', 'otu_family');
   my $genus_idx = header_index_fallback(\%idx, 'consensus_genus', 'otu_genus');
   my $species_idx = header_index_fallback(\%idx, 'consensus_species', 'otu_species');
+  my $kingdom_idx = header_index_fallback(\%idx, 'consensus_kingdom', 'otu_kingdom');
 
   if (!defined $cons_idx) {
     warn_once("missing_column:$blast_consensus_path:consensus_id");
@@ -2216,9 +2678,11 @@ sub collect_consensus_assignments_by_level {
     next if $cons_idx > $#f;
     my $cons_id = trim_text($f[$cons_idx]);
     next if $cons_id eq '' || $seen_cons{$cons_id}++;
-    my $sample = SampleLabel::normalize_sample_base(
-      (defined $sample_idx && $sample_idx <= $#f) ? $f[$sample_idx] : '');
+    my $raw_sample = (defined $sample_idx && $sample_idx <= $#f) ? trim_text($f[$sample_idx]) : '';
+    my $sample = resolve_reporting_identity($raw_sample);
     my $marker = (defined $marker_idx && $marker_idx <= $#f) ? marker_from_token($f[$marker_idx]) : marker_from_token($cons_id);
+    my $kingdom = (defined $kingdom_idx && $kingdom_idx <= $#f) ? trim_text($f[$kingdom_idx]) : '';
+    next unless is_kingdom_consistent($kingdom, $marker, $CONFIGURED_TARGET_TAX_MAP);
     my $reads = (defined $reads_idx && $reads_idx <= $#f) ? trim_text($f[$reads_idx]) : '';
     $reads = ($reads =~ /^\d+$/) ? 0 + $reads : undef;
     my $_perc_raw2 = do { my $v = (defined $perc_idx && $perc_idx <= $#f) ? trim_text($f[$perc_idx]) : ''; $v ne '' ? $v + 0 : undef };
@@ -2230,6 +2694,7 @@ sub collect_consensus_assignments_by_level {
     my $species = (defined $species_idx && $species_idx <= $#f) ? normalize_taxon($f[$species_idx]) : undef;
     push @rows, {
       consensus_id => $cons_id,
+      raw_sample => $raw_sample,
       sample => $sample,
       marker => $marker,
       reads => $reads,
@@ -2266,6 +2731,8 @@ sub collect_consensus_assignments_by_level {
         cons_ids => {},
         reads_total => 0,
         reads_any => 0,
+        consolidated_reads_total => 0,
+        consolidated_reads_any => 0,
         perc_min => undef,
         perc_max => undef,
         aln_min => undef,
@@ -2278,6 +2745,10 @@ sub collect_consensus_assignments_by_level {
       if (defined $row->{reads}) {
         $g->{reads_total} += $row->{reads};
         $g->{reads_any} = 1;
+        if (defined $row->{consensus_id} && defined $consolidated_cons_ref && exists $consolidated_cons_ref->{$row->{consensus_id}}) {
+          $g->{consolidated_reads_total} += $row->{reads};
+          $g->{consolidated_reads_any} = 1;
+        }
       }
       if (defined $row->{perc_id}) {
         $g->{perc_min} = $row->{perc_id} if !defined $g->{perc_min} || $row->{perc_id} < $g->{perc_min};
@@ -2296,6 +2767,15 @@ sub collect_consensus_assignments_by_level {
       for my $cid (keys %{$g->{cons_ids}}) {
         $consolidated_cons_n++ if defined $consolidated_cons_ref && exists $consolidated_cons_ref->{$cid};
       }
+      # Look up per-replicate read counts from the OTU-blast-derived map (keyed by collapsed sample + marker).
+      # Consensus sequences are built from collapsed reads, so we use the OTU-level replicate distribution
+      # for the same (sample, marker) as a proxy.
+      my $_cons_rep_map;
+      if ($identity_mode eq 'collapse' && defined $sample_marker_rep_reads_ref) {
+        my $_mk = $g->{marker} // 'OTHER';
+        $_cons_rep_map = $sample_marker_rep_reads_ref->{$g->{sample}}{$_mk};
+      }
+      my $_cons_rep_arr = _rep_reads_array($_cons_rep_map);
       my $row_out = {
         taxon => $g->{taxon},
         sample => $g->{sample},
@@ -2305,16 +2785,22 @@ sub collect_consensus_assignments_by_level {
         species => ($g->{species} // ($level eq 'species' ? $g->{taxon} : undef)),
         consensus_count => $cons_count,
         consolidated_consensus_count => $consolidated_cons_n,
+        consolidated_consensus_reads_total => ($g->{reads_any} ? $g->{consolidated_reads_total} : undef),
         reads_total => ($g->{reads_any} ? $g->{reads_total} : undef),
         perc_id_min => $g->{perc_min},
         perc_id_max => $g->{perc_max},
         aln_length_min => $g->{aln_min},
         aln_length_max => $g->{aln_max},
+        (defined $_cons_rep_arr ? (replicate_reads => $_cons_rep_arr) : ()),
       };
       if ($level eq 'species' && $spec_interest_enabled) {
         $row_out->{species_interest} = (defined $spec_interest_ref && $spec_interest_ref->{$g->{taxon}})
           ? JSON::PP::true
           : JSON::PP::false;
+      }
+      if ($opt{identity_mode} eq 'track') {
+        my $track_entry = resolve_track_unit_metrics_entry($g->{sample}, $g->{sample}, $g->{marker});
+        add_track_identity_fields($row_out, $track_entry);
       }
       push @agg, $row_out;
     }
@@ -2337,6 +2823,7 @@ sub collect_consensus_assignments_by_level {
 
 sub consensus_emitted_by_marker_from_provenance {
   my ($path) = @_;
+  return undef unless defined $path && $path ne '';
   if (exists $_parsed_rows{$path}) {
     return undef unless defined $_parsed_rows{$path};
     my %seen;
@@ -2352,7 +2839,6 @@ sub consensus_emitted_by_marker_from_provenance {
     }
     return \%counts;
   }
-  return undef unless defined $path && $path ne '';
   if (!-e $path || !-s $path) {
     warn_once("missing_or_empty:$path");
     return undef;
@@ -2517,6 +3003,7 @@ sub otu_active_by_marker_from_otu_def {
 
 sub otu_assigned_by_marker_from_blast_otu {
   my ($path, $filter_set) = @_;
+  return undef unless defined $path && $path ne '';
   if (exists $_parsed_rows{$path}) {
     return undef unless defined $_parsed_rows{$path};
     my %seen;
@@ -2541,7 +3028,6 @@ sub otu_assigned_by_marker_from_blast_otu {
     }
     return \%counts;
   }
-  return undef unless defined $path && $path ne '';
   if (!-e $path || !-s $path) {
     warn_once("missing_or_empty:$path");
     return undef;
@@ -2613,10 +3099,10 @@ sub otu_counts_by_marker_from_set {
 }
 
 sub kv_value {
-  my ($path, $key) = @_;
+  my ($path, $key, $quiet_missing) = @_;
   return undef unless defined $path && $path ne '';
   if (!-e $path || !-s $path) {
-    warn_once("missing_or_empty:$path");
+    warn_once("missing_or_empty:$path") unless $quiet_missing;
     return undef;
   }
   my $FH = open_cached_text_handle($path);
@@ -2670,6 +3156,7 @@ sub normalize_lock_otu_key {
 
 sub load_blast_otu_flags {
   my ($path) = @_;
+  return undef unless defined $path && $path ne '';
   if (exists $_parsed_rows{$path}) {
     return undef unless defined $_parsed_rows{$path};
     my %flags;
@@ -2706,7 +3193,6 @@ sub load_blast_otu_flags {
     }
     return \%flags;
   }
-  return undef unless defined $path && $path ne '';
   return undef if !-e $path || !-s $path;
   my $FH = open_cached_text_handle($path);
   if (!defined $FH) {
@@ -2791,6 +3277,7 @@ sub otu_lock_sets {
       active_not_frozen => {},
     },
   );
+  return \%out unless defined $path && $path ne '';
   if (exists $_parsed_rows{$path}) {
     return \%out unless defined $_parsed_rows{$path};
     my $rows = $_parsed_rows{$path};
@@ -2849,9 +3336,7 @@ sub otu_lock_sets {
     $out{counts}{active_not_frozen}       = scalar keys %{ $out{sets}{active_not_frozen} };
     return \%out;
   }
-  return \%out unless defined $path && $path ne '';
-  if (!-e $path) {
-    warn_once("missing_or_empty:$path");
+  if (!-e $path || !-s $path) {
     return \%out;
   }
   my $FH = open_cached_text_handle($path);
@@ -2996,12 +3481,10 @@ sub load_size_streak_sets {
   return \%out unless defined $path && $path ne '';
   if (!-e $path) {
     $out{status} = 'missing';
-    warn_once("missing_or_empty:$path");
     return \%out;
   }
   if (!-s $path) {
     $out{status} = 'empty';
-    warn_once("missing_or_empty:$path");
     return \%out;
   }
   my $FH = open_cached_text_handle($path);
@@ -3188,7 +3671,6 @@ sub select_otu_fate_universe {
     return \%sel;
   }
   if ($sizes->{status} eq 'empty' && $otu_def->{status} eq 'empty') {
-    warn_once('otu_fate_universe_empty:strict_round');
     $sel{set} = {};
     $sel{source} = 'none';
     $sel{reason} = 'strict_empty_round';
@@ -3214,6 +3696,7 @@ sub load_blast_unassigned_otus {
     assigned => {},
     seen => {},
   );
+  return \%out unless defined $path && $path ne '';
   if (exists $_parsed_rows{$path}) {
     return \%out unless defined $_parsed_rows{$path};
     my %assigned;
@@ -3244,7 +3727,6 @@ sub load_blast_unassigned_otus {
     $out{enabled}  = 1;
     return \%out;
   }
-  return \%out unless defined $path && $path ne '';
   if (!-e $path || !-s $path) {
     warn_once("missing_or_empty:$path");
     return \%out;
@@ -3385,6 +3867,7 @@ sub build_prune_policy_ctx {
 
 sub count_lock_consolidated {
   my ($path) = @_;
+  return undef unless defined $path && $path ne '';
   if (exists $_parsed_rows{$path}) {
     return undef unless defined $_parsed_rows{$path};
     my $rows = $_parsed_rows{$path};
@@ -3403,9 +3886,7 @@ sub count_lock_consolidated {
     }
     return $count;
   }
-  return undef unless defined $path && $path ne '';
   if (!-e $path || !-s $path) {
-    warn_once("missing_or_empty:$path");
     return undef;
   }
   my $FH = open_cached_text_handle($path);
@@ -3521,15 +4002,29 @@ sub build_figures_from_list {
   return @figures;
 }
 
-my $timestamp_utc = strftime('%Y-%m-%dT%H:%M:%SZ', gmtime());
+my $timestamp_utc = (defined $opt{timestamp_utc} && $opt{timestamp_utc} ne '')
+  ? $opt{timestamp_utc}
+  : strftime('%Y-%m-%dT%H:%M:%SZ', gmtime());
+my $round_status = 'ok';
+my $failure_reason;
+my $failure_stage;
+if (defined $opt{round_failed_file} && $opt{round_failed_file} ne '' && -s $opt{round_failed_file}) {
+  $round_status = 'failed';
+  my $raw = cached_file_text($opt{round_failed_file});
+  if (defined $raw) {
+    $failure_reason = $$raw;
+    $failure_reason =~ s/\s+\z//;
+    $failure_reason = undef if $failure_reason eq '';
+  }
+  $failure_reason //= 'Round failed';
+  $failure_stage = 'fast_on_target_detection';
+}
 
 # Warm parsed-row cache for inputs read multiple times per invocation.
 get_parsed_rows($opt{read_info});
 get_parsed_rows($opt{on_target});
-get_parsed_rows($opt{otu_lock_summary});
 get_parsed_rows($opt{otu_def});
 get_parsed_rows($opt{blast_otu});
-get_parsed_rows($opt{consensus_round_provenance});
 get_parsed_rows($opt{demult});
 
 my $reads_total    = count_rows($opt{read_info}, 1);
@@ -3597,12 +4092,6 @@ if (defined $otu_universe_set) {
   $otu_lock_cons = $otu_lock_cons_raw;
   $otu_lock_frozen = $otu_lock_frozen_raw;
 }
-my $otu_anf_by_marker = defined($otu_active_not_frozen)
-  ? otu_counts_by_marker_from_set(\%otu_fate_universe_set)
-  : undef;
-my $otu_anf_assigned_by_marker = defined($otu_active_not_frozen)
-  ? otu_assigned_by_marker_from_blast_otu($opt{blast_otu}, \%otu_fate_universe_set)
-  : undef;
 my $blast_f_reads = kv_value($opt{otu_blast_filter_stats}, 'kept_reads');
 my $blast_f_otus  = kv_value($opt{otu_blast_filter_stats}, 'kept_otus');
 my $blast_missing_policy = kv_value($opt{otu_blast_filter_stats}, 'missing_policy');
@@ -3611,8 +4100,8 @@ my $blast_mode    = (defined($opt{blast_filter_mode}) && $opt{blast_filter_mode}
 my $cons_emitted       = count_rows($opt{blast_consensus}, 1);
 my $cons_consolidated  = count_rows($opt{consensus_consolidated_ids}, 0);
 
-my $diag_rows_total = kv_value($opt{otu_members_blastdiag_stats}, 'rows_total');
-my $diag_otu_total  = kv_value($opt{otu_members_blastdiag_stats}, 'otu_total');
+my $diag_rows_total = kv_value($opt{otu_members_blastdiag_stats}, 'rows_total', 1);
+my $diag_otu_total  = kv_value($opt{otu_members_blastdiag_stats}, 'otu_total', 1);
 my $blast_assigned_otu_total = count_unique_column_fallback($opt{blast_otu}, 'otu_id', 'OTU_id');
 my $size_streak_mode = defined $opt{otu_size_streak_mode}
   ? lc(trim_text($opt{otu_size_streak_mode}))
@@ -3639,9 +4128,6 @@ my $policy_ctx = build_prune_policy_ctx(
   blast_sets => $blast_unassigned_sets,
   blast_grace_raw => to_nonneg_int($opt{otu_blast_unassigned_grace_rounds}),
 );
-if ($policy_ctx->{size_enabled} && !$policy_ctx->{size_possible}) {
-  warn_once("size_streak_inputs_missing:$opt{otu_sizes_round}");
-}
 my $blast_unassigned_grace = $policy_ctx->{blast_grace_active} ? 1 : 0;
 my $size_grace = $policy_ctx->{size_grace_active} ? 1 : 0;
 if (!defined $round_index && defined $opt{otu_blast_filter_skip_rounds} && $opt{otu_blast_filter_skip_rounds} =~ /^[0-9]+$/) {
@@ -3732,6 +4218,9 @@ seed_sample_entries_from_roster(
   \%sample_label_to_id,
   \%sample_id_to_label,
 );
+if ($opt{identity_mode} eq 'track' && defined $opt{track_identity} && $opt{track_identity} ne '') {
+  seed_track_unit_metrics_from_identity($opt{track_identity}, $opt{sample_roster});
+}
 $g_roster_ready = 1;
 my $demux_total_reads = 0;
 my $no_adapter_reads = 0;
@@ -3775,14 +4264,14 @@ if ($informative_source_available) {
 my $otu_informative_by_marker = $informative_source_available
   ? otu_counts_by_marker_from_set(\%otu_informative_set)
   : undef;
-my $otu_informative_assigned_by_marker = $informative_source_available
-  ? otu_assigned_by_marker_from_blast_otu($opt{blast_otu}, \%otu_informative_set)
-  : undef;
-my $consolidated_cons_set = load_id_set($opt{consensus_consolidated_ids});
 my $_blast_otu_for_sunburst = (defined $opt{blast_otu_cumulative} && $opt{blast_otu_cumulative} ne '' && -s $opt{blast_otu_cumulative})
   ? $opt{blast_otu_cumulative} : $opt{blast_otu};
-my $otu_assignments_by_level = collect_otu_assignments_by_level($_blast_otu_for_sunburst, $opt{otu_sizes_round}, \%spec_interest, $spec_interest_enabled, $lock_frozen_set, $otu_assignment_thresholds);
-my $consensus_assignments_by_level = collect_consensus_assignments_by_level($opt{blast_consensus}, \%spec_interest, $spec_interest_enabled, $consolidated_cons_set);
+my $otu_informative_assigned_by_marker = $informative_source_available
+  ? otu_assigned_by_marker_from_blast_otu($_blast_otu_for_sunburst, \%otu_informative_set)
+  : undef;
+my $consolidated_cons_set = load_id_set($opt{consensus_consolidated_ids});
+my ($otu_assignments_by_level, $otu_rep_reads, $sample_marker_rep_reads) = collect_otu_assignments_by_level($_blast_otu_for_sunburst, $opt{otu_sizes_round}, \%spec_interest, $spec_interest_enabled, $lock_frozen_set, $otu_assignment_thresholds);
+my $consensus_assignments_by_level = collect_consensus_assignments_by_level($opt{blast_consensus}, \%spec_interest, $spec_interest_enabled, $consolidated_cons_set, $opt{identity_mode}, $sample_marker_rep_reads);
 my %otu_active_by_marker_taxon = (
   assigned => blank_marker_count_map(),
   unassigned => blank_marker_count_map(),
@@ -3793,14 +4282,14 @@ my %otu_active_by_marker_taxon = (
   its2_unassigned => undef,
   other_unassigned => undef,
 );
-if (defined $otu_anf_by_marker || defined $otu_anf_assigned_by_marker) {
+if (defined $otu_informative_by_marker || defined $otu_informative_assigned_by_marker) {
   my @_anf_markers = @CONFIGURED_MARKERS ? @CONFIGURED_MARKERS : qw(COI ITS2);
   for my $marker (@_anf_markers, 'OTHER') {
-    my $total = defined $otu_anf_by_marker
-      ? (exists $otu_anf_by_marker->{$marker} ? $otu_anf_by_marker->{$marker} : 0)
+    my $total = defined $otu_informative_by_marker
+      ? (exists $otu_informative_by_marker->{$marker} ? $otu_informative_by_marker->{$marker} : 0)
       : undef;
-    my $assigned = defined $otu_anf_assigned_by_marker
-      ? (exists $otu_anf_assigned_by_marker->{$marker} ? $otu_anf_assigned_by_marker->{$marker} : 0)
+    my $assigned = defined $otu_informative_assigned_by_marker
+      ? (exists $otu_informative_assigned_by_marker->{$marker} ? $otu_informative_assigned_by_marker->{$marker} : 0)
       : undef;
     $otu_active_by_marker_taxon{assigned}{$marker} =
       defined($assigned) ? 0 + $assigned : undef;
@@ -3848,14 +4337,12 @@ if (defined $debug_otu_out && $debug_otu_out ne '') {
     if ($informative_source_available) {
       $info_in_blast = 0;
       $info_missing = 0;
-      $info_assigned_taxid = 0;
       $info_assigned_text = 0;
       $info_text_no_taxid = 0;
       for my $otu (keys %otu_informative_set) {
         if (defined $flags && exists $flags->{$otu}) {
           $info_in_blast++;
           my $f = $flags->{$otu};
-          $info_assigned_taxid++ if $f->{taxid};
           if ($f->{text}) {
             $info_assigned_text++;
             $info_text_no_taxid++ if !$f->{taxid};
@@ -3867,6 +4354,12 @@ if (defined $debug_otu_out && $debug_otu_out ne '') {
         } else {
           $info_missing++;
         }
+      }
+      # informative_assigned_taxid: use cumulative blast count so it is
+      # consistent with informative_assigned_taxid_{marker} and the barplot.
+      if (defined $otu_informative_assigned_by_marker) {
+        $info_assigned_taxid = 0;
+        $info_assigned_taxid += $_ for values %{$otu_informative_assigned_by_marker};
       }
     }
 
@@ -4022,6 +4515,12 @@ if (defined $opt{demult} && $opt{demult} ne '') {
             }
           }
           increment_sample_demux_marker_counts($entry, $_dmx_marker);
+          my $track_entry = resolve_track_unit_metrics_entry($sample_val, $entry->{label}, $_dmx_marker);
+          if (defined $track_entry) {
+            $track_entry->{reads_demux} = 0 unless defined $track_entry->{reads_demux};
+            $track_entry->{reads_demux}++;
+            increment_sample_demux_marker_counts($track_entry, $_dmx_marker);
+          }
           my $rep_dmx = ensure_replicate_sub_entry($entry, $sample_val);
           if (defined $rep_dmx) {
             $rep_dmx->{reads_demux} = 0 unless defined $rep_dmx->{reads_demux};
@@ -4071,6 +4570,12 @@ if (defined $opt{demult} && $opt{demult} ne '') {
               }
             }
             increment_sample_demux_marker_counts($entry, $_dmx_marker);
+            my $track_entry = resolve_track_unit_metrics_entry($f[$sample_idx], $entry->{label}, $_dmx_marker);
+            if (defined $track_entry) {
+              $track_entry->{reads_demux} = 0 unless defined $track_entry->{reads_demux};
+              $track_entry->{reads_demux}++;
+              increment_sample_demux_marker_counts($track_entry, $_dmx_marker);
+            }
             my $rep_dmx = ensure_replicate_sub_entry($entry, $f[$sample_idx]);
             if (defined $rep_dmx) {
               $rep_dmx->{reads_demux} = 0 unless defined $rep_dmx->{reads_demux};
@@ -4093,6 +4598,7 @@ my $blast_read_fate = collect_blast_read_fate_and_sample_metrics(
   \%sample_metrics,
   \%sample_label_to_id,
   \%sample_id_to_label,
+  ((scalar keys %TRACK_UNIT_METRICS) ? \%TRACK_UNIT_METRICS : undef),
 );
 if ($blast_read_fate->{enabled}) {
   $blast_assignment_status = $blast_read_fate->{assignment_status};
@@ -4125,12 +4631,14 @@ if (defined $opt{blast_consensus} && $opt{blast_consensus} ne '') {
         }
         my $sample_idx = header_index_fallback(\%idx, 'sample');
         my $cons_idx = header_index_fallback(\%idx, 'consensus_id', 'long_seq_id');
+        my $marker_idx = header_index_fallback(\%idx, 'barcode_by_homology');
         if (!defined $sample_idx) {
           warn_once("missing_column:$opt{blast_consensus}:sample");
         } elsif (!defined $cons_idx) {
           warn_once("missing_column:$opt{blast_consensus}:consensus_id_or_long_seq_id");
         } else {
           my %seen_sample_consensus;
+          my %seen_track_unit_consensus;
           while (my $line = <$FH>) {
             chomp $line;
             next if $line =~ /^\s*$/;
@@ -4146,6 +4654,16 @@ if (defined $opt{blast_consensus} && $opt{blast_consensus} ne '') {
             if (!$seen_sample_consensus{$k}) {
               $entry->{consensus_emitted}++;
               $seen_sample_consensus{$k} = 1;
+            }
+            my $marker_raw = (defined $marker_idx && $marker_idx <= $#f) ? $f[$marker_idx] : $cons_id;
+            my $track_entry = resolve_track_unit_metrics_entry($f[$sample_idx], $entry->{label}, $marker_raw);
+            if (defined $track_entry) {
+              $track_entry->{consensus_emitted} = 0 unless defined $track_entry->{consensus_emitted};
+              my $track_k = $track_entry->{track_unit_id} . "\t" . $cons_id;
+              if (!$seen_track_unit_consensus{$track_k}) {
+                $track_entry->{consensus_emitted}++;
+                $seen_track_unit_consensus{$track_k} = 1;
+              }
             }
             my $rep_cons = ensure_replicate_sub_entry($entry, $f[$sample_idx]);
             if (defined $rep_cons) {
@@ -4259,11 +4777,22 @@ if (defined $opt{demult} && $opt{demult} ne '' && -s $opt{demult}) {
   $demux_enabled = JSON::PP::false();
 }
 
+my $read_fate_demult_path = $opt{demult};
+if (defined $opt{read_fate_demult} && $opt{read_fate_demult} ne '' && -e $opt{read_fate_demult} && -s $opt{read_fate_demult}) {
+  $read_fate_demult_path = $opt{read_fate_demult};
+}
+my $read_fate_blast_path = $opt{blast_otu};
+if (defined $opt{read_fate_blast} && $opt{read_fate_blast} ne '' && -e $opt{read_fate_blast} && -s $opt{read_fate_blast}) {
+  $read_fate_blast_path = $opt{read_fate_blast};
+}
+
 my $public_read_fate = build_public_marker_split_read_fate(
-  $opt{demult},
-  $opt{blast_otu},
+  $read_fate_demult_path,
+  $read_fate_blast_path,
+  $opt{blast_unassigned_ids},
   $reads_total,
   $reads_on_target,
+  $opt{read_fate_live_current} ? 1 : 0,
 );
 
 # Sample-specific figures: manifest is resolved per sample_id under
@@ -4290,6 +4819,21 @@ for my $sid (keys %sample_metrics) {
     },
   );
   $sample_entry->{figures} = \@sample_figures;
+}
+if ($opt{identity_mode} eq 'track' && %TRACK_UNIT_METRICS) {
+  for my $unit_id (keys %TRACK_UNIT_METRICS) {
+    my $track_entry = $TRACK_UNIT_METRICS{$unit_id};
+    my $replicate_label = $track_entry->{track_replicate_label} // '';
+    next if $replicate_label eq '';
+    next if !exists $sample_label_to_id{$replicate_label};
+    my $sample_sid = $sample_label_to_id{$replicate_label};
+    my $sample_entry = $sample_metrics{$sample_sid};
+    my @sample_figures = ();
+    if (defined $sample_entry && ref($sample_entry->{figures}) eq 'ARRAY') {
+      @sample_figures = @{$sample_entry->{figures}};
+    }
+    $track_entry->{figures} = \@sample_figures;
+  }
 }
 
 my @figures;
@@ -4439,6 +4983,16 @@ if (defined $opt{fig_dir} && $opt{fig_dir} ne '') {
   }
 }
 
+# Convert { OTU_id => { collapsed_sample => {rep=>count} } } to
+# { OTU_id => { collapsed_sample => [{label,count},...] } } for JSON serialisation.
+my %_otu_rep_reads_json;
+for my $_otu_key (keys %$otu_rep_reads) {
+  for my $_smp (keys %{$otu_rep_reads->{$_otu_key}}) {
+    my $_arr = _rep_reads_array($otu_rep_reads->{$_otu_key}{$_smp});
+    $_otu_rep_reads_json{$_otu_key}{$_smp} = $_arr if defined $_arr;
+  }
+}
+
 my $obj = {
   schema_version => $opt{schema_version},
   run_id         => $opt{run_id},
@@ -4446,6 +5000,10 @@ my $obj = {
   barcode        => $opt{barcode},
   round_barcode  => $opt{round_barcode},
   timestamp_utc  => $timestamp_utc,
+  asset_snapshot_policy => (defined($opt{asset_snapshot_policy}) && $opt{asset_snapshot_policy} ne '' ? $opt{asset_snapshot_policy} : undef),
+  round_status   => $round_status,
+  failure_reason => $failure_reason,
+  failure_stage  => $failure_stage,
   markers => {
     order => \@CONFIGURED_MARKERS,
     target_taxa_by_marker => $CONFIGURED_TARGET_TAX_MAP,
@@ -4489,6 +5047,7 @@ my $obj = {
     prune_candidates_round => $prune_candidates_round,
     active_by_marker_taxon => \%otu_active_by_marker_taxon,
     assignments_by_level   => $otu_assignments_by_level,
+    (%_otu_rep_reads_json ? (replicate_reads => \%_otu_rep_reads_json) : ()),
   },
   blast => {
     filtered_reads => (defined($blast_f_reads) ? 0 + $blast_f_reads : undef),
@@ -4506,7 +5065,9 @@ my $obj = {
   assignment_thresholds => {
     otu => clone_threshold_tree($otu_assignment_thresholds),
   },
+  identity_mode => $opt{identity_mode},
   sample_metrics => \%sample_metrics,
+  (%TRACK_UNIT_METRICS ? (track_unit_metrics => \%TRACK_UNIT_METRICS) : ()),
   figures => \@figures,
   warnings => \@warnings,
 };

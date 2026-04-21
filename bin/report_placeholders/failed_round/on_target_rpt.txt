@@ -1,0 +1,1 @@
+read_id	qc_filter	barcode	kingdom	kingdom_perc_identity	kingdom_aln_length	on_target_kingdom

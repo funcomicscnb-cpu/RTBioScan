@@ -188,7 +188,8 @@ case "$policy" in
 							effective=adapter;
 						} else {
 							if (is_unusable(barcode)) {
-								fatal("ERROR: track mode requires usable adapter= or barcode= token for read " id);
+								print "WARN: track mode skipping unannotated read (no usable adapter or barcode): " id > "/dev/stderr";
+								next;
 							}
 							if (is_no_adapter(barcode)) {
 								fatal("ERROR: barcode=no_adapter does not qualify for track-mode no-adapter handling for read " id);

@@ -18,16 +18,19 @@ my $context = lc($ENV{"RTBIOSCAN_DEMUX_IDENTITY_CONTEXT"} || '');
 die "ERROR: RTBIOSCAN_DEMUX_IDENTITY_CONTEXT is required\n" if $context eq '';
 
 sub ensure_dirs {
-	if (!-d "single_exp") {
-		system "mkdir -p single_exp/fastq/hac";
-		system "mkdir -p single_exp/fastq/sup";
-		system "mkdir -p single_exp/fastq/fast";
-		system "mkdir -p $results_dir/single_exp/fastq/hac";
-		system "mkdir -p $results_dir/single_exp/fastq/sup";
-		system "mkdir -p $results_dir/single_exp/fastq/fast";
-		system "mkdir -p $results_dir/single_exp/fasta/hac";
-		system "mkdir -p $results_dir/single_exp/fasta/sup";
-		system "mkdir -p $results_dir/single_exp/fasta/fast";
+	for my $dir (
+		"single_exp/fastq/hac",
+		"single_exp/fastq/sup",
+		"single_exp/fastq/fast",
+		"$results_dir/single_exp/fastq/hac",
+		"$results_dir/single_exp/fastq/sup",
+		"$results_dir/single_exp/fastq/fast",
+		"$results_dir/single_exp/fasta/hac",
+		"$results_dir/single_exp/fasta/sup",
+		"$results_dir/single_exp/fasta/fast",
+	) {
+		next if -d $dir;
+		system("mkdir", "-p", $dir) == 0 or die "ERROR: failed to create directory $dir\n";
 	}
 }
 

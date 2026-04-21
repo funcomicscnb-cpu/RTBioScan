@@ -1,7 +1,11 @@
 import os
 from pathlib import Path
+import pty
 import re
+import select
+import shlex
 import subprocess
+import time
 
 import pytest
 
@@ -251,8 +255,10 @@ def _find_masked_shell_command_starts(text: str) -> list[int]:
                     expect_command_start = False
                     continue
             if text[idx] == ")":
-                next_idx = _skip_inline_shell_whitespace(text, idx + 1)
-                if next_idx > idx + 1 and _looks_like_shell_command_token(text, next_idx):
+                next_idx = idx + 1
+                while next_idx < len(text) and text[next_idx] in (_INLINE_SHELL_WS + "\n"):
+                    next_idx += 1
+                if next_idx < len(text) and _looks_like_shell_command_token(text, next_idx):
                     idx = next_idx
                     in_case_patterns = False
                     expect_command_start = True
@@ -392,6 +398,12 @@ def _make_nextflow_shim(
     run_stdout: str = "",
     run_stderr: str = "NEXTFLOW_RUN_SENTINEL\n",
     run_exit: int = 86,
+    log_stdout: str = "",
+    log_stderr: str = "",
+    log_exit: int = 0,
+    clean_stdout: str = "",
+    clean_stderr: str = "",
+    clean_exit: int = 0,
 ) -> tuple[dict[str, str], Path]:
     shim_dir = tmp_path / "nextflow-shim"
     shim_dir.mkdir(parents=True, exist_ok=True)
@@ -410,7 +422,7 @@ def _make_nextflow_shim(
         "subcmd=''\n"
         "for arg in \"$@\"; do\n"
         "  case \"$arg\" in\n"
-        "    config|run)\n"
+        "    config|run|log|clean)\n"
         "      subcmd=\"$arg\"\n"
         "      break\n"
         "      ;;\n"
@@ -426,6 +438,16 @@ def _make_nextflow_shim(
         "    printf '%s' \"${NEXTFLOW_SHIM_RUN_STDERR:-}\" >&2\n"
         "    exit \"${NEXTFLOW_SHIM_RUN_EXIT:-0}\"\n"
         "    ;;\n"
+        "  log)\n"
+        "    printf '%s' \"${NEXTFLOW_SHIM_LOG_STDOUT:-}\"\n"
+        "    printf '%s' \"${NEXTFLOW_SHIM_LOG_STDERR:-}\" >&2\n"
+        "    exit \"${NEXTFLOW_SHIM_LOG_EXIT:-0}\"\n"
+        "    ;;\n"
+        "  clean)\n"
+        "    printf '%s' \"${NEXTFLOW_SHIM_CLEAN_STDOUT:-}\"\n"
+        "    printf '%s' \"${NEXTFLOW_SHIM_CLEAN_STDERR:-}\" >&2\n"
+        "    exit \"${NEXTFLOW_SHIM_CLEAN_EXIT:-0}\"\n"
+        "    ;;\n"
         "esac\n"
         "echo 'unexpected nextflow invocation' >&2\n"
         "exit 98\n",
@@ -440,7 +462,140 @@ def _make_nextflow_shim(
     env["NEXTFLOW_SHIM_RUN_STDOUT"] = run_stdout
     env["NEXTFLOW_SHIM_RUN_STDERR"] = run_stderr
     env["NEXTFLOW_SHIM_RUN_EXIT"] = str(run_exit)
+    env["NEXTFLOW_SHIM_LOG_STDOUT"] = log_stdout
+    env["NEXTFLOW_SHIM_LOG_STDERR"] = log_stderr
+    env["NEXTFLOW_SHIM_LOG_EXIT"] = str(log_exit)
+    env["NEXTFLOW_SHIM_CLEAN_STDOUT"] = clean_stdout
+    env["NEXTFLOW_SHIM_CLEAN_STDERR"] = clean_stderr
+    env["NEXTFLOW_SHIM_CLEAN_EXIT"] = str(clean_exit)
     return env, log_path
+
+
+def _make_wrapper_root(tmp_path: Path) -> tuple[Path, Path]:
+    wrapper_root = tmp_path / "wrapper_root"
+    (wrapper_root / "bin" / "lib").mkdir(parents=True)
+    script = wrapper_root / "RTBioScan.sh"
+    script.write_text((REPO_ROOT / "RTBioScan.sh").read_text(encoding="utf-8"), encoding="utf-8")
+    (wrapper_root / "bin" / "lib" / "stale_lock_utils.sh").write_text(
+        (REPO_ROOT / "bin" / "lib" / "stale_lock_utils.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    return wrapper_root, script
+
+
+def _write_wrapper_nextflow_shim(
+    wrapper_root: Path,
+    env: dict[str, str],
+    *,
+    log_stdout: str = "",
+    log_stderr: str = "",
+    log_exit: int = 0,
+    clean_stdout: str = "",
+    clean_stderr: str = "",
+    clean_exit: int = 0,
+) -> Path:
+    log_path = wrapper_root / "nextflow_calls.log"
+    shim_path = wrapper_root / "nextflow"
+    shim_path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "{\n"
+        "  printf 'PWD\\t%s\\n' \"$PWD\"\n"
+        "  for arg in \"$@\"; do\n"
+        "    printf 'ARG\\t%s\\n' \"$arg\"\n"
+        "  done\n"
+        "  printf 'END\\n'\n"
+        "} >> \"$NEXTFLOW_SHIM_LOG\"\n"
+        "subcmd=''\n"
+        "for arg in \"$@\"; do\n"
+        "  case \"$arg\" in\n"
+        "    log|clean)\n"
+        "      subcmd=\"$arg\"\n"
+        "      break\n"
+        "      ;;\n"
+        "  esac\n"
+        "done\n"
+        "case \"$subcmd\" in\n"
+        "  log)\n"
+        "    printf '%s' \"${NEXTFLOW_SHIM_LOG_STDOUT:-}\"\n"
+        "    printf '%s' \"${NEXTFLOW_SHIM_LOG_STDERR:-}\" >&2\n"
+        "    exit \"${NEXTFLOW_SHIM_LOG_EXIT:-0}\"\n"
+        "    ;;\n"
+        "  clean)\n"
+        "    printf '%s' \"${NEXTFLOW_SHIM_CLEAN_STDOUT:-}\"\n"
+        "    printf '%s' \"${NEXTFLOW_SHIM_CLEAN_STDERR:-}\" >&2\n"
+        "    exit \"${NEXTFLOW_SHIM_CLEAN_EXIT:-0}\"\n"
+        "    ;;\n"
+        "esac\n"
+        "echo 'unexpected nextflow invocation' >&2\n"
+        "exit 98\n",
+        encoding="utf-8",
+    )
+    shim_path.chmod(0o755)
+    env["NEXTFLOW_SHIM_LOG"] = str(log_path)
+    env["NEXTFLOW_SHIM_LOG_STDOUT"] = log_stdout
+    env["NEXTFLOW_SHIM_LOG_STDERR"] = log_stderr
+    env["NEXTFLOW_SHIM_LOG_EXIT"] = str(log_exit)
+    env["NEXTFLOW_SHIM_CLEAN_STDOUT"] = clean_stdout
+    env["NEXTFLOW_SHIM_CLEAN_STDERR"] = clean_stderr
+    env["NEXTFLOW_SHIM_CLEAN_EXIT"] = str(clean_exit)
+    return log_path
+
+
+def _run_command_via_pty(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    wait_for_output: str,
+    input_bytes: bytes,
+    timeout: float = 10.0,
+) -> tuple[int, str]:
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        os.chdir(cwd)
+        os.execvpe(argv[0], argv, env)
+
+    output = bytearray()
+    prompt_bytes = wait_for_output.encode("utf-8")
+    input_sent = False
+    deadline = time.time() + timeout
+    exit_status: int | None = None
+
+    try:
+        while True:
+            if time.time() > deadline:
+                os.kill(pid, 9)
+                _, exit_status = os.waitpid(pid, 0)
+                partial_output = output.decode("utf-8", errors="replace")
+                raise AssertionError(f"timed out waiting for PTY command completion; output={partial_output!r}")
+
+            ready, _, _ = select.select([master_fd], [], [], 0.1)
+            if master_fd in ready:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    output.extend(chunk)
+                    if (not input_sent) and prompt_bytes in output:
+                        os.write(master_fd, input_bytes)
+                        input_sent = True
+
+            waited_pid, waited_status = os.waitpid(pid, os.WNOHANG)
+            if waited_pid == pid:
+                exit_status = waited_status
+                break
+
+        if not input_sent:
+            raise AssertionError(f"did not observe PTY prompt {wait_for_output!r}")
+    finally:
+        os.close(master_fd)
+
+    if exit_status is None:
+        raise AssertionError("missing PTY child exit status")
+
+    return os.waitstatus_to_exitcode(exit_status), output.decode("utf-8", errors="replace")
 
 
 def _read_nextflow_invocations(log_path: Path) -> list[tuple[str, list[str]]]:
@@ -461,6 +616,20 @@ def _read_nextflow_invocations(log_path: Path) -> list[tuple[str, list[str]]]:
         elif kind == "ARG":
             args.append(value)
     return invocations
+
+
+def _write_wrapper_ps_shim(wrapper_root: Path, lines: list[str]) -> Path:
+    ps_path = wrapper_root / "bin" / "ps"
+    ps_path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        "cat <<'EOF'\n"
+        + "\n".join(lines)
+        + "\nEOF\n",
+        encoding="utf-8",
+    )
+    ps_path.chmod(0o755)
+    return ps_path
 
 
 def _metadata_fixture_args(run_id: str = "TestRun") -> list[str]:
@@ -565,9 +734,8 @@ def test_main_nf_supports_primers_only_demultiplex_mode() -> None:
     demux_config_text = (REPO_ROOT / "lib" / "DemuxConfig.groovy").read_text(encoding="utf-8")
     assert "final String mode;" in demux_config_text
     assert 'DEMUX_MODE=\\"${mode ?: \'off\'}\\"' in demux_config_text
-    assert "if (mode in ['primers_only', 'primers-only', 'primer_only', 'primer-only'])" in text
+    assert "if (mode == 'primers_only') {" in text
     assert "return new DemuxConfig(true, 'primers_only', null, absPath(params.primer_indexes?.toString()))" in text
-    assert "if (demuxCfg.mode == 'primers_only') {" in text
     assert '[ "\\$DEMUX_MODE" = "primers_only" ] && [ -f "\\$PRIMERS_PATH" ]' in text
     assert "--rename '{id}|sup|barcode={adapter_name}|adapter={adapter_name}'" in text
     assert "--rename '{id}|hac|barcode={adapter_name}|adapter={adapter_name}'" in text
@@ -576,21 +744,32 @@ def test_main_nf_supports_primers_only_demultiplex_mode() -> None:
 def test_rtbioscan_precreates_realtime_directories_before_pipeline_start() -> None:
     text = (REPO_ROOT / "RTBioScan.sh").read_text(encoding="utf-8")
     assert 'if [[ $feeder -eq 1 && -n "$run_id" ]]; then' in text
-    assert '"results/pod5/$run_id/reads_rt_round_pod5"' in text
-    assert '"results/pod5/$run_id/ori_round_pod5"' in text
-    assert '"results/pod5/$run_id/full_pod5"' in text
-    assert '"results/pod5/$run_id/done_round_pod5"' in text
-    assert '"results/pod5/$run_id/metadata"' in text
+    assert '"${SCRIPT_DIR}/results/pod5/$run_id/reads_rt_round_pod5"' in text
+    assert '"${SCRIPT_DIR}/results/pod5/$run_id/ori_round_pod5"' in text
+    assert '"${SCRIPT_DIR}/results/pod5/$run_id/full_pod5"' in text
+    assert '"${SCRIPT_DIR}/results/pod5/$run_id/done_round_pod5"' in text
+    assert '"${SCRIPT_DIR}/results/pod5/$run_id/metadata"' in text
 
 
 def test_rtbioscan_validates_feeder_input_folder_exists_and_checks_liveness() -> None:
     text = (REPO_ROOT / "RTBioScan.sh").read_text(encoding="utf-8")
-    assert 'if [[ $feeder -eq 1 && $skip_pod5 -eq 0 && -n "$input_folder" && ! -e "$input_folder" ]]; then' in text
-    assert 'echo "ERROR: --input_folder does not exist: $input_folder" >&2' in text
+    assert 'if [[ $feeder -eq 1 && $skip_pod5 -eq 0 && -n "$input_folder" && ! -d "$input_folder" ]]; then' in text
+    assert 'echo "ERROR: --input_folder directory does not exist: $input_folder" >&2' in text
     assert ': >"$feeder_log"' in text
     assert 'if ! kill -0 "$FEEDER_PID" 2>/dev/null; then' in text
     assert 'echo "ERROR: [RTBioScan] POD5 feeder exited immediately." >&2' in text
     assert 'echo "       Feeder log: $feeder_log" >&2' in text
+
+
+def test_rtbioscan_defers_signal_cleanup_until_child_pids_are_recorded() -> None:
+    text = (REPO_ROOT / "RTBioScan.sh").read_text(encoding="utf-8")
+    assert 'LAUNCH_IN_PROGRESS=0' in text
+    assert 'PENDING_SIGNAL_NAME=""' in text
+    assert 'PENDING_SIGNAL_EXIT_CODE=""' in text
+    assert "finalize_pending_signal_if_needed() {" in text
+    assert 'if [[ "${LAUNCH_IN_PROGRESS:-0}" -eq 1 ]]; then' in text
+    assert 'finalize_pending_signal_if_needed' in text
+    assert 'kill -s "$_signal" "$_nextflow_pid" 2>/dev/null || true' in text
 
 
 def test_rtbioscan_prefers_explicit_primers_fasta_for_primer_indexes() -> None:
@@ -651,7 +830,19 @@ def test_rtbioscan_has_config_target_resolution_helper_and_exact_command_layout(
 
 
 def test_rtbioscan_do_metadata_uses_config_derived_targets(tmp_path: Path) -> None:
-    script = REPO_ROOT / "RTBioScan.sh"
+    wrapper_root = tmp_path / "wrapper_root"
+    (wrapper_root / "bin" / "lib").mkdir(parents=True)
+    script = wrapper_root / "RTBioScan.sh"
+    script.write_text((REPO_ROOT / "RTBioScan.sh").read_text(encoding="utf-8"), encoding="utf-8")
+    (wrapper_root / "bin" / "Metadata_pod5_processing.sh").write_text(
+        (REPO_ROOT / "bin" / "Metadata_pod5_processing.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (wrapper_root / "bin" / "lib" / "stale_lock_utils.sh").write_text(
+        (REPO_ROOT / "bin" / "lib" / "stale_lock_utils.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    sample_info_dir = wrapper_root / "results" / "sample_info" / "TestRun"
     env, log_path = _make_nextflow_shim(
         tmp_path,
         config_stdout="params.targets = 'ITS2|COI'\n",
@@ -670,7 +861,7 @@ def test_rtbioscan_do_metadata_uses_config_derived_targets(tmp_path: Path) -> No
     assert "ERROR: unable to resolve params.targets" not in text
     assert "Targets: ITS2|COI" in result.stdout
     assert "==> [RTBioScan] Metadata setup complete." in result.stdout
-    assert (tmp_path / "results" / "sample_info" / "TestRun" / "demult.fasta").exists()
+    assert (sample_info_dir / "demult.fasta").exists()
     invocations = _read_nextflow_invocations(log_path)
     assert [args for _, args in invocations if "config" in args]
 
@@ -700,7 +891,7 @@ def test_rtbioscan_do_metadata_empty_targets_fail_in_feeder_metadata_path(tmp_pa
     )
     assert result.returncode != 0
     text = result.stdout + result.stderr
-    assert "ERROR: explicit wrapper-level --targets must not be empty when using RTBioScan.sh." in text
+    assert "ERROR: wrapper option '--targets' is missing its required value." in text
     assert "ERROR: no valid targets were provided for metadata resolution" not in text
     assert "WARNING: --do_metadata is using the implicit default --targets" not in text
     assert "==> [RTBioScan] Setting up results/sample_info/TestRun/ for run 'TestRun' ..." not in text
@@ -717,7 +908,7 @@ def test_rtbioscan_pipeline_only_empty_targets_fail_before_pipeline_start(tmp_pa
     )
     assert result.returncode != 0
     text = result.stdout + result.stderr
-    assert "ERROR: explicit wrapper-level --targets must not be empty when using RTBioScan.sh." in text
+    assert "ERROR: wrapper option '--targets' is missing its required value." in text
     assert "==> [RTBioScan] Starting pipeline ..." not in text
 
 
@@ -1007,7 +1198,12 @@ def test_rtbioscan_feeder_uses_config_derived_targets(tmp_path: Path) -> None:
         assert "ERROR: unable to resolve params.targets" not in text
         assert "==> [RTBioScan] Feeder started" in result.stdout
         assert feeder_log.exists()
-        assert "Targets: ITS2|COI" in feeder_log.read_text(encoding="utf-8")
+        deadline = time.time() + 2.0
+        feeder_text = feeder_log.read_text(encoding="utf-8")
+        while "Targets: ITS2|COI" not in feeder_text and time.time() < deadline:
+            time.sleep(0.1)
+            feeder_text = feeder_log.read_text(encoding="utf-8")
+        assert "Targets: ITS2|COI" in feeder_text
     finally:
         if original_log is None:
             if feeder_log.exists():
@@ -1039,7 +1235,7 @@ def test_rtbioscan_feeder_empty_targets_fail_before_feeder_and_pipeline_start(tm
     )
     assert result.returncode != 0
     text = result.stdout + result.stderr
-    assert "ERROR: explicit wrapper-level --targets must not be empty when using RTBioScan.sh." in text
+    assert "ERROR: wrapper option '--targets' is missing its required value." in text
     assert "==> [RTBioScan] Starting POD5 feeder" not in text
     assert "==> [RTBioScan] Starting pipeline ..." not in text
     assert not (tmp_path / "results" / "pod5" / "MyRun").exists()
@@ -1290,20 +1486,26 @@ def test_rtbioscan_supports_temp_only_cleanup_modes() -> None:
     assert 'history_contains_run()' in text
     assert 'resolve_cleanup_root_for_run()' in text
     assert 'lookup_state_id_for_run()' in text
+    assert 'collect_nextflow_cache_targets_for_run()' in text
+    assert 'feeder_lock_has_live_holder_for_root()' in text
+    assert '"$_outdir/runs/${clean_run_id}"' in text
+    assert '"${_root}/results/config/${_run_id}"' in text
+    assert '"${_root}/results/runs/${_run_id}"' in text
     assert '"$_outdir/temp/ongoing/state/${_state_id}"' in text
     assert '"$_outdir/temp/current/state/${_state_id}"' in text
     assert '"$_outdir/ongoing/state/${_state_id}"' in text
     assert '_target_root="${clean_ref:-$LAUNCH_DIR}"' in text
     assert 'cd "$_target_root"' in text
     assert '_nextflow_clean_args=(-f -k "$clean_temp_run_id")' in text
-    assert '_nextflow_clean_args=(-f -k)' in text
+    assert '[[ -d "${_target_root}/work" ]] && _work_dir="${_target_root}/work"' in text
     assert '"$_nextflow_bin" clean "${_nextflow_preview_args[@]}"' in text
     assert '"$_nextflow_bin" clean "${_nextflow_clean_args[@]}"' in text
+    assert "per-task .command*" in text
 
 
 def test_rtbioscan_clean_all_defaults_to_launch_dir(tmp_path: Path) -> None:
     launch_dir = tmp_path / "launch_root"
-    (launch_dir / "results" / "runs").mkdir(parents=True)
+    (launch_dir / "results" / "report_html").mkdir(parents=True)
     (launch_dir / ".nextflow").mkdir()
     script = REPO_ROOT / "RTBioScan.sh"
 
@@ -1316,16 +1518,51 @@ def test_rtbioscan_clean_all_defaults_to_launch_dir(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert f"under '{launch_dir}'" in result.stdout
-    assert str(launch_dir / "results" / "runs") in result.stdout
+    assert str(launch_dir / "results" / "report_html") in result.stdout
+
+
+def test_rtbioscan_clean_temp_all_dry_run_does_not_require_nextflow(tmp_path: Path) -> None:
+    launch_dir = tmp_path / "launch_root"
+    wrapper_dir = tmp_path / "wrapper_root"
+    (launch_dir / "results" / "temp").mkdir(parents=True)
+    (launch_dir / "results" / "ongoing").mkdir(parents=True)
+    (launch_dir / "work" / "ab").mkdir(parents=True)
+    wrapper_dir.mkdir()
+    script = wrapper_dir / "RTBioScan.sh"
+    script.write_text((REPO_ROOT / "RTBioScan.sh").read_text(encoding="utf-8"), encoding="utf-8")
+    (wrapper_dir / "bin" / "lib").mkdir(parents=True)
+    (wrapper_dir / "bin" / "lib" / "stale_lock_utils.sh").write_text(
+        (REPO_ROOT / "bin" / "lib" / "stale_lock_utils.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(script), "--clean-temp-all", "--dry-run"],
+        cwd=launch_dir,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"under '{launch_dir}'" in result.stdout
+    assert str(launch_dir / "results" / "temp") in result.stdout
+    assert str(launch_dir / "results" / "ongoing") in result.stdout
+    assert f"clear   {launch_dir / 'work'}/*  (directory kept)" in result.stdout
+    assert "nextflow executable not found" not in (result.stdout + result.stderr)
 
 
 def test_rtbioscan_clean_run_prefers_launch_dir_history(tmp_path: Path) -> None:
     run_id = "unique_history_run"
+    session_id = "cd7fd034-3ba3-42e9-b6b5-f7e4030cfe2e"
     launch_dir = tmp_path / "launch_root"
     (launch_dir / ".nextflow").mkdir(parents=True)
-    (launch_dir / "results" / "runs" / run_id).mkdir(parents=True)
+    (launch_dir / ".nextflow" / "cache" / session_id / "db").mkdir(parents=True)
+    (launch_dir / ".nextflow" / "cache" / session_id / "db" / "LOCK").write_text("", encoding="utf-8")
+    (launch_dir / "results" / "report_html" / "runs" / run_id).mkdir(parents=True)
+    (launch_dir / "results" / "runs" / run_id / "report_assets" / ".private_signatures").mkdir(parents=True)
+    (launch_dir / "work" / "ab").mkdir(parents=True)
     (launch_dir / ".nextflow" / "history").write_text(
-        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\tsession\tnextflow run main.nf -name {run_id}\n",
+        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\t{session_id}\tnextflow run main.nf -name {run_id}\n",
         encoding="utf-8",
     )
     script = REPO_ROOT / "RTBioScan.sh"
@@ -1339,7 +1576,314 @@ def test_rtbioscan_clean_run_prefers_launch_dir_history(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert f"in '{launch_dir}'" in result.stdout
+    assert str(launch_dir / "results" / "report_html" / "runs" / run_id) in result.stdout
     assert str(launch_dir / "results" / "runs" / run_id) in result.stdout
+    assert str(launch_dir / ".nextflow" / "cache" / session_id) in result.stdout
+    assert "Nextflow cache/locks" in result.stdout
+    assert f"nextflow -n -k {run_id}" in result.stdout
+    assert f"clear   {launch_dir / 'work'}/*  (directory kept)" not in result.stdout
+
+
+def test_rtbioscan_clean_run_removes_cache_locks_when_nextflow_clean_fails(tmp_path: Path) -> None:
+    run_id = "cache_lock_run"
+    session_id = "cd7fd034-3ba3-42e9-b6b5-f7e4030cfe2e"
+    launch_dir = tmp_path / "launch_root"
+    cache_dir = launch_dir / ".nextflow" / "cache" / session_id
+    run_dir = launch_dir / "results" / "runs" / run_id
+    cache_dir.joinpath("db").mkdir(parents=True)
+    cache_dir.joinpath("db", "LOCK").write_text("", encoding="utf-8")
+    run_dir.mkdir(parents=True)
+    (launch_dir / ".nextflow" / "history").write_text(
+        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\t{session_id}\tnextflow run main.nf -name {run_id}\n",
+        encoding="utf-8",
+    )
+    wrapper_root, script = _make_wrapper_root(tmp_path)
+    env = os.environ.copy()
+    log_path = _write_wrapper_nextflow_shim(
+        wrapper_root,
+        env,
+        clean_stderr="Unable to acquire lock on session\n",
+        clean_exit=1,
+    )
+
+    result = subprocess.run(
+        ["bash", str(script), "--clean", run_id, "--yes"],
+        cwd=launch_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "removing run cache/locks so the run name can be reused" in result.stderr
+    assert not cache_dir.exists()
+    assert not run_dir.exists()
+    assert (launch_dir / ".nextflow" / "history").read_text(encoding="utf-8") == ""
+    invocations = _read_nextflow_invocations(log_path)
+    assert [args for _, args in invocations if args and args[0] == "clean"] == [
+        ["clean", "-n", "-k", run_id],
+        ["clean", "-f", "-k", run_id],
+    ]
+
+
+def test_rtbioscan_clean_run_does_not_match_prefix_run_id_feeder(tmp_path: Path) -> None:
+    run_id = "prefix-run-1"
+    other_run_id = "prefix-run-12"
+    launch_dir = tmp_path / "launch_root"
+    run_dir = launch_dir / "results" / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (launch_dir / ".nextflow").mkdir(parents=True)
+    (launch_dir / ".nextflow" / "history").write_text(
+        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\tsession-id\tnextflow run main.nf -name {run_id}\n",
+        encoding="utf-8",
+    )
+    wrapper_root, script = _make_wrapper_root(tmp_path)
+    env = os.environ.copy()
+    env["PATH"] = f"{wrapper_root / 'bin'}:{env.get('PATH', '')}"
+    log_path = _write_wrapper_nextflow_shim(wrapper_root, env, clean_stdout="NEXTFLOW_CLEAN_OK\n")
+    _write_wrapper_ps_shim(
+        wrapper_root,
+        [f"999999 bash {wrapper_root / 'bin' / 'Metadata_pod5_processing.sh'} --run_id {other_run_id}"],
+    )
+
+    result = subprocess.run(
+        ["bash", str(script), "--clean", run_id, "--yes"],
+        cwd=launch_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    text = result.stdout + result.stderr
+    assert result.returncode == 0, text
+    assert f"Checking for active feeder with run '{run_id}' before --clean" not in text
+    assert not run_dir.exists()
+    invocations = _read_nextflow_invocations(log_path)
+    assert [args for _, args in invocations if args and args[0] == "clean"] == [
+        ["clean", "-n", "-k", run_id],
+        ["clean", "-f", "-k", run_id],
+    ]
+
+
+def test_rtbioscan_clean_prompt_precedes_same_run_feeder_stop() -> None:
+    text = (REPO_ROOT / "RTBioScan.sh").read_text(encoding="utf-8")
+
+    prompt_idx = text.index("if [[ $yes -eq 0 ]]; then")
+    stop_idx = text.index('stop_clean_run_feeder_if_active_or_die "$_target_root" "$clean_run_id"')
+    assert prompt_idx < stop_idx
+
+
+def test_rtbioscan_clean_temp_dry_run_does_not_list_specific_work_dirs(tmp_path: Path) -> None:
+    run_id = "temp_preview_run"
+    launch_dir = tmp_path / "launch_root"
+    work_dir = launch_dir / "work" / "aa" / "111111111111111111111111111111"
+    work_dir.mkdir(parents=True)
+    (launch_dir / ".nextflow").mkdir(parents=True)
+    (launch_dir / "results" / "temp" / "ongoing" / "state" / run_id).mkdir(parents=True)
+    (launch_dir / ".nextflow" / "history").write_text(
+        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\tsession\tnextflow run main.nf -name {run_id}\n",
+        encoding="utf-8",
+    )
+    wrapper_root, script = _make_wrapper_root(tmp_path)
+    env = os.environ.copy()
+    log_path = _write_wrapper_nextflow_shim(wrapper_root, env, clean_stdout="NEXTFLOW_CLEAN_PREVIEW\n")
+
+    result = subprocess.run(
+        ["bash", str(script), "--clean-temp", run_id, "--dry-run"],
+        cwd=launch_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert str(work_dir) not in result.stdout
+    invocations = _read_nextflow_invocations(log_path)
+    assert not [args for _, args in invocations if args and args[0] == "log"]
+    assert [args for _, args in invocations if args and args[0] == "clean"] == [["clean", "-n", "-k", run_id]]
+
+
+def test_rtbioscan_clean_prompt_uses_tty_and_recovers_sane_mode(tmp_path: Path) -> None:
+    run_id = "tty_clean_run"
+    launch_dir = tmp_path / "launch_root"
+    work_dir = launch_dir / "work" / "aa" / "111111111111111111111111111111"
+    (launch_dir / ".nextflow").mkdir(parents=True)
+    (launch_dir / "results" / "report_html" / "runs" / run_id).mkdir(parents=True)
+    work_dir.mkdir(parents=True)
+    (work_dir / ".command.sh").write_text("echo stub\n", encoding="utf-8")
+    (launch_dir / ".nextflow" / "history").write_text(
+        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\tsession\tnextflow run main.nf -name {run_id}\n",
+        encoding="utf-8",
+    )
+    wrapper_root, script = _make_wrapper_root(tmp_path)
+    env = os.environ.copy()
+    log_path = _write_wrapper_nextflow_shim(wrapper_root, env, clean_stdout="NEXTFLOW_CLEAN_OK\n")
+
+    shell_command = (
+        "stty -icanon echo -icrnl; "
+        f"exec bash {shlex.quote(str(script))} --clean {shlex.quote(run_id)}"
+    )
+    exit_code, output = _run_command_via_pty(
+        ["bash", "-lc", shell_command],
+        cwd=launch_dir,
+        env=env,
+        wait_for_output="Delete the above? [y/N] ",
+        input_bytes=b"y\r",
+    )
+
+    assert exit_code == 0, output
+    assert "Delete the above? [y/N] " in output
+    assert "==> [RTBioScan] Clean complete." in output
+    assert "^M" not in output
+    assert not (launch_dir / "results" / "report_html" / "runs" / run_id).exists()
+    assert work_dir.exists()
+    assert (work_dir / ".command.sh").exists()
+    assert (launch_dir / ".nextflow" / "history").read_text(encoding="utf-8") == ""
+    invocations = _read_nextflow_invocations(log_path)
+    clean_invocations = [args for _, args in invocations if "clean" in args]
+    assert len(clean_invocations) == 2
+    assert clean_invocations[0] == ["clean", "-n", "-k", run_id]
+    assert clean_invocations[1] == ["clean", "-f", "-k", run_id]
+
+
+def test_rtbioscan_clean_temp_yes_preserves_work_stub_dirs(tmp_path: Path) -> None:
+    run_id = "temp_remove_run"
+    launch_dir = tmp_path / "launch_root"
+    work_dir = launch_dir / "work" / "aa" / "111111111111111111111111111111"
+    temp_state_dir = launch_dir / "results" / "temp" / "ongoing" / "state" / run_id
+    current_state_dir = launch_dir / "results" / "temp" / "current" / "state" / run_id
+    ongoing_state_dir = launch_dir / "results" / "ongoing" / "state" / run_id
+    work_dir.mkdir(parents=True)
+    (work_dir / ".command.sh").write_text("echo stub\n", encoding="utf-8")
+    temp_state_dir.mkdir(parents=True)
+    current_state_dir.mkdir(parents=True)
+    ongoing_state_dir.mkdir(parents=True)
+    (launch_dir / ".nextflow").mkdir(parents=True)
+    history_text = (
+        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\tsession\tnextflow run main.nf -name {run_id}\n"
+    )
+    (launch_dir / ".nextflow" / "history").write_text(history_text, encoding="utf-8")
+    wrapper_root, script = _make_wrapper_root(tmp_path)
+    env = os.environ.copy()
+    log_path = _write_wrapper_nextflow_shim(wrapper_root, env, clean_stdout="NEXTFLOW_CLEAN_OK\n")
+
+    result = subprocess.run(
+        ["bash", str(script), "--clean-temp", run_id, "--yes"],
+        cwd=launch_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert work_dir.exists()
+    assert (work_dir / ".command.sh").exists()
+    assert not temp_state_dir.exists()
+    assert not current_state_dir.exists()
+    assert not ongoing_state_dir.exists()
+    assert (launch_dir / ".nextflow" / "history").read_text(encoding="utf-8") == history_text
+    invocations = _read_nextflow_invocations(log_path)
+    assert [args for _, args in invocations if args and args[0] == "clean"] == [
+        ["clean", "-n", "-k", run_id],
+        ["clean", "-f", "-k", run_id],
+    ]
+
+
+def test_rtbioscan_clean_temp_yes_handles_empty_rm_targets_without_nounset_failure(tmp_path: Path) -> None:
+    run_id = "temp_no_targets_run"
+    launch_dir = tmp_path / "launch_root"
+    work_dir = launch_dir / "work" / "aa" / "111111111111111111111111111111"
+    work_dir.mkdir(parents=True)
+    (work_dir / ".command.sh").write_text("echo stub\n", encoding="utf-8")
+    (launch_dir / ".nextflow").mkdir(parents=True)
+    (launch_dir / ".nextflow" / "history").write_text(
+        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\tsession\tnextflow run main.nf -name {run_id}\n",
+        encoding="utf-8",
+    )
+    wrapper_root, script = _make_wrapper_root(tmp_path)
+    env = os.environ.copy()
+    log_path = _write_wrapper_nextflow_shim(wrapper_root, env, clean_stdout="NEXTFLOW_CLEAN_OK\n")
+
+    result = subprocess.run(
+        ["bash", str(script), "--clean-temp", run_id, "--yes"],
+        cwd=launch_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "unbound variable" not in (result.stdout + result.stderr)
+    assert "==> [RTBioScan] Clean complete." in result.stdout
+    assert work_dir.exists()
+    invocations = _read_nextflow_invocations(log_path)
+    assert [args for _, args in invocations if args and args[0] == "clean"] == [
+        ["clean", "-n", "-k", run_id],
+        ["clean", "-f", "-k", run_id],
+    ]
+
+
+def test_rtbioscan_clean_without_tty_requires_yes(tmp_path: Path) -> None:
+    run_id = "notty_clean_run"
+    launch_dir = tmp_path / "launch_root"
+    (launch_dir / ".nextflow").mkdir(parents=True)
+    (launch_dir / "results" / "runs" / run_id).mkdir(parents=True)
+    (launch_dir / ".nextflow" / "history").write_text(
+        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\tsession\tnextflow run main.nf -name {run_id}\n",
+        encoding="utf-8",
+    )
+    wrapper_root, script = _make_wrapper_root(tmp_path)
+    env = os.environ.copy()
+    _write_wrapper_nextflow_shim(wrapper_root, env, clean_stdout="NEXTFLOW_CLEAN_PREVIEW\n")
+
+    result = subprocess.run(
+        ["bash", str(script), "--clean", run_id],
+        cwd=launch_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert (
+        "ERROR: interactive cleanup confirmation requires a controlling terminal; "
+        "rerun with --yes for non-interactive cleanup."
+    ) in result.stderr
+    assert (launch_dir / "results" / "runs" / run_id).exists()
+
+
+def test_rtbioscan_clean_temp_does_not_remove_work_stubs_when_nextflow_clean_fails(tmp_path: Path) -> None:
+    run_id = "temp_fail_run"
+    launch_dir = tmp_path / "launch_root"
+    work_dir = launch_dir / "work" / "aa" / "111111111111111111111111111111"
+    work_dir.mkdir(parents=True)
+    (work_dir / ".command.sh").write_text("echo stub\n", encoding="utf-8")
+    (launch_dir / ".nextflow").mkdir(parents=True)
+    (launch_dir / ".nextflow" / "history").write_text(
+        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\tsession\tnextflow run main.nf -name {run_id}\n",
+        encoding="utf-8",
+    )
+    wrapper_root, script = _make_wrapper_root(tmp_path)
+    env = os.environ.copy()
+    log_path = _write_wrapper_nextflow_shim(wrapper_root, env, clean_stderr="NEXTFLOW_CLEAN_FAIL\n", clean_exit=1)
+
+    result = subprocess.run(
+        ["bash", str(script), "--clean-temp", run_id, "--yes"],
+        cwd=launch_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "ERROR: Nextflow work/ temp cleanup failed." in result.stderr
+    assert work_dir.exists()
+    assert (work_dir / ".command.sh").exists()
+    invocations = _read_nextflow_invocations(log_path)
+    assert [args for _, args in invocations if args and args[0] == "clean"] == [
+        ["clean", "-n", "-k", run_id],
+        ["clean", "-f", "-k", run_id],
+    ]
 
 
 def test_rtbioscan_clean_ref_targets_explicit_root(tmp_path: Path) -> None:
@@ -1369,28 +1913,26 @@ def test_rtbioscan_clean_ref_targets_explicit_root(tmp_path: Path) -> None:
 
 def test_main_nf_validates_otu_blast_min_members_and_mode() -> None:
     text = MAIN_NF.read_text(encoding="utf-8")
-    assert "if ( !params.containsKey('otu_blast_min_members') || params.otu_blast_min_members == null ) {" in text
-    assert "params.otu_blast_min_members = 3" in text
+    config_text = (REPO_ROOT / "nextflow.config").read_text(encoding="utf-8")
+    assert 'otu_blast_min_members = 3' in config_text
     assert "def otuBlastMinMembersStr = params.otu_blast_min_members.toString().trim()" in text
     assert "Invalid --otu_blast_min_members '${params.otu_blast_min_members}'. Provide an integer >= 0." in text
-    assert "if ( !params.containsKey('otu_blast_filter_mode') || params.otu_blast_filter_mode == null ) {" in text
-    assert "params.otu_blast_filter_mode = 'enforce'" in text
+    assert 'otu_blast_filter_mode = "enforce"' in config_text
     assert "def otuBlastFilterModeCanonical = params.otu_blast_filter_mode.toString().trim().toLowerCase()" in text
     assert "Invalid --otu_blast_filter_mode '${params.otu_blast_filter_mode}'. Allowed values: off, observe, enforce" in text
-    assert "if ( !params.containsKey('otu_blast_filter_skip_rounds') || params.otu_blast_filter_skip_rounds == null ) {" in text
-    assert "params.otu_blast_filter_skip_rounds = '3'" in text
+    assert 'otu_blast_filter_skip_rounds = "3"' in config_text
     assert "def otuBlastFilterSkipRoundsRaw = params.otu_blast_filter_skip_rounds.toString().trim().toLowerCase()" in text
     assert "Invalid --otu_blast_filter_skip_rounds '${params.otu_blast_filter_skip_rounds}'. Allowed values: none, all, or integer >= 0." in text
-    assert "if ( !params.containsKey('otu_blast_enforce_missing_max_frac') || params.otu_blast_enforce_missing_max_frac == null ) {" in text
+    assert 'otu_blast_enforce_missing_max_frac = 0.1' in config_text
     assert "def otuBlastEnforceMissingMaxFracStr = params.otu_blast_enforce_missing_max_frac.toString().trim()" in text
     assert "Invalid --otu_blast_enforce_missing_max_frac '${params.otu_blast_enforce_missing_max_frac}'. Provide a decimal fraction in [0,1]." in text
-    assert "if ( !params.containsKey('otu_blast_enforce_no_clusters_policy') || params.otu_blast_enforce_no_clusters_policy == null ) {" in text
+    assert 'otu_blast_enforce_no_clusters_policy = "fallback_unfiltered"' in config_text
     assert "def otuBlastEnforceNoClustersPolicyCanonical = params.otu_blast_enforce_no_clusters_policy.toString().trim().toLowerCase()" in text
     assert "Invalid --otu_blast_enforce_no_clusters_policy '${params.otu_blast_enforce_no_clusters_policy}'. Allowed values: fail, fallback_unfiltered, allow_empty" in text
-    assert "if ( !params.containsKey('otu_size_streak_mode') || params.otu_size_streak_mode == null ) {" in text
+    assert 'otu_size_streak_mode = "enforce"' in config_text
     assert "def otuSizeStreakModeCanonical = params.otu_size_streak_mode.toString().trim().toLowerCase()" in text
     assert "Invalid --otu_size_streak_mode '${params.otu_size_streak_mode}'. Allowed values: off, observe, enforce" in text
-    assert "if ( !params.containsKey('otu_size_streak_min_rounds') || params.otu_size_streak_min_rounds == null ) {" in text
+    assert 'otu_size_streak_min_rounds = 3' in config_text
     assert "def otuSizeStreakMinRoundsStr = params.otu_size_streak_min_rounds.toString().trim()" in text
     assert "Invalid --otu_size_streak_min_rounds '${params.otu_size_streak_min_rounds}'. Provide an integer >= 1." in text
 
@@ -1413,8 +1955,8 @@ def test_main_nf_wires_otu_blast_filter_helper_in_blast_process() -> None:
     assert 'BLAST_FILTER_DECISION="${barcode}_blast_filter_decision.tsv"' in text
     assert 'ROUND_HASH_MAP="${barcode}_blast_round_hash_map.tsv"' in text
     assert 'ROUND_HASH_COUNTS="${barcode}_blast_round_hash_counts.tsv"' in text
-    assert '"${baseDir}/bin/otu_filter_reads_by_otu_size.pl"' in text
-    assert '${baseDir}/bin/otu_blast_filter_decide.sh' in text
+    assert '"\\$BIN_DIR/otu_filter_reads_by_otu_size.pl"' in text
+    assert '"\\$BIN_DIR/otu_blast_filter_decide.sh"' in text
     assert '${baseDir}/bin/otu_blast_effective_mode.sh' in text
     assert '${baseDir}/bin/round_index_assign.sh' in text
     assert '"${qced_reads_nr}"' in text
@@ -1442,12 +1984,12 @@ def test_main_nf_wires_otu_blast_filter_helper_in_blast_process() -> None:
     assert 'BLAST_INPUT_FASTA="\\$BLAST_FILTERED_FASTA"' in text
     assert 'count_marker_reads() {' in blast_block
     assert 'extract_marker_reads() {' in blast_block
-    assert 'MARKER_RESCUE_STATS="${ongoingStateDir}/${round_barcode}/${barcode}_blast_marker_rescue.tsv"' in blast_block
+    assert 'MARKER_RESCUE_STATS="\\$ROUND_DIR/${barcode}_blast_marker_rescue.tsv"' in blast_block
     assert 'if [ "\\$orig_marker_count" -gt 0 ] && [ "\\$filtered_marker_count" -lt "\\$OTU_BLAST_MIN_MEMBERS" ]; then' in blast_block
     assert 'echo "INFO: rescuing sparse marker=\\$target_marker into BLAST input because filtered_count=\\$filtered_marker_count < min_members=\\$OTU_BLAST_MIN_MEMBERS (original_count=\\$orig_marker_count)" 1>&2' in blast_block
     assert '_p_targets="${params.targets}"' in text
     assert 'IFS=\'|\' read -ra _TARGETS   <<< "\\$_p_targets"' in text
-    assert '"${baseDir}/bin/blast_otu_pretax.sh" \\' in blast_block
+    assert '"\\$BIN_DIR/blast_otu_pretax.sh" \\' in blast_block
     assert '"\\$_p_targets" \\' in blast_block
     assert '"\\$_p_blast_db_specs" \\' in blast_block
     assert 'seqkit grep -r -p' in helper_text
@@ -1468,9 +2010,9 @@ def test_main_nf_makes_otu_refine_failures_explicit_and_uses_new_helpers() -> No
     assert 'OTU_REFINE_PHASE_TIMINGS_FILE="\\$OTU_REFINE_PHASE_TIMINGS_FILE" \\' in text
     assert 'OTU_REFINE_PHASE_TIMINGS_MS_FILE="\\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" \\' in text
     assert 'OTU_REFINE_WORKLOAD_STATS_FILE="\\$OTU_REFINE_WORKLOAD_STATS_FILE" \\' in text
-    assert 'bash "${baseDir}/bin/otu_refine_blastreport_parallel.sh" \\' in text
+    assert 'bash "\\$BIN_DIR/otu_refine_blastreport_parallel.sh" \\' in text
     assert 'ERROR: otu_refine_blastreport_parallel.sh failed for ${barcode}/${round_barcode}' in text
-    assert '${baseDir}/bin/filter_sup_non_no_adapter_fasta.pl' in text
+    assert '"\\$BIN_DIR/filter_sup_non_no_adapter_fasta.pl"' in text
     assert '${baseDir}/bin/detect_consensus_sample_mode.sh' in text
     assert "grep -q 'adapter=barcode' blast_report_annotated.txt" not in text
     wrapper_text = (REPO_ROOT / "bin" / "otu_refine_blastreport_parallel.sh").read_text(encoding="utf-8")
@@ -1535,7 +2077,7 @@ def test_main_nf_tracks_sup_path_stats_and_timings() -> None:
     assert "printf 'shared_extract_hac_fixed_ids\\t0\\n'" in text
     assert "printf 'shared_extract_fasta_reads\\t0\\n'" in text
     assert 'SUP_CACHE_SKIP_PERSIST=0' in text
-    assert 'source "${baseDir}/bin/blast_sup_path.sh"' in text
+    assert 'source "\\$BIN_DIR/blast_sup_path.sh"' in text
     assert 'sup_candidate_extract' in text
     assert 'sup_shared_candidate_extract' in text
     assert 'sup_cache_lookup' in text
@@ -1598,11 +2140,11 @@ def test_main_nf_tracks_sup_path_stats_and_timings() -> None:
     assert 'sup_emit_zero_timing "sup_fastq_merge"' in text
     assert 'sup_emit_zero_timing "sup_summary_merge"' in text
     assert 'sup_emit_zero_timing "sup_cache_persist"' in text
-    assert 'cp "\\$SUP_PATH_STATS_FILE" ${ongoingStateDir}/${round_barcode}/${barcode}_sup_path_stats.tsv 2>/dev/null || true' in text
-    assert 'cp "\\$SUP_PATH_TIMINGS_MS_FILE" ${ongoingStateDir}/${round_barcode}/${barcode}_sup_path_timings_ms.tsv 2>/dev/null || true' in text
-    assert 'cp "\\$SUP_PATH_TIMINGS_MS_FILE" "\\${STATE_DIR}/${barcode}_sup_path_timings_ms_last.tsv" 2>/dev/null || true' in text
-    assert 'cp ${barcode}_blastreport_hac.list ${ongoingStateDir}/${round_barcode}/${barcode}_blastreport_hac.list 2>/dev/null || true' in text
-    assert 'cp ${barcode}_blastreport_sup.list ${ongoingStateDir}/${round_barcode}/${barcode}_blastreport_sup.list 2>/dev/null || true' in text
+    assert 'copy_soft "\\$SUP_PATH_STATS_FILE" "\\$ROUND_DIR/${barcode}_sup_path_stats.tsv"' in text
+    assert 'copy_soft "\\$SUP_PATH_TIMINGS_MS_FILE" "\\$ROUND_DIR/${barcode}_sup_path_timings_ms.tsv"' in text
+    assert 'copy_soft "\\$SUP_PATH_TIMINGS_MS_FILE" "\\${STATE_DIR}/${barcode}_sup_path_timings_ms_last.tsv"' in text
+    assert 'copy_soft ${barcode}_blastreport_hac.list "\\$ROUND_DIR/${barcode}_blastreport_hac.list"' in text
+    assert 'copy_soft ${barcode}_blastreport_sup.list "\\$ROUND_DIR/${barcode}_blastreport_sup.list"' in text
 
 
 def test_sup_path_stats_semantics_fixture(tmp_path: Path) -> None:
@@ -1664,12 +2206,12 @@ def test_main_nf_derives_no_adapter_policy_from_observed_annotations() -> None:
     init_idx = text.index(': > "\\$NO_ADAPTER_POLICY_TSV"')
     guard_idx = text.index('if [ -s blast_report_annotated_otu_evidence.txt ]; then')
     validate_idx = text.index('validate_no_adapter_policy_value separate_no_adapter "\\$SEPARATE_NO_ADAPTER"')
-    cp_idx = text.index('cp "\\$NO_ADAPTER_POLICY_TSV" "${ongoingStateDir}/\\${round_barcode}/\\$NO_ADAPTER_POLICY_TSV" 2>/dev/null || true')
+    cp_idx = text.index('copy_soft "\\$NO_ADAPTER_POLICY_TSV" "\\$ROUND_DIR/\\$NO_ADAPTER_POLICY_TSV"')
     breakdown_idx = text.index('append_otu_refine_breakdown "no_adapter_policy"')
     assert init_idx < guard_idx
     assert validate_idx < cp_idx
     assert cp_idx < breakdown_idx
-    assert 'if ! bash ${baseDir}/bin/detect_no_adapter_policy.sh blast_report_annotated_otu_evidence.txt > "\\$NO_ADAPTER_POLICY_TSV"; then' in text
+    assert 'if ! bash "\\$BIN_DIR/detect_no_adapter_policy.sh" blast_report_annotated_otu_evidence.txt > "\\$NO_ADAPTER_POLICY_TSV"; then' in text
     assert 'ERROR: detect_no_adapter_policy.sh failed for ${barcode}/${round_barcode}' in text
     assert 'no_adapter_policy_value() {' in text
     assert 'validate_no_adapter_policy_value() {' in text
@@ -1683,17 +2225,19 @@ def test_main_nf_derives_no_adapter_policy_from_observed_annotations() -> None:
     assert 'validate_no_adapter_policy_value observed_non_no_adapter "\\$OBSERVED_NON_NO_ADAPTER"' in text
     assert 'validate_no_adapter_policy_value separate_no_adapter "\\$SEPARATE_NO_ADAPTER"' in text
     assert 'SEPARATE_NO_ADAPTER=0' in text
-    assert 'mkdir -p "${ongoingStateDir}/\\${round_barcode}" 2>/dev/null || true' in text
+    assert 'mkdir -p "\\$ROUND_DIR" 2>/dev/null || true' in text
     assert 'INFO: no_adapter_policy observed_no_adapter=\\$OBSERVED_NO_ADAPTER observed_non_no_adapter=\\$OBSERVED_NON_NO_ADAPTER separate_no_adapter=\\$SEPARATE_NO_ADAPTER' in text
     assert 'cp blast_report_annotated_otu.txt blast_report_annotated_otu_evidence.txt 2>/dev/null || true' in text
-    assert '"${baseDir}/bin/select_reads2sup.pl" blast_report_annotated_otu.txt 50 keep_no_adapter ${barcode}_read_pident.tsv "\\$BLOCKED_OTU" > tmp || :' in text
+    assert 'if ! "\\$BIN_DIR/select_reads2sup.pl" blast_report_annotated_otu.txt 50 keep_no_adapter ${barcode}_read_pident.tsv "\\$BLOCKED_OTU" > tmp; then' in text
+    assert 'ERROR: select_reads2sup.pl failed for ${barcode}/${round_barcode}' in text
+    assert '"\\$BIN_DIR/select_reads2sup.pl" blast_report_annotated_otu.txt 50 keep_no_adapter ${barcode}_read_pident.tsv "\\$BLOCKED_OTU" > tmp || :' not in text
     assert "sed -E 's/[Kpcofgs]__//g' tmp > blast_report_annotated_otu.txt || mv tmp blast_report_annotated_otu.txt" in text
     assert "sed -E 's/[Kpcofgs]__//g' blast_report_annotated_otu.txt \\" in text
-    assert '"${baseDir}/bin/prefer_blast_rows_by_model.sh" \\' in text
+    assert '"\\$BIN_DIR/prefer_blast_rows_by_model.sh" \\' in text
     assert '--output blast_report_annotated_preferred.txt \\' in text
     assert '--policy sup_hac2sup_preferred; then' in text
     assert '--mode annotated_tsv' not in text
-    assert 'bash ${baseDir}/bin/filter_blast_rows_by_adapter_class.sh blast_report_annotated_otu_evidence.txt no_adapter > blast_report_annotated_otu_noadapter.txt' in text
+    assert 'bash "\\$BIN_DIR/filter_blast_rows_by_adapter_class.sh" blast_report_annotated_otu_evidence.txt no_adapter > blast_report_annotated_otu_noadapter.txt' in text
     assert 'WARN: filter_blast_rows_by_adapter_class.sh failed for no_adapter split; continuing without split report' in text
 
 
@@ -1728,7 +2272,7 @@ cp "$NO_ADAPTER_POLICY_TSV" "${{ONGOING_STATE_DIR}}/${{round_barcode}}/$(basenam
 
 def test_main_nf_uses_record_safe_fasta_filter_for_rolling_sup_rewrite() -> None:
     text = MAIN_NF.read_text(encoding="utf-8")
-    assert 'perl ${baseDir}/bin/filter_sup_non_no_adapter_fasta.pl "\\$PROTECTED_READ_IDS_EVER_STATE" "\\${STATE_DIR}/qced_reads_hq_accumulated.fasta" > tmp' in text
+    assert 'perl "\\$BIN_DIR/filter_sup_non_no_adapter_fasta.pl" "\\$PROTECTED_READ_IDS_EVER_STATE" "\\${STATE_DIR}/qced_reads_hq_accumulated.fasta" > tmp' in text
     assert 'WARN: filter_sup_non_no_adapter_fasta.pl failed; retaining existing rolling pool prior to append' in text
     assert 'grep -F -A 1 "|sup|" "\\${STATE_DIR}/qced_reads_hq_accumulated.fasta"' not in text
     assert 'KEEP_NO_ADAPTER=1' not in text
@@ -1762,7 +2306,7 @@ def test_consensus_uses_shared_adapter_row_filter() -> None:
     assert 'lock_enabled=1' in text
     assert 'adapter_row_filter_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/filter_blast_rows_by_adapter_class.sh"' in text
     assert 'tmp_clean_blast_report_full.txt sample "$sample" > "$sample_blast" 2>"$filter_stderr"' in text
-    assert 'WARN: filter_blast_rows_by_adapter_class.sh failed for sample=$sample exit_code=$filter_status stderr=$filter_err; continuing with empty sample_blast' in text
+    assert 'ERROR: filter_blast_rows_by_adapter_class.sh failed for sample=$sample exit_code=$filter_status stderr=$filter_err' in text
 
 
 def test_consensus_timing_outputs_are_wired() -> None:
@@ -1870,12 +2414,12 @@ def test_consensus_timing_outputs_are_wired() -> None:
     assert '${ongoingStateDir}/${round_barcode}/${barcode}_consensus_process_metrics.tsv' in main_text
     assert '${ongoingStateDir}/${round_barcode}/${barcode}_cache_hydration_stats.tsv' in main_text
     assert '"\\${STATE_DIR}/${barcode}_blast_process_timings_last.tsv"' in main_text
-    assert '${ongoingStateDir}/${round_barcode}/${barcode}_blast_process_timings.tsv' in main_text
-    assert '${ongoingStateDir}/${round_barcode}/${barcode}_otu_refine_phase_timings.tsv' in main_text
-    assert '${ongoingStateDir}/${round_barcode}/${barcode}_otu_refine_phase_timings_ms.tsv' in main_text
-    assert '${ongoingStateDir}/${round_barcode}/${barcode}_otu_refine_process_breakdown.tsv' in main_text
-    assert '${ongoingStateDir}/${round_barcode}/${barcode}_otu_refine_process_breakdown_ms.tsv' in main_text
-    assert '${ongoingStateDir}/${round_barcode}/${barcode}_otu_refine_workload_stats.tsv' in main_text
+    assert '"\\$ROUND_DIR/${barcode}_blast_process_timings.tsv"' in main_text
+    assert '"\\$ROUND_DIR/${barcode}_otu_refine_phase_timings.tsv"' in main_text
+    assert '"\\$ROUND_DIR/${barcode}_otu_refine_phase_timings_ms.tsv"' in main_text
+    assert '"\\$ROUND_DIR/${barcode}_otu_refine_process_breakdown.tsv"' in main_text
+    assert '"\\$ROUND_DIR/${barcode}_otu_refine_process_breakdown_ms.tsv"' in main_text
+    assert '"\\$ROUND_DIR/${barcode}_otu_refine_workload_stats.tsv"' in main_text
     assert '"\\${STATE_DIR}/${barcode}_otu_refine_phase_timings_ms_last.tsv"' in main_text
     assert '"\\${STATE_DIR}/${barcode}_otu_refine_process_breakdown_last.tsv"' in main_text
     assert '"\\${STATE_DIR}/${barcode}_otu_refine_process_breakdown_ms_last.tsv"' in main_text
@@ -1904,7 +2448,7 @@ def test_main_nf_blast_process_fixes_preserve_fail_fast_timing_and_locking() -> 
     text = MAIN_NF.read_text(encoding="utf-8")
 
     assert 'BLAST_HIT_EXTRACT_FAILED=0' in text
-    assert 'if ! perl ${baseDir}/bin/focus_hq_tax_fasta.pl "\\$BLAST_HIT_REPORT" ${fasta_hq_qced} > ${barcode}_tmp_focus_hit.fasta; then' in text
+    assert 'if ! perl "\\$BIN_DIR/focus_hq_tax_fasta.pl" "\\$BLAST_HIT_REPORT" ${fasta_hq_qced} > ${barcode}_tmp_focus_hit.fasta; then' in text
     assert 'BLAST_HIT_EXTRACT_FAILED=1' in text
     assert 'if [ "\\$BLAST_HIT_EXTRACT_FAILED" -ne 0 ] && [ -s "\\$BLAST_HIT_REPORT" ]; then' in text
     assert 'ERROR: failed to initialize rolling pool from BLAST-hit FASTA extraction' in text
@@ -1922,8 +2466,8 @@ def test_main_nf_blast_process_fixes_preserve_fail_fast_timing_and_locking() -> 
     assert '"\\$STATE_BLASTREPORT_SNAPSHOT"' in merge_block
     assert 'rm -f "\\$STATE_BLASTREPORT_SNAPSHOT"' in merge_block
 
-    publish_start = text.index('cp ${barcode}_blastreport_round.txt ${ongoingStateDir}/${round_barcode}/blastreport.txt')
-    publish_end = text.index('cp "\\$BLAST_FILTER_STATS" ${ongoingStateDir}/${round_barcode}/${barcode}_blast_filter_stats.tsv', publish_start)
+    publish_start = text.index('cp ${barcode}_blastreport_round.txt "\\$ROUND_DIR/blastreport.txt"')
+    publish_end = text.index('copy_soft "\\$BLAST_FILTER_STATS" "\\$ROUND_DIR/${barcode}_blast_filter_stats.tsv"', publish_start)
     publish_block = text[publish_start:publish_end]
     assert 'if acquire_lock "\\${BLASTREPORT_LOCK}"; then' in publish_block
     assert 'STATE_BLASTREPORT_TMP="\\${STATE_DIR}/blastreport.txt.tmp.\\$\\$"' in publish_block
@@ -1949,8 +2493,8 @@ def test_main_nf_sources_shared_lock_and_db_signature_helpers() -> None:
     assert "they see the original $?" in lock_utils_text
     stale_lock_utils_text = (REPO_ROOT / "bin" / "lib" / "stale_lock_utils.sh").read_text(encoding="utf-8")
     assert "stale_lock_maybe_reclaim() {" in stale_lock_utils_text
-    assert 'source "${baseDir}/bin/lib/db_sig_utils.sh"' in text
-    assert text.count('source "${baseDir}/bin/lib/db_sig_utils.sh"') >= 2
+    assert 'db_sig_utils.sh' in text
+    assert text.count('db_sig_utils.sh') >= 2
 
 
 def test_main_nf_guards_round_barcode_collisions_before_round_dir_use() -> None:
@@ -2002,20 +2546,20 @@ def test_main_nf_wires_size_streak_phase_b_in_reporting_otu_definition() -> None
 
 def test_main_nf_wires_unified_round_prune_flow_and_consensus_apply() -> None:
     text = MAIN_NF.read_text(encoding="utf-8")
+    config_text = (REPO_ROOT / "nextflow.config").read_text(encoding="utf-8")
     blast_block = text.split("process blast_OTU_pretax {", 1)[1].split("process _reporting_blast_pretax {", 1)[0]
     consensus_block = text.split("process consensus {", 1)[1].split("process _reporting_consensus_tax {", 1)[0]
-    assert "if ( !params.containsKey('prune_cumulative_pool_all') || params.prune_cumulative_pool_all == null ) {" in text
-    assert "params.prune_cumulative_pool_all = true" in text
+    assert 'prune_cumulative_pool_all = true' in config_text
     assert "def pruneCumulativePoolAll = parseBoolStrict(params.prune_cumulative_pool_all, true, 'prune_cumulative_pool_all')" in text
     assert 'PRUNE_CUMULATIVE_POOL_ALL="${pruneCumulativePoolAll ? \'1\' : \'0\'}"' in text
     assert 'ROUND_PRUNE_IDS="\\$ROUND_DIR/${barcode}_round_prune_ids.list"' in text
     assert 'ROUND_PRUNE_STATS="\\$ROUND_DIR/${barcode}_round_prune_stats.tsv"' in text
     assert 'ROUND_PRUNE_APPLY_STATS="\\$ROUND_DIR/${barcode}_round_prune_apply.tsv"' in text
     assert 'BLAST_FILTER_DROPPED_IDS="${barcode}_blast_filter_dropped_read_ids.list"' in text
-    assert text.count('bash ${baseDir}/bin/prune_round_orchestrate.sh \\') >= 2
-    assert 'perl ${baseDir}/bin/blast_assigned_otu_keys.pl \\' in blast_block
-    assert 'perl ${baseDir}/bin/persist_otu_keys_ever.pl \\' in blast_block
-    assert 'perl ${baseDir}/bin/expand_otu_keys_to_member_ids.pl \\' in blast_block
+    assert text.count('prune_round_orchestrate.sh') >= 2
+    assert 'perl "\\$BIN_DIR/blast_assigned_otu_keys.pl" \\' in blast_block
+    assert 'perl "\\$BIN_DIR/persist_otu_keys_ever.pl" \\' in blast_block
+    assert 'perl "\\$BIN_DIR/expand_otu_keys_to_member_ids.pl" \\' in blast_block
     assert 'perl ${baseDir}/bin/consensus_assigned_otu_keys.pl \\' in consensus_block
     assert 'ERROR: failed to extract blast-assigned OTU keys' in blast_block
     assert 'ERROR: failed to persist blast-assigned OTU keys' in blast_block
@@ -2056,47 +2600,44 @@ def test_main_nf_wires_unified_round_prune_flow_and_consensus_apply() -> None:
 
 def test_main_nf_validates_round_lock_scope_and_cpu_maxfork_params() -> None:
     text = MAIN_NF.read_text(encoding="utf-8")
-    assert "if ( !params.containsKey('round_lock_scope') || params.round_lock_scope == null ) {" in text
-    assert "params.round_lock_scope = 'full_round'" in text
+    config_text = (REPO_ROOT / "nextflow.config").read_text(encoding="utf-8")
+    assert 'round_lock_scope = "full_round"' in config_text
     assert "def roundLockScopeCanonical = params.round_lock_scope.toString().trim().toLowerCase()" in text
     assert "Invalid --round_lock_scope '${params.round_lock_scope}'. Allowed values: full_round, dorado_only" in text
-    assert "if ( !params.containsKey('maxforks_fast') || params.maxforks_fast == null ) {" in text
+    assert 'maxforks_fast = 1' in config_text
     assert "def maxForksFastVal = maxForksFastStr.toInteger()" in text
-    assert "if ( !params.containsKey('maxforks_reporting') || params.maxforks_reporting == null ) {" in text
-    assert "if ( !params.containsKey('maxforks_consensus') || params.maxforks_consensus == null ) {" in text
-    assert "if ( !params.containsKey('maxforks_core_cpu') || params.maxforks_core_cpu == null ) {" in text
+    assert 'maxforks_reporting = 2' in config_text
+    assert 'maxforks_consensus = 1' in config_text
+    assert 'maxforks_stateful_core = 1' in config_text
     assert "def maxForksReportingVal = maxForksReportingStr.toInteger()" in text
     assert "def maxForksConsensusVal = maxForksConsensusStr.toInteger()" in text
-    assert "def maxForksCoreCpuVal = maxForksCoreCpuStr.toInteger()" in text
-    assert "if ( !params.containsKey('html_report_enabled') || params.html_report_enabled == null ) {" in text
+    assert "def maxForksStatefulCoreVal = maxForksStatefulCoreStr.toInteger()" in text
+    assert 'html_report_enabled = true' in config_text
     assert "def htmlReportEnabled = parseBoolStrict(params.html_report_enabled, true, 'html_report_enabled')" in text
-    assert "if ( !params.containsKey('html_report_auto_refresh') || params.html_report_auto_refresh == null ) {" in text
+    assert 'html_report_auto_refresh = true' in config_text
     assert "def htmlReportAutoRefresh = parseBoolStrict(params.html_report_auto_refresh, true, 'html_report_auto_refresh')" in text
-    assert "if ( !params.containsKey('html_report_refresh_seconds') || params.html_report_refresh_seconds == null ) {" in text
+    assert 'html_report_refresh_seconds = 15' in config_text
     assert "def htmlReportRefreshSecondsStr = params.html_report_refresh_seconds.toString().trim()" in text
     assert "Invalid --html_report_refresh_seconds '${params.html_report_refresh_seconds}'. Provide an integer >= 1." in text
-    assert "if ( !params.containsKey('html_report_url_prefix') || params.html_report_url_prefix == null ) {" in text
+    assert 'html_report_url_prefix = ""' in config_text
     assert "def htmlReportUrlPrefix = params.html_report_url_prefix.toString().trim()" in text
-    assert "if ( !params.containsKey('html_report_sample_plot_max') || params.html_report_sample_plot_max == null ) {" in text
+    assert 'html_report_sample_plot_max = 10' in config_text
     assert "def htmlReportSamplePlotMaxStr = params.html_report_sample_plot_max.toString().trim()" in text
     assert "Invalid --html_report_sample_plot_max '${params.html_report_sample_plot_max}'. Provide an integer >= 0." in text
-    assert "if ( !params.containsKey('consensus_keep_original_reads') || params.consensus_keep_original_reads == null ) {" in text
-    assert "params.consensus_keep_original_reads = false" in text
+    assert 'consensus_keep_original_reads = false' in config_text
     assert "def consensusKeepOriginalReads = parseBoolStrict(params.consensus_keep_original_reads, false, 'consensus_keep_original_reads')" in text
-    assert "if ( !params.containsKey('prune_unassigned_clusters') || params.prune_unassigned_clusters == null ) {" in text
+    assert 'prune_unassigned_clusters = false' in config_text
     assert "def pruneUnassignedClusters = parseBoolStrict(params.prune_unassigned_clusters, false, 'prune_unassigned_clusters')" in text
-    assert "if ( !params.containsKey('prune_unassigned_drop_reads') || params.prune_unassigned_drop_reads == null ) {" in text
-    assert "params.prune_unassigned_drop_reads = false" in text
+    assert 'prune_unassigned_drop_reads = false' in config_text
     assert "def pruneUnassignedDropReads = parseBoolStrict(params.prune_unassigned_drop_reads, false, 'prune_unassigned_drop_reads')" in text
     assert "prune_unassigned_drop_reads disabled because prune_unassigned_clusters is false" in text
-    assert "if ( !params.containsKey('prune_unassigned_grace_rounds') || params.prune_unassigned_grace_rounds == null ) {" in text
+    assert 'prune_unassigned_grace_rounds = 3' in config_text
     assert "def pruneUnassignedGraceRoundsStr = params.prune_unassigned_grace_rounds.toString().trim()" in text
     assert "Invalid --prune_unassigned_grace_rounds '${params.prune_unassigned_grace_rounds}'. Provide an integer >= 0." in text
-    assert "if ( !params.containsKey('prune_unassigned_keep_top') || params.prune_unassigned_keep_top == null ) {" in text
+    assert 'prune_unassigned_keep_top = 5' in config_text
     assert "def pruneUnassignedKeepTopStr = params.prune_unassigned_keep_top.toString().trim()" in text
     assert "Invalid --prune_unassigned_keep_top '${params.prune_unassigned_keep_top}'. Provide an integer >= 0." in text
-    assert "if ( !params.containsKey('prune_cumulative_pool_all') || params.prune_cumulative_pool_all == null ) {" in text
-    assert "params.prune_cumulative_pool_all = true" in text
+    assert 'prune_cumulative_pool_all = true' in config_text
     assert "def pruneCumulativePoolAll = parseBoolStrict(params.prune_cumulative_pool_all, true, 'prune_cumulative_pool_all')" in text
 
 
@@ -2108,7 +2649,7 @@ def test_main_nf_wires_unassigned_cluster_prune_flow() -> None:
     assert 'tuple val(barcode), val(round_barcode), file(\'blast_report_annotated.txt\') into blast_agg_ch' in blast_block
     assert 'tuple val(barcode), val(round_barcode), file("${barcode}_blastreport_sup.sam"), file("${barcode}_round_sup.tsv"), file("${barcode}_blastreport_sup_pre.fastq"), file("${barcode}_preblastreport_join.txt"), file("blast_report_annotated_preferred.txt"), file("blast_report_annotated_noadapter.txt"), file("${barcode}_blast_filter_stats.tsv") into report_blast' in blast_block
     assert 'tuple val(barcode), val(round_barcode), file("blast_report_annotated.txt"), file("${barcode}_assigned_read_ids.list") into blast2consensus' in blast_block
-    assert blast_block.count('perl ${baseDir}/bin/blast_assigned_read_ids.pl \\') == 1
+    assert blast_block.count('perl "\\$BIN_DIR/blast_assigned_read_ids.pl" \\') == 1
     assert '"${barcode}_blastreport_round.txt" \\' in blast_block
     assert '${barcode}_assigned_read_ids.list' in blast_block
     assert 'protected_pool_added=0' in blast_block
@@ -2141,11 +2682,32 @@ def test_main_nf_wires_unassigned_cluster_prune_flow() -> None:
 def test_main_nf_wires_run_started_utc_file() -> None:
     text = MAIN_NF.read_text(encoding="utf-8")
     fast_block = text.split("process fast_on_target_detection {", 1)[1].split("process _reporting_fast_on_target {", 1)[0]
-    run_summary_block = text.split("process getting_run_summary {", 1)[1].split("process backup_update_and_clean {", 1)[0]
+    backup_block = text.split("process backup_update_and_clean {", 1)[1]
     # Atomic write-once via noclobber; single assertion covers mechanism + exact write target.
     assert 'set -C; date -u \'+%Y-%m-%dT%H:%M:%SZ\' > "${ongoingStateDir}/_state/run_started_utc.txt"' in fast_block
-    # --run-started-utc-file wired in getting_run_summary → report_run_json.pl call.
-    assert '--run-started-utc-file "${ongoingStateDir}/_state/run_started_utc.txt"' in run_summary_block
+    # --run-started-utc-file is now wired in backup_update_and_clean → report_run_json.pl call.
+    assert '--run-started-utc-file "${ongoingStateDir}/_state/run_started_utc.txt"' in backup_block
+
+
+def test_main_nf_getting_run_summary_conditional_consensus_consolidated_ids() -> None:
+    """--consensus-consolidated-ids is only passed when the file is non-empty.
+
+    Early rounds have an empty consolidated_ids file (no consolidations yet).
+    Passing the path unconditionally triggers a spurious missing_or_empty warning
+    in report_round_json.pl. The fix uses a _CONS_IDS_ARG guard so the arg is
+    omitted when the file is empty, suppressing the false-positive warning.
+    """
+    text = MAIN_NF.read_text(encoding="utf-8")
+    summary_block = text.split("process getting_run_summary {", 1)[1].split("process backup_update_and_clean {", 1)[0]
+    # Guard must initialise the variable before the perl call.
+    assert '_CONS_IDS_ARG=""' in summary_block
+    # Conditional population using [ -s ] (non-empty file test).
+    assert 'if [ -s "\\$ROUND_DIR/' in summary_block
+    assert '_CONS_IDS_ARG="--consensus-consolidated-ids' in summary_block
+    # Variable expansion (not hardcoded path) passed to report_round_json.pl.
+    assert '\\$_CONS_IDS_ARG \\' in summary_block
+    # Hardcoded form must NOT appear.
+    assert '--consensus-consolidated-ids "\\$ROUND_DIR/' not in summary_block
 
 
 def test_main_nf_routes_dorado_basecalling_through_lock_helper() -> None:
@@ -2159,7 +2721,7 @@ def test_main_nf_routes_dorado_basecalling_through_lock_helper() -> None:
     assert 'DORADO_LOCK="\\${STATE_DIR}/.dorado.lock"' in text
     assert '${baseDir}/bin/with_dorado_lock.sh "\\$DORADO_LOCK" "\\$DORADO_LOCK_WAIT" "fast_on_target_detection:\\$round_barcode" -- \\' in text
     assert '${baseDir}/bin/with_dorado_lock.sh "\\$DORADO_LOCK" "\\$DORADO_LOCK_WAIT" "hac_basecalling:\\$round_barcode" -- \\' in text
-    assert '${baseDir}/bin/with_dorado_lock.sh "\\$DORADO_LOCK" "\\$DORADO_LOCK_WAIT" "blast_OTU_pretax:\\$round_barcode:sup" -- \\' in text
+    assert '"\\$BIN_DIR/with_dorado_lock.sh" "\\$DORADO_LOCK" "\\$DORADO_LOCK_WAIT" "blast_OTU_pretax:\\$round_barcode:sup" -- \\' in text
     assert 'ROUND_LOCK_SCOPE="${roundLockScopeCanonical}"' in text
     assert 'round_barcode="\\${round_barcode}"' not in fast_block
     assert 'round_barcode="${round_barcode}"' in hac_block
@@ -2178,20 +2740,44 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert "], 'getting_run_summary_inputs')" in text
     assert 'getting_run_summary_with_path = ChannelUtils.strictRoundJoin(getting_run_summary_inputs, get_summary_ch)' in text
     assert 'complete_round_with_path = ChannelUtils.strictRoundJoin(complete_round_ch, close_round_ch)' in text
-    assert 'tuple env(barcode), env(round_barcode), val(read_path) into close_round_ch, get_summary_ch' in fast_block
+    assert 'tuple env(barcode), env(round_barcode), val(read_path) into close_round_ch, get_summary_ch, failed_round_source_ch' in fast_block
+    assert 'def failedRoundPlaceholderRoot = file("${baseDir}/bin/report_placeholders/failed_round", checkIfExists: true)' in text
+    assert "if (!(resolvedContext in ['full_collapse', 'primers_only', 'full_track', 'off'])) {" in text
+    assert 'def failedRoundPlaceholderAssets = resolveFailedRoundPlaceholderAssets(demuxIdentityContext)' in text
+    assert 'failed_round_ch = failed_round_source_ch' in text
+    assert 'rm -f ${ongoingStateDir}/\\$round_barcode/ROUND_FAILED.txt' in fast_block
+    assert 'process failed_round_summary_placeholders {' not in text
+    assert 'failed_round_ch.into {' in text
+    assert 'failed_blst_rpt_summary_src_ch' in text
+    assert 'failed_cons_rpt_summary_src_ch' in text
+    assert 'failed_otu_def_rpt_summary_src_ch' in text
+    assert 'failed_otu_def_rpt_sidecar_summary_src_ch' in text
+    assert 'failed_demult_rpt_summary_src_ch' in text
+    assert 'failed_demult_rpt_sidecar_summary_src_ch' in text
+    assert 'failed_target_rpt_summary_src_ch' in text
+    assert 'failed_blast_agg_src_ch' in text
+    assert 'failed_cons_agg_src_ch' in text
+    assert '[barcode, round_barcode, failedRoundPlaceholderAssets.blastOtuPretaxRpt, failedRoundPlaceholderAssets.readInfoRpt, failedRoundPlaceholderAssets.blastOtuNoadapterRpt, failedRoundPlaceholderAssets.blastFilterStats]' in text
+    assert '[barcode, round_barcode, failedRoundPlaceholderAssets.blastConsensusTaxRpt, failedRoundPlaceholderAssets.consensusRoundProv]' in text
+    assert '[barcode, round_barcode, failedRoundPlaceholderAssets.otuDefRpt, failedRoundPlaceholderAssets.otuMembersRound, failedRoundPlaceholderAssets.otuSizesRound]' in text
+    assert '[barcode, round_barcode, failedRoundPlaceholderAssets.otuDefSidecar]' in text
+    assert '[barcode, round_barcode, failedRoundPlaceholderAssets.demultRpt]' in text
+    assert '[barcode, round_barcode, failedRoundPlaceholderAssets.demultSidecar]' in text
+    assert '[barcode, round_barcode, failedRoundPlaceholderAssets.onTargetRpt]' in text
+    assert '[barcode, round_barcode, failedRoundPlaceholderAssets.blastReportAnnotated]' in text
+    assert '[barcode, round_barcode, failedRoundPlaceholderAssets.consensusBlastFull]' in text
     assert 'tuple val(barcode), val(round_barcode), file(blast_otu_pretax_rpt), file(read_info_rpt), file(blast_otu_noadapter_rpt), file(blast_filter_stats), file(blast_consensus_tax), file(consensus_round_provenance), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round), file(otu_def_rpt_sidecar), file(demult_rpt), file(demult_rpt_sidecar), file(on_target_rpt), file(summary), file(summary_otu), val(read_path) from getting_run_summary_with_path' in summary_block
     assert 'val(read_path) from get_summary_ch' not in summary_block
     assert 'tuple val(barcode), val(round_barcode), val(read_path) from complete_round_with_path' in backup_block
+    assert 'tuple val(barcode), val(round_barcode), file("report_render.request") into report_render_request_ch' in backup_block
     assert 'val(read_path) from close_round_ch' not in backup_block
     assert 'ROUND_REPORT_JSON="\\$ROUND_DIR/round_report.json"' in summary_block
-    assert 'REPORT_HISTORY_JSONL="\\$STATE_DIR/report_history.jsonl"' in summary_block
-    assert 'REPORT_HISTORY_LOCK="\\$STATE_DIR/.report_history.lock"' in summary_block
-    assert 'REPORT_RENDER_LOCK="\\$STATE_DIR/.report_render.lock"' in summary_block
-    assert 'REPORT_STATE_JSON="${params.outdir}/report_state.json"' in summary_block
-    assert 'RUN_REPORT_JSON="\\$ROUND_DIR/run_report.json"' in summary_block
-    assert 'RUN_INDEX_JSONL="${params.outdir}/runs_index.jsonl"' in summary_block
-    assert 'RUN_INDEX_LOCK="${params.outdir}/.runs_index.lock"' in summary_block
-    assert 'RUN_REPORT_DIR="${params.outdir}/runs/${run_name}"' in summary_block
+    assert 'ROUND_REPORT_JSON_STAGED="${barcode}_round_report_pre_frozen.json"' in summary_block
+    assert 'ROUND_LIVE_STAGE="\\$ROUND_DIR/report_live_stage"' in summary_block
+    assert 'REPORT_LIVE_ASSET_DIR="\\$ROUND_LIVE_STAGE/report_assets"' in summary_block
+    assert 'REPORT_SAMPLE_STAGE_DIR="\\$REPORT_LIVE_ASSET_DIR/samples"' in summary_block
+    assert 'REPORT_FIG_URL_PREFIX="runs/${run_name}/report_assets/live_round"' in summary_block
+    assert 'REPORT_SAMPLE_FIG_URL_PREFIX="runs/${run_name}/report_assets/live_round/samples"' in summary_block
     assert 'ROUND_INDEX_FILE="\\$STATE_DIR/round_index.tsv"' in summary_block
     assert 'ACTIVE_PRUNE_COUNTS_OUT="\\$ROUND_DIR/active_prune_candidates_counts.tsv"' in summary_block
     assert 'OTU_SIZE_STREAK_IDS_LAST="\\$STATE_DIR/${barcode}_otu_size_streak_prune_ids_last.txt"' in summary_block
@@ -2203,47 +2789,118 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'WARN: active_prune_candidates.pl failed (rc=\\$active_prune_rc)' in summary_block
     assert 'report_sample_read_counts_plots.sh \\' in summary_block
     assert 'perl ${baseDir}/bin/report_round_json.pl \\' in summary_block
-    assert 'cp "${ongoingStateDir}/_state/${barcode}_demult_rpt.txt" "${barcode}_demult_rpt_cumulative.txt"' in summary_block
+    assert 'render_round_report_json() {' in summary_block
+    assert 'ROUND_REPORT_TIMESTAMP_UTC=""' not in summary_block
+    assert 'ROUND_TIMESTAMP_UTC="\\$(date -u +%Y-%m-%dT%H:%M:%SZ)"' in summary_block
+    assert 'render_round_report_json "\\$ROUND_REPORT_JSON_STAGED"' in summary_block
+    assert 'render_round_report_json "\\$ROUND_REPORT_JSON"' in summary_block
+    assert 'render_round_report_json "\\$ROUND_REPORT_JSON" "\\$ROUND_REPORT_TIMESTAMP_UTC"' not in summary_block
+    assert 'set -- --timestamp-utc "\\$timestamp_override"' not in summary_block
+    assert '--timestamp-utc "\\$ROUND_TIMESTAMP_UTC" \\' in summary_block
+    assert '"\\$@" \\' not in summary_block
+    assert '--asset-snapshot-policy "latest_only" \\' in summary_block
+    assert 'DEMULT_RPT_SOURCE="${ongoingStateDir}/_state/${barcode}_demult_rpt.txt"' in summary_block
+    assert 'DEMULT_RPT_SOURCE="${demult_rpt}"' in summary_block
+    assert 'cp "\\$DEMULT_RPT_SOURCE" "${barcode}_demult_rpt_cumulative.txt"' in summary_block
     assert 'bash ${baseDir}/bin/demult_summary.sh ${barcode}_demult_rpt_cumulative.txt ${barcode}' in summary_block
     assert 'cp "${barcode}_summary_demult_rpt.txt" "${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt"' in summary_block
     assert '--demult "${demult_rpt}" \\' in summary_block
-    assert '--schema-version "1.4" \\' in summary_block
+    assert '--read-fate-demult "${barcode}_read_fate_demult_first_seen.tsv" \\' in summary_block
+    assert '--schema-version "1.6" \\' in summary_block
     assert '--otu-sizes-round "${otu_sizes_round}" \\' in summary_block
     assert '--otu-size-streak "\\$ROUND_DIR/${barcode}_otu_size_streak.tsv" \\' in summary_block
     assert '--active-prune-counts "\\$ACTIVE_PRUNE_COUNTS_OUT" \\' in summary_block
     assert '--blast-filter-dropped-ids "\\$ROUND_DIR/${barcode}_blast_filter_dropped_read_ids.list" \\' in summary_block
     assert '--round-index-file "\\$ROUND_DIR/round_index.tsv" \\' in summary_block
     assert '--consensus-round-provenance "${consensus_round_provenance}" \\' in summary_block
-    assert 'LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_history_append.sh "\\$ROUND_REPORT_JSON" "\\$REPORT_HISTORY_JSONL" "\\$REPORT_HISTORY_LOCK"' in summary_block
-    assert 'perl ${baseDir}/bin/report_run_json.pl \\' in summary_block
-    assert '--schema-version "1.4" \\' in summary_block
-    assert 'bash ${baseDir}/bin/report_run_index_update.sh "\\$RUN_REPORT_JSON" "\\$RUN_INDEX_JSONL" "\\$RUN_INDEX_LOCK"' in summary_block
-    assert 'python3 ${baseDir}/bin/report_render.py \\' in summary_block
+    assert '--read-fate-blast "${barcode}_read_fate_blast_first_seen.tsv" \\' in summary_block
+    assert '_ROUND_FAILED_ARG=""' in summary_block
+    assert '--round-failed-file \\$ROUND_DIR/ROUND_FAILED.txt' in summary_block
+    assert '--json "\\$ROUND_REPORT_JSON_STAGED" \\' in summary_block
+    assert summary_block.index('--json "\\$ROUND_REPORT_JSON_STAGED" \\') < summary_block.index('Time_taxonomy_otu_frozen.sig')
+    assert 'perl ${baseDir}/bin/report_sync_figures.pl \\' in summary_block
+    assert '--asset-dir "\\$REPORT_LIVE_ASSET_DIR" \\' in summary_block
+    assert 'bash ${baseDir}/bin/report_live_stage.sh \\' in summary_block
+    assert '--stage-root "\\$ROUND_LIVE_STAGE" \\' in summary_block
+    assert '--sample-fig-dir "\\$REPORT_SAMPLE_STAGE_DIR" \\' in summary_block
+    assert 'publish_report_history' not in summary_block
+    assert summary_block.index('Time_taxonomy_otu_frozen.sig') < summary_block.index('wait || true')
     assert 'Time_taxonomy.R' not in summary_block
     assert 'Time_taxonomy_otu.R' in summary_block
     assert 'Time_taxonomy_otu.sig' in summary_block
-    assert 'while true; do' in summary_block
-    assert 'if mkdir "\\$REPORT_RENDER_LOCK_DIR" 2>/dev/null; then' in summary_block
-    assert 'if [ "\\$render_lock_acquired" -eq 1 ]; then' in summary_block
-    assert 'if [ -d "\\$REPORT_RENDER_LOCK_DIR" ]; then' not in summary_block
-    assert 'WARN: skipping HTML report render for round=${round_barcode}; lock timeout on \\${REPORT_RENDER_LOCK}' in summary_block
-    assert '--run-index "\\$RUN_INDEX_JSONL" \\' in summary_block
-    assert '--state-out "\\$REPORT_STATE_JSON" \\' in summary_block
-    assert '--state-url "report_state.json" \\' in summary_block
-    assert '--run-id-filter "${run_name}" \\' in summary_block
-    cumulative_stage_idx = summary_block.index('cp "${ongoingStateDir}/_state/${barcode}_demult_rpt.txt" "${barcode}_demult_rpt_cumulative.txt"')
+    assert 'REPORT_HISTORY_JSONL="\\$STATE_TMP/report_history.jsonl"' in backup_block
+    assert 'REPORT_HISTORY_LOCK="\\$STATE_TMP/.report_history.lock"' in backup_block
+    assert 'REPORT_RENDER_LOCK="\\$STATE_TMP/.report_render.lock"' in backup_block
+    assert 'REPORT_LIVE_PUBLISH_LOCK="\\$STATE_TMP/.report_live_publish.lock"' in backup_block
+    assert 'RUN_REPORT_JSON="\\$ROUND_TMP/run_report.json"' in backup_block
+    assert 'RUN_INDEX_JSONL="${params.outdir}/report_html/runs_index.jsonl"' in backup_block
+    assert 'RUN_INDEX_LOCK="${params.outdir}/.runs_index.lock"' in backup_block
+    assert 'RUN_REPORT_DIR="${params.outdir}/report_html/runs/${run_name}"' in backup_block
+    assert 'RUN_REPORT_PENDING="\\$RUN_REPORT_DIR/.report_render_pending"' in backup_block
+    assert 'REPORT_ASSET_DIR="${params.outdir}/report_html/runs/${run_name}/report_assets"' in backup_block
+    assert 'history_lock_acquired=0' in backup_block
+    assert 'release_report_history_lock() {' in backup_block
+    assert 'acquire_report_history_lock() {' in backup_block
+    assert 'publish_report_history() {' in backup_block
+    assert '--check-live-order \\' in backup_block
+    assert '--current-round-barcode "${round_barcode}" \\' in backup_block
+    assert 'INFO: normalizing report history order for ${round_barcode}' in backup_block
+    assert '--live \\' in backup_block
+    assert '--skip-render \\' in backup_block
+    assert "trap 'release_report_history_lock' EXIT HUP INT TERM" in backup_block
+    assert 'trap - EXIT HUP INT TERM' in backup_block
+    assert 'bash ${baseDir}/bin/report_live_publish.sh \\' in backup_block
+    assert '--lock-path "\\$REPORT_LIVE_PUBLISH_LOCK"' in backup_block
+    assert 'bash ${baseDir}/bin/report_history_append.sh --no-lock "\\$ROUND_REPORT_JSON" "\\$REPORT_HISTORY_JSONL" "\\$REPORT_HISTORY_LOCK"' in backup_block
+    assert 'WARN: report history publication failed (rc=\\$history_rc)' in backup_block
+    assert 'perl ${baseDir}/bin/report_run_json.pl \\' in backup_block
+    assert 'bash ${baseDir}/bin/report_run_index_update.sh "\\$RUN_REPORT_JSON" "\\$RUN_INDEX_JSONL" "\\$RUN_INDEX_LOCK"' in backup_block
+    assert 'ensure_local_round_alias() {' in summary_block
+    assert 'ROUND_DEMULT_RPT_LOCAL="${barcode}_demult_rpt.txt"' in summary_block
+    assert 'ROUND_DEMULT_SIDECAR_LOCAL="${barcode}_demult_rpt.contract.tsv"' in summary_block
+    assert 'ROUND_OTU_RPT_LOCAL="${barcode}_otu_def_rpt.txt"' in summary_block
+    assert 'ROUND_OTU_SIDECAR_LOCAL="${barcode}_otu_def_rpt.contract.tsv"' in summary_block
+    assert 'ensure_local_round_alias "${demult_rpt}" "\\$ROUND_DEMULT_RPT_LOCAL"' in summary_block
+    assert 'ensure_local_round_alias "${demult_rpt_sidecar}" "\\$ROUND_DEMULT_SIDECAR_LOCAL"' in summary_block
+    assert 'ensure_local_round_alias "${otu_def_rpt}" "\\$ROUND_OTU_RPT_LOCAL"' in summary_block
+    assert 'ensure_local_round_alias "${otu_def_rpt_sidecar}" "\\$ROUND_OTU_SIDECAR_LOCAL"' in summary_block
+    assert '"\\$ROUND_DEMULT_RPT_LOCAL" \\' in summary_block
+    assert '"\\$ROUND_DEMULT_SIDECAR_LOCAL" \\' in summary_block
+    assert '"\\$ROUND_OTU_RPT_LOCAL" \\' in summary_block
+    assert '"\\$ROUND_OTU_SIDECAR_LOCAL"' in summary_block
+    assert 'write_report_metadata_files' in backup_block
+    assert 'printf \'render=0\\nround_barcode=%s\\n\' "${round_barcode}" > "\\$RENDER_REQUEST_FILE"' in backup_block
+    assert 'printf \'render=1\\nround_barcode=%s\\n\' "${round_barcode}" > "\\$RENDER_REQUEST_FILE"' in backup_block
+    async_block = text.split("process async_report_render {", 1)[1]
+    assert 'tuple val(barcode), val(round_barcode), file(render_request_file) from report_render_request_ch' in async_block
+    assert 'REQUEST_RENDER="\\$(awk -F= \'/^render=/{print \\$2; exit}\' "${render_request_file}" 2>/dev/null || true)"' in async_block
+    assert 'if ! acquire_lock_dir_wait "\\$REPORT_RENDER_LOCK" "\\$RENDER_LOCK_WAIT"; then' in async_block
+    assert '--history "\\$SNAPSHOT_PATH" \\' in async_block
+    assert '--skip-root-report \\' in async_block
+    assert 'python3 ${baseDir}/bin/report_publication_check.py \\' in async_block
+    assert 'clear_run_report_pending' in async_block
+    assert 'REPORT_ROOT_RENDER_LOCK="${params.outdir}/.report_root_render.lock"' in async_block
+    assert "blst_rpt_summary = preferRealRoundRows(blst_rpt_summary, failed_blst_rpt_summary, 'blst_rpt_summary')" in text
+    assert "blast_agg_ch = preferRealRoundRows(blast_agg_ch, failed_blast_agg_ch, 'blast_agg_ch')" in text
+    assert "cons_agg_ch = preferRealRoundRows(cons_agg_ch, failed_cons_agg_ch, 'cons_agg_ch')" in text
+    demult_source_idx = summary_block.index('DEMULT_RPT_SOURCE="${ongoingStateDir}/_state/${barcode}_demult_rpt.txt"')
+    cumulative_stage_idx = summary_block.index('cp "\\$DEMULT_RPT_SOURCE" "${barcode}_demult_rpt_cumulative.txt"')
     demult_summary_idx = summary_block.index('bash ${baseDir}/bin/demult_summary.sh ${barcode}_demult_rpt_cumulative.txt ${barcode}')
     summary_copy_idx = summary_block.index('cp "${barcode}_summary_demult_rpt.txt" "${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt"')
     read_counts_idx = summary_block.index('_plot_key="Read_counts|')
     sample_assets_idx = summary_block.index('report_sample_read_counts_plots.sh \\')
-    round_json_idx = summary_block.index('--demult "${demult_rpt}" \\')
-    cumulative_stage_cmd = 'cp "${ongoingStateDir}/_state/${barcode}_demult_rpt.txt" "${barcode}_demult_rpt_cumulative.txt"'
-    post_stage_block = summary_block[cumulative_stage_idx:round_json_idx]
+    final_render_idx = summary_block.index('render_round_report_json "\\$ROUND_REPORT_JSON"')
+    stage_sync_idx = summary_block.index('report_sync_figures.pl \\')
+    live_stage_idx = summary_block.index('report_live_stage.sh \\')
+    wait_idx = summary_block.index('wait || true')
+    cumulative_stage_cmd = 'cp "\\$DEMULT_RPT_SOURCE" "${barcode}_demult_rpt_cumulative.txt"'
+    post_stage_block = summary_block[cumulative_stage_idx:final_render_idx]
     post_stage_suffix = post_stage_block[len(cumulative_stage_cmd):]
     post_stage_suffix = re.sub(r'\\\s*\n\s*', ' ', post_stage_suffix)
     assert not _has_forbidden_demult_write(post_stage_suffix), post_stage_suffix
-    assert cumulative_stage_idx < demult_summary_idx < summary_copy_idx < read_counts_idx < sample_assets_idx
-    assert round_json_idx > cumulative_stage_idx
+    assert demult_source_idx < cumulative_stage_idx < demult_summary_idx < summary_copy_idx < read_counts_idx < sample_assets_idx
+    assert stage_sync_idx < live_stage_idx < final_render_idx
+    assert demult_source_idx < wait_idx < final_render_idx
 
 
 def test_forbidden_demult_write_scanner_shell_position_regression() -> None:
@@ -2252,6 +2909,8 @@ def test_forbidden_demult_write_scanner_shell_position_regression() -> None:
         '(cp tmp "${demult_rpt}")',
         'case x in y) cp tmp "${demult_rpt}" ;; esac',
         'case x\nin\n  y) cp tmp "${demult_rpt}" ;;\nesac',
+        'case x in y)cp tmp "${demult_rpt}" ;; esac',
+        'case x in\ny)\ncp tmp "${demult_rpt}"\n;;\nesac',
         'case $(foo | bar) in y) cp tmp "${demult_rpt}" ;; esac',
         'case `foo && bar` in y) mv tmp "${barcode}_demult_rpt.txt" ;; esac',
         'case $(foo `bar | baz`) in y) cp tmp "${demult_rpt}" ;; esac',
@@ -2266,6 +2925,8 @@ def test_forbidden_demult_write_scanner_shell_position_regression() -> None:
         'env VAR="a b" mv tmp "${barcode}_demult_rpt.txt"',
         'FOO=1 env VAR=1 cp tmp "${demult_rpt}"',
         'command env VAR=1 cp tmp "${demult_rpt}"',
+        'env VAR=1 cp tmp "${demult_rpt}"',
+        'command env VAR=1 mv tmp "${barcode}_demult_rpt.txt"',
         'FOO=1 command env VAR=1 cp tmp "${demult_rpt}"',
         'printf ${foo} > "${demult_rpt}"',
         'printf ${var#pat} > "${demult_rpt}"',
@@ -2404,6 +3065,20 @@ def test_main_nf_fails_fast_on_round_join_key_loss() -> None:
     assert 'ChannelUtils.strictRoundJoin' in text
 
 
+def test_main_nf_wires_track_identity_into_demux_and_consensus_guards() -> None:
+    text = MAIN_NF.read_text(encoding="utf-8")
+    demux_block = text.split("process demultiplexing_hq_reads {", 1)[1].split("# -- §3: Primers-only mode", 1)[0]
+    consensus_block = text.split("# -- §3: Consensus_simple.sh execution (reads or cache-only mode) --", 1)[1].split(
+        'echo "INFO: No sup_reads and no consensus cache; skipping Consensus_simple.sh this round" 1>&2',
+        1,
+    )[0]
+
+    assert 'TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv"' in demux_block
+    assert 'build_track_adapter_marker_map "\\$TRACK_IDENTITY_TSV" "\\$TRACK_ADAPTER_MARKER_MAP"' in demux_block
+    assert 'filter_track_marker_unit_fastq.sh' in demux_block
+    assert 'RTBIOSCAN_TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv"' in consensus_block
+
+
 def test_main_nf_backup_update_and_clean_uses_incremental_backup_sync_helpers() -> None:
     text = MAIN_NF.read_text(encoding="utf-8")
     backup_block = text.split("process backup_update_and_clean {", 1)[1].split('"""', 2)[1]
@@ -2430,3 +3105,21 @@ def test_main_nf_backup_update_and_clean_uses_incremental_backup_sync_helpers() 
     ):
         assert name in backup_block
     assert 'strictRoundJoinAll requires channel-like inputs; element ${idx + 1} was ${ch?.getClass()?.name ?: \'null\'}' in CHANNEL_UTILS.read_text(encoding="utf-8")
+
+
+def test_backup_update_and_clean_publishes_report_history_unconditionally() -> None:
+    text = MAIN_NF.read_text(encoding="utf-8")
+    backup_block = text.split("process backup_update_and_clean {", 1)[1].split('"""', 2)[1]
+    publish_block = backup_block.split('if [ "\\$report_live_publish_rc" -ne 0 ]; then', 1)[1].split('if [ "\\$history_rc" -ne 0 ]; then', 1)[0]
+
+    assert 'set +e\n\t\t\tpublish_report_history\n\t\t\thistory_rc=\\$?\n\t\t\tset -e' in publish_block
+    assert 'FEEDER_SLICE_SIDECAR' not in publish_block
+    assert 'IS_FEEDER_SLICE_ROUND' not in publish_block
+    assert 'skipping history append to prevent orphan round pollution' not in publish_block
+    assert 'if [ "\\$history_rc" -ne 0 ]; then' in backup_block
+
+
+def test_main_nf_defines_check_hostname_helper() -> None:
+    text = MAIN_NF.read_text(encoding="utf-8")
+    assert 'checkHostname()' in text
+    assert 'def checkHostname() {' in text

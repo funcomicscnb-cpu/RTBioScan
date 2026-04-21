@@ -17,10 +17,21 @@ def _run(args):
     )
 
 
-def _write_lock_summary(path: Path, otu_key: str) -> None:
+def _write_lock_summary(
+    path: Path,
+    otu_key: str,
+    *,
+    extra_header: str = "",
+    extra_row: str = "",
+) -> None:
+    header = "otu_key\teffective_consolidated\tis_frozen"
+    row = f"{otu_key}\t0\t0"
+    if extra_header:
+        header = f"{header}\t{extra_header}"
+    if extra_row:
+        row = f"{row}\t{extra_row}"
     path.write_text(
-        "otu_key\teffective_consolidated\tis_frozen\n"
-        f"{otu_key}\t0\t0\n",
+        f"{header}\n{row}\n",
         encoding="utf-8",
     )
 
@@ -187,6 +198,7 @@ def test_report_round_json_basic(tmp_path: Path) -> None:
     assert data["reads"]["hac"] == 2
     assert data["reads"]["sup"] == 1
     assert data["otu"]["canonical"]["active"] == 2
+
     assert data["otu"]["canonical"]["consolidated"] == 1
     assignments = data["otu"]["assignments_by_level"]
     assert "species" in assignments
@@ -242,6 +254,194 @@ def test_report_round_json_basic(tmp_path: Path) -> None:
     assert prune["round_index"] == 1
     assert prune["size_streak_round_candidates"] == 2
     assert prune["size_streak_eligible_candidates"] == 2
+
+
+def test_report_round_json_accepts_lock_summary_with_top_two_columns(tmp_path: Path) -> None:
+    read_info = tmp_path / "read_info.tsv"
+    read_info.write_text(
+        "read_id\tfilename\trun_id\tbarcode\tfast_length\tfast_mean_qscore\thac_length\thac_mean_qscore\tsup_length\tsup_mean_qscore\n"
+        "r1\tf\tR\tb\t100\t10\t99\t12\tNA\tNA\n",
+        encoding="utf-8",
+    )
+    on_target = tmp_path / "on_target.tsv"
+    on_target.write_text("read_id\tqc_filter\ton_target_kingdom\nr1\tIN\tON_TARGET\n", encoding="utf-8")
+    otu_def = tmp_path / "otu_def.tsv"
+    otu_def.write_text("read_id\tOTU_id\nr1\tOTUB_1-COI\n", encoding="utf-8")
+    blast_otu = tmp_path / "blast_otu.tsv"
+    blast_otu.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        "r1\tCOI\thac\tsample_A_1\thit\t123\t100\t99\tOTUB_1-COI\tF1\tG1\tS1\n",
+        encoding="utf-8",
+    )
+    otu_sizes_round = tmp_path / "otu_sizes_round.tsv"
+    otu_sizes_round.write_text("otu_id\tsize\nOTUB_1-COI\t1\n", encoding="utf-8")
+    blast_cons = tmp_path / "blast_cons.tsv"
+    blast_cons.write_text(
+        "consensus_id\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample\t"
+        "taxid\tblast_hit\taln_length\tperc_id\tconsensus_kingdom\tconsensus_phylum\t"
+        "consensus_class\tconsensus_order\tconsensus_family\tconsensus_genus\tconsensus_species\n",
+        encoding="utf-8",
+    )
+    consensus_round_prov = tmp_path / "consensus_round_provenance.tsv"
+    consensus_round_prov.write_text(
+        "round_barcode\tsample\totu_key\tconsensus_id\treads_used_round\n",
+        encoding="utf-8",
+    )
+    size_streak_stats = tmp_path / "size_streak.tsv"
+    size_streak_stats.write_text("reads_prune_candidate\t0\notus_prune_candidate\t0\n", encoding="utf-8")
+    size_streak_state = tmp_path / "otu_size_streak.tsv"
+    size_streak_state.write_text("", encoding="utf-8")
+    blast_filter = tmp_path / "blast_filter.tsv"
+    blast_filter.write_text("kept_reads\t1\nkept_otus\t1\ndropped_otus\t0\nmissing_policy\tdrop\n", encoding="utf-8")
+    blast_filter_dropped = tmp_path / "blast_filter_dropped.list"
+    blast_filter_dropped.write_text("", encoding="utf-8")
+    blastdiag_stats = tmp_path / "blastdiag.tsv"
+    blastdiag_stats.write_text("rows_total\t1\notu_total\t1\n", encoding="utf-8")
+    round_index = tmp_path / "round_index.tsv"
+    round_index.write_text("round_barcode\tround_index\noutput_round_1\t1\n", encoding="utf-8")
+    active_prune_counts = tmp_path / "active_prune_counts.tsv"
+    active_prune_counts.write_text(
+        "active_total\t1\n"
+        "size_streak_active\t0\n"
+        "size_streak_candidates\t0\n"
+        "union\t0\n"
+        "active_scope\tround\n"
+        "active_scope_reason\tround_local_ok\n"
+        "size_streak_input_status\tready\n"
+        "size_streak_possible\t1\n"
+        "size_streak_applied\t0\n"
+        "size_streak_disabled\t1\n"
+        "effective_mode\toff\n"
+        "effective_reason\twithin_skip_window\n"
+        "round_index\t1\n"
+        "size_streak_round_candidates\t0\n"
+        "size_streak_eligible_candidates\t0\n",
+        encoding="utf-8",
+    )
+    lock_summary = tmp_path / "lock.tsv"
+    _write_lock_summary(
+        lock_summary,
+        "OTUB_1-COI",
+        extra_header="otu_sig_rule\ttop1_cluster_size\ttop1_cluster_qscore\ttop2_cluster_size\ttop2_cluster_qscore\ttop2_ratio\ttop2_delta_reads",
+        extra_row="top_two_gap\t10\t30\t4\t30\t2.500000\t6",
+    )
+    consolidated = tmp_path / "cons_ids.txt"
+    consolidated.write_text("", encoding="utf-8")
+    out = tmp_path / "round_report.json"
+
+    result = _run(
+        [
+            "--run-id",
+            "runA",
+            "--state-id",
+            "stateA",
+            "--barcode",
+            "RTBioScan",
+            "--round-barcode",
+            "output_round_1",
+            "--out",
+            str(out),
+            "--read-info",
+            str(read_info),
+            "--on-target",
+            str(on_target),
+            "--otu-def",
+            str(otu_def),
+            "--blast-otu",
+            str(blast_otu),
+            "--otu-sizes-round",
+            str(otu_sizes_round),
+            "--blast-consensus",
+            str(blast_cons),
+            "--consensus-round-provenance",
+            str(consensus_round_prov),
+            "--active-prune-counts",
+            str(active_prune_counts),
+            "--otu-size-streak-stats",
+            str(size_streak_stats),
+            "--otu-size-streak",
+            str(size_streak_state),
+            "--otu-size-streak-mode",
+            "off",
+            "--otu-size-streak-min-rounds",
+            "2",
+            "--otu-lock-summary",
+            str(lock_summary),
+            "--otu-blast-filter-stats",
+            str(blast_filter),
+            "--blast-filter-dropped-ids",
+            str(blast_filter_dropped),
+            "--otu-blast-min-members",
+            "1",
+            "--otu-blast-filter-skip-rounds",
+            "none",
+            "--otu-blast-unassigned-grace-rounds",
+            "0",
+            "--round-index-file",
+            str(round_index),
+            "--otu-members-blastdiag-stats",
+            str(blastdiag_stats),
+            "--blast-filter-mode",
+            "off",
+            "--consensus-consolidated-ids",
+            str(consolidated),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["otu"]["canonical"]["active"] == 1
+    assert data["otu"]["canonical"]["consolidated"] == 0
+
+
+def test_report_round_json_honors_timestamp_override(tmp_path: Path) -> None:
+    out = tmp_path / "round_report.json"
+    timestamp_utc = "2026-04-10T12:34:56Z"
+
+    result = _run(
+        [
+            "--run-id",
+            "runA",
+            "--barcode",
+            "RTBioScan",
+            "--round-barcode",
+            "output_round_1",
+            "--timestamp-utc",
+            timestamp_utc,
+            "--out",
+            str(out),
+        ]
+    )
+
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["timestamp_utc"] == timestamp_utc
+
+
+def test_report_round_json_marks_failed_round_when_failure_file_present(tmp_path: Path) -> None:
+    failed = tmp_path / "ROUND_FAILED.txt"
+    failed.write_text("No target reads for runA_3\n", encoding="utf-8")
+    out = tmp_path / "round_report.json"
+
+    result = _run(
+        [
+            "--run-id",
+            "runA",
+            "--barcode",
+            "RTBioScan",
+            "--round-barcode",
+            "runA_3",
+            "--out",
+            str(out),
+            "--round-failed-file",
+            str(failed),
+        ]
+    )
+
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["round_status"] == "failed"
+    assert data["failure_reason"] == "No target reads for runA_3"
+    assert data["failure_stage"] == "fast_on_target_detection"
 
 
 def test_report_round_json_on_target_fallback_legacy_rows(tmp_path: Path) -> None:
@@ -411,6 +611,77 @@ def test_report_round_json_tolerates_repeated_headers_blank_and_malformed_rows(t
     assert len(cons_rows) == 1
     assert cons_rows[0]["taxon"] == "S"
     assert cons_rows[0]["consensus_count"] == 1
+
+
+def test_report_round_json_emits_frozen_and_consolidated_read_totals(tmp_path: Path) -> None:
+    read_info = tmp_path / "read_info.tsv"
+    read_info.write_text(
+        "read_id\tfilename\trun_id\tbarcode\tfast_length\tfast_mean_qscore\thac_length\thac_mean_qscore\tsup_length\tsup_mean_qscore\n"
+        "r1\tf\tR\tb\t100\t10\t99\t12\tNA\tNA\n",
+        encoding="utf-8",
+    )
+    on_target = tmp_path / "on_target.tsv"
+    on_target.write_text("read_id\tqc_filter\ton_target_kingdom\nr1\tIN\tON_TARGET\n", encoding="utf-8")
+    blast_otu = tmp_path / "blast_otu.tsv"
+    blast_otu.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        "r2\tCOI\thac\tsample_A\thit\t123\t100\t98\tOTUB_A-COI\tF1\tG1\tS1\n",
+        encoding="utf-8",
+    )
+    otu_sizes_round = tmp_path / "otu_sizes_round.tsv"
+    otu_sizes_round.write_text("otu_id\tsize\nOTUB_F-COI\t5\nOTUB_A-COI\t3\n", encoding="utf-8")
+    lock_summary = tmp_path / "lock.tsv"
+    lock_summary.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n"
+        "OTUB_F-COI\t0\t1\n"
+        "OTUB_A-COI\t0\t0\n",
+        encoding="utf-8",
+    )
+    blast_cons = tmp_path / "blast_cons.tsv"
+    blast_cons.write_text(
+        "consensus_id\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample\t"
+        "taxid\tblast_hit\taln_length\tperc_id\tconsensus_kingdom\tconsensus_phylum\t"
+        "consensus_class\tconsensus_order\tconsensus_family\tconsensus_genus\tconsensus_species\n"
+        "Consensus1_sample_A\tCOI\tconsensus\t10\tsample_A\t123\thit\t100\t99\tK\tP\tC\tO\tF\tG\tS\n"
+        "Consensus2_sample_A\tCOI\tconsensus\t4\tsample_A\t123\thit\t100\t98\tK\tP\tC\tO\tF\tG\tS\n",
+        encoding="utf-8",
+    )
+    consolidated = tmp_path / "cons_ids.txt"
+    consolidated.write_text("Consensus1_sample_A\n", encoding="utf-8")
+    out = tmp_path / "round_report.json"
+
+    result = _run(
+        [
+            "--run-id", "runA",
+            "--barcode", "RTBioScan",
+            "--round-barcode", "output_round_1",
+            "--out", str(out),
+            "--read-info", str(read_info),
+            "--on-target", str(on_target),
+            "--blast-otu", str(blast_otu),
+            "--otu-sizes-round", str(otu_sizes_round),
+            "--otu-lock-summary", str(lock_summary),
+            "--blast-consensus", str(blast_cons),
+            "--consensus-consolidated-ids", str(consolidated),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+
+    otu_row = data["otu"]["assignments_by_level"]["species"][0]
+    assert otu_row["taxon"] == "S1"
+    assert otu_row["otu_count"] == 2
+    assert otu_row["frozen_otu_count"] == 1
+    assert otu_row["reads_total"] == 8
+    assert otu_row["frozen_otu_reads_total"] == 5
+
+    cons_row = data["consensus"]["assignments_by_level"]["species"][0]
+    assert cons_row["taxon"] == "S"
+    assert cons_row["consensus_count"] == 2
+    assert cons_row["consolidated_consensus_count"] == 1
+    assert cons_row["reads_total"] == 14
+    assert cons_row["consolidated_consensus_reads_total"] == 10
 
 
 def test_fate_size_streak_enforce_missing_file(tmp_path: Path) -> None:
@@ -937,7 +1208,7 @@ def test_fate_universe_strict_empty_round_no_lock_fallback(tmp_path: Path) -> No
     assert diagnostic["fate_universe_otu_def_status"] == "empty"
     assert diagnostic["fate_conservation_ok"] is True
     assert diagnostic["fate_conservation_delta"] is None
-    assert "otu_fate_universe_empty:strict_round" in data["warnings"]
+    assert "otu_fate_universe_empty:strict_round" not in data["warnings"]
     assert "otu_fate_universe_fallback:lock_summary" not in data["warnings"]
 
 
@@ -1351,6 +1622,127 @@ def test_report_round_json_uses_passed_demult_input(tmp_path: Path) -> None:
     assert data["read_fate"]["demux_total_reads"] == 1
 
 
+def test_report_round_json_read_fate_uses_first_seen_inputs_only(tmp_path: Path) -> None:
+    read_info = tmp_path / "read_info.tsv"
+    read_info.write_text(
+        "read_id\tfilename\trun_id\tbarcode\tfast_length\tfast_mean_qscore\thac_length\thac_mean_qscore\tsup_length\tsup_mean_qscore\n"
+        "r_old\tf\tR\tb\t100\t10\t100\t12\tNA\tNA\n"
+        "r_new\tf\tR\tb\t101\t10\t101\t12\tNA\tNA\n",
+        encoding="utf-8",
+    )
+    on_target = tmp_path / "on_target.tsv"
+    on_target.write_text(
+        "read_id\tbarcode\ton_target_kingdom\n"
+        "r_old\tb\tON_TARGET\n"
+        "r_new\tb\tON_TARGET\n",
+        encoding="utf-8",
+    )
+    demult = tmp_path / "demult.tsv"
+    demult.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\n"
+        "r_old\tCOI\thac\tsample_A_1\n"
+        "r_new\tCOI\thac\tsample_A_1\n",
+        encoding="utf-8",
+    )
+    read_fate_demult = tmp_path / "read_fate_demult.tsv"
+    read_fate_demult.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\n"
+        "r_new\tCOI\thac\tsample_A_1\n",
+        encoding="utf-8",
+    )
+    blast_otu = tmp_path / "blast_otu.tsv"
+    blast_otu.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\ttaxid\totu_id\totu_family\totu_genus\totu_species\n"
+        "r_old\tCOI\thac\tsample_A_1\t123\tOTUB_1-COI\tF\tG\tS\n"
+        "r_new\tCOI\thac\tsample_A_1\tNA\tOTUB_2-COI\tUnassigned\tUnassigned\tUnassigned\n",
+        encoding="utf-8",
+    )
+    read_fate_blast = tmp_path / "read_fate_blast.tsv"
+    read_fate_blast.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\ttaxid\totu_id\totu_family\totu_genus\totu_species\n"
+        "r_new\tCOI\thac\tsample_A_1\tNA\tOTUB_2-COI\tUnassigned\tUnassigned\tUnassigned\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "round_report.json"
+    result = _run(
+        [
+            "--run-id",
+            "runA",
+            "--barcode",
+            "RTBioScan",
+            "--round-barcode",
+            "output_round_2",
+            "--out",
+            str(out),
+            "--read-info",
+            str(read_info),
+            "--on-target",
+            str(on_target),
+            "--demult",
+            str(demult),
+            "--read-fate-demult",
+            str(read_fate_demult),
+            "--blast-otu",
+            str(blast_otu),
+            "--read-fate-blast",
+            str(read_fate_blast),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    by_label = {v.get("label"): v for v in data["sample_metrics"].values()}
+    assert by_label["sample_A"]["reads_demux"] == 2
+    assert by_label["sample_A"]["reads_blast_assigned"] == 1
+    read_fate = data["read_fate"]
+    assert read_fate["marker_split_status"] == "ok"
+    assert read_fate["demux_total_reads"] == 1
+    assert read_fate["blast_seen_reads"] == 1
+    assert read_fate["blast_assigned_reads"] == 0
+    assert read_fate["blast_unassigned_reads"] == 1
+
+
+def test_report_round_json_falls_back_when_first_seen_inputs_missing(tmp_path: Path) -> None:
+    demult = tmp_path / "demult.tsv"
+    demult.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\n"
+        "r1\tCOI\thac\tsample_A_1\n",
+        encoding="utf-8",
+    )
+    blast_otu = tmp_path / "blast_otu.tsv"
+    blast_otu.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\ttaxid\totu_id\totu_family\totu_genus\totu_species\n"
+        "r1\tCOI\thac\tsample_A_1\t123\tOTUB_1-COI\tF\tG\tS\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "round_report.json"
+    result = _run(
+        [
+            "--run-id",
+            "runA",
+            "--barcode",
+            "RTBioScan",
+            "--round-barcode",
+            "output_round_1",
+            "--out",
+            str(out),
+            "--demult",
+            str(demult),
+            "--read-fate-demult",
+            str(tmp_path / "missing_read_fate_demult.tsv"),
+            "--blast-otu",
+            str(blast_otu),
+            "--read-fate-blast",
+            str(tmp_path / "missing_read_fate_blast.tsv"),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    read_fate = data["read_fate"]
+    assert read_fate["demux_total_reads"] == 1
+    assert read_fate["blast_seen_reads"] == 1
+    assert read_fate["blast_assigned_reads"] == 1
+
+
 def test_report_round_json_seeds_sample_metrics_from_roster(tmp_path: Path) -> None:
     demult = tmp_path / "demult.tsv"
     demult.write_text(
@@ -1440,7 +1832,67 @@ def test_report_round_json_header_only_consensus_provenance_sets_null(tmp_path: 
     assert result.returncode == 0, result.stderr
     data = json.loads(out.read_text(encoding="utf-8"))
     assert "consensus_used_reads" not in data["read_fate"]
-    assert any("missing_or_empty_data_rows:" in w for w in data["warnings"])
+    assert not any("missing_or_empty_data_rows:" in w for w in data["warnings"])
+
+
+def test_report_round_json_optional_early_round_inputs_do_not_emit_noise_warnings(tmp_path: Path) -> None:
+    otu_sizes_round = tmp_path / "otu_sizes_round.tsv"
+    otu_sizes_round.write_text("otu_id\tsize\n", encoding="utf-8")
+    otu_def = tmp_path / "otu_def.tsv"
+    otu_def.write_text("read_id\tOTU_id\n", encoding="utf-8")
+    otu_size_streak = tmp_path / "otu_size_streak.tsv"
+    otu_size_streak.write_text("", encoding="utf-8")
+    otu_members_blastdiag_stats = tmp_path / "otu_members_blastdiag_stats.tsv"
+    otu_members_blastdiag_stats.write_text("", encoding="utf-8")
+    consensus_round_provenance = tmp_path / "consensus_round_provenance.tsv"
+    consensus_round_provenance.write_text(
+        "round_barcode\tsample\totu_key\tconsensus_id\treads_used_round\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "round_report.json"
+    result = _run(
+        [
+            "--run-id",
+            "runA",
+            "--barcode",
+            "RTBioScan",
+            "--round-barcode",
+            "output_round_1",
+            "--out",
+            str(out),
+            "--otu-def",
+            str(otu_def),
+            "--otu-lock-summary",
+            str(tmp_path / "missing_otu_lock_summary.tsv"),
+            "--otu-members-blastdiag-stats",
+            str(otu_members_blastdiag_stats),
+            "--otu-size-streak",
+            str(otu_size_streak),
+            "--otu-size-streak-mode",
+            "enforce",
+            "--otu-size-streak-min-rounds",
+            "2",
+            "--otu-sizes-round",
+            str(otu_sizes_round),
+            "--consensus-round-provenance",
+            str(consensus_round_provenance),
+            "--blast-filter-mode",
+            "off",
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    warnings = data["warnings"]
+    assert not any("missing_otu_lock_summary.tsv" in w for w in warnings)
+    assert not any("otu_members_blastdiag_stats.tsv" in w for w in warnings)
+    assert not any("otu_size_streak.tsv" in w for w in warnings)
+    assert not any("missing_or_empty_data_rows:" in w for w in warnings)
+    assert "otu_fate_universe_empty:strict_round" not in warnings
+    assert not any(w.startswith("size_streak_inputs_missing:") for w in warnings)
+    diagnostic = data["otu"]["diagnostic"]
+    assert diagnostic["fate_universe_reason"] == "strict_empty_round"
+    assert diagnostic["fate_universe_sizes_status"] == "empty"
+    assert diagnostic["fate_universe_otu_def_status"] == "empty"
 
 
 def test_report_round_json_na_consensus_provenance_sets_null(tmp_path: Path) -> None:
@@ -2008,6 +2460,81 @@ def test_assignments_sample_marker_suffix_stripped(tmp_path: Path) -> None:
     assert cons_samples == {"MySample"}, f"Consensus assignment samples wrong: {cons_samples}"
 
 
+def test_assignments_by_level_track_mode_isolates_track_units(tmp_path: Path) -> None:
+    """In track mode, assignments_by_level must emit separate rows per track unit.
+    Two replicates (sample_A_1, sample_A_2) with different species must NOT be
+    merged into a single 'sample_A' row."""
+    blast_otu = tmp_path / "blast_otu.tsv"
+    blast_otu.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid"
+        "\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        "r1\tCOI\thac\tsample_A_1\thit\t101\t400\t98.0\tOTUB_1-COI\tF\tG\tSpecies_alpha\n"
+        "r2\tCOI\thac\tsample_A_2\thit\t102\t400\t98.0\tOTUB_2-COI\tF\tG\tSpecies_beta\n",
+        encoding="utf-8",
+    )
+    blast_cons = tmp_path / "blast_cons.tsv"
+    blast_cons.write_text(
+        "consensus_id\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample"
+        "\ttaxid\tblast_hit\taln_length\tperc_id\tconsensus_kingdom\tconsensus_phylum"
+        "\tconsensus_class\tconsensus_order\tconsensus_family\tconsensus_genus\tconsensus_species\n"
+        "Cons1\tCOI\tconsensus\t10\tsample_A_1\t101\thit\t400\t98.0\tK\tP\tC\tO\tF\tG\tSpecies_alpha\n"
+        "Cons2\tCOI\tconsensus\t8\tsample_A_2\t102\thit\t400\t98.0\tK\tP\tC\tO\tF\tG\tSpecies_beta\n",
+        encoding="utf-8",
+    )
+    lock_summary = tmp_path / "lock.tsv"
+    lock_summary.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n"
+        "OTUB_1-COI\t0\t0\n"
+        "OTUB_2-COI\t0\t0\n",
+        encoding="utf-8",
+    )
+    otu_sizes = tmp_path / "otu_sizes.tsv"
+    otu_sizes.write_text(
+        "otu_id\tsize\nOTUB_1-COI\t5\nOTUB_2-COI\t4\n", encoding="utf-8"
+    )
+    consolidated = tmp_path / "cons_ids.txt"
+    consolidated.write_text("", encoding="utf-8")
+    roster = tmp_path / "roster.tsv"
+    roster.write_text("track_id\n" "sample_A_1\n" "sample_A_2\n", encoding="utf-8")
+    out = tmp_path / "round_report.json"
+    result = _run(
+        [
+            "--barcode", "RTBioScan",
+            "--round-barcode", "round_1",
+            "--run-id", "testrun",
+            "--out", str(out),
+            "--blast-otu", str(blast_otu),
+            "--otu-sizes-round", str(otu_sizes),
+            "--blast-consensus", str(blast_cons),
+            "--otu-lock-summary", str(lock_summary),
+            "--consensus-consolidated-ids", str(consolidated),
+            "--blast-filter-mode", "off",
+            "--identity-mode", "track",
+            "--sample-roster", str(roster),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+
+    # OTU: two track units must appear as separate rows, not merged
+    otu_rows = data["otu"]["assignments_by_level"]["species"]
+    otu_by_sample = {r["sample"]: r["species"] for r in otu_rows if isinstance(r, dict)}
+    assert "sample_A_1" in otu_by_sample, f"sample_A_1 missing from OTU rows: {otu_by_sample}"
+    assert "sample_A_2" in otu_by_sample, f"sample_A_2 missing from OTU rows: {otu_by_sample}"
+    assert otu_by_sample["sample_A_1"] == "Species_alpha", f"Wrong species for sample_A_1: {otu_by_sample}"
+    assert otu_by_sample["sample_A_2"] == "Species_beta", f"Wrong species for sample_A_2: {otu_by_sample}"
+    assert "sample_A" not in otu_by_sample, f"Collapsed key 'sample_A' must not appear in track mode: {otu_by_sample}"
+
+    # Consensus: same isolation requirement
+    cons_rows = data["consensus"]["assignments_by_level"]["species"]
+    cons_by_sample = {r["sample"]: r["species"] for r in cons_rows if isinstance(r, dict)}
+    assert "sample_A_1" in cons_by_sample, f"sample_A_1 missing from consensus rows: {cons_by_sample}"
+    assert "sample_A_2" in cons_by_sample, f"sample_A_2 missing from consensus rows: {cons_by_sample}"
+    assert cons_by_sample["sample_A_1"] == "Species_alpha", f"Wrong species for sample_A_1: {cons_by_sample}"
+    assert cons_by_sample["sample_A_2"] == "Species_beta", f"Wrong species for sample_A_2: {cons_by_sample}"
+    assert "sample_A" not in cons_by_sample, f"Collapsed key 'sample_A' must not appear in track mode: {cons_by_sample}"
+
+
 def test_reads_total_counts_all_rows_including_malformed(tmp_path: Path) -> None:
     """reads.total must equal all non-blank data rows; reads.hac/sup count only valid-value rows."""
     read_info = tmp_path / "read_info.tsv"
@@ -2164,6 +2691,157 @@ def test_track_mode_separation(tmp_path: Path) -> None:
     assert labels == {"CS.D.P_1_MPnew1", "CS.D.P_2_MPnew1"}, f"unexpected labels: {labels}"
 
 
+def test_track_mode_marker_qualified_labels_match_track_roster(tmp_path: Path) -> None:
+    """Track mode: terminal marker suffixes should resolve to the roster track unit."""
+    base_args, out = _make_identity_scenario(
+        tmp_path,
+        [("r1", "CS.D.P_1_MPnew1_COI"), ("r2", "CS.D.P_1_MPnew1_ITS2")],
+    )
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text(
+        "sample_id\ttrack_id\n"
+        "CS.D.P\tCS.D.P_1_MPnew1\n",
+        encoding="utf-8",
+    )
+    result = _run(base_args + [
+        "--identity-mode", "track",
+        "--sample-roster", str(roster),
+    ])
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    metrics = data["sample_metrics"]
+    assert len(metrics) == 1, f"expected 1 track entry, got {len(metrics)}: {list(metrics)}"
+    entry = next(iter(metrics.values()))
+    assert entry["label"] == "CS.D.P_1_MPnew1"
+    assert entry["reads_blast_assigned"] == 2
+    assert entry["otu_active"] == 1
+
+
+def test_track_mode_emits_track_unit_metrics_and_canonical_assignment_fields(tmp_path: Path) -> None:
+    blast_otu = tmp_path / "blast_otu.tsv"
+    blast_otu.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        "r1\tCOI\thac\tsample_A_1\thit\t101\t400\t98.0\tOTU_A-COI\tF\tG\tSpecies_alpha\n"
+        "r2\tITS2\thac\tsample_A_1\thit\t102\t400\t97.5\tOTU_B-ITS2\tF\tG\tSpecies_beta\n",
+        encoding="utf-8",
+    )
+    blast_cons = tmp_path / "blast_cons.tsv"
+    blast_cons.write_text(
+        "consensus_id\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample\ttaxid\tblast_hit\taln_length\tperc_id\tconsensus_kingdom\tconsensus_phylum\tconsensus_class\tconsensus_order\tconsensus_family\tconsensus_genus\tconsensus_species\n"
+        "Cons1\tCOI\tconsensus\t10\tsample_A_1\t101\thit\t400\t98.0\tK\tP\tC\tO\tF\tG\tSpecies_alpha\n"
+        "Cons2\tITS2\tconsensus\t8\tsample_A_1\t102\thit\t400\t97.5\tK\tP\tC\tO\tF\tG\tSpecies_beta\n",
+        encoding="utf-8",
+    )
+    lock_summary = tmp_path / "lock.tsv"
+    lock_summary.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n"
+        "OTU_A-COI\t0\t0\n"
+        "OTU_B-ITS2\t0\t0\n",
+        encoding="utf-8",
+    )
+    otu_sizes = tmp_path / "otu_sizes.tsv"
+    otu_sizes.write_text(
+        "otu_id\tsize\nOTU_A-COI\t5\nOTU_B-ITS2\t4\n",
+        encoding="utf-8",
+    )
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text(
+        "sample_id\ttrack_id\treplicate_number\n"
+        "sample_A\tsample_A_1\t1\n",
+        encoding="utf-8",
+    )
+    track_identity = tmp_path / "track_identity.tsv"
+    track_identity.write_text(
+        "sample_id\ttrack_id\treplicate_number\tmarker_id\tunit_id_track\n"
+        "sample_A\tsample_A_1\t1\tCOI\tsample_A_1_COI\n"
+        "sample_A\tsample_A_1\t1\tITS2\tsample_A_1_ITS2\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "round_report.json"
+    result = _run(
+        [
+            "--barcode", "RTBioScan",
+            "--round-barcode", "round_1",
+            "--run-id", "testrun",
+            "--out", str(out),
+            "--blast-otu", str(blast_otu),
+            "--otu-sizes-round", str(otu_sizes),
+            "--blast-consensus", str(blast_cons),
+            "--otu-lock-summary", str(lock_summary),
+            "--blast-filter-mode", "off",
+            "--identity-mode", "track",
+            "--sample-roster", str(roster),
+            "--track-identity", str(track_identity),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+
+    sample_metrics = data["sample_metrics"]
+    assert len(sample_metrics) == 1
+    sample_entry = next(iter(sample_metrics.values()))
+    assert sample_entry["label"] == "sample_A_1"
+
+    tum = data["track_unit_metrics"]
+    assert sorted(tum) == ["sample_A_1_COI", "sample_A_1_ITS2"]
+    assert tum["sample_A_1_COI"]["track_sample_label"] == "sample_A"
+    assert tum["sample_A_1_COI"]["track_replicate_id"] == "sample_A_1"
+    assert tum["sample_A_1_COI"]["track_replicate_number"] == 1
+    assert tum["sample_A_1_COI"]["track_replicate_label"] == "sample_A_1"
+    assert tum["sample_A_1_COI"]["track_sample_replicate_label"] == "sample_A_1"
+    assert tum["sample_A_1_COI"]["track_primer_label"] == "COI"
+    assert tum["sample_A_1_COI"]["reads_demux"] is None
+    assert tum["sample_A_1_COI"]["reads_blast_assigned"] == 1
+    assert tum["sample_A_1_COI"]["otu_active"] == 1
+    assert tum["sample_A_1_COI"]["consensus_emitted"] == 1
+    assert tum["sample_A_1_ITS2"]["track_primer_label"] == "ITS2"
+
+    otu_rows = data["otu"]["assignments_by_level"]["species"]
+    otu_by_unit = {row["track_unit_id"]: row for row in otu_rows}
+    assert otu_by_unit["sample_A_1_COI"]["sample"] == "sample_A_1"
+    assert otu_by_unit["sample_A_1_COI"]["track_sample_label"] == "sample_A"
+    assert otu_by_unit["sample_A_1_COI"]["track_replicate_number"] == 1
+    assert otu_by_unit["sample_A_1_COI"]["track_sample_replicate_label"] == "sample_A_1"
+    assert otu_by_unit["sample_A_1_COI"]["track_primer_label"] == "COI"
+    assert otu_by_unit["sample_A_1_ITS2"]["track_primer_label"] == "ITS2"
+
+    cons_rows = data["consensus"]["assignments_by_level"]["species"]
+    cons_by_unit = {row["track_unit_id"]: row for row in cons_rows}
+    assert cons_by_unit["sample_A_1_COI"]["track_sample_replicate_label"] == "sample_A_1"
+    assert cons_by_unit["sample_A_1_COI"]["track_primer_label"] == "COI"
+    assert cons_by_unit["sample_A_1_ITS2"]["track_primer_label"] == "ITS2"
+
+
+def test_track_mode_duplicate_track_marker_mapping_fails(tmp_path: Path) -> None:
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text(
+        "sample_id\ttrack_id\treplicate_number\n"
+        "sample_A\tsample_A_1\t1\n",
+        encoding="utf-8",
+    )
+    track_identity = tmp_path / "track_identity.tsv"
+    track_identity.write_text(
+        "sample_id\ttrack_id\treplicate_number\tmarker_id\tunit_id_track\n"
+        "sample_A\tsample_A_1\t1\tCOI\tsample_A_1_COI\n"
+        "sample_A\tsample_A_1\t1\tCOI\tsample_A_1_COI_alt\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "round_report.json"
+    result = _run(
+        [
+            "--barcode", "RTBioScan",
+            "--round-barcode", "round_1",
+            "--run-id", "testrun",
+            "--out", str(out),
+            "--identity-mode", "track",
+            "--sample-roster", str(roster),
+            "--track-identity", str(track_identity),
+        ]
+    )
+    assert result.returncode != 0
+    assert "maps track_id 'sample_A_1' and marker 'COI' to multiple unit_id_track values" in result.stderr
+
+
 def test_track_mode_missing_roster(tmp_path: Path) -> None:
     """Track mode without --sample-roster must fail immediately."""
     base_args, out = _make_identity_scenario(tmp_path, [("r1", "CS.D.P_1_MPnew1")])
@@ -2218,4 +2896,92 @@ def test_track_mode_incompatible_roster_format(tmp_path: Path) -> None:
         "--sample-roster", str(roster),
     ])
     assert result.returncode != 0
-    assert "track_id" in result.stderr
+
+
+def test_informative_barplot_uses_cumulative_blast(tmp_path: Path) -> None:
+    """Regression: consolidated OTU absent from current-round blast but present
+    in cumulative blast must count as assigned in otu.active_by_marker_taxon."""
+    # Current-round blast: only OTUB_2-COI (OTUB_1-COI has dropped out,
+    # simulating post-pruning behaviour).
+    blast_otu = tmp_path / "blast_otu.tsv"
+    blast_otu.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        "r3\tCOI\thac\tsample_B_2\thit\t234\t100\t98\tOTUB_2-COI\tF2\tG2\tS2\n",
+        encoding="utf-8",
+    )
+    # Cumulative blast: both OTUs with valid taxids.
+    blast_otu_cum = tmp_path / "blast_otu_cum.tsv"
+    blast_otu_cum.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        "r1\tCOI\thac\tsample_A_1\thit\t123\t100\t99\tOTUB_1-COI\tF1\tG1\tS1\n"
+        "r3\tCOI\thac\tsample_B_2\thit\t234\t100\t98\tOTUB_2-COI\tF2\tG2\tS2\n",
+        encoding="utf-8",
+    )
+    # Lock: OTUB_1-COI is consolidated; OTUB_2-COI is active_not_frozen.
+    lock_summary = tmp_path / "lock.tsv"
+    lock_summary.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n"
+        "OTUB_1-COI\t1\t0\n"
+        "OTUB_2-COI\t0\t0\n",
+        encoding="utf-8",
+    )
+    otu_def = tmp_path / "otu_def.tsv"
+    otu_def.write_text(
+        "read_id\tOTU_id\nr1\tOTUB_1-COI\nr2\tOTUB_1-COI\nr3\tOTUB_2-COI\n",
+        encoding="utf-8",
+    )
+    otu_sizes_round = tmp_path / "otu_sizes_round.tsv"
+    otu_sizes_round.write_text(
+        "otu_id\tsize\nOTUB_1-COI\t2\nOTUB_2-COI\t1\n",
+        encoding="utf-8",
+    )
+    round_index = tmp_path / "round_index.tsv"
+    round_index.write_text("round_barcode\tround_index\noutput_round_5\t5\n", encoding="utf-8")
+    active_prune_counts = tmp_path / "active_prune_counts.tsv"
+    active_prune_counts.write_text(
+        "active_total\t1\nsize_streak_active\t0\nsize_streak_candidates\t0\n"
+        "union\t0\nactive_scope\tround\nactive_scope_reason\tround_local_ok\n"
+        "size_streak_input_status\tready\nsize_streak_possible\t1\n"
+        "size_streak_applied\t1\nsize_streak_disabled\t0\n"
+        "effective_mode\tenforce\neffective_reason\tapplied\n"
+        "round_index\t5\nsize_streak_round_candidates\t0\nsize_streak_eligible_candidates\t0\n",
+        encoding="utf-8",
+    )
+    size_streak_stats = tmp_path / "size_streak_stats.tsv"
+    size_streak_stats.write_text("reads_prune_candidate\t0\notus_prune_candidate\t0\n", encoding="utf-8")
+    size_streak_state = tmp_path / "otu_size_streak.tsv"
+    size_streak_state.write_text("", encoding="utf-8")
+    out = tmp_path / "round_report.json"
+
+    result = _run([
+        "--run-id", "runA",
+        "--barcode", "RTBioScan",
+        "--round-barcode", "output_round_5",
+        "--out", str(out),
+        "--otu-def", str(otu_def),
+        "--blast-otu", str(blast_otu),
+        "--blast-otu-cumulative", str(blast_otu_cum),
+        "--otu-sizes-round", str(otu_sizes_round),
+        "--otu-lock-summary", str(lock_summary),
+        "--active-prune-counts", str(active_prune_counts),
+        "--otu-size-streak-stats", str(size_streak_stats),
+        "--otu-size-streak", str(size_streak_state),
+        "--otu-size-streak-mode", "enforce",
+        "--otu-size-streak-min-rounds", "2",
+        "--otu-blast-filter-skip-rounds", "none",
+        "--otu-blast-unassigned-grace-rounds", "0",
+        "--otu-blast-min-members", "1",
+        "--round-index-file", str(round_index),
+    ])
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    otu_break = data["otu"]["active_by_marker_taxon"]
+    # Both consolidated (OTUB_1-COI) and active_not_frozen (OTUB_2-COI) must be
+    # counted as assigned because both appear in the cumulative blast with valid
+    # taxids. Before the fix, coi_assigned was 1 (current-round blast, missing
+    # the consolidated OTU).
+    assert otu_break["coi_assigned"] == 2, (
+        f"Expected 2 COI assigned (1 consolidated + 1 active from cumulative blast), "
+        f"got {otu_break['coi_assigned']}"
+    )
+    assert otu_break["coi_unassigned"] == 0

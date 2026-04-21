@@ -1,6 +1,9 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+use FindBin;
+
+require "$FindBin::Bin/lib/sample_label.pl";
 
 my $program_name = $ENV{DETECT_CONSENSUS_SAMPLE_MODE_PROG} || $0;
 
@@ -36,24 +39,26 @@ sub extract_adapter_from_read_id {
     return undef;
 }
 
+sub is_header_read_id {
+    my ($read_id) = @_;
+    return 1 if !defined $read_id;
+    my $value = trim_text($read_id);
+    return 1 if $value eq '';
+    return 1 if $value =~ /^#/;
+    return 1 if $value eq 'read_id' || $value eq 'seq_id' || $value eq 'long_read_id';
+    return 0;
+}
+
 sub is_no_adapter_adapter {
     my ($adapter) = @_;
-    my $adapter_lc = lc trim_text($adapter);
-    return $adapter_lc =~ /^no_adapter(?:_[0-9]+)?$/ ? 1 : 0;
+    return SampleLabel::is_no_adapter_label($adapter) ? 1 : 0;
 }
 
 sub normalize_sample_base {
     my ($sample) = @_;
-    # Keep this normalization as a local compatibility mirror of adapter_utils.sh;
-    # the detector tests are the primary guard against intentional or accidental drift.
-    $sample = trim_text($sample);
-    return undef if $sample eq '';
-    return 'no_adapter' if is_no_adapter_adapter($sample);
-    $sample =~ s/_[0-9]+$//;
-    $sample =~ s/_[0-9]+_/_/;
-    $sample = trim_text($sample);
-    return undef if $sample eq '';
-    return $sample;
+    my $normalized = SampleLabel::normalize_sample_base($sample);
+    return undef if !defined($normalized) || $normalized eq '';
+    return $normalized;
 }
 
 sub valid_barcoded_sample {
@@ -142,7 +147,7 @@ if ($identity_mode eq 'track') {
             chomp $line;
             next if $line =~ /^\s*$/;
             my ($read_id) = split /\t/, $line, 2;
-            next if defined($read_id) && $read_id eq 'read_id';
+            next if is_header_read_id($read_id);
             my $adapter = extract_adapter_from_read_id($read_id);
             die "track mode requires adapter= token in blast row: $read_id\n"
                 if !defined($adapter) || trim_text($adapter) eq '';
@@ -189,6 +194,7 @@ if (-s $blast_report) {
         chomp $line;
         next if $line eq '';
         my ($read_id) = split /\t/, $line, 2;
+        next if is_header_read_id($read_id);
         my $adapter = extract_adapter_from_read_id($read_id);
         next if !defined($adapter) || $adapter eq '';
         if (is_no_adapter_adapter($adapter)) {

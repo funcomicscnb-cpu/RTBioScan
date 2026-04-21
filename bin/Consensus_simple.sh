@@ -36,7 +36,7 @@ min_reads="${3:-5}"
 if ! is_uint "$min_reads"; then
 	min_reads=5
 fi
-# Maximum reads per OTU to use for consensus
+# Maximum reads per OTU available for optional consensus input capping
 max_reads="${4:-50}"
 if ! is_uint "$max_reads"; then
 	max_reads=50
@@ -58,7 +58,6 @@ fi
 selection_min=10
 frozen_members="${7:-}"
 samples_file="samples.txt"
-#blast_report="blast_report_full.txt"
 blast_report="blast_report_annotated.txt"
 sup_reads="${CONSENSUS_SUP_READS:-qced_reads_hq_accumulated.fasta}"
 qscore_map="read_qscore.tsv"
@@ -85,6 +84,7 @@ consolidated_otu_keys_current="$out_dir/otu_consolidated_keys.current.tsv"
 consolidated_otu_keys_drop="$out_dir/otu_consolidated_keys.drop.tsv"
 consensus_map="$out_dir/consensus_otu_map.tsv"
 lock_summary="$out_dir/otu_lock_summary.tsv"
+significant_cluster_summary="$out_dir/significant_cluster_summary.tsv"
 round_id="${CONSENSUS_ROUND_ID:-NA}"
 mkdir -p "$cache_root"
 if [ -s "$consolidated_ids_global" ]; then
@@ -94,10 +94,19 @@ else
 fi
 : > "$consolidated_ids_current"
 lock_enabled="${CONSENSUS_LOCK_ENABLED:-1}"
+consolidation_mode="${CONSENSUS_OTU_CONSOLIDATION_MODE:-lock}"
 lock_ratio="${CONSENSUS_LOCK_RATIO:-0.1}"
 lock_min_cons_reads="${CONSENSUS_LOCK_MIN_CONS_READS:-$selection_min}"
 lock_min_stable_rounds="${CONSENSUS_LOCK_MIN_STABLE_ROUNDS:-1}"
 lock_revalidate_every_rounds="${CONSENSUS_LOCK_REVALIDATE_EVERY_ROUNDS:-0}"
+sig_min_cluster_reads="${CONSENSUS_SIG_MIN_CLUSTER_READS:-10}"
+sig_min_cluster_qscore="${CONSENSUS_SIG_MIN_CLUSTER_QSCORE:-$consolidated_min_qscore}"
+sig_rule="${CONSENSUS_SIG_RULE:-fraction}"
+sig_min_pool_fraction="${CONSENSUS_SIG_MIN_POOL_FRACTION:-0.10}"
+sig_min_top_fraction="${CONSENSUS_SIG_MIN_TOP_FRACTION:-0.20}"
+sig_top2_min_ratio="${CONSENSUS_SIG_TOP2_MIN_RATIO:-2.0}"
+sig_top2_min_delta_reads="${CONSENSUS_SIG_TOP2_MIN_DELTA_READS:-5}"
+sig_min_stable_rounds="${CONSENSUS_SIG_MIN_STABLE_ROUNDS:-2}"
 lock_prev_keys_src="${CONSENSUS_LOCK_KEYS_PREV:-}"
 lock_reset_keys="${CONSENSUS_LOCK_RESET_KEYS:-}"
 prune_frozen_policy="${CONSENSUS_PRUNE_FROZEN_POLICY:-always}"
@@ -107,9 +116,16 @@ prune_unassigned_keep_top="${CONSENSUS_PRUNE_UNASSIGNED_KEEP_TOP:-5}"
 prune_unassigned_drop_reads="${CONSENSUS_PRUNE_UNASSIGNED_DROP_READS:-0}"
 assigned_ids_list="${CONSENSUS_ASSIGNED_IDS:-}"
 round_index_file="${CONSENSUS_ROUND_INDEX_FILE:-}"
+selector_ranking="${CONSENSUS_SELECTOR_RANKING:-qscore_first}"
+selector_enforce_max_reads="${CONSENSUS_ENFORCE_MAX_READS:-0}"
 lock_enabled="$(normalize_bool_01 "$lock_enabled")"
 if [ "$lock_enabled" != "0" ] && [ "$lock_enabled" != "1" ]; then
 	lock_enabled=1
+fi
+consolidation_mode="$(printf '%s' "$consolidation_mode" | tr '[:upper:]' '[:lower:]')"
+if [ "$consolidation_mode" != "lock" ] && [ "$consolidation_mode" != "significant_clusters" ]; then
+	echo "ERROR: CONSENSUS_OTU_CONSOLIDATION_MODE must be 'lock' or 'significant_clusters' (got '$consolidation_mode')" 1>&2
+	exit 1
 fi
 if ! is_decimal "$lock_ratio"; then
 	lock_ratio=0.1
@@ -125,6 +141,34 @@ if [ "$lock_min_stable_rounds" -lt 1 ]; then
 fi
 if ! is_uint "$lock_revalidate_every_rounds"; then
 	lock_revalidate_every_rounds=0
+fi
+if ! is_uint "$sig_min_cluster_reads" || [ "$sig_min_cluster_reads" -lt 1 ]; then
+	sig_min_cluster_reads=10
+fi
+if ! is_decimal "$sig_min_cluster_qscore"; then
+	sig_min_cluster_qscore="$consolidated_min_qscore"
+fi
+sig_rule="$(printf '%s' "$sig_rule" | tr '[:upper:]' '[:lower:]')"
+if [ "$sig_rule" != "fraction" ] && [ "$sig_rule" != "top_two_gap" ]; then
+	sig_rule="fraction"
+fi
+if ! is_decimal "$sig_min_pool_fraction"; then
+	sig_min_pool_fraction=0.10
+fi
+if ! is_decimal "$sig_min_top_fraction"; then
+	sig_min_top_fraction=0.20
+fi
+if ! is_decimal "$sig_top2_min_ratio"; then
+	sig_top2_min_ratio=2.0
+fi
+if awk -v v="$sig_top2_min_ratio" 'BEGIN{exit !(v<=1)}'; then
+	sig_top2_min_ratio=2.0
+fi
+if ! is_uint "$sig_top2_min_delta_reads"; then
+	sig_top2_min_delta_reads=5
+fi
+if ! is_uint "$sig_min_stable_rounds" || [ "$sig_min_stable_rounds" -lt 1 ]; then
+	sig_min_stable_rounds=2
 fi
 if [ "$prune_frozen_policy" != "always" ] && [ "$prune_frozen_policy" != "until_consolidated" ] && [ "$prune_frozen_policy" != "never" ]; then
 	prune_frozen_policy="always"
@@ -142,6 +186,26 @@ if ! is_uint "$prune_unassigned_grace_rounds"; then
 fi
 if ! is_uint "$prune_unassigned_keep_top"; then
 	prune_unassigned_keep_top=5
+fi
+selector_ranking="$(printf '%s' "$selector_ranking" | tr '[:upper:]' '[:lower:]')"
+if [ "$selector_ranking" != "qscore_first" ] && [ "$selector_ranking" != "count_then_qscore" ]; then
+	echo "ERROR: CONSENSUS_SELECTOR_RANKING must be 'qscore_first' or 'count_then_qscore' (got '$selector_ranking')" 1>&2
+	exit 1
+fi
+selector_enforce_max_reads="$(normalize_bool_01 "$selector_enforce_max_reads")"
+if [ "$selector_enforce_max_reads" != "0" ] && [ "$selector_enforce_max_reads" != "1" ]; then
+	echo "ERROR: CONSENSUS_ENFORCE_MAX_READS must be a boolean 0/1 true/false yes/no on/off (got '$selector_enforce_max_reads')" 1>&2
+	exit 1
+fi
+if [ "$selector_enforce_max_reads" -eq 1 ]; then
+	selector_min_cap="$selection_min"
+	if [ "$min_reads" -gt "$selector_min_cap" ]; then
+		selector_min_cap="$min_reads"
+	fi
+	if [ "$max_reads" -lt "$selector_min_cap" ]; then
+		echo "ERROR: consensus_max_reads ($max_reads) must be >= max(consensus_min_reads, selection_min) ($selector_min_cap) when CONSENSUS_ENFORCE_MAX_READS=1" 1>&2
+		exit 1
+	fi
 fi
 if [ -n "$lock_prev_keys_src" ] && [ -s "$lock_prev_keys_src" ]; then
 	cp "$lock_prev_keys_src" "$consolidated_otu_keys_prev"
@@ -183,7 +247,8 @@ if [ "$id_drop_global_suffix_mode" != "strict" ] && [ "$id_drop_global_suffix_mo
 fi
 id_mismatch_events=0
 printf 'consensus_id\totu_key\tsample\tn_reads\tmin_qscore\tfrozen_flag\tconsolidated_flag\n' > "$consensus_map"
-printf 'round_id\tsample\totu_key\tn_cand\tmin_cand\tmin_cand_ok\tis_frozen\tlock_enabled\tcluster_cons_count\tcluster_cons_min\tcluster_noncons_max\tlock_ratio\tratio_threshold\tlock_rule_pass\tstable_count\tmin_stable_rounds\tshould_consolidate\teffective_consolidated\treason\tsource\n' > "$lock_summary"
+printf 'round_id\tsample\totu_key\tn_cand\tmin_cand\tmin_cand_ok\tis_frozen\tlock_enabled\tcluster_cons_count\tcluster_cons_min\tcluster_noncons_max\tlock_ratio\tratio_threshold\tlock_rule_pass\tstable_count\tmin_stable_rounds\tshould_consolidate\teffective_consolidated\treason\tsource\tconsolidation_mode\tqfiltered_pool_count\tfloor_cluster_count\ttop_floor_size\tsignificant_cluster_count\tmin_significant_cluster_size\tmax_nonsignificant_cluster_size\totu_sig_rule\ttop1_cluster_size\ttop1_cluster_qscore\ttop2_cluster_size\ttop2_cluster_qscore\ttop2_ratio\ttop2_delta_reads\n' > "$lock_summary"
+printf 'round_id\tsample\totu_key\tcluster_seq_hash\tcluster_reads\tcluster_qscore\tqfiltered_pool_count\tpool_fraction\ttop_fraction\tfloor_flag\tsignificant_flag\totu_sig_rule\tcandidate_role\tpasses_top2_rule\n' > "$significant_cluster_summary"
 prune_stats_round="$out_dir/consensus_prune_unassigned_stats.tsv"
 printf 'round_id\tsample\totu_key\tprune_requested\tprune_applied\treason\ttotal_clusters\tassigned_clusters\tunassigned_clusters\tkept_unassigned\tdropped_unassigned\tkeep_unassigned_top\n' > "$prune_stats_round"
 pruned_unassigned_round="$out_dir/pruned_unassigned_reads_round.list"
@@ -267,7 +332,7 @@ read_cache_consensus_meta() {
 		printf 'NA\tNA\t1\n'
 		return 0
 	fi
-	awk '
+	awk -v stat="$prefilter_status" -v out_hdr="tmp_clean_blast_report_full.txt" -v targets_raw="$target_tokens_env" -v target_taxa_raw="$target_taxa_env" '
 		NR == 1 {
 			h=$0
 			sub(/^>/, "", h)
@@ -345,6 +410,20 @@ filter_consolidated_ids_by_dropped_keys() {
 	fi
 	awk -v MODE="ids" -v DROP="$drop_file" -v ID_GLOBAL_SUFFIX_MODE="$id_drop_global_suffix_mode" -f "$drop_filter_awk" "$drop_file" "$in_file" "$in_file" > "$out_file"
 }
+build_consolidation_policy_signature() {
+	if [ "$consolidation_mode" = "significant_clusters" ]; then
+		if [ "$sig_rule" = "top_two_gap" ]; then
+			printf 'mode=%s|sig_min_cluster_reads=%s|sig_min_cluster_qscore=%s|sig_min_stable_rounds=%s|sig_rule=%s|sig_top2_min_ratio=%s|sig_top2_min_delta_reads=%s\n' \
+				"$consolidation_mode" "$sig_min_cluster_reads" "$sig_min_cluster_qscore" "$sig_min_stable_rounds" \
+				"$sig_rule" "$sig_top2_min_ratio" "$sig_top2_min_delta_reads"
+		else
+			printf 'mode=%s|sig_min_cluster_reads=%s|sig_min_cluster_qscore=%s|sig_min_pool_fraction=%s|sig_min_top_fraction=%s|sig_min_stable_rounds=%s\n' \
+				"$consolidation_mode" "$sig_min_cluster_reads" "$sig_min_cluster_qscore" "$sig_min_pool_fraction" "$sig_min_top_fraction" "$sig_min_stable_rounds"
+		fi
+	else
+		printf 'mode=%s\n' "$consolidation_mode"
+	fi
+}
 
 _detect_cpu_budget() {
 	local _p
@@ -361,6 +440,8 @@ _detect_cpu_budget() {
 cons_log "Consensus debug enabled. min_reads=$min_reads max_reads=$max_reads min_qscore=$min_qscore consolidated_min_qscore=$consolidated_min_qscore selection_min=$selection_min max_N=$max_N"
 cons_log "Consolidated IDs: prev_exists=$( [ -s "$consolidated_ids_prev" ] && echo yes || echo no )"
 cons_log "Policies: zero_emit_policy=$zero_emit_policy id_mismatch_policy=$id_mismatch_policy cache_below_min_policy=$cache_below_min_policy id_drop_global_suffix_mode=$id_drop_global_suffix_mode"
+cons_log "Selector: ranking=$selector_ranking enforce_max_reads=$selector_enforce_max_reads"
+cons_log "Consolidation: mode=$consolidation_mode lock_enabled=$lock_enabled lock_ratio=$lock_ratio lock_min_cons_reads=$lock_min_cons_reads lock_min_stable_rounds=$lock_min_stable_rounds sig_rule=$sig_rule sig_min_cluster_reads=$sig_min_cluster_reads sig_min_cluster_qscore=$sig_min_cluster_qscore sig_min_pool_fraction=$sig_min_pool_fraction sig_min_top_fraction=$sig_min_top_fraction sig_top2_min_ratio=$sig_top2_min_ratio sig_top2_min_delta_reads=$sig_top2_min_delta_reads sig_min_stable_rounds=$sig_min_stable_rounds"
 
 round_index=""
 if [ -n "$round_index_file" ] && [ -s "$round_index_file" ] && [ -n "$round_id" ] && [ "$round_id" != "NA" ]; then
@@ -424,7 +505,7 @@ resolve_ids_to_supreads_map() {
 			return (n=="sup"?3:(n=="hac"?2:1));
 		}
 		function parse_hdr(h, a, n, i, f) {
-			n=split(h, a, "|");
+				n=split(h, a, /\|/);
 			delete P;
 			P["uuid"]=(n>=1?a[1]:"");
 			P["target"]=(n>=2?a[2]:"");
@@ -487,7 +568,6 @@ resolve_ids_to_supreads_map() {
 	' "$in_ids" > "$out_map"
 }
 
-#This needs to be changed!
 script_path=$1
 Consensus_Rscript="$script_path/Consensus_simple.R"
 drop_filter_awk="$script_path/consensus_drop_filter.awk"
@@ -526,14 +606,22 @@ if ! command -v vsearch >/dev/null 2>&1; then
 	echo "Error: vsearch not found in PATH (required for consensus clustering)" 1>&2
 	exit 1
 fi
-if ! command -v Rscript >/dev/null 2>&1; then
-	echo "Error: Rscript not found in PATH (required for consensus)" 1>&2
-	exit 1
-fi
-if ! Rscript -e 'suppressPackageStartupMessages(library(muscle))' >/dev/null 2>&1; then
-	echo "Error: R package \"muscle\" is not available in this environment" 1>&2
-	exit 1
-fi
+rscript_cmd="${RTBIOSCAN_RSCRIPT:-Rscript}"
+case "$rscript_cmd" in
+	*/*)
+		if [ ! -x "$rscript_cmd" ]; then
+			echo "Error: Rscript is not executable at '$rscript_cmd' (required for consensus)" 1>&2
+			exit 1
+		fi
+		;;
+	*)
+		if ! command -v "$rscript_cmd" >/dev/null 2>&1; then
+			echo "Error: Rscript not found in PATH (required for consensus)" 1>&2
+			exit 1
+		fi
+		rscript_cmd="$(command -v "$rscript_cmd")"
+		;;
+esac
 if [ ! -s "$sup_reads" ] && [ "$cache_has_files" -eq 0 ]; then
 	echo "Error: $sup_reads is missing or empty and no cache found (required for consensus read extraction)" 1>&2
 	exit 1
@@ -579,23 +667,53 @@ if [ "$prune_frozen_policy" = "until_consolidated" ] || [ "$prune_frozen_policy"
 	prune_frozen_ids=0
 fi
 
-# Scope prefilter (intentional): keep Metazoa+COI and Viridiplantae+ITS2 rows.
+# Scope prefilter: keep rows whose normalized marker/taxon pair matches the
+# configured RTBIOSCAN_TARGET_TOKENS <-> RTBIOSCAN_TARGET_TAXA positional map.
 # Always write an output file and preserve header when present.
 prefilter_status="$out_dir/prefilter_status.tsv"
 prefilter_input_rows=0
 prefilter_output_rows=0
 prefilter_metazoa_coi_rows=0
 prefilter_viridiplantae_its2_rows=0
+target_tokens_env="${RTBIOSCAN_TARGET_TOKENS:-}"
+target_taxa_env="${RTBIOSCAN_TARGET_TAXA:-}"
 _t_startup_state_end=$(timing_now)
 append_timing_row "$phase_timings_raw_file" "global" "-" "startup_validation_and_state" "$_t_startup_state_start" "$_t_startup_state_end"
 _t_prefilter_partition_start=$(timing_now)
 if [ -s "$blast_report" ]; then
-	awk '
+	awk -v stat="$prefilter_status" -v out_hdr="tmp_clean_blast_report_full.txt" -v targets_raw="$target_tokens_env" -v target_taxa_raw="$target_taxa_env" '
 		BEGIN{
 			OFS="\t";
 			has_header=0;
 			kingdom_col=3;
 			marker_col=4;
+				n_pairs=split(targets_raw, targets, /\|/);
+				split(target_taxa_raw, target_taxa, /\|/);
+			for (i=1; i<=n_pairs; i++) {
+				t=targets[i];
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", t);
+				t=toupper(t);
+				if (t=="ITS" || t=="ITS1" || t=="ITS2") t="ITS2";
+				k=tolower(target_taxa[i]);
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", k);
+				if (t != "" && k != "") {
+					pair_key=t SUBSEP k;
+					target_pair[pair_key]=1;
+					pair_order[++pair_count]=pair_key;
+				}
+			}
+		}
+		function marker_norm(v, out) {
+			out=toupper(v);
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", out);
+			if (out=="ITS" || out=="ITS1" || out=="ITS2") out="ITS2";
+			return out;
+		}
+		function slugify(v, out) {
+			out=tolower(v);
+			gsub(/[^a-z0-9]+/, "_", out);
+			gsub(/^_+|_+$/, "", out);
+			return out;
 		}
 		NR==1 && $1=="read_id" {
 			print;
@@ -612,20 +730,20 @@ if [ -s "$blast_report" ]; then
 			kingdom=(kingdom_col<=NF ? $kingdom_col : "");
 			kl=tolower(kingdom);
 			if (has_header) {
-				ml=tolower(marker_col<=NF ? $marker_col : "");
+				ml=marker_norm(marker_col<=NF ? $marker_col : "");
 			} else {
 				# blast_report_annotated.txt format: col 1 is read_id|target|model|...|OTUB_N-target
-				# The marker (COI/ITS2) is the 2nd pipe-delimited field of the read ID.
-				n=split($1, rid_fields, "|");
-				ml=tolower(n>=2 ? rid_fields[2] : "");
+				# The marker is the 2nd pipe-delimited field of the read ID.
+					n=split($1, rid_fields, /\|/);
+				ml=marker_norm(n>=2 ? rid_fields[2] : "");
 			}
-			is_mc=(kl ~ /metazoa/ && ml ~ /coi/);
-			is_vi=(kl ~ /viridiplantae/ && ml ~ /its2/);
-			if (is_mc || is_vi) {
+			match_key=ml SUBSEP kl;
+			if (match_key in target_pair) {
 				print;
 				out_rows++;
-				if (is_mc) mc_rows++;
-				if (is_vi) vi_rows++;
+				pair_rows[match_key]++;
+				if (ml=="COI" && kl=="metazoa") mc_rows++;
+				if (ml=="ITS2" && kl=="viridiplantae") vi_rows++;
 			}
 		}
 		END{
@@ -633,12 +751,17 @@ if [ -s "$blast_report" ]; then
 			print "prefilter_output_rows\t" (out_rows+0) > stat;
 			print "prefilter_metazoa_coi_rows\t" (mc_rows+0) > stat;
 			print "prefilter_viridiplantae_its2_rows\t" (vi_rows+0) > stat;
+			for (i=1; i<=pair_count; i++) {
+				key=pair_order[i];
+				split(key, parts, SUBSEP);
+				print "prefilter_pair_" i "_" slugify(parts[1]) "_" slugify(parts[2]) "_rows\t" (pair_rows[key]+0) > stat;
+			}
 			if (!has_header) {
 				# Keep downstream contracts stable even when input has no header.
 				print "read_id\totu_id\totu_kingdom\tbarcode_by_homology" > out_hdr;
 			}
 		}
-	' stat="$prefilter_status" out_hdr="tmp_clean_blast_report_full.txt" "$blast_report" > tmp_clean_blast_report_full.txt.data
+	' "$blast_report" > tmp_clean_blast_report_full.txt.data
 	if head -n1 "$blast_report" | awk '$1=="read_id"{exit 0} {exit 1}'; then
 		mv tmp_clean_blast_report_full.txt.data tmp_clean_blast_report_full.txt
 	else
@@ -813,6 +936,10 @@ _best_consensus_addition() {
 			[ -f "$_bca_out_dir/${_bca_sel_otu}_all_reads.list"  ] && cat "$_bca_out_dir/${_bca_sel_otu}_all_reads.list"  >> "$_bca_orig"
 			[ -f "$_bca_out_dir/${_bca_sel_otu}_reads_sup.fasta" ] && cat "$_bca_out_dir/${_bca_sel_otu}_reads_sup.fasta" >  "$_bca_sup"
 		fi
+		# Fallback: _all_reads.list no longer exists; derive read IDs from sup fasta
+		if [ ! -s "$_bca_orig" ] && [ -s "$_bca_sup" ]; then
+			awk '/^>/{sub(/^>/, ""); print}' "$_bca_sup" > "$_bca_orig"
+		fi
 	fi
 	local _bca_rmode="${CONSENSUS_READS_MODE:-representative}"
 	local _bca_rval="$_bca_sel_reads"
@@ -874,7 +1001,6 @@ hydrate_sample_cache() {
 	return 0
 }
 
-#Consensus loop
 while IFS= read -r sample; do
 	(
 	if [ ! -e "$out_dir/$sample" ]; then mkdir -p "$out_dir/$sample"; fi
@@ -890,6 +1016,8 @@ while IFS= read -r sample; do
 	prune_stats_round="$out_dir/$sample/_prune_stats.tmp"
 	lock_summary="$out_dir/$sample/_lock_summary.tmp"
 	consensus_map="$out_dir/$sample/_consensus_map.tmp"
+	significant_cluster_summary_sample="$out_dir/$sample/_significant_cluster_summary.tmp"
+	policy_reset_sample_file="$out_dir/$sample/_policy_reset_sample.tmp"
 	: > "$consolidated_ids_current"
 	: > "$consolidated_otu_keys_current"
 	: > "$eligible_counts_file"
@@ -898,6 +1026,8 @@ while IFS= read -r sample; do
 	: > "$prune_stats_round"
 	: > "$lock_summary"
 	: > "$consensus_map"
+	: > "$significant_cluster_summary_sample"
+	: > "$policy_reset_sample_file"
 	emitted_consensus_count=0
 	merged_input_headers_total=0
 	id_mismatch_events=0
@@ -914,10 +1044,40 @@ while IFS= read -r sample; do
 	lock_state_file="$sample_cache_dir/lock_state.tsv"
 	lock_state_prev="$sample_cache_dir/lock_state.prev.tsv"
 	lock_state_current="$sample_cache_dir/lock_state.current.tsv"
+	policy_signature_file="$sample_cache_dir/consolidation_policy_signature.txt"
+	current_policy_signature="$(build_consolidation_policy_signature)"
+	previous_policy_signature=""
+	policy_reset_reason=""
+	if [ -s "$policy_signature_file" ]; then
+		previous_policy_signature="$(head -n 1 "$policy_signature_file" 2>/dev/null || true)"
+	fi
+	policy_reset_sample=0
+	if [ "$lock_enabled" -eq 1 ]; then
+		if [ -n "$previous_policy_signature" ] && [ "$previous_policy_signature" != "$current_policy_signature" ]; then
+			policy_reset_sample=1
+			policy_reset_reason="signature_changed"
+		elif [ -z "$previous_policy_signature" ] && [ "$consolidation_mode" = "significant_clusters" ]; then
+			if [ -s "$lock_state_file" ] || awk -v s="$sample" 'BEGIN{found=0} NF>=2 && $1==s {found=1; exit} END{exit !found}' "$consolidated_otu_keys_prev" 2>/dev/null; then
+				policy_reset_sample=1
+				policy_reset_reason="missing_legacy_signature"
+			fi
+		fi
+	fi
+	if [ "$policy_reset_sample" -eq 1 ]; then
+		printf '%s\n' "$sample" > "$policy_reset_sample_file"
+		cons_log "sample=$sample consolidation_policy_reset reason=${policy_reset_reason:-unknown} previous='${previous_policy_signature:-NA}' current='$current_policy_signature'"
+	fi
 	if [ -s "$lock_state_file" ]; then
 		cp "$lock_state_file" "$lock_state_prev"
 	else
 		: > "$lock_state_prev"
+	fi
+	if [ "$policy_reset_sample" -eq 1 ]; then
+		: > "$lock_state_prev"
+	fi
+	sample_lock_min_stable_rounds="$lock_min_stable_rounds"
+	if [ "$consolidation_mode" = "significant_clusters" ]; then
+		sample_lock_min_stable_rounds="$sig_min_stable_rounds"
 	fi
 	if [ -s "$lock_reset_list" ] && [ -s "$lock_state_prev" ]; then
 		awk 'BEGIN{FS=OFS="\t"}
@@ -957,7 +1117,7 @@ while IFS= read -r sample; do
 		: > "$carry_forward_state"
 		fallback_empty_sample_blast_count=0
 		worker_failures_selector=0
-		if [ "$lock_enabled" -eq 1 ] && [ -s "$consolidated_otu_keys_prev" ]; then
+	if [ "$lock_enabled" -eq 1 ] && [ "$policy_reset_sample" -eq 0 ] && [ -s "$consolidated_otu_keys_prev" ]; then
 			awk -v s="$sample" 'BEGIN{FS=OFS="\t"}
 				NF==1 { print $1; next }
 				NF>=2 && $1==s { print $2 }
@@ -992,14 +1152,12 @@ while IFS= read -r sample; do
 		else
 			filter_status=$?
 			filter_err="$(tr '\n' ' ' < "$filter_stderr" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
-			fallback_empty_sample_blast_count=$((fallback_empty_sample_blast_count + 1))
 			if [ -n "$filter_err" ]; then
-				echo "WARN: filter_blast_rows_by_adapter_class.sh failed for sample=$sample exit_code=$filter_status stderr=$filter_err; continuing with empty sample_blast" 1>&2
+				echo "ERROR: filter_blast_rows_by_adapter_class.sh failed for sample=$sample exit_code=$filter_status stderr=$filter_err" 1>&2
 			else
-				echo "WARN: filter_blast_rows_by_adapter_class.sh failed for sample=$sample exit_code=$filter_status; continuing with empty sample_blast" 1>&2
+				echo "ERROR: filter_blast_rows_by_adapter_class.sh failed for sample=$sample exit_code=$filter_status" 1>&2
 			fi
-			echo "METRIC: fallback_empty_sample_blast_count=$fallback_empty_sample_blast_count sample=$sample" 1>&2
-			: > "$sample_blast"
+			exit 1
 		fi
 	fi
 	rm -f "$filter_stderr"
@@ -1009,7 +1167,7 @@ while IFS= read -r sample; do
 			rid=$1;
 			if (rid=="") next;
 			otu=""; bc=""; ad=""; model="";
-			n=split(rid, t, "|");
+				n=split(rid, t, /\|/);
 			if (n>=3) model=t[3];
 			for (i=1; i<=n; i++) {
 				if (t[i] ~ /^OTUB_[^|[:space:]]+$/) otu=t[i];
@@ -1193,7 +1351,7 @@ while IFS= read -r sample; do
 							FNR==NR { f[$1]=1; next }
 							{
 								u=$1
-								if (index(u,"|")>0) { split(u,a,"|"); u=a[1] }
+								if (index(u,"|")>0) { split(u,a,/\|/); u=a[1] }
 								if (u in f) { found=1; exit }
 							}
 							END { exit(found ? 0 : 1) }
@@ -1208,7 +1366,7 @@ while IFS= read -r sample; do
 					if [ "$prune_frozen_ids" -eq 1 ] && [ -s "$frozen_ids_list" ]; then
 						raw_elig=$(awk 'BEGIN{FS=OFS="\t"}
 							FNR==NR { f[$1]=1; next }
-							function uuid(id, a) { split(id, a, "|"); return a[1] }
+							function uuid(id, a) { split(id, a, /\|/); return a[1] }
 						($5=="sup" || $5=="hac2sup") {
 							u=uuid($1);
 							if (!(u in f)) c++;
@@ -1217,7 +1375,7 @@ while IFS= read -r sample; do
 					' "$frozen_ids_list" "$raw_otu_rows")
 						awk 'BEGIN{FS=OFS="\t"}
 							FNR==NR { f[$1]=1; next }
-							function uuid(id, a) { split(id, a, "|"); return a[1] }
+							function uuid(id, a) { split(id, a, /\|/); return a[1] }
 						($6=="sup" || $6=="hac2sup") {
 							u=uuid($1);
 							if (!(u in f)) print $1;
@@ -1256,7 +1414,7 @@ while IFS= read -r sample; do
 					if [ "$prune_frozen_ids" -eq 1 ] && [ -s "$frozen_ids_list" ]; then
 							raw_elig=$(awk 'BEGIN{FS=OFS="\t"}
 								FNR==NR { f[$1]=1; next }
-								function uuid(id, a) { split(id, a, "|"); return a[1] }
+								function uuid(id, a) { split(id, a, /\|/); return a[1] }
 								($5=="sup" || $5=="hac2sup" || $5=="hac_fixed" || $5=="hac") {
 									u=uuid($1);
 									if (!(u in f)) c++;
@@ -1265,7 +1423,7 @@ while IFS= read -r sample; do
 							' "$frozen_ids_list" "$raw_otu_rows")
 							awk 'BEGIN{FS=OFS="\t"}
 								FNR==NR { f[$1]=1; next }
-								function uuid(id, a) { split(id, a, "|"); return a[1] }
+								function uuid(id, a) { split(id, a, /\|/); return a[1] }
 								($6=="sup" || $6=="hac2sup" || $6=="hac_fixed" || $6=="hac") {
 									u=uuid($1);
 									if (!(u in f)) print $1;
@@ -1318,7 +1476,7 @@ while IFS= read -r sample; do
 					}
 					{
 						hdr=$1; uuid=hdr;
-						if (index(uuid,"|")>0){split(uuid,a,"|"); uuid=a[1];}
+						if (index(uuid,"|")>0){split(uuid,a,/\|/); uuid=a[1];}
 						if (uuid in q) {
 							model=m[uuid];
 							rank=(model=="sup"?3:(model=="hac"?2:1));
@@ -1328,8 +1486,8 @@ while IFS= read -r sample; do
 				awk 'BEGIN{FS=OFS="\t"}
 					{
 						if (NF>=4) { uuid=$1; hdr=$2; r=$3+0; q=$4+0; }
-						else if (NF==3) { hdr=$1; r=$2+0; q=$3+0; uuid=hdr; if (index(uuid,"|")>0){split(uuid,a,"|"); uuid=a[1];} }
-						else if (NF==2) { hdr=$1; r=1; q=$2+0; uuid=hdr; if (index(uuid,"|")>0){split(uuid,a,"|"); uuid=a[1];} }
+						else if (NF==3) { hdr=$1; r=$2+0; q=$3+0; uuid=hdr; if (index(uuid,"|")>0){split(uuid,a,/\|/); uuid=a[1];} }
+						else if (NF==2) { hdr=$1; r=1; q=$2+0; uuid=hdr; if (index(uuid,"|")>0){split(uuid,a,/\|/); uuid=a[1];} }
 						else { next }
 							sub(/\|OTUB_[^|[:space:]]+$/, "", hdr);
 							if (!(uuid in br) || r>br[uuid] || (r==br[uuid] && q>bq[uuid])) {
@@ -1367,7 +1525,7 @@ while IFS= read -r sample; do
 						awk 'FNR==NR { f[$1]=1; next }
 							{
 								id=$1; uuid=id;
-								if (index(uuid,"|")>0) { split(uuid,a,"|"); uuid=a[1]; }
+								if (index(uuid,"|")>0) { split(uuid,a,/\|/); uuid=a[1]; }
 								if (!(uuid in f)) print id;
 							}' "$frozen_ids_list" "$pool_ids_raw" > "$pool_ids"
 					else
@@ -1459,27 +1617,42 @@ while IFS= read -r sample; do
 		# O1b: batch pool extraction
 		if [ -s "$_union_pool_ids" ]; then
 			LC_ALL=C sort -u "$_union_pool_ids" -o "$_union_pool_ids"
+			_pool_fetch_ids="$_union_pool_ids.present"
+			_pool_id_count=$(wc -l < "$_union_pool_ids" 2>/dev/null | tr -d ' ' || echo 0)
+			_pool_id_count=${_pool_id_count:-0}
 			if [ -f "${sup_reads}.fai" ] && command -v samtools >/dev/null 2>&1; then
-				samtools faidx -r "$_union_pool_ids" "$sup_reads" > "$_union_pool_reads" 2>/dev/null || \
-					{ cons_log "WARN: O1b samtools faidx failed for pool extraction"; : > "$_union_pool_reads"; }
-				# samtools exits 0 even when IDs are absent; fall back to seqtk if output is empty but IDs were non-empty
-				_pool_id_count=$(wc -l < "$_union_pool_ids" 2>/dev/null || echo 0)
+				awk 'NR==FNR { have[$1]=1; next } ($1 in have) { print $1 }' "${sup_reads}.fai" "$_union_pool_ids" > "$_pool_fetch_ids"
+				_pool_present_count=$(wc -l < "$_pool_fetch_ids" 2>/dev/null | tr -d ' ' || echo 0)
+				_pool_present_count=${_pool_present_count:-0}
+				_pool_missing_count=$(( _pool_id_count - _pool_present_count ))
+				if [ "$_pool_missing_count" -gt 0 ]; then
+					cons_log "WARN: O1b skipped $_pool_missing_count pool IDs absent from accumulated FASTA for sample=$sample"
+				fi
+				if [ "$_pool_present_count" -gt 0 ]; then
+					if ! samtools faidx -r "$_pool_fetch_ids" "$sup_reads" > "$_union_pool_reads" 2>/dev/null; then
+						cons_log "WARN: O1b samtools faidx failed for present pool IDs; falling back to seqtk"
+						if ! seqtk subseq "$sup_reads" "$_pool_fetch_ids" > "$_union_pool_reads"; then
+							echo "ERROR: O1b seqtk fallback failed for pool extraction: sup_reads=$sup_reads union_ids=$_pool_fetch_ids" 1>&2
+							exit 1
+						fi
+					fi
+				else
+					: > "$_union_pool_reads"
+				fi
+				# Guard empty output even after present-ID prefilter.
 				_pool_extracted=$(grep -c '^>' "$_union_pool_reads" 2>/dev/null || true)
 				_pool_extracted=${_pool_extracted:-0}
-				if [ "$_pool_extracted" -eq 0 ] && [ "$_pool_id_count" -gt 0 ]; then
-					cons_log "WARN: O1b samtools returned empty output for $_pool_id_count pool IDs; falling back to seqtk"
-					if ! seqtk subseq "$sup_reads" "$_union_pool_ids" > "$_union_pool_reads"; then
-						cons_log "WARN: O1b seqtk fallback also failed; pool reads empty"
-						: > "$_union_pool_reads"
+				if [ "$_pool_extracted" -eq 0 ] && [ "$_pool_present_count" -gt 0 ]; then
+					cons_log "WARN: O1b samtools returned empty output for $_pool_present_count present pool IDs; falling back to seqtk"
+					if ! seqtk subseq "$sup_reads" "$_pool_fetch_ids" > "$_union_pool_reads"; then
+						echo "ERROR: O1b seqtk fallback failed for pool extraction: sup_reads=$sup_reads union_ids=$_union_pool_ids" 1>&2
+						exit 1
 					fi
 				fi
 			else
 				if ! seqtk subseq "$sup_reads" "$_union_pool_ids" > "$_union_pool_reads"; then
-					id_mismatch_events=$((id_mismatch_events + 1))
-					msg="Consensus seqtk extraction failed (pool batch): sup_reads=$sup_reads union_ids=$_union_pool_ids"
-					echo "WARN: $msg" 1>&2
-					cons_log "$msg"
-					: > "$_union_pool_reads"
+					echo "ERROR: Consensus seqtk extraction failed (pool batch): sup_reads=$sup_reads union_ids=$_union_pool_ids" 1>&2
+					exit 1
 				fi
 			fi
 			if [ -s "$_union_pool_reads" ] && [ -s "$_union_pool_map" ]; then
@@ -1518,8 +1691,12 @@ while IFS= read -r sample; do
 					"$selection_min"
 					"$min_qscore"
 					"$_p1_sel_prefix"
+					"--ranking" "$selector_ranking"
 					"--emit-prune-stats" "$_p1_sel_prune_stats"
 				)
+				if [ "$selector_enforce_max_reads" -eq 1 ]; then
+					_p1_selector_cmd+=( "--max-selected-reads" "$max_reads" )
+				fi
 				if [ "$prune_unassigned_clusters" -eq 1 ]; then
 					_p1_selector_cmd+=(
 						"--prune-unassigned"
@@ -1677,47 +1854,188 @@ while IFS= read -r sample; do
 				cluster_rule_ok=0
 				cluster_cons_min=""
 				cluster_noncons_max=0
-			cluster_cons_count=0
-			if [ "$n_cand" -ge "$selection_min" ] && [ "${min_cand_use:-NA}" != "NA" ]; then
-				if awk -v v="$min_cand_use" -v thr="$consolidated_min_qscore" 'BEGIN{exit !(v>=thr)}'; then
-					min_cand_ok=1
-				fi
-			fi
-			if [ "$lock_enabled" -eq 1 ] && [ -s "$reps_all" ]; then
-				while IFS=$'\t' read -r _hash _rep _rq _rk _cnt _sel; do
-					[ -n "$_cnt" ] || continue
-					case "$_cnt" in
-						*[!0-9]*) continue ;;
-					esac
-					rq_ok=0
-					if [ -n "$_rq" ] && [ "$_rq" != "NA" ]; then
-						if awk -v v="$_rq" -v thr="$consolidated_min_qscore" 'BEGIN{exit !(v>=thr)}'; then
-							rq_ok=1
-						fi
+				cluster_cons_count=0
+				qfiltered_pool_count=0
+				floor_cluster_count=0
+				top_floor_size=0
+				significant_cluster_count=0
+				min_significant_cluster_size=""
+				max_nonsignificant_cluster_size=0
+				top1_cluster_hash=""
+				top1_cluster_size=0
+				top1_cluster_qscore="NA"
+				top2_cluster_hash=""
+				top2_cluster_size=0
+				top2_cluster_qscore="NA"
+				top2_ratio="NA"
+				top2_delta_reads="NA"
+				top2_ratio_ok=0
+				top2_delta_ok=0
+				decision_min_stable_rounds="$lock_min_stable_rounds"
+				if [ "$n_cand" -ge "$selection_min" ] && [ "${min_cand_use:-NA}" != "NA" ]; then
+					if awk -v v="$min_cand_use" -v thr="$consolidated_min_qscore" 'BEGIN{exit !(v>=thr)}'; then
+						min_cand_ok=1
 					fi
-					if [ "$rq_ok" -eq 1 ] && [ "$_cnt" -ge "$lock_min_cons_reads" ]; then
-						cluster_cons_count=$((cluster_cons_count + 1))
-						if [ -z "$cluster_cons_min" ] || [ "$_cnt" -lt "$cluster_cons_min" ]; then
-							cluster_cons_min="$_cnt"
+				fi
+				if [ "$lock_enabled" -eq 1 ] && [ -s "$reps_all" ]; then
+					if [ "$consolidation_mode" = "significant_clusters" ]; then
+						sig_eval_tmp="${sel_prefix}.sig_eval.tsv"
+						: > "$sig_eval_tmp"
+						while IFS=$'\t' read -r _hash _rep _rq _rk _cnt _sel; do
+							[ -n "$_cnt" ] || continue
+							case "$_cnt" in
+								*[!0-9]*) continue ;;
+							esac
+							qfiltered_pool_count=$((qfiltered_pool_count + _cnt))
+							floor_flag=0
+							rq_ok=0
+							if [ -n "$_rq" ] && [ "$_rq" != "NA" ]; then
+								if awk -v v="$_rq" -v thr="$sig_min_cluster_qscore" 'BEGIN{exit !(v>=thr)}'; then
+									rq_ok=1
+								fi
+							fi
+							if [ "$rq_ok" -eq 1 ] && [ "$_cnt" -ge "$sig_min_cluster_reads" ]; then
+								floor_flag=1
+								floor_cluster_count=$((floor_cluster_count + 1))
+								if [ -z "$cluster_cons_min" ] || [ "$_cnt" -lt "$cluster_cons_min" ]; then
+									cluster_cons_min="$_cnt"
+								fi
+								if [ "$_cnt" -gt "$top_floor_size" ]; then
+									top_floor_size="$_cnt"
+								fi
+								if [ "$_cnt" -gt "$top1_cluster_size" ]; then
+									top1_cluster_hash="${_hash:-NA}"
+									top1_cluster_size="$_cnt"
+									top1_cluster_qscore="${_rq:-NA}"
+								fi
+							else
+								if [ "$_cnt" -gt "$cluster_noncons_max" ]; then
+									cluster_noncons_max="$_cnt"
+								fi
+							fi
+							printf "%s\t%s\t%s\t%s\t%s\n" "${_hash:-NA}" "$_cnt" "${_rq:-NA}" "$floor_flag" "$rq_ok" >> "$sig_eval_tmp"
+						done < "$reps_all"
+						cluster_cons_count="$floor_cluster_count"
+						decision_min_stable_rounds="$sig_min_stable_rounds"
+						if [ -s "$sig_eval_tmp" ]; then
+							if [ "$sig_rule" = "top_two_gap" ] && [ "$top1_cluster_size" -gt 0 ]; then
+								while IFS=$'\t' read -r _hash _cnt _rq _floor_flag _rq_ok; do
+									if [ "$_rq_ok" = "1" ] && [ "$_hash" != "$top1_cluster_hash" ] && [ "$_cnt" -gt "$top2_cluster_size" ]; then
+										top2_cluster_hash="${_hash:-NA}"
+										top2_cluster_size="$_cnt"
+										top2_cluster_qscore="${_rq:-NA}"
+									fi
+								done < "$sig_eval_tmp"
+								if [ "$top2_cluster_size" -gt 0 ]; then
+									top2_ratio=$(awk -v a="$top1_cluster_size" -v b="$top2_cluster_size" 'BEGIN{printf "%.6f", a/b}')
+									top2_delta_reads=$((top1_cluster_size - top2_cluster_size))
+									if awk -v v="$top2_ratio" -v thr="$sig_top2_min_ratio" 'BEGIN{exit !(v>=thr)}'; then
+										top2_ratio_ok=1
+									fi
+									if [ "$top2_delta_reads" -ge "$sig_top2_min_delta_reads" ]; then
+										top2_delta_ok=1
+									fi
+								else
+									top2_ratio="INF"
+									top2_delta_reads="$top1_cluster_size"
+									top2_ratio_ok=1
+									top2_delta_ok=1
+								fi
+								if [ "$top2_ratio_ok" -eq 1 ] && [ "$top2_delta_ok" -eq 1 ]; then
+									cluster_rule_ok=1
+									significant_cluster_count=1
+									min_significant_cluster_size="$top1_cluster_size"
+								fi
+							fi
+							while IFS=$'\t' read -r _hash _cnt _rq _floor_flag _rq_ok; do
+								pool_fraction="NA"
+								top_fraction="NA"
+								significant_flag=0
+								candidate_role="other"
+								passes_top2_rule="NA"
+								if [ "$qfiltered_pool_count" -gt 0 ]; then
+									pool_fraction=$(awk -v c="$_cnt" -v t="$qfiltered_pool_count" 'BEGIN{printf "%.6f", c/t}')
+								fi
+								if [ "$top_floor_size" -gt 0 ]; then
+									top_fraction=$(awk -v c="$_cnt" -v t="$top_floor_size" 'BEGIN{printf "%.6f", c/t}')
+								fi
+								if [ "$sig_rule" = "top_two_gap" ]; then
+									passes_top2_rule="$cluster_rule_ok"
+									if [ -n "$top1_cluster_hash" ] && [ "$_hash" = "$top1_cluster_hash" ]; then
+										candidate_role="leader"
+									elif [ "$top2_cluster_size" -gt 0 ] && [ -n "$top2_cluster_hash" ] && [ "$_hash" = "$top2_cluster_hash" ]; then
+										candidate_role="competitor"
+									fi
+									if [ "$cluster_rule_ok" -eq 1 ] && [ "$candidate_role" = "leader" ]; then
+										significant_flag=1
+									fi
+								else
+									if [ "$_floor_flag" = "1" ] && [ "$pool_fraction" != "NA" ] && [ "$top_fraction" != "NA" ]; then
+										if awk -v p="$pool_fraction" -v pt="$sig_min_pool_fraction" -v tf="$top_fraction" -v tt="$sig_min_top_fraction" 'BEGIN{exit !(p>=pt && tf>=tt)}'; then
+											significant_flag=1
+											significant_cluster_count=$((significant_cluster_count + 1))
+											if [ -z "$min_significant_cluster_size" ] || [ "$_cnt" -lt "$min_significant_cluster_size" ]; then
+												min_significant_cluster_size="$_cnt"
+											fi
+										fi
+									fi
+								fi
+								if [ "$significant_flag" -eq 0 ] && [ "$_cnt" -gt "$max_nonsignificant_cluster_size" ]; then
+									max_nonsignificant_cluster_size="$_cnt"
+								fi
+								printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+									"$round_id" "$sample" "$otu_key" "${_hash:-NA}" "$_cnt" "${_rq:-NA}" "$qfiltered_pool_count" \
+									"$pool_fraction" "$top_fraction" "$_floor_flag" "$significant_flag" "$sig_rule" "$candidate_role" "$passes_top2_rule" >> "$significant_cluster_summary_sample"
+							done < "$sig_eval_tmp"
+						fi
+						rm -f "$sig_eval_tmp"
+						if [ "$sig_rule" != "top_two_gap" ] && [ "$significant_cluster_count" -gt 0 ]; then
+							cluster_rule_ok=1
 						fi
 					else
-						if [ "$_cnt" -gt "$cluster_noncons_max" ]; then
-							cluster_noncons_max="$_cnt"
+						while IFS=$'\t' read -r _hash _rep _rq _rk _cnt _sel; do
+							[ -n "$_cnt" ] || continue
+							case "$_cnt" in
+								*[!0-9]*) continue ;;
+							esac
+							rq_ok=0
+							if [ -n "$_rq" ] && [ "$_rq" != "NA" ]; then
+								if awk -v v="$_rq" -v thr="$consolidated_min_qscore" 'BEGIN{exit !(v>=thr)}'; then
+									rq_ok=1
+								fi
+							fi
+							if [ "$rq_ok" -eq 1 ] && [ "$_cnt" -ge "$lock_min_cons_reads" ]; then
+								cluster_cons_count=$((cluster_cons_count + 1))
+								if [ -z "$cluster_cons_min" ] || [ "$_cnt" -lt "$cluster_cons_min" ]; then
+									cluster_cons_min="$_cnt"
+								fi
+							else
+								if [ "$_cnt" -gt "$cluster_noncons_max" ]; then
+									cluster_noncons_max="$_cnt"
+								fi
+							fi
+						done < "$reps_all"
+						if [ -n "$cluster_cons_min" ]; then
+							thr=$(awk -v r="$lock_ratio" -v m="$cluster_cons_min" 'BEGIN{printf "%.6f", r*m}')
+							if awk -v non="$cluster_noncons_max" -v t="$thr" 'BEGIN{exit !(non<=t)}'; then
+								cluster_rule_ok=1
+							fi
 						fi
 					fi
-				done < "$reps_all"
-				if [ -n "$cluster_cons_min" ]; then
-					thr=$(awk -v r="$lock_ratio" -v m="$cluster_cons_min" 'BEGIN{printf "%.6f", r*m}')
-					if awk -v non="$cluster_noncons_max" -v t="$thr" 'BEGIN{exit !(non<=t)}'; then
-						cluster_rule_ok=1
-					fi
 				fi
-			fi
 				if [ "$lock_enabled" -eq 1 ]; then
-					if [ "$is_frozen" -eq 1 ] && [ "$cluster_rule_ok" -eq 1 ] && [ "$cluster_cons_count" -gt 0 ]; then
-						lock_rule_pass=1
+					if [ "$consolidation_mode" = "significant_clusters" ]; then
+						if [ "$is_frozen" -eq 1 ] && [ "$significant_cluster_count" -gt 0 ]; then
+							lock_rule_pass=1
+						else
+							lock_rule_pass=0
+						fi
 					else
-						lock_rule_pass=0
+						if [ "$is_frozen" -eq 1 ] && [ "$cluster_rule_ok" -eq 1 ] && [ "$cluster_cons_count" -gt 0 ]; then
+							lock_rule_pass=1
+						else
+							lock_rule_pass=0
+						fi
 					fi
 					if [ "$lock_rule_pass" -eq 1 ]; then
 						if [ "$prev_lock_pass" -eq 1 ]; then
@@ -1728,7 +2046,7 @@ while IFS= read -r sample; do
 					else
 						stable_count=0
 					fi
-					if [ "$lock_rule_pass" -eq 1 ] && [ "$stable_count" -ge "$lock_min_stable_rounds" ]; then
+					if [ "$lock_rule_pass" -eq 1 ] && [ "$stable_count" -ge "$decision_min_stable_rounds" ]; then
 						should_consolidate=1
 					fi
 				else
@@ -1739,12 +2057,12 @@ while IFS= read -r sample; do
 					lock_rule_pass=0
 				fi
 				printf "%s\t%s\t%s\n" "$otu_key" "$stable_count" "$lock_rule_pass" >> "$lock_state_current"
-				[ "$CONS_DEBUG" = "1" ] && cons_log "OTU=$otu_key consolidate_decision=$should_consolidate n_cand=$n_cand min_cand=${min_cand_use:-$min_cand} min_cand_ok=$min_cand_ok cluster_cons_count=$cluster_cons_count cluster_cons_min=${cluster_cons_min:-NA} cluster_noncons_max=$cluster_noncons_max cluster_rule_ok=$cluster_rule_ok lock_rule_pass=$lock_rule_pass stable_count=$stable_count min_stable_rounds=$lock_min_stable_rounds"
+				[ "$CONS_DEBUG" = "1" ] && cons_log "OTU=$otu_key consolidate_decision=$should_consolidate n_cand=$n_cand min_cand=${min_cand_use:-$min_cand} min_cand_ok=$min_cand_ok cluster_cons_count=$cluster_cons_count cluster_cons_min=${cluster_cons_min:-NA} cluster_noncons_max=$cluster_noncons_max cluster_rule_ok=$cluster_rule_ok lock_rule_pass=$lock_rule_pass stable_count=$stable_count min_stable_rounds=$decision_min_stable_rounds qfiltered_pool_count=$qfiltered_pool_count floor_cluster_count=$floor_cluster_count top_floor_size=$top_floor_size significant_cluster_count=$significant_cluster_count sig_rule=$sig_rule top1_cluster_size=$top1_cluster_size top1_cluster_qscore=${top1_cluster_qscore:-NA} top2_cluster_size=$top2_cluster_size top2_cluster_qscore=${top2_cluster_qscore:-NA} top2_ratio=${top2_ratio:-NA} top2_delta_reads=${top2_delta_reads:-NA}"
 
 			# If a cached consensus is already marked consolidated, reuse it even if
 			# the current round doesn't meet consolidation thresholds.
 			cache_cons_consolidated=0
-			if [ -s "$cache_cons" ] && grep -q 'consolidated=1' "$cache_cons" 2>/dev/null; then
+			if [ "$policy_reset_sample" -eq 0 ] && [ -s "$cache_cons" ] && grep -q 'consolidated=1' "$cache_cons" 2>/dev/null; then
 				cache_cons_consolidated=1
 			fi
 			effective_consolidated=0
@@ -1752,7 +2070,7 @@ while IFS= read -r sample; do
 				effective_consolidated=1
 			fi
 			ratio_threshold="NA"
-			if [ -n "$cluster_cons_min" ]; then
+			if [ "$consolidation_mode" != "significant_clusters" ] && [ -n "$cluster_cons_min" ]; then
 				ratio_threshold=$(awk -v r="$lock_ratio" -v m="$cluster_cons_min" 'BEGIN{printf "%.6f", r*m}')
 			fi
 			reason="ok"
@@ -1761,14 +2079,36 @@ while IFS= read -r sample; do
 			elif [ "$is_frozen" -eq 0 ]; then
 				reason="not_frozen"
 			elif [ "$lock_enabled" -eq 1 ]; then
-				if [ "$cluster_cons_count" -le 0 ]; then
-					reason="no_candidate_clusters"
-				elif [ "$cluster_rule_ok" -eq 0 ]; then
-					reason="ratio_failed"
-				elif [ "$stable_count" -lt "$lock_min_stable_rounds" ]; then
-					reason="stable_rounds"
+				if [ "$consolidation_mode" = "significant_clusters" ]; then
+					if [ "$floor_cluster_count" -le 0 ]; then
+						reason="no_floor_clusters"
+					elif [ "$sig_rule" = "top_two_gap" ] && [ "$significant_cluster_count" -le 0 ]; then
+						if [ "$top2_cluster_size" -gt 0 ] && [ "$top2_ratio_ok" -eq 0 ] && [ "$top2_delta_ok" -eq 0 ]; then
+							reason="top_two_ratio_and_delta_failed"
+						elif [ "$top2_ratio_ok" -eq 0 ]; then
+							reason="top_two_ratio_failed"
+						elif [ "$top2_delta_ok" -eq 0 ]; then
+							reason="top_two_delta_failed"
+						else
+							reason="lock_pending"
+						fi
+					elif [ "$significant_cluster_count" -le 0 ]; then
+						reason="no_significant_clusters"
+					elif [ "$stable_count" -lt "$decision_min_stable_rounds" ]; then
+						reason="stable_rounds"
+					else
+						reason="lock_pending"
+					fi
 				else
-					reason="lock_pending"
+					if [ "$cluster_cons_count" -le 0 ]; then
+						reason="no_candidate_clusters"
+					elif [ "$cluster_rule_ok" -eq 0 ]; then
+						reason="ratio_failed"
+					elif [ "$stable_count" -lt "$decision_min_stable_rounds" ]; then
+						reason="stable_rounds"
+					else
+						reason="lock_pending"
+					fi
 				fi
 			else
 				if [ "$min_cand_ok" -eq 0 ]; then
@@ -1777,11 +2117,17 @@ while IFS= read -r sample; do
 					reason="pending"
 				fi
 			fi
-			printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+			lock_summary_sig_rule="NA"
+			if [ "$consolidation_mode" = "significant_clusters" ]; then
+				lock_summary_sig_rule="$sig_rule"
+			fi
+			printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
 				"$round_id" "$sample" "$otu_key" "$n_cand" "${min_cand_use:-$min_cand}" "$min_cand_ok" "$is_frozen" \
 				"$lock_enabled" "$cluster_cons_count" "${cluster_cons_min:-NA}" "$cluster_noncons_max" "$lock_ratio" \
-				"$ratio_threshold" "$lock_rule_pass" "$stable_count" "$lock_min_stable_rounds" "$should_consolidate" \
-				"$effective_consolidated" "$reason" "computed" >> "$lock_summary"
+				"$ratio_threshold" "$lock_rule_pass" "$stable_count" "$decision_min_stable_rounds" "$should_consolidate" \
+				"$effective_consolidated" "$reason" "computed" "$consolidation_mode" "$qfiltered_pool_count" "$floor_cluster_count" \
+				"$top_floor_size" "$significant_cluster_count" "${min_significant_cluster_size:-NA}" "$max_nonsignificant_cluster_size" \
+				"$lock_summary_sig_rule" "${top1_cluster_size:-0}" "${top1_cluster_qscore:-NA}" "${top2_cluster_size:-0}" "${top2_cluster_qscore:-NA}" "${top2_ratio:-NA}" "${top2_delta_reads:-NA}" >> "$lock_summary"
 			if [ "$effective_consolidated" -eq 1 ]; then
 				echo "$otu_key" >> "$consolidated_keys"
 				printf "%s\t%s\n" "$sample" "$otu_key" >> "$consolidated_otu_keys_current"
@@ -1843,18 +2189,29 @@ while IFS= read -r sample; do
 				sort -u "$union_cand_ids" -o "$union_cand_ids"
 				if [ -f "${sup_reads}.fai" ] && command -v samtools >/dev/null 2>&1; then
 					# O1: indexed random-access extraction — O(n_candidates) instead of O(n_total_reads).
-					# samtools faidx exits 0 even when some IDs are absent (prints warnings to stderr).
-					samtools faidx -r "$union_cand_ids" "$sup_reads" > "$union_cand_reads" || true
+					# Some samtools builds exit nonzero when any requested ID is absent, so prefilter via .fai.
+					union_cand_fetch_ids="${union_cand_ids}.present"
+					union_cand_total=$(wc -l < "$union_cand_ids" 2>/dev/null | tr -d ' ' || echo 0)
+					union_cand_total=${union_cand_total:-0}
+					awk 'NR==FNR { have[$1]=1; next } ($1 in have) { print $1 }' "${sup_reads}.fai" "$union_cand_ids" > "$union_cand_fetch_ids"
+					union_cand_present=$(wc -l < "$union_cand_fetch_ids" 2>/dev/null | tr -d ' ' || echo 0)
+					union_cand_present=${union_cand_present:-0}
+					union_cand_missing=$(( union_cand_total - union_cand_present ))
+					if [ "$union_cand_missing" -gt 0 ]; then
+						cons_log "WARN: candidate batch skipped $union_cand_missing IDs absent from accumulated FASTA for sample=$sample"
+					fi
+					if [ "$union_cand_present" -gt 0 ]; then
+						if ! samtools faidx -r "$union_cand_fetch_ids" "$sup_reads" > "$union_cand_reads"; then
+							echo "ERROR: Consensus batch samtools extraction failed: sample=$sample sup_reads=$sup_reads union_ids=$union_cand_fetch_ids" 1>&2
+							exit 1
+						fi
+					else
+						: > "$union_cand_reads"
+					fi
 				else
 					if ! seqtk subseq "$sup_reads" "$union_cand_ids" > "$union_cand_reads"; then
-						id_mismatch_events=$((id_mismatch_events + 1))
-						msg="Consensus batch seqtk extraction failed: sample=$sample union_ids=$union_cand_ids"
-						if [ "$id_mismatch_policy" = "fail" ]; then
-							echo "ERROR: $msg" 1>&2; exit 1
-						else
-							echo "WARN: $msg" 1>&2
-						fi
-						cons_log "$msg"
+						echo "ERROR: Consensus batch seqtk extraction failed: sample=$sample union_ids=$union_cand_ids" 1>&2
+						exit 1
 					fi
 				fi
 				# Split union FASTA back to per-OTU _reads_sup.fasta (exact ID match).
@@ -1928,20 +2285,29 @@ while IFS= read -r sample; do
 							printf "%s\t%s\n" "$sample" "$locked_key" >> "$consolidated_otu_keys_current"
 							IFS=$'\t' read -r cache_n cache_minq cache_frozen < <(read_cache_consensus_meta "$cache_cons")
 							printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$locked_key" "$sample" "$cache_n" "$cache_minq" "$cache_frozen" "1" >> "$sample_meta"
-							printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+							lock_summary_sig_rule_cf="NA"
+							if [ "$consolidation_mode" = "significant_clusters" ]; then
+								lock_summary_sig_rule_cf="$sig_rule"
+							fi
+							printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
 								"$round_id" "$sample" "$locked_key" "$cache_n" "$cache_minq" "NA" "$cache_frozen" \
 								"$lock_enabled" "NA" "NA" "NA" "$lock_ratio" "NA" "$prev_lock_pass" "$prev_stable_count" \
-								"$lock_min_stable_rounds" "0" "1" "carry_forward_cache" "carry_forward" >> "$lock_summary"
+								"$sample_lock_min_stable_rounds" "0" "1" "carry_forward_cache" "carry_forward" \
+								"$consolidation_mode" "0" "0" "0" "0" "NA" "0" "$lock_summary_sig_rule_cf" "0" "NA" "0" "NA" "NA" "NA" >> "$lock_summary"
 							echo "$cache_cons" >> "$cached_list"
 							[ "$CONS_DEBUG" = "1" ] && cons_log "OTU=$locked_key locked_cache_carry_forward source=missing_from_otu_list"
 						else
 							echo "WARN: OTU=$locked_key locked but cache missing during carry-forward; metadata placeholder emitted" 1>&2
 							printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$locked_key" "$sample" "0" "NA" "1" "0" >> "$sample_meta"
 							printf "%s\t%s\n" "$sample" "$locked_key" >> "$consolidated_otu_keys_drop"
-							printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+							lock_summary_sig_rule_cf="NA"
+							if [ "$consolidation_mode" = "significant_clusters" ]; then
+								lock_summary_sig_rule_cf="$sig_rule"
+							fi
+							printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
 								"$round_id" "$sample" "$locked_key" "0" "NA" "NA" "1" "$lock_enabled" "NA" "NA" "NA" \
-								"$lock_ratio" "NA" "$prev_lock_pass" "$prev_stable_count" "$lock_min_stable_rounds" "0" "0" \
-								"carry_forward_cache_missing" "carry_forward" >> "$lock_summary"
+								"$lock_ratio" "NA" "$prev_lock_pass" "$prev_stable_count" "$sample_lock_min_stable_rounds" "0" "0" \
+								"carry_forward_cache_missing" "carry_forward" "$consolidation_mode" "0" "0" "0" "0" "NA" "0" "$lock_summary_sig_rule_cf" "0" "NA" "0" "NA" "NA" "NA" >> "$lock_summary"
 						fi
 						done < "$carry_forward_state"
 					fi
@@ -1984,7 +2350,7 @@ while IFS= read -r sample; do
 				_t_r_input_scan_end=$(timing_now)
 				append_timing_row "$sample_timing_file" "sample" "$sample" "r_consensus_input_scan" "$_t_r_input_scan_start" "$_t_r_input_scan_end"
 				_t_r_exec_start=$(timing_now)
-				Rscript "$Consensus_Rscript" "$sample" "$min_reads" "$max_N" || { echo "ERROR: Rscript failed for sample $sample" 1>&2; exit 1; }
+				"$rscript_cmd" "$Consensus_Rscript" "$sample" "$min_reads" "$max_N" || { echo "ERROR: Rscript failed for sample $sample" 1>&2; exit 1; }
 				_t_r_exec_end=$(timing_now)
 				append_timing_row "$sample_timing_file" "sample" "$sample" "r_consensus_exec" "$_t_r_exec_start" "$_t_r_exec_end"
 				if [ -s "$sample_consensus_fasta" ]; then
@@ -2063,7 +2429,7 @@ while IFS= read -r sample; do
 							reads="reads-0";
 							if (match(h, /reads-[0-9]+/)) { reads=substr(h, RSTART, RLENGTH); }
 							sample="";
-							split(h, b, "|"); sample=b[1];
+							split(h, b, /\|/); sample=b[1];
 							if (sample=="") sample="unknown";
 						newh=sample "|" otu;
 						if (marker != "") { newh=newh "|" marker; }
@@ -2092,7 +2458,7 @@ while IFS= read -r sample; do
 				}
 				/^>/{
 					h_raw=substr($0,2);
-					n=split(h_raw,a,"|");
+					n=split(h_raw,a,/\|/);
 					otu_key="NA";
 					tmp=h_raw;
 					while (match(tmp, /\|OTU=[^|]+/)) {
@@ -2182,7 +2548,7 @@ while IFS= read -r sample; do
 								tmp=substr(tmp, RSTART+RLENGTH);
 							}
 							if (otu == "") {
-								n=split(h, p, "|");
+								n=split(h, p, /\|/);
 								if (n>=2) {
 									otu=p[2];
 									if (n>=3 && p[3] != "" && otu !~ ("-" p[3] "$")) otu=otu "-" p[3];
@@ -2263,7 +2629,7 @@ while IFS= read -r sample; do
 							if [ -n "$cons_header" ]; then
 								consensus_id=$(printf "%s\n" "$cons_header" | awk -F'|' 'NF>=2{print $2 "_" $1}')
 								prior_keep=0
-								if [ -n "$_cons_ids_prev_file" ]; then
+								if [ "$policy_reset_sample" -eq 0 ] && [ -n "$_cons_ids_prev_file" ]; then
 									if grep -Fxq "$cons_header" "$_cons_ids_prev_file"; then
 										prior_keep=1
 									elif [ -n "$consensus_id" ] && grep -Fxq "$consensus_id" "$_cons_ids_prev_file"; then
@@ -2334,6 +2700,9 @@ while IFS= read -r sample; do
 			cp "$lock_state_prev" "$lock_state_file"
 		else
 			: > "$lock_state_file"
+		fi
+		if [ "$lock_enabled" -eq 1 ]; then
+			printf "%s\n" "$current_policy_signature" > "$policy_signature_file"
 		fi
 		rm -f "$lock_state_prev" "$lock_state_current"
 	printf "emitted\t%d\nmerged\t%d\nmismatches\t%d\nselector_failures\t%d\nfallback_empty_sample_blast_count\t%d\n" \
@@ -2413,6 +2782,7 @@ for _f in "$out_dir"/*/_eligible_size_streak.tmp; do [ -f "$_f" ] && cat "$_f" >
 for _f in "$out_dir"/*/_pruned_unassigned.tmp;    do [ -f "$_f" ] && cat "$_f" >> "$pruned_unassigned_round";       done
 for _f in "$out_dir"/*/_prune_stats.tmp;          do [ -f "$_f" ] && cat "$_f" >> "$prune_stats_round";             done
 for _f in "$out_dir"/*/_lock_summary.tmp;         do [ -f "$_f" ] && cat "$_f" >> "$lock_summary";                 done
+for _f in "$out_dir"/*/_significant_cluster_summary.tmp; do [ -f "$_f" ] && cat "$_f" >> "$significant_cluster_summary"; done
 for _f in "$out_dir"/*/_consensus_map.tmp;        do [ -f "$_f" ] && cat "$_f" >> "$consensus_map";                done
 
 if [ "$prune_unassigned_drop_reads" -eq 1 ] && [ -s "$pruned_unassigned_round" ]; then
@@ -2422,6 +2792,31 @@ _t_sample_output_merge_end=$(timing_now)
 append_timing_row "$phase_timings_raw_file" "global" "-" "sample_output_merge" "$_t_sample_output_merge_start" "$_t_sample_output_merge_end"
 
 _t_consolidated_finalize_start=$(timing_now)
+policy_reset_samples_list="$out_dir/policy_reset_samples.list"
+policy_reset_prev_keys="$out_dir/policy_reset_prev_keys.tsv"
+consolidated_ids_prev_effective="$out_dir/consolidated_consensus_ids.prev.effective"
+: > "$policy_reset_samples_list"
+: > "$policy_reset_prev_keys"
+for _f in "$out_dir"/*/_policy_reset_sample.tmp; do
+	[ -f "$_f" ] || continue
+	cat "$_f" >> "$policy_reset_samples_list"
+done
+if [ -s "$policy_reset_samples_list" ]; then
+	LC_ALL=C sort -u -o "$policy_reset_samples_list" "$policy_reset_samples_list"
+	if [ -s "$consolidated_otu_keys_prev" ]; then
+		awk 'BEGIN{FS=OFS="\t"}
+			FNR==NR { reset[$1]=1; next }
+			NF>=2 && ($1 in reset) { print > prev_drop; next }
+			{ print }
+		' prev_drop="$policy_reset_prev_keys" "$policy_reset_samples_list" "$consolidated_otu_keys_prev" > "${consolidated_otu_keys_prev}.tmp" \
+			&& mv "${consolidated_otu_keys_prev}.tmp" "$consolidated_otu_keys_prev"
+	fi
+fi
+if [ -s "$policy_reset_prev_keys" ] && [ -s "$consolidated_ids_prev" ]; then
+	filter_consolidated_ids_by_dropped_keys "$consolidated_ids_prev" "$consolidated_ids_prev_effective" "$policy_reset_prev_keys"
+else
+	cp "$consolidated_ids_prev" "$consolidated_ids_prev_effective" 2>/dev/null || : > "$consolidated_ids_prev_effective"
+fi
 cons_ids_source=""
 cons_ids_kept_previous=0
 cons_ids_reason=""
@@ -2431,8 +2826,8 @@ if [ "$emitted_consensus_count" -gt 0 ]; then
 		cons_ids_source="$consolidated_ids_current"
 		cons_ids_reason="emitted"
 		cons_log "CONS_IDS: prepared current set (emitted_consensus_count=$emitted_consensus_count)"
-	elif [ -s "$consolidated_ids_prev" ]; then
-		cons_ids_source="$consolidated_ids_prev"
+	elif [ -s "$consolidated_ids_prev_effective" ]; then
+		cons_ids_source="$consolidated_ids_prev_effective"
 		cons_ids_kept_previous=1
 		cons_ids_reason="emitted_keep_prev"
 		cons_log "CONS_IDS: consensus emitted but no new consolidations; keeping previous IDs"
@@ -2441,8 +2836,8 @@ if [ "$emitted_consensus_count" -gt 0 ]; then
 		cons_ids_reason="emitted_no_prev"
 		cons_log "CONS_IDS: consensus emitted but no consolidated IDs exist yet"
 	fi
-elif [ -s "$consolidated_ids_prev" ]; then
-	cons_ids_source="$consolidated_ids_prev"
+elif [ -s "$consolidated_ids_prev_effective" ]; then
+	cons_ids_source="$consolidated_ids_prev_effective"
 	cons_ids_kept_previous=1
 	cons_ids_reason="no_emission_keep_prev"
 	cons_log "CONS_IDS: keeping previous (no consensus emitted)"
@@ -2541,10 +2936,13 @@ if [ "$emitted_consensus_count" -eq 0 ] && [ "$merged_input_headers_total" -gt 0
 	exit 1
 fi
 rm -f "$consolidated_ids_prev"
+rm -f "$consolidated_ids_prev_effective"
 rm -f "$consolidated_ids_current"
 rm -f "$consolidated_otu_keys_prev"
 rm -f "$consolidated_otu_keys_current"
 rm -f "$consolidated_otu_keys_drop"
+rm -f "$policy_reset_samples_list"
+rm -f "$policy_reset_prev_keys"
 rm -f "$lock_reset_list"
 rm -f "$sup_index"
 

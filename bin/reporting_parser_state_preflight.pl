@@ -23,6 +23,26 @@ ReportingParserStateTxn::recover_leftover_transaction_or_die(
 	context => $context,
 );
 
+my $state_demult_report_exists = -e $state_demult_report ? 1 : 0;
+my $state_demult_sidecar_exists = -e $state_demult_sidecar ? 1 : 0;
+my $state_otu_report_exists = -e $state_otu_report ? 1 : 0;
+my $state_otu_sidecar_exists = -e $state_otu_sidecar ? 1 : 0;
+my $sentinel_exists = -e $demult_bootstrap_sentinel ? 1 : 0;
+
+# Recover from a legacy stray demux parser-state file left behind without its
+# sidecar. This is safe only when there is no bootstrap sentinel and no OTU
+# parser-state pair yet, which means the accumulated parser state is still
+# logically absent for this state.
+if (
+	!$sentinel_exists &&
+	!$state_otu_report_exists &&
+	!$state_otu_sidecar_exists &&
+	($state_demult_report_exists xor $state_demult_sidecar_exists)
+) {
+	unlink $state_demult_report if $state_demult_report_exists;
+	unlink $state_demult_sidecar if $state_demult_sidecar_exists;
+}
+
 my $round_demult = ReportingContractSidecar::validate_report_and_sidecar(
 	report_kind => 'demult_rpt',
 	context => $context,
@@ -53,7 +73,6 @@ my $state_otu = ReportingContractSidecar::validate_report_and_sidecar(
 
 my $state_demult_absent = $state_demult->{state} eq 'absent' ? 1 : 0;
 my $state_otu_absent = $state_otu->{state} eq 'absent' ? 1 : 0;
-my $sentinel_exists = -e $demult_bootstrap_sentinel ? 1 : 0;
 
 die "ERROR: accumulated demux state exists without accumulated OTU-definition state\n"
 	if !$state_demult_absent && $state_otu_absent;

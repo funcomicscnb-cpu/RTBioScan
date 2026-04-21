@@ -1,0 +1,1 @@
+read_id	filename	run_id	barcode	fast_length	fast_mean_qscore	hac_length	hac_mean_qscore	sup_length	sup_mean_qscore

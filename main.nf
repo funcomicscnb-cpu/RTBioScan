@@ -8,46 +8,25 @@
 // ChannelUtils (strictRoundJoin family) → lib/ChannelUtils.groovy (auto-loaded by Nextflow)
 
 // Compute demultiplexing enablement once and reuse it everywhere.
-// This avoids mismatches where params.demultiplex_mode='auto' or 'on' but the files are missing/empty.
+// This avoids mismatches where params.demultiplex_mode aliases normalize to the same effective mode.
 def replicateModeCanonical = getReplicateModeCanonical()
 def demuxCfg = getDemuxConfig()
 def demuxIdentityContext = getDemuxIdentityContext(demuxCfg)
-def demuxEnabledForRun = false
-try {
-    def idxOk = hasFastaHeader(demuxCfg.indexes)
-    def priOk = hasFastaHeader(demuxCfg.primers)
-    if (demuxCfg.mode == 'primers_only') {
-        demuxEnabledForRun = demuxCfg.enabled && priOk
-    } else if (demuxCfg.mode == 'full') {
-        demuxEnabledForRun = demuxCfg.enabled && idxOk && priOk
-    } else {
-        demuxEnabledForRun = false
-    }
-} catch (Exception e) {
+def idxOk = hasFastaHeader(demuxCfg.indexes)
+def priOk = hasFastaHeader(demuxCfg.primers)
+def demuxEnabledForRun
+if (demuxCfg.mode == 'primers_only') {
+    demuxEnabledForRun = demuxCfg.enabled && priOk
+} else if (demuxCfg.mode == 'full') {
+    demuxEnabledForRun = demuxCfg.enabled && idxOk && priOk
+} else {
     demuxEnabledForRun = false
 }
 def demuxEnabledInt = demuxEnabledForRun ? 1 : 0
-def fullDemuxBranchWillRun = demuxEnabledForRun &&
-    demuxCfg.mode == 'full' &&
-    isRegularFilePath(demuxCfg.indexes) &&
-    isRegularFilePath(demuxCfg.primers)
-if (replicateModeCanonical == 'track' && fullDemuxBranchWillRun) {
-    def trackArtifacts = getTrackArtifactPaths()
-    requireTrackArtifactPath(trackArtifacts.trackRoster, 'track_roster.tsv', 'when entering the full-demux branch')
-    requireTrackArtifactPath(trackArtifacts.trackActiveUnits, 'track_active_units.txt', 'when entering the full-demux branch')
-    requireTrackArtifactPath(trackArtifacts.trackIdentity, 'track_identity.tsv', 'when entering the full-demux branch')
-}
+def fullDemuxBranchWillRun = demuxEnabledForRun && demuxCfg.mode == 'full'
 
-custom_runName = params.name
-run_name = params.name
-if (!(workflow.runName ==~ /[a-z]+_[a-z]+/)) {
-    custom_runName = workflow.runName
-}
-if (!run_name) {
-    run_name = custom_runName ?: workflow.runName
-}
-
-	def available_cpus = Runtime.runtime.availableProcessors()
+custom_runName = workflow.runName
+run_name = workflow.runName
 
 	// Header log info (matches main_barcoding.nf behavior)
 	log.info nfcoreHeader()
@@ -80,8 +59,6 @@ def usingDockerProfile = activeProfiles.contains('docker')
 def usingCondaProfile = activeProfiles.contains('conda')
 
 def readsProvided = params.reads?.toString()?.trim()
-def readsRtProvided = params.reads_rt?.toString()?.trim()
-def readsFlagProvided = (workflow.commandLine ?: '') ==~ /(?s).*(^|\\s)--reads(=|\\s).*/
 def deriveGlobRoot = { pattern ->
     try {
         def s = pattern?.toString()
@@ -104,29 +81,16 @@ def deriveGlobRoot = { pattern ->
         return null
     }
 }
-if (readsRtProvided) {
-    if (runMode != 'realtime') {
-        exit 1, "--reads_rt is only supported with --run_mode realtime"
-    }
-    if (readsFlagProvided && readsProvided && readsProvided != readsRtProvided) {
-        log.warn "Both --reads and deprecated --reads_rt were provided; using --reads_rt"
-    }
-    readsProvided = readsRtProvided
-    log.warn "--reads_rt is deprecated; use --reads with --run_mode realtime"
-}
-
 if (!readsProvided) {
     exit 1, "Please provide --reads (and optionally --run_mode batch|realtime)"
 }
-def effectiveReads = readsProvided
-
 if (runMode == 'batch') {
     reads = Channel
-        .fromPath(effectiveReads, checkIfExists: true)
-        .ifEmpty { exit 1, """Cannot find any reads matching: ${effectiveReads}
+        .fromPath(readsProvided, checkIfExists: true)
+        .ifEmpty { exit 1, """Cannot find any reads matching: ${readsProvided}
 NB: Path needs to be enclosed in quotes!""" }
 } else {
-    def realtimePattern = effectiveReads.toString()
+    def realtimePattern = readsProvided.toString()
     def realtimeDir = deriveGlobRoot(realtimePattern)
     def dirOk = (realtimeDir && new File(realtimeDir).exists() && new File(realtimeDir).isDirectory())
     if (!dirOk) {
@@ -137,7 +101,7 @@ NB: Path needs to be enclosed in quotes!""" }
         def watchedReads = Channel.watchPath(realtimePattern)
         reads = initialReads.concat(watchedReads)
     } else {
-        reads = initialReads.ifEmpty { exit 1, """Cannot find any realtime reads matching: ${effectiveReads}
+        reads = initialReads.ifEmpty { exit 1, """Cannot find any realtime reads matching: ${readsProvided}
 NB: Path needs to be enclosed in quotes!""" }
     }
 }
@@ -149,7 +113,7 @@ if (params.containsKey('state_id') && params.state_id != null) {
     stateIdRaw = params.state_id.toString().trim()
 }
 if (!stateIdRaw) {
-    stateIdRaw = (custom_runName ?: workflow.runName)?.toString()
+    stateIdRaw = workflow.runName?.toString()
 }
 // Keep it filesystem-friendly.
 def stateId = stateIdRaw.replaceAll(/[^A-Za-z0-9_.-]+/, "_")
@@ -157,16 +121,57 @@ def ongoingStateDir = params.outdir ? "${params.outdir}/temp/ongoing/state/${sta
 def currentStateDir = params.outdir ? "${params.outdir}/temp/current/state/${stateId}" : null
 def currentResultsStateDir = params.outdir ? "${params.outdir}/current/state/${stateId}" : null
 def ongoingResultsStateDir = params.outdir ? "${params.outdir}/ongoing/state/${stateId}" : null
+def failedRoundPlaceholderRoot = file("${baseDir}/bin/report_placeholders/failed_round", checkIfExists: true)
+def resolveFailedRoundPlaceholderAssets = { context ->
+	def resolvedContext = context?.toString()
+	if (!(resolvedContext in ['full_collapse', 'primers_only', 'full_track', 'off'])) {
+		exit 1, "Unsupported failed-round placeholder context '${resolvedContext}'"
+	}
+	def contextDir = file("${failedRoundPlaceholderRoot}/${resolvedContext}", checkIfExists: true)
+	[
+		blastOtuPretaxRpt      : file("${failedRoundPlaceholderRoot}/blast_otu_pretax_rpt.txt", checkIfExists: true),
+		blastOtuNoadapterRpt   : file("${failedRoundPlaceholderRoot}/blast_otu_noadapter_rpt.txt", checkIfExists: true),
+		readInfoRpt            : file("${failedRoundPlaceholderRoot}/read_info_rpt.txt", checkIfExists: true),
+		blastFilterStats       : file("${failedRoundPlaceholderRoot}/blast_filter_stats.tsv", checkIfExists: true),
+		blastConsensusTaxRpt   : file("${failedRoundPlaceholderRoot}/blast_consensus_tax_rpt.txt", checkIfExists: true),
+		consensusRoundProv     : file("${failedRoundPlaceholderRoot}/consensus_round_provenance.tsv", checkIfExists: true),
+		onTargetRpt            : file("${failedRoundPlaceholderRoot}/on_target_rpt.txt", checkIfExists: true),
+		blastReportAnnotated   : file("${failedRoundPlaceholderRoot}/blast_report_annotated.txt", checkIfExists: true),
+		consensusBlastFull     : file("${failedRoundPlaceholderRoot}/consensus_blast_report_full.txt", checkIfExists: true),
+		otuDefRpt              : file("${failedRoundPlaceholderRoot}/otu_def_rpt.txt", checkIfExists: true),
+		otuMembersRound        : file("${failedRoundPlaceholderRoot}/otu_members_round.tsv", checkIfExists: true),
+		otuSizesRound          : file("${failedRoundPlaceholderRoot}/otu_sizes_round.tsv", checkIfExists: true),
+		demultRpt              : file("${failedRoundPlaceholderRoot}/demult_rpt.txt", checkIfExists: true),
+		demultSidecar          : file("${contextDir}/demult_rpt.contract.tsv", checkIfExists: true),
+		otuDefSidecar          : file("${contextDir}/otu_def_rpt.contract.tsv", checkIfExists: true),
+	]
+}
+def failedRoundPlaceholderAssets = resolveFailedRoundPlaceholderAssets(demuxIdentityContext)
+def preferRealRoundRows = { primaryCh, fallbackCh, label = null ->
+	primaryCh
+		.filter { row ->
+			def values = (row instanceof List) ? row : [row]
+			if (values.size() < 2) {
+				throw new IllegalArgumentException("Malformed round tuple for ${label ?: 'preferRealRoundRows'}")
+			}
+			def roundBarcode = values[1]?.toString()
+			if (!roundBarcode) {
+				throw new IllegalArgumentException("Missing round_barcode for ${label ?: 'preferRealRoundRows'}")
+			}
+			!file("${ongoingStateDir}/${roundBarcode}/ROUND_FAILED.txt").exists()
+		}
+		.mix(fallbackCh)
+}
 
 // Skip POD5 files already recorded as processed in the rolling state.
 // This is important for crash/restart scenarios where the input directory still contains old POD5 files.
 def donePod5Path = ongoingStateDir ? "${ongoingStateDir}/_state/done_pod5.txt" : null
 def donePod5RootDir = null
 try {
-    if (runMode == 'realtime' && effectiveReads) {
+    if (runMode == 'realtime' && readsProvided) {
         // Realtime reads are typically a glob like `/path/*.pod5` or `/path/*pod5`.
         // Use its parent dir as a best-effort anchor for backward-compatible basename entries.
-        donePod5RootDir = new File(effectiveReads.toString()).getParent()
+        donePod5RootDir = new File(readsProvided.toString()).getParent()
     }
 } catch (Exception e) {
     donePod5RootDir = null
@@ -261,10 +266,18 @@ def isDonePod5 = { p ->
 reads = reads.filter { p -> !isDonePod5(p) }.distinct()
 
 // --- PREAMBLE §3: Parameter defaults and validation ---
-summary['Reads'] = effectiveReads
+if (!params.containsKey('rscript_bin') || params.rscript_bin == null || !params.rscript_bin.toString().trim()) {
+    params.rscript_bin = 'Rscript'
+}
+summary['Reads'] = readsProvided
 summary['Run Mode'] = runMode
 summary['Run Name'] = custom_runName ?: workflow.runName
 summary['State ID'] = stateId
+def markerConfig = validateAndCanonicalizeMarkerParams()
+summary['Targets'] = markerConfig.targetsCanonical
+summary['Target Taxa'] = markerConfig.targetTaxaCanonical
+summary['Global Min Read Length'] = markerConfig.globalMinReadLength.toString()
+summary['Global Max Read Length'] = markerConfig.globalMaxReadLength.toString()
 
 def timingCfg  = validateTimingLockParams()
 def staleLockTtlMinutesStr      = timingCfg.staleLockTtlMinutesStr
@@ -274,7 +287,7 @@ def forkCfg    = validateForkParams()
 def maxForksFastVal             = forkCfg.maxForksFastVal
 def maxForksReportingVal        = forkCfg.maxForksReportingVal
 def maxForksConsensusVal        = forkCfg.maxForksConsensusVal
-def maxForksCoreCpuVal          = forkCfg.maxForksCoreCpuVal
+def maxForksStatefulCoreVal     = forkCfg.maxForksStatefulCoreVal
 
 def htmlCfg    = validateHtmlReportParams()
 def htmlReportEnabled           = htmlCfg.htmlReportEnabled
@@ -282,14 +295,6 @@ def htmlReportAutoRefresh       = htmlCfg.htmlReportAutoRefresh
 def htmlReportRefreshSecondsStr = htmlCfg.htmlReportRefreshSecondsStr
 def htmlReportUrlPrefix         = htmlCfg.htmlReportUrlPrefix
 def htmlReportSamplePlotMaxStr  = htmlCfg.htmlReportSamplePlotMaxStr
-
-// Avoid "Access to undefined parameter" warnings for optional params.
-if ( !params.containsKey('hostnames') || params.hostnames == null ) {
-    params.hostnames = [:]
-}
-if ( !params.containsKey('restart_force') || params.restart_force == null ) {
-    params.restart_force = false
-}
 
 def otuRecoveryCfg = validateOtuRecoveryPruneParams()
 def otuDbOnlyPolicyCanonical                 = otuRecoveryCfg.otuDbOnlyPolicyCanonical
@@ -312,14 +317,25 @@ def consensusKeepOriginalReads           = consensusCfg.consensusKeepOriginalRea
 def consensusZeroEmitPolicyCanonical     = consensusCfg.consensusZeroEmitPolicyCanonical
 def consensusIdMismatchPolicyCanonical   = consensusCfg.consensusIdMismatchPolicyCanonical
 def consensusCacheBelowMinPolicyCanonical = consensusCfg.consensusCacheBelowMinPolicyCanonical
+def consensusSelectorRankingCanonical    = consensusCfg.consensusSelectorRankingCanonical
+def consensusEnforceMaxReads             = consensusCfg.consensusEnforceMaxReads
 def assignProtLevelCanonical             = consensusCfg.assignProtLevelCanonical
 def pruneCumulativePoolAll               = consensusCfg.pruneCumulativePoolAll
 
 def otuClusterCfg = validateOtuClusterLockParams()
+def otuConsolidationModeCanonical   = otuClusterCfg.otuConsolidationModeCanonical
 def otuLockRatioStr                  = otuClusterCfg.otuLockRatioStr
 def otuLockMinConsReadsStr           = otuClusterCfg.otuLockMinConsReadsStr
 def otuLockMinStableRoundsStr        = otuClusterCfg.otuLockMinStableRoundsStr
 def otuLockRevalidateEveryRoundsStr  = otuClusterCfg.otuLockRevalidateEveryRoundsStr
+def otuSigMinClusterReadsStr         = otuClusterCfg.otuSigMinClusterReadsStr
+def otuSigMinClusterQscoreStr        = otuClusterCfg.otuSigMinClusterQscoreStr
+def otuSigRuleCanonical              = otuClusterCfg.otuSigRuleCanonical
+def otuSigMinPoolFractionStr         = otuClusterCfg.otuSigMinPoolFractionStr
+def otuSigMinTopFractionStr          = otuClusterCfg.otuSigMinTopFractionStr
+def otuSigTop2MinRatioStr            = otuClusterCfg.otuSigTop2MinRatioStr
+def otuSigTop2MinDeltaReadsStr       = otuClusterCfg.otuSigTop2MinDeltaReadsStr
+def otuSigMinStableRoundsStr         = otuClusterCfg.otuSigMinStableRoundsStr
 def otuSizeStreakModeCanonical       = otuClusterCfg.otuSizeStreakModeCanonical
 def otuSizeStreakMinRoundsStr        = otuClusterCfg.otuSizeStreakMinRoundsStr
 
@@ -334,32 +350,11 @@ def otuBlastEnforceNoClustersPolicyCanonical = otuBlastCfg.otuBlastEnforceNoClus
 def otuBlastUnassignedModeCanonical          = otuBlastCfg.otuBlastUnassignedModeCanonical
 def otuUnassignedStreakModeCanonical         = otuBlastCfg.otuUnassignedStreakModeCanonical
 
-if ( !params.containsKey('make_round_tar') || params.make_round_tar == null ) {
-    params.make_round_tar = false
-}
 def _runId        = params.run_id?.toString()?.trim() ?: ""
 def podBaseDir    = _runId ? "${workflow.launchDir}/results/pod5/${_runId}"         : "${workflow.launchDir}/results/pod5"
+def feederGlobalLedgerDir = "${workflow.launchDir}/results/temp/_global/feeder_dedup"
 def sampleInfoDir = _runId ? "${workflow.launchDir}/results/sample_info/${_runId}" : "${workflow.launchDir}/results/sample_info"
 validateSampleInfoInventory(demuxIdentityContext)
-// Optional "species/genus of interest" inputs (used for filtering which taxa appear in plots/tables).
-// Keep defaults defined to avoid Nextflow "Access to undefined parameter" warnings.
-if ( !params.containsKey('metazoa_spc_basics') ) {
-    params.metazoa_spc_basics = null
-}
-if ( !params.containsKey('viridiplantae_spc_basics') ) {
-    params.viridiplantae_spc_basics = null
-}
-if ( !params.containsKey('local_metazoa_gns') ) {
-    params.local_metazoa_gns = null
-}
-if ( !params.containsKey('local_viridiplantae_gns') ) {
-    params.local_viridiplantae_gns = null
-}
-
-// Dorado runtime device selection: "metal" (default on macOS), "cpu", or "cuda:0" etc.
-if ( !params.containsKey('dorado_device') || params.dorado_device == null ) {
-    params.dorado_device = 'metal'
-}
 
 // Fail fast if Dorado or its model directories are missing/misconfigured.
 // (We can't reliably sanity-check model load here without executing Dorado, so we do structural checks.)
@@ -405,8 +400,22 @@ def doradoBasecallerHelp = ''
 def doradoHelpExit = -1
 try {
     def proc = new ProcessBuilder(doradoBin, 'basecaller', '--help').redirectErrorStream(true).start()
-    doradoBasecallerHelp = proc.inputStream.getText('UTF-8')
-    doradoHelpExit = proc.waitFor()
+    def outBuf = new StringBuffer()
+    def tOut = Thread.startDaemon {
+        proc.inputStream.withReader('UTF-8') { r ->
+            r.eachLine { line -> outBuf.append(line).append('\n') }
+        }
+    }
+    def timedOut = !proc.waitFor(30L, java.util.concurrent.TimeUnit.SECONDS)
+    if (timedOut) {
+        proc.destroyForcibly()
+        tOut.join(500)
+        log.warn "Dorado capability probe timed out (30s); falling back to legacy tuning flags"
+    } else {
+        tOut.join()
+        doradoBasecallerHelp = outBuf.toString()
+        doradoHelpExit = proc.exitValue()
+    }
 } catch (Exception e) {
     log.warn "Unable to inspect Dorado basecaller help for ${doradoBin}: ${e.message}"
 }
@@ -518,9 +527,6 @@ def effectiveRestartMode = params.restart_mode?.toString()?.trim()?.toLowerCase(
 if (!effectiveRestartMode || effectiveRestartMode == 'null') {
     effectiveRestartMode = 'off'
 }
-	if (effectiveRestartMode == 'off' && (params.restart ?: 0) != 0) {
-	    effectiveRestartMode = 'restore'
-	}
 	// Safety: require an explicit rolling-state namespace when using restore/reset.
 	// Otherwise a new Nextflow run name will default to a new stateId and "restore" can appear ignored.
 	if (effectiveRestartMode in ['restore', 'reset']) {
@@ -536,7 +542,7 @@ if (!effectiveRestartMode || effectiveRestartMode == 'null') {
 	    env.LOCK_WAIT = (params.lock_wait_seconds ?: 300).toString()
     env.RUN_NAME = (custom_runName ?: workflow.runName)?.toString() ?: ''
     env.STATE_ID = (stateId ?: '') as String
-    env.FORCE = ((params.restart_force ?: false) ? '1' : '0')
+    env.FORCE = parseBoolStrict(params.restart_force, false, 'restart_force') ? '1' : '0'
 
     // Avoid Groovy's ProcessGroovyMethods (`.execute()`, `.waitForProcessOutput()`), which are not available
     // in some Nextflow DSL1 runtimes. Use plain Java ProcessBuilder instead.
@@ -575,27 +581,7 @@ def restartTokenForCache = (effectiveRestartMode in ['restore','reset']) ? "${ef
 
 // formatOtuIdentity() → bottom of this file (hoisted method)
 
-// Check the hostnames against configured profiles
-// checkHostname()
 
-Channel.from(summary.collect{ [it.key, it.value] })
-    .map { k,v -> "<dt>$k</dt><dd><samp>${v ?: '<span style=\"color:#999999;\">N/A</a>'}</samp></dd>" }
-    .reduce { a, b -> return [a, b].join("\n            ") }
-    .map { x -> """
-    id: 'nf-core-rtnanopipeline-summary'
-    description: " - this information is collected when the pipeline is started."
-    section_name: 'nf-core/rtnanopipeline Workflow Summary'
-    section_href: 'https://github.com/nf-core/rtnanopipeline'
-    plot_type: 'html'
-    data: |
-        <dl class=\"dl-horizontal\">
-            $x
-        </dl>
-    """.stripIndent() }
-    .set { ch_workflow_summary }
-
-	
-	
 // Get fast sequences, identify their kingdom and select the pairs target, kingdom to be kept for further analysis
 // ============================================================
 // STAGE A — FAST PRE-FILTER (fast_on_target_detection)
@@ -611,7 +597,7 @@ process fast_on_target_detection {
 	
     output:
     tuple env(barcode), env(round_barcode), file("*.pod5"), file("*reads_target.list") into hq_reads_get
-	tuple env(barcode), env(round_barcode), val(read_path) into close_round_ch, get_summary_ch
+	tuple env(barcode), env(round_barcode), val(read_path) into close_round_ch, get_summary_ch, failed_round_source_ch
 	tuple  env(barcode), env(round_barcode), file("*fast.fasta"), file("*qced_reads_kingdom.txt"), file("*fast.sam"), file("*reads_target.list") into on_target_report
 	
     script:
@@ -626,7 +612,6 @@ process fast_on_target_detection {
 			mkdir -p "${ongoingStateDir}/_state"
 			# set -C (noclobber, O_CREAT|O_EXCL): first process writes timestamp, others silently no-op.
 			( set -C; date -u '+%Y-%m-%dT%H:%M:%SZ' > "${ongoingStateDir}/_state/run_started_utc.txt" ) 2>/dev/null || true
-		BLAST_HEADER='read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_taxid\totu_kingdom\totu_phylum\totu_class\totu_order\totu_family\totu_genus\totu_species'
 		THREADS=${params.align_threads}
 		if [ -z "\$THREADS" ] || [ "\$THREADS" = "null" ]; then
 			THREADS=${task.cpus}
@@ -840,12 +825,16 @@ process fast_on_target_detection {
 		fi
 		if [ -s \${barcode}_fast.sam ];
 		then
+		if ! command -v seqkit >/dev/null 2>&1; then
+			echo "ERROR: seqkit not found in PATH (required for FAST read filtering)" 1>&2
+			exit 1
+		fi
 		if samtools fasta \$barcode\\_fast.sam | seqkit seq -j "\$THREADS" -g -M ${params.max_read_length} -m ${params.min_read_length} > \$barcode\\_fast.fasta;
 		then
 			echo "\$barcode\\_fast.fasta created" 1>&2
 		else
-			echo "WARN: \$barcode\\_fast.fasta not created; continuing with empty placeholders" 1>&2
-			: > \$barcode\\_fast.fasta
+			echo "ERROR: failed to create \$barcode\\_fast.fasta from \$barcode\\_fast.sam" 1>&2
+			exit 1
 		fi
 	else
 		: > \$barcode\\_fast.fasta
@@ -870,6 +859,8 @@ process fast_on_target_detection {
 	_p_target_taxa="${params.target_taxa}"
 	IFS='|' read -ra _F_TARGETS    <<< "\$_p_targets_ft"
 	IFS='|' read -ra _F_TARGET_TAXA <<< "\$_p_target_taxa"
+	mkdir -p ${ongoingStateDir}/\$round_barcode
+	rm -f ${ongoingStateDir}/\$round_barcode/ROUND_FAILED.txt
 	: > \$barcode\\_reads_target.list
 	for _fi in "\${!_F_TARGETS[@]}"; do
 		_ft="\${_F_TARGETS[\$_fi]}"
@@ -900,6 +891,60 @@ process fast_on_target_detection {
 		"""
 	}
 
+failed_round_ch = failed_round_source_ch
+	.map { barcode, round_barcode, read_path ->
+		def roundFailedFile = file("${ongoingStateDir}/${round_barcode}/ROUND_FAILED.txt")
+		roundFailedFile.exists() ? [barcode, round_barcode, roundFailedFile] : null
+	}
+	.filter { it != null }
+failed_round_ch.into {
+	failed_blst_rpt_summary_src_ch
+	failed_cons_rpt_summary_src_ch
+	failed_otu_def_rpt_summary_src_ch
+	failed_otu_def_rpt_sidecar_summary_src_ch
+	failed_demult_rpt_summary_src_ch
+	failed_demult_rpt_sidecar_summary_src_ch
+	failed_target_rpt_summary_src_ch
+	failed_blast_agg_src_ch
+	failed_cons_agg_src_ch
+}
+failed_blst_rpt_summary = failed_blst_rpt_summary_src_ch
+	.map { barcode, round_barcode, round_failed_file ->
+		[barcode, round_barcode, failedRoundPlaceholderAssets.blastOtuPretaxRpt, failedRoundPlaceholderAssets.readInfoRpt, failedRoundPlaceholderAssets.blastOtuNoadapterRpt, failedRoundPlaceholderAssets.blastFilterStats]
+	}
+failed_cons_rpt_summary = failed_cons_rpt_summary_src_ch
+	.map { barcode, round_barcode, round_failed_file ->
+		[barcode, round_barcode, failedRoundPlaceholderAssets.blastConsensusTaxRpt, failedRoundPlaceholderAssets.consensusRoundProv]
+	}
+failed_otu_def_rpt_summary = failed_otu_def_rpt_summary_src_ch
+	.map { barcode, round_barcode, round_failed_file ->
+		[barcode, round_barcode, failedRoundPlaceholderAssets.otuDefRpt, failedRoundPlaceholderAssets.otuMembersRound, failedRoundPlaceholderAssets.otuSizesRound]
+	}
+failed_otu_def_rpt_sidecar_summary = failed_otu_def_rpt_sidecar_summary_src_ch
+	.map { barcode, round_barcode, round_failed_file ->
+		[barcode, round_barcode, failedRoundPlaceholderAssets.otuDefSidecar]
+	}
+failed_demult_rpt_summary = failed_demult_rpt_summary_src_ch
+	.map { barcode, round_barcode, round_failed_file ->
+		[barcode, round_barcode, failedRoundPlaceholderAssets.demultRpt]
+	}
+failed_demult_rpt_sidecar_summary = failed_demult_rpt_sidecar_summary_src_ch
+	.map { barcode, round_barcode, round_failed_file ->
+		[barcode, round_barcode, failedRoundPlaceholderAssets.demultSidecar]
+	}
+failed_target_rpt_summary = failed_target_rpt_summary_src_ch
+	.map { barcode, round_barcode, round_failed_file ->
+		[barcode, round_barcode, failedRoundPlaceholderAssets.onTargetRpt]
+	}
+failed_blast_agg_ch = failed_blast_agg_src_ch
+	.map { barcode, round_barcode, round_failed_file ->
+		[barcode, round_barcode, failedRoundPlaceholderAssets.blastReportAnnotated]
+	}
+failed_cons_agg_ch = failed_cons_agg_src_ch
+	.map { barcode, round_barcode, round_failed_file ->
+		[barcode, round_barcode, failedRoundPlaceholderAssets.consensusBlastFull]
+	}
+
 // ============================================================
 // STAGE B — REPORTING (_reporting_fast_on_target)
 // ============================================================
@@ -916,13 +961,11 @@ process _reporting_fast_on_target {
     file("${barcode}_read_info_rpt.txt")
 	
 	script:
-
 	"""
 	set -euo pipefail
 	shopt -s nullglob
 	export LC_ALL=C
 	RESTART_TOKEN="${restartTokenForCache}"
-	THREADS=${task.cpus}
 
 	DORADO_SUMMARY_HEADER='input_filename\tbatch_id\tparent_read_id\tread_id\trun_id\tchannel\tmux\tminknow_events\tstart_time\tduration\tpasses_filtering\ttemplate_start\tnum_events_template\ttemplate_duration\tsequence_length_template\tmean_qscore_template\tpore_type\texperiment_id\tsample_id\tend_reason\n'
 
@@ -1004,10 +1047,7 @@ process hac_basecalling {
 		fi
 
 		if [ "\$SKIP_HAC" -eq 1 ]; then
-			# Keep placeholder outputs and fall through so Nextflow can still capture val outputs.
-			: > ${barcode}_hac.sam
-			: > ${barcode}_hac.fastq
-			: > ${barcode}_hac_filtered.fastq
+			: # placeholder outputs already created above; fall through so Nextflow captures val outputs
 		else
 			
 		wait_seconds=${params.file_wait_minutes * 60}
@@ -1055,20 +1095,24 @@ process hac_basecalling {
 				echo "ERROR: No HAC reads recovered after successful HAC basecalling" 1>&2
 				exit 1
 			fi
-	perl ${baseDir}/bin/fastq_add_annotations2ids.pl ${target_reads_list}  ${barcode}_hac.fastq >  ${barcode}_hac_annotated.fastq || : > ${barcode}_hac_annotated.fastq
+	perl ${baseDir}/bin/fastq_add_annotations2ids.pl ${target_reads_list} ${barcode}_hac.fastq > ${barcode}_hac_annotated.fastq
 	_p_targets="${params.targets}"
 	IFS='|' read -ra _TARGETS  <<< "\$_p_targets"
 	_p_min_read_lengths="${params.min_read_lengths}"
 	IFS='|' read -ra _MIN_LENS <<< "\$_p_min_read_lengths"
-	_p_max_read_lengths="${params.max_read_lengths}"
-	IFS='|' read -ra _MAX_LENS <<< "\$_p_max_read_lengths"
-	: > ${barcode}_hac_filtered.fastq
-	for _i in "\${!_TARGETS[@]}"; do
-		grep -A3 "|\${_TARGETS[\$_i]}\$" ${barcode}_hac_annotated.fastq | grep -v "^--\$" \
-			| seqkit seq -j ${task.cpus} -g -M "\${_MAX_LENS[\$_i]}" -m "\${_MIN_LENS[\$_i]}" \
-			>> ${barcode}_hac_filtered.fastq || true
-	done
-		
+		_p_max_read_lengths="${params.max_read_lengths}"
+		IFS='|' read -ra _MAX_LENS <<< "\$_p_max_read_lengths"
+		: > ${barcode}_hac_filtered.fastq
+		for _i in "\${!_TARGETS[@]}"; do
+			grep -A3 "|\${_TARGETS[\$_i]}\$" ${barcode}_hac_annotated.fastq | grep -v "^--\$" \
+				> _tmp_hac_filter_\${_i}.fastq || true
+			if [ -s _tmp_hac_filter_\${_i}.fastq ]; then
+				seqkit seq -j ${task.cpus} -g -M "\${_MAX_LENS[\$_i]}" -m "\${_MIN_LENS[\$_i]}" \
+					_tmp_hac_filter_\${_i}.fastq >> ${barcode}_hac_filtered.fastq
+			fi
+			rm -f _tmp_hac_filter_\${_i}.fastq
+		done
+
 	if [ -f ${barcode}_read_names_hq.list ];
 	then
 		rm ${barcode}_read_names_hq.list
@@ -1129,10 +1173,7 @@ process _reporting_hac_basecalling {
 	fi
 	cp -f ${barcode}_round_hac.tsv ${ongoingStateDir}/${round_barcode}/${barcode}_hac.tsv 2>/dev/null || true
 
-	# Update read_info report with HAC columns; on failure, keep the existing on-target report.
-	if ! perl ${baseDir}/bin/reporting_getting_hq.pl ${barcode}_round_hac.tsv ${round_hac_sam} ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt ${params.min_read_length} ${params.max_read_length} ${params.min_quality_score} ${barcode}; then
-		cp -f ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt ${barcode}_read_info_rpt.txt 2>/dev/null || printf 'read_id\tqc_filter\tbarcode\tkingdom\tkingdom_perc_identity\tkingdom_aln_length\ton_target_kingdom\thac_length\thac_mean_qscore\n' > ${barcode}_read_info_rpt.txt
-	fi
+	perl ${baseDir}/bin/reporting_getting_hq.pl ${barcode}_round_hac.tsv ${round_hac_sam} ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt ${params.min_read_length} ${params.max_read_length} ${params.min_quality_score} ${barcode}
 	cp -f ${barcode}_read_info_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt 2>/dev/null || true
 	
 	"""
@@ -1193,9 +1234,77 @@ process demultiplexing_hq_reads {
 			IFS='|' read -ra _MIN_LENS <<< "\$_p_min_read_lengths"
 		}
 
+		build_track_adapter_marker_map() {
+			local identity_tsv="\$1"
+			local out_map="\$2"
+			awk '
+				BEGIN { FS = OFS = "\t" }
+				NR == 1 {
+					for (i = 1; i <= NF; i++) {
+						if (\$i == "unit_id_track") unit_col = i
+						else if (\$i == "marker_id") marker_col = i
+					}
+					if (!unit_col || !marker_col) {
+						print "ERROR: track_identity.tsv is missing unit_id_track or marker_id header" > "/dev/stderr"
+						exit 1
+					}
+					next
+				}
+				{
+					unit = \$unit_col
+					marker = \$marker_col
+					gsub(/^[[:space:]]+|[[:space:]]+\$/, "", unit)
+					gsub(/^[[:space:]]+|[[:space:]]+\$/, "", marker)
+					if (unit == "" || marker == "") {
+						print "ERROR: track_identity.tsv contains empty unit_id_track or marker_id value" > "/dev/stderr"
+						exit 1
+					}
+					if ((unit in seen) && seen[unit] != marker) {
+						print "ERROR: track_identity.tsv maps unit_id_track to multiple markers: " unit > "/dev/stderr"
+						exit 1
+					}
+					if (!(unit in seen)) {
+						print unit, marker
+					}
+					seen[unit] = marker
+				}
+			' "\$identity_tsv" > "\$out_map"
+		}
+
+		filter_track_marker_matches() {
+			local fastq_path="\$1"
+			local target_marker="\$2"
+			local label="\$3"
+			if [ "${replicateModeCanonical}" != "track" ]; then
+				return 0
+			fi
+			if [ ! -s "\$fastq_path" ]; then
+				: > "\$fastq_path"
+				return 0
+			fi
+			bash "${baseDir}/bin/filter_track_marker_unit_fastq.sh" \
+				"\$TRACK_ADAPTER_MARKER_MAP" \
+				"\$target_marker" \
+				"\$fastq_path" \
+				"\$label"
+		}
+
+	_PRIMERS_PATH_FILTERED=""
+	if [ -f "\$PRIMERS_PATH" ]; then
+		awk '/^>/{p=(\$0 != ">NA_NA"); if(p) print; next} p{print}' "\$PRIMERS_PATH" > _filtered_primers.fasta
+		_PRIMERS_PATH_FILTERED="_filtered_primers.fasta"
+	fi
+
 	    # -- §2: Full-demux mode (barcode + primer cutadapt on rolling SUP + HAC reads) --
     if [ "\$DO_DEMUX" -eq 1 ] && [ "\$DEMUX_MODE" = "full" ] && [ -f "\$INDEXES_PATH" ] && [ -f "\$PRIMERS_PATH" ];
 	    then
+			TRACK_IDENTITY_TSV=""
+			TRACK_ADAPTER_MARKER_MAP=""
+			if [ "${replicateModeCanonical}" = "track" ]; then
+				TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv"
+				TRACK_ADAPTER_MARKER_MAP="${barcode}_track_adapter_marker.tsv"
+				build_track_adapter_marker_map "\$TRACK_IDENTITY_TSV" "\$TRACK_ADAPTER_MARKER_MAP"
+			fi
 			# Copy rolling SUP fastq under lock into the task directory for stable demux input
 			restore_rolling_sup_fastq
 
@@ -1205,27 +1314,36 @@ process demultiplexing_hq_reads {
 				for _i in "\${!_TARGETS[@]}"; do
 					_t="\${_TARGETS[\$_i]}"
 					_ml="\${_MIN_LENS[\$_i]}"
-					if grep -A3 "|\${_t}\$" "\$ROLLING_SUP_FASTQ" | grep -v "^--\$" \
-						| cutadapt -g file:"\$INDEXES_PATH" -j ${task.cpus} --action=trim --rc -e 0.1 -m "\${_ml}" \
+					grep -A3 "|\${_t}\$" "\$ROLLING_SUP_FASTQ" | grep -v "^--\$" \
+						> _tmp_reads_sup_\${_t}.fastq || true
+					if [ -s _tmp_reads_sup_\${_t}.fastq ]; then
+						cutadapt -g file:"\$INDEXES_PATH" -j ${task.cpus} --action=trim --rc -e 0.1 -m "\${_ml}" \
 						  --rename '{id}|sup|barcode={cut_prefix}|adapter={adapter_name}' \
-						  -o ${barcode}_sup_annotated_\${_t}.fastq - > output_cutadapt_stringent_sup_\${_t}.out;
-					then
+						  -o ${barcode}_sup_annotated_\${_t}.fastq _tmp_reads_sup_\${_t}.fastq \
+						  > output_cutadapt_stringent_sup_\${_t}.out
 						if grep adapter ${barcode}_sup_annotated_\${_t}.fastq | grep -F -v no_adapter | sed 's/^@//;' \
 							> ${barcode}_sup_annotated_with_adapter_\${_t}.list;
 						then
-							if samtools faidx ${barcode}_sup_annotated_\${_t}.fastq \
+							samtools faidx ${barcode}_sup_annotated_\${_t}.fastq \
 								-r ${barcode}_sup_annotated_with_adapter_\${_t}.list -f \
-								> ${barcode}_sup_annotated_with_adapter_\${_t}.fastq;
-							then
-								echo "${barcode}_sup_annotated_with_adapter_\${_t}.fastq is successfully generated" 1>&2
-							fi
+								> ${barcode}_sup_annotated_with_adapter_\${_t}.fastq
+							filter_track_marker_matches \
+								${barcode}_sup_annotated_with_adapter_\${_t}.fastq \
+								"\${_t}" \
+								"${barcode}_sup_annotated_with_adapter_\${_t}.fastq"
+							echo "${barcode}_sup_annotated_with_adapter_\${_t}.fastq is successfully generated" 1>&2
 						fi
 						grep -F -A3 no_adapter ${barcode}_sup_annotated_\${_t}.fastq | grep -v "^--\$" \
-							| cutadapt -g file:"\$PRIMERS_PATH" -j ${task.cpus} --action=trim --rc \
+							> _tmp_noadapter_sup_\${_t}.fastq || true
+						if [ -s _tmp_noadapter_sup_\${_t}.fastq ]; then
+							cutadapt -g file:"\$_PRIMERS_PATH_FILTERED" -j ${task.cpus} --action=trim --rc \
 							  --discard-untrimmed -e 0.3 -m "\${_ml}" --rename "{id}|\${_t}" \
-							  -o ${barcode}_sup_annotated_no_adapter_\${_t}.fastq - \
-							  > output_cutadapt_stringent_\${_t}B.out || true
-					fi
+							  -o ${barcode}_sup_annotated_no_adapter_\${_t}.fastq _tmp_noadapter_sup_\${_t}.fastq \
+							  > output_cutadapt_stringent_\${_t}B.out
+							rm -f _tmp_noadapter_sup_\${_t}.fastq
+						fi
+				fi
+				rm -f _tmp_reads_sup_\${_t}.fastq
 				done
 	
 				sup_with=( ${barcode}_sup_annotated_with_adapter_*.fastq )
@@ -1239,33 +1357,42 @@ process demultiplexing_hq_reads {
 					cat ${barcode}_sup_annotated_no_adapter.fastq >> ${barcode}_hac_sup_annotated_clean.fastq
 				fi
 			fi
-		
-		
+
+
 			load_demux_target_arrays
 			for _i in "\${!_TARGETS[@]}"; do
 				_t="\${_TARGETS[\$_i]}"
 				_ml="\${_MIN_LENS[\$_i]}"
-				if grep -A3 "|\${_t}\$" ${hac_reads_fastq} | grep -v "^--\$" \
-					| cutadapt -g file:"\$INDEXES_PATH" -j ${task.cpus} --action=trim --rc -e 0.1 -m "\${_ml}" \
+				grep -A3 "|\${_t}\$" ${hac_reads_fastq} | grep -v "^--\$" \
+					> _tmp_reads_hac_\${_t}.fastq || true
+				if [ -s _tmp_reads_hac_\${_t}.fastq ]; then
+					cutadapt -g file:"\$INDEXES_PATH" -j ${task.cpus} --action=trim --rc -e 0.1 -m "\${_ml}" \
 					  --rename '{id}|hac|barcode={cut_prefix}|adapter={adapter_name}' \
-					  -o ${barcode}_hac_annotated_\${_t}.fastq - > output_cutadapt_stringent_\${_t}.out;
-				then
+					  -o ${barcode}_hac_annotated_\${_t}.fastq _tmp_reads_hac_\${_t}.fastq \
+					  > output_cutadapt_stringent_\${_t}.out
 					if grep -F adapter ${barcode}_hac_annotated_\${_t}.fastq | grep -F -v no_adapter | sed 's/^@//;' \
 						> ${barcode}_hac_annotated_with_adapter_\${_t}.list;
-				then
-						if samtools faidx ${barcode}_hac_annotated_\${_t}.fastq \
+					then
+						samtools faidx ${barcode}_hac_annotated_\${_t}.fastq \
 							-r ${barcode}_hac_annotated_with_adapter_\${_t}.list -f \
-							> ${barcode}_hac_annotated_with_adapter_\${_t}.fastq;
-						then
-							echo "${barcode}_hac_annotated_with_adapter_\${_t}.fastq is successfully generated" 1>&2
-						fi
+							> ${barcode}_hac_annotated_with_adapter_\${_t}.fastq
+						filter_track_marker_matches \
+							${barcode}_hac_annotated_with_adapter_\${_t}.fastq \
+							"\${_t}" \
+							"${barcode}_hac_annotated_with_adapter_\${_t}.fastq"
+						echo "${barcode}_hac_annotated_with_adapter_\${_t}.fastq is successfully generated" 1>&2
 					fi
 					grep -F -A3 no_adapter ${barcode}_hac_annotated_\${_t}.fastq | grep -v "^--\$" \
-						| cutadapt -g file:"\$PRIMERS_PATH" -j ${task.cpus} --action=trim --rc \
+						> _tmp_noadapter_hac_\${_t}.fastq || true
+					if [ -s _tmp_noadapter_hac_\${_t}.fastq ]; then
+						cutadapt -g file:"\$_PRIMERS_PATH_FILTERED" -j ${task.cpus} --action=trim --rc \
 						  --discard-untrimmed -e 0.3 -m "\${_ml}" --rename "{id}|\${_t}" \
-						  -o ${barcode}_hac_annotated_no_adapter_\${_t}.fastq - \
-						  > output_cutadapt_stringent_\${_t}B.out || true
+						  -o ${barcode}_hac_annotated_no_adapter_\${_t}.fastq _tmp_noadapter_hac_\${_t}.fastq \
+						  > output_cutadapt_stringent_\${_t}B.out
+						rm -f _tmp_noadapter_hac_\${_t}.fastq
+					fi
 				fi
+				rm -f _tmp_reads_hac_\${_t}.fastq
 			done
 
 		
@@ -1297,27 +1424,28 @@ elif [ "\$DO_DEMUX" -eq 1 ] && [ "\$DEMUX_MODE" = "primers_only" ] && [ -f "\$PR
 				for _i in "\${!_TARGETS[@]}"; do
 					_t="\${_TARGETS[\$_i]}"
 					_ml="\${_MIN_LENS[\$_i]}"
-					if grep -A3 "|\${_t}\$" "\$ROLLING_SUP_FASTQ" | grep -v "^--\$" \\
-						| cutadapt -g file:"\$PRIMERS_PATH" -j ${task.cpus} --action=trim --rc \\
+					grep -A3 "|\${_t}\$" "\$ROLLING_SUP_FASTQ" | grep -v "^--\$" \\
+						> _tmp_reads_sup_\${_t}.fastq || true
+					if [ -s _tmp_reads_sup_\${_t}.fastq ]; then
+						cutadapt -g file:"\$_PRIMERS_PATH_FILTERED" -j ${task.cpus} --action=trim --rc \\
 						  --discard-untrimmed -e 0.3 -m "\${_ml}" \\
 						  --rename '{id}|sup|barcode={adapter_name}|adapter={adapter_name}' \\
-						  -o ${barcode}_sup_annotated_with_adapter_\${_t}.fastq - \\
-						  > output_cutadapt_stringent_sup_\${_t}.out;
-					then
+						  -o ${barcode}_sup_annotated_with_adapter_\${_t}.fastq _tmp_reads_sup_\${_t}.fastq \\
+						  > output_cutadapt_stringent_sup_\${_t}.out
 						if [ -s ${barcode}_sup_annotated_with_adapter_\${_t}.fastq ]; then
 							awk 'NR % 4 == 1 { sub(/^@/, "", \$0); print }' \\
 								${barcode}_sup_annotated_with_adapter_\${_t}.fastq \\
 								> ${barcode}_sup_annotated_with_adapter_\${_t}.list
-							if [ -s ${barcode}_sup_annotated_with_adapter_\${_t}.list ] \\
-								&& samtools faidx ${barcode}_sup_annotated_with_adapter_\${_t}.fastq \\
+							if [ -s ${barcode}_sup_annotated_with_adapter_\${_t}.list ]; then
+								samtools faidx ${barcode}_sup_annotated_with_adapter_\${_t}.fastq \\
 								   -r ${barcode}_sup_annotated_with_adapter_\${_t}.list -f \\
-								   > ${barcode}_sup_annotated_with_adapter_\${_t}.filtered.fastq;
-							then
+								   > ${barcode}_sup_annotated_with_adapter_\${_t}.filtered.fastq
 								mv ${barcode}_sup_annotated_with_adapter_\${_t}.filtered.fastq \\
 								   ${barcode}_sup_annotated_with_adapter_\${_t}.fastq
 							fi
 						fi
 					fi
+					rm -f _tmp_reads_sup_\${_t}.fastq
 				done
 
 				sup_with=( ${barcode}_sup_annotated_with_adapter_*.fastq )
@@ -1331,27 +1459,28 @@ elif [ "\$DO_DEMUX" -eq 1 ] && [ "\$DEMUX_MODE" = "primers_only" ] && [ -f "\$PR
 			for _i in "\${!_TARGETS[@]}"; do
 				_t="\${_TARGETS[\$_i]}"
 				_ml="\${_MIN_LENS[\$_i]}"
-				if grep -A3 "|\${_t}\$" ${hac_reads_fastq} | grep -v "^--\$" \\
-					| cutadapt -g file:"\$PRIMERS_PATH" -j ${task.cpus} --action=trim --rc \\
+				grep -A3 "|\${_t}\$" ${hac_reads_fastq} | grep -v "^--\$" \\
+					> _tmp_reads_hac_\${_t}.fastq || true
+				if [ -s _tmp_reads_hac_\${_t}.fastq ]; then
+					cutadapt -g file:"\$_PRIMERS_PATH_FILTERED" -j ${task.cpus} --action=trim --rc \\
 					  --discard-untrimmed -e 0.3 -m "\${_ml}" \\
 					  --rename '{id}|hac|barcode={adapter_name}|adapter={adapter_name}' \\
-					  -o ${barcode}_hac_annotated_with_adapter_\${_t}.fastq - \\
-					  > output_cutadapt_stringent_\${_t}.out;
-				then
+					  -o ${barcode}_hac_annotated_with_adapter_\${_t}.fastq _tmp_reads_hac_\${_t}.fastq \\
+					  > output_cutadapt_stringent_\${_t}.out
 					if [ -s ${barcode}_hac_annotated_with_adapter_\${_t}.fastq ]; then
 						awk 'NR % 4 == 1 { sub(/^@/, "", \$0); print }' \\
 							${barcode}_hac_annotated_with_adapter_\${_t}.fastq \\
 							> ${barcode}_hac_annotated_with_adapter_\${_t}.list
-						if [ -s ${barcode}_hac_annotated_with_adapter_\${_t}.list ] \\
-							&& samtools faidx ${barcode}_hac_annotated_with_adapter_\${_t}.fastq \\
+						if [ -s ${barcode}_hac_annotated_with_adapter_\${_t}.list ]; then
+							samtools faidx ${barcode}_hac_annotated_with_adapter_\${_t}.fastq \\
 							   -r ${barcode}_hac_annotated_with_adapter_\${_t}.list -f \\
-							   > ${barcode}_hac_annotated_with_adapter_\${_t}.filtered.fastq;
-						then
+							   > ${barcode}_hac_annotated_with_adapter_\${_t}.filtered.fastq
 							mv ${barcode}_hac_annotated_with_adapter_\${_t}.filtered.fastq \\
 							   ${barcode}_hac_annotated_with_adapter_\${_t}.fastq
 						fi
 					fi
 				fi
+				rm -f _tmp_reads_hac_\${_t}.fastq
 			done
 
 			hac_with=( ${barcode}_hac_annotated_with_adapter_*.fastq )
@@ -1456,7 +1585,7 @@ PY
 }
 
 // ============================================================
-// STAGE E — REPORTING (_reporting_hq_demultiplexing)
+// STAGE E (REPORTING) — (_reporting_hq_demultiplexing)
 // ============================================================
 process _reporting_hq_demultiplexing {
 
@@ -1477,11 +1606,32 @@ process _reporting_hq_demultiplexing {
 	shopt -s nullglob
 	export LC_ALL=C
 	RESTART_TOKEN="${restartTokenForCache}"
+	ROUND_FAILED_FILE="${ongoingStateDir}/${round_barcode}/ROUND_FAILED.txt"
+	ROUND_FAILED=0
+	if [ -f "\$ROUND_FAILED_FILE" ]; then
+		ROUND_FAILED=1
+	fi
 		
 
 	export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
 	export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
-	perl ${baseDir}/bin/reporting_demultiplexing.pl ${hac_sup_annotated_clean_fastq} ${params.outdir}/ongoing ${round_barcode} ${barcode}
+	if ! perl ${baseDir}/bin/reporting_demultiplexing.pl ${hac_sup_annotated_clean_fastq} ${params.outdir}/ongoing ${round_barcode} ${barcode}; then
+		if [ "\$ROUND_FAILED" -eq 1 ]; then
+			cp "${failedRoundPlaceholderAssets.demultRpt}" ${barcode}_demult_rpt.txt
+			cp "${failedRoundPlaceholderAssets.demultSidecar}" ${barcode}_demult_rpt.contract.tsv
+		else
+			exit 1
+		fi
+	fi
+	if [ ! -f ${barcode}_demult_rpt.txt ] || [ ! -f ${barcode}_demult_rpt.contract.tsv ]; then
+		if [ "\$ROUND_FAILED" -eq 1 ]; then
+			cp "${failedRoundPlaceholderAssets.demultRpt}" ${barcode}_demult_rpt.txt
+			cp "${failedRoundPlaceholderAssets.demultSidecar}" ${barcode}_demult_rpt.contract.tsv
+		else
+			echo "ERROR: demultiplexing report outputs are missing for round ${round_barcode}" 1>&2
+			exit 1
+		fi
+	fi
 	mkdir -p ${ongoingStateDir}/${round_barcode}/
 	cp -f ${barcode}_demult_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_demult_rpt.txt 2>/dev/null || true
 	cp -f ${barcode}_demult_rpt.contract.tsv ${ongoingStateDir}/${round_barcode}/${barcode}_demult_rpt.contract.tsv 2>/dev/null || true
@@ -1499,7 +1649,7 @@ process OTU_definition {
 	// Must be schedulable even when the next POD5 has already entered `fast_on_target_detection`
 	// and is waiting on the round lock.
 	cpus { params.cluster_threads }
-	    maxForks maxForksCoreCpuVal
+	    maxForks maxForksStatefulCoreVal
 	    label 'cluster'
     input:
 	tuple val(barcode), val(round_barcode), file(fasta_hq_qced) from otu_analysis
@@ -1743,8 +1893,14 @@ process OTU_definition {
 	ROLLING_QCED=""
 	if acquire_lock "\$QCED_LOCK"; then
 		if [ -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ]; then
-			cp "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ${barcode}_rolling_qced_reads_hq_accumulated.fasta || true
-			ROLLING_QCED="${barcode}_rolling_qced_reads_hq_accumulated.fasta"
+			if cp "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ${barcode}_rolling_qced_reads_hq_accumulated.fasta \
+				&& [ -r ${barcode}_rolling_qced_reads_hq_accumulated.fasta ]; then
+				ROLLING_QCED="${barcode}_rolling_qced_reads_hq_accumulated.fasta"
+			else
+				release_lock "\$QCED_LOCK"
+				echo "ERROR: failed to stage rolling HQ snapshot from \${STATE_DIR}/qced_reads_hq_accumulated.fasta" 1>&2
+				exit 1
+			fi
 		fi
 		release_lock "\$QCED_LOCK"
 	else
@@ -1763,9 +1919,9 @@ process OTU_definition {
 			: > ${barcode}_rolling_protected.fasta
 		fi
 		# Extract SUP reads
-		seqkit grep -r -p "\\|sup\\|" "\$ROLLING_QCED" > ${barcode}_rolling_sup.fasta || : > ${barcode}_rolling_sup.fasta
+		awk '/^>/{keep=(index(\$0,"|sup|")>0); if(keep)print; next} keep{print}' "\$ROLLING_QCED" > ${barcode}_rolling_sup.fasta
 		# Extract HAC_FIXED reads
-		seqkit grep -r -p "\\|hac_fixed\\|" "\$ROLLING_QCED" > ${barcode}_rolling_hac_fixed.fasta || : > ${barcode}_rolling_hac_fixed.fasta
+		awk '/^>/{keep=(index(\$0,"|hac_fixed|")>0); if(keep)print; next} keep{print}' "\$ROLLING_QCED" > ${barcode}_rolling_hac_fixed.fasta
 		# Write SUP first and track their IDs
 		awk '/^>/{id=substr(\$0,2); sub(/ .*/,\"\",id); print id > \"sup_ids.list\"} {print}' ${barcode}_rolling_sup.fasta > ${barcode}_qced_reads_hq_accumulated.fasta
 		# Append HAC_FIXED only if ID not present in SUP
@@ -1818,7 +1974,7 @@ process OTU_definition {
 		cp "\$HASH_MAP" "\${STATE_DIR}/${barcode}_otu_hash_map.tsv.tmp" 2>/dev/null && mv "\${STATE_DIR}/${barcode}_otu_hash_map.tsv.tmp" "\${STATE_DIR}/${barcode}_otu_hash_map.tsv" || true
 		cp "\$HASH_MAP" "${ongoingStateDir}/${round_barcode}/${barcode}_otu_hash_map.tsv" 2>/dev/null || true
 		FROZEN_BY_HASH="${barcode}_frozen_members_by_hash.tsv"
-		${baseDir}/bin/otu_add_frozen_members_by_hash.pl "\$FROZEN_META" "\$HASH_MAP" "\$FROZEN_BY_HASH" || : > "\$FROZEN_BY_HASH"
+		${baseDir}/bin/otu_add_frozen_members_by_hash.pl "\$FROZEN_META" "\$HASH_MAP" "\$FROZEN_BY_HASH"
 		if [ -s "\$FROZEN_BY_HASH" ]; then
 			perl ${baseDir}/bin/otu_members_append_unique.pl "\$FROZEN_MEMBERS" "\$FROZEN_BY_HASH" "\$FROZEN_MEMBERS_SEEN"
 		fi
@@ -1897,10 +2053,12 @@ process OTU_definition {
 					if cd-hit-est-2d -i "\$NEW_FASTA" -i2 "\$FROZEN_REPS" -c ${cdHitIdentity} -d 0 -T "\$THREADS" -o ${barcode}_new_vs_frozen; then
 						FROZEN_2D_OK=1
 					else
-						echo "WARN: cd-hit-est-2d failed; treating all new reads as unassigned" 1>&2
+						echo "ERROR: cd-hit-est-2d failed during frozen assignment for ${barcode}/${round_barcode}" 1>&2
+						exit 1
 					fi
 				else
-					echo "WARN: cd-hit-est-2d not found; treating all new reads as unassigned" 1>&2
+					echo "ERROR: cd-hit-est-2d not found during frozen assignment for ${barcode}/${round_barcode}" 1>&2
+					exit 1
 				fi
 
 				if [ -s ${barcode}_new_vs_frozen.clstr ]; then
@@ -1924,7 +2082,7 @@ process OTU_definition {
 			fi
 			if [ "\$NEW_UNASSIGNED_READY" -ne 1 ]; then
 				if [ -s ${barcode}_new_unassigned.list ]; then
-					seqkit faidx -j "\$THREADS" -l ${barcode}_new_unassigned.list -r "\$NEW_FASTA" > ${barcode}_new_unassigned.fasta || : > ${barcode}_new_unassigned.fasta
+					seqkit faidx -j "\$THREADS" -l ${barcode}_new_unassigned.list -r "\$NEW_FASTA" > ${barcode}_new_unassigned.fasta
 				else
 					: > ${barcode}_new_unassigned.fasta
 				fi
@@ -2026,7 +2184,7 @@ process OTU_definition {
 
 			if [ -s "\$ACTIVE_POOL_LOCAL" ]; then
 				if cd-hit-est -i "\$ACTIVE_POOL_LOCAL" -c ${cdHitIdentity} -d 0 -o ${barcode}_active_nr.fasta -T "\$THREADS"; then
-					echo "HQ reads cd-hit is successful" 1>&2
+					echo "INFO: cd-hit-est clustering complete" 1>&2
 				fi
 							${baseDir}/bin/otu_parse_clstr.pl ${barcode}_active_nr.fasta.clstr ${barcode}_active_members.tsv ${barcode}_active_counts.tsv
 							ACTIVE_COUNTS_INST="${barcode}_active_counts_instances.tsv"
@@ -2075,7 +2233,7 @@ process OTU_definition {
 					fi
 					awk 'NR==FNR{p[\$1]=1; next} {if(p[\$1]) print \$2}' ${barcode}_promoted_clusters.tsv ${barcode}_active_members.tsv > promoted_read_ids.list
 					if [ -s promoted_read_ids.list ]; then
-						seqkit grep -v -f promoted_read_ids.list "\$ACTIVE_POOL_LOCAL" > ${barcode}_active_pool_pruned.fasta || : > ${barcode}_active_pool_pruned.fasta
+						awk 'NR==FNR{drop[\$1]=1; next} /^>/{id=substr(\$0,2); sub(/ .*/,"",id); keep=!(id in drop); if(keep)print; next} keep{print}' promoted_read_ids.list "\$ACTIVE_POOL_LOCAL" > ${barcode}_active_pool_pruned.fasta
 						cp ${barcode}_active_pool_pruned.fasta "\$ACTIVE_POOL"
 					else
 						cp "\$ACTIVE_POOL_LOCAL" "\$ACTIVE_POOL"
@@ -2095,8 +2253,8 @@ process OTU_definition {
 					${baseDir}/bin/otu_hash_map_from_fasta.pl \
 						"${barcode}_active_nr.fasta" \
 						"${barcode}_active_nr_hash_map_tmp.tsv" \
-						"${barcode}_active_nr_hash_counts_tmp.tsv" \
-					&& cat "${barcode}_active_nr_hash_map_tmp.tsv" >> "\$NR_HASH_MAP_FILE" || true
+						"${barcode}_active_nr_hash_counts_tmp.tsv"
+					cat "${barcode}_active_nr_hash_map_tmp.tsv" >> "\$NR_HASH_MAP_FILE"
 				fi
 				if [ -s "\$FROZEN_META" ]; then
 					awk -F'\t' 'NF>=3 && length(\$2)>0 && length(\$3)>0{i=index(\$2,"|"); uuid=(i>1)?substr(\$2,1,i-1):\$2; if(length(uuid)>0) print uuid"\t"\$3}' "\$FROZEN_META" >> "\$NR_HASH_MAP_FILE"
@@ -2113,45 +2271,16 @@ process OTU_definition {
 				fi
 			fi
 
-	
-			
 	# -- §7: State persistence and cleanup --
-	if [ -f "\${STATE_DIR}/accumulated_qced_reads.fasta" ];
-	then
-		rm "\${STATE_DIR}/accumulated_qced_reads.fasta"
-	fi
-	
-	if [ -f "\${STATE_DIR}/qced_reads_nr.fasta" ];
-	then
-		rm "\${STATE_DIR}/qced_reads_nr.fasta"
-	fi
-	
-	if [ -f "\${STATE_DIR}/qced_reads_nr.fasta.clstr" ];
-	then
-		rm "\${STATE_DIR}/qced_reads_nr.fasta.clstr"
-	fi
-
-	if [ -f ${ongoingStateDir}/${round_barcode}/accumulated_qced_reads.fasta ];
-	then
-		rm ${ongoingStateDir}/${round_barcode}/accumulated_qced_reads.fasta
-	fi	
-	if [ -f ${ongoingStateDir}/${round_barcode}/qced_reads_nr.fasta ];
-	then
-		rm ${ongoingStateDir}/${round_barcode}/qced_reads_nr.fasta
-	fi
-	
-	if [ -f ${ongoingStateDir}/${round_barcode}/qced_reads_nr.fasta.clstr ];
-	then
-		rm ${ongoingStateDir}/${round_barcode}/qced_reads_nr.fasta.clstr
-	fi
+	rm -f "\${STATE_DIR}/accumulated_qced_reads.fasta"
+	rm -f "\${STATE_DIR}/qced_reads_nr.fasta"
+	rm -f "\${STATE_DIR}/qced_reads_nr.fasta.clstr"
+	rm -f ${ongoingStateDir}/${round_barcode}/accumulated_qced_reads.fasta
+	rm -f ${ongoingStateDir}/${round_barcode}/qced_reads_nr.fasta
+	rm -f ${ongoingStateDir}/${round_barcode}/qced_reads_nr.fasta.clstr
 	cp ${barcode}_qced_reads_nr.fasta.clstr ${ongoingStateDir}/${round_barcode}/qced_reads_nr.fasta.clstr
 	cp ${barcode}_qced_reads_nr.fasta.clstr "\${STATE_DIR}/qced_reads_nr.fasta.clstr"
-	
-
-	if [ -f ${barcode}_qced_reads_hq_accumulated.fasta ];
-	then
-		rm ${barcode}_qced_reads_hq_accumulated.fasta
-	fi
+	rm -f ${barcode}_qced_reads_hq_accumulated.fasta
 	set -- ${barcode}_qced_reads_nr[0-9]*
 	[ -f "\${1:-}" ] && rm ${barcode}_qced_reads_nr[0-9]* || true
 
@@ -2169,7 +2298,6 @@ otu_def_reporting_inputs = ChannelUtils.strictRoundJoin(report_otu, demult_contr
 // ============================================================
 process _reporting_OTU_definition {
   maxForks maxForksReportingVal
-//  publishDir "${params.outdir}/ongoing/", mode: 'copy', overwrite: true
   input:
     tuple val(barcode), val(round_barcode), file(otu_clstr), file(demult) from otu_def_reporting_inputs
   output:
@@ -2184,6 +2312,11 @@ process _reporting_OTU_definition {
 	RESTART_TOKEN="${restartTokenForCache}"
 	OTU_SIZE_STREAK_MODE="${otuSizeStreakModeCanonical}"
 	OTU_SIZE_STREAK_MIN_ROUNDS="${otuSizeStreakMinRoundsStr}"
+	ROUND_FAILED_FILE="${ongoingStateDir}/${round_barcode}/ROUND_FAILED.txt"
+	ROUND_FAILED=0
+	if [ -f "\$ROUND_FAILED_FILE" ]; then
+		ROUND_FAILED=1
+	fi
 	LOCK_WAIT=${params.lock_wait_seconds}
 	source "${baseDir}/bin/lib/lock_utils.sh"
 	init_lock_helpers
@@ -2191,7 +2324,27 @@ process _reporting_OTU_definition {
 	_p_targets="${params.targets}"
 	IFS='|' read -ra _TARGETS <<< "\$_p_targets"
 	export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
-	perl ${baseDir}/bin/reporting_otu_definition.pl ${otu_clstr} ${demult} ${round_barcode} ${barcode} "\${_TARGETS[@]}"
+	if ! perl ${baseDir}/bin/reporting_otu_definition.pl ${otu_clstr} ${demult} ${round_barcode} ${barcode} "\${_TARGETS[@]}"; then
+		if [ "\$ROUND_FAILED" -eq 1 ]; then
+			cp "${failedRoundPlaceholderAssets.otuDefRpt}" ${barcode}_otu_def_rpt.txt
+			cp "${failedRoundPlaceholderAssets.otuMembersRound}" ${barcode}_otu_members_round.tsv
+			cp "${failedRoundPlaceholderAssets.otuSizesRound}" ${barcode}_otu_sizes_round.tsv
+			cp "${failedRoundPlaceholderAssets.otuDefSidecar}" ${barcode}_otu_def_rpt.contract.tsv
+		else
+			exit 1
+		fi
+	fi
+	if [ ! -f ${barcode}_otu_def_rpt.txt ] || [ ! -f ${barcode}_otu_members_round.tsv ] || [ ! -f ${barcode}_otu_sizes_round.tsv ] || [ ! -f ${barcode}_otu_def_rpt.contract.tsv ]; then
+		if [ "\$ROUND_FAILED" -eq 1 ]; then
+			cp "${failedRoundPlaceholderAssets.otuDefRpt}" ${barcode}_otu_def_rpt.txt
+			cp "${failedRoundPlaceholderAssets.otuMembersRound}" ${barcode}_otu_members_round.tsv
+			cp "${failedRoundPlaceholderAssets.otuSizesRound}" ${barcode}_otu_sizes_round.tsv
+			cp "${failedRoundPlaceholderAssets.otuDefSidecar}" ${barcode}_otu_def_rpt.contract.tsv
+		else
+			echo "ERROR: OTU definition report outputs are missing for round ${round_barcode}" 1>&2
+			exit 1
+		fi
+	fi
 	[ -f ${barcode}_otu_members_round.tsv ] || printf 'otu_id\tread_id\n' > ${barcode}_otu_members_round.tsv
 	[ -f ${barcode}_otu_sizes_round.tsv ] || printf 'otu_id\tsize\n' > ${barcode}_otu_sizes_round.tsv
 	mkdir -p ${ongoingStateDir}/${round_barcode}
@@ -2202,15 +2355,23 @@ process _reporting_OTU_definition {
 	: > "\$OTU_SIZES_CANONICAL"
 	: > "\$OTU_MEMBERS_CANONICAL_STATS"
 	if [ -s ${barcode}_otu_def_rpt.txt ]; then
-		if ! perl "${baseDir}/bin/otu_export_members_from_blastreport.pl" \
-			${barcode}_otu_def_rpt.txt \
-			"\$OTU_MEMBERS_CANONICAL" \
-			"\$OTU_SIZES_CANONICAL" \
-			"\$OTU_MEMBERS_CANONICAL_STATS"; then
-			echo "WARN: failed to export canonical OTU membership from ${barcode}_otu_def_rpt.txt" 1>&2
-			: > "\$OTU_MEMBERS_CANONICAL"
-			: > "\$OTU_SIZES_CANONICAL"
-			: > "\$OTU_MEMBERS_CANONICAL_STATS"
+		if [ "\$ROUND_FAILED" -eq 1 ]; then
+			if ! perl "${baseDir}/bin/otu_export_members_from_blastreport.pl" \
+				${barcode}_otu_def_rpt.txt \
+				"\$OTU_MEMBERS_CANONICAL" \
+				"\$OTU_SIZES_CANONICAL" \
+				"\$OTU_MEMBERS_CANONICAL_STATS"; then
+				echo "WARN: failed to export canonical OTU membership from ${barcode}_otu_def_rpt.txt" 1>&2
+				: > "\$OTU_MEMBERS_CANONICAL"
+				: > "\$OTU_SIZES_CANONICAL"
+				: > "\$OTU_MEMBERS_CANONICAL_STATS"
+			fi
+		else
+			perl "${baseDir}/bin/otu_export_members_from_blastreport.pl" \
+				${barcode}_otu_def_rpt.txt \
+				"\$OTU_MEMBERS_CANONICAL" \
+				"\$OTU_SIZES_CANONICAL" \
+				"\$OTU_MEMBERS_CANONICAL_STATS"
 		fi
 	fi
 	if [ -s "\$OTU_MEMBERS_CANONICAL_STATS" ]; then
@@ -2292,9 +2453,7 @@ fi
 		cp "\$OTU_SIZE_STREAK_IDS" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_size_streak_prune_ids.txt 2>/dev/null || true
 		cp "\$OTU_SIZE_STREAK_STATS" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_size_streak_stats.tsv 2>/dev/null || true
 		cp "\$OTU_SIZE_STREAK_STATE_NEXT" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_size_streak.tsv 2>/dev/null || true
-	
-	
-	
+
 		"""
 }
 
@@ -2309,12 +2468,11 @@ blast_pretax_inputs = ChannelUtils.strictRoundJoinAll([
 // ============================================================
 process blast_OTU_pretax {
 	cpus { params.blast_threads }
-	    maxForks maxForksCoreCpuVal
+	    maxForks maxForksStatefulCoreVal
 		label 'blast'
 		time '20h'
 
-//    publishDir "${params.outdir}/ongoing/", mode: 'copy', overwrite: true
-    input: 
+    input:
       tuple val(barcode), val(round_barcode), file(fasta_hq_qced), file(qced_reads_nr), file(read_file), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round) from blast_pretax_inputs
     output:
       tuple val(barcode), val(round_barcode), file('blast_report_annotated.txt') into blast_agg_ch
@@ -2322,9 +2480,6 @@ process blast_OTU_pretax {
       tuple val(barcode), val(round_barcode), file("blast_report_annotated.txt"), file("${barcode}_assigned_read_ids.list") into blast2consensus
 
 	script:
-	
-//	read_file = file(reads)
-	
 	if(!usingDockerProfile){
 	    db_dir = "$baseDir/"
 	    taxdb_dir = "$baseDir/"
@@ -2363,54 +2518,28 @@ process blast_OTU_pretax {
 		mkdir -p "\${STATE_DIR}"
 		LOCK_WAIT=${params.lock_wait_seconds}
 		PIPELINE_BASEDIR="${baseDir}"
-		source "${baseDir}/bin/lib/lock_utils.sh"
-		source "${baseDir}/bin/lib/blast_process_common.sh"
+		BIN_DIR="${baseDir}/bin"
+		LIB_DIR="\${BIN_DIR}/lib"
+		ROUND_DIR="${ongoingStateDir}/${round_barcode}"
+		CONSENSUS_DIR="${ongoingStateDir}/Consensus"
+		copy_soft(){ cp "\$1" "\$2" 2>/dev/null||:; }
+		source "\$LIB_DIR/lock_utils.sh"
+		source "\$LIB_DIR/blast_process_common.sh"
+		# append_otu_refine_breakdown writes:
+		# } >> "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" 2>/dev/null || true
+		# } >> "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" 2>/dev/null || true
 		init_lock_helpers
 		refresh_protected_read_ids_ever "\$PROTECTED_READ_IDS_EVER_STATE"
-			append_process_timing() {
-				local phase="\$1"
-				local start_ts="\$2"
-			local end_ts="\$3"
-			local seconds=0
-			if [ -n "\$start_ts" ] && [ -n "\$end_ts" ] && [[ "\$start_ts" != *[!0-9]* ]] && [[ "\$end_ts" != *[!0-9]* ]] && [ "\$end_ts" -ge "\$start_ts" ]; then
-				seconds=\$(( end_ts - start_ts ))
-			fi
-			printf '%s\t%s\t%s\n' "\${round_barcode}" "\$phase" "\$seconds" >> blast_process_timings.tsv
-			}
 			printf 'round_barcode\tphase\tseconds\n' > blast_process_timings.tsv
-			append_otu_refine_breakdown() {
-				local phase="\$1"
-				local start_ms="\$2"
-				local end_ms="\$3"
-				local elapsed_ms=0
-				local seconds=0
-				if [ -n "\$start_ms" ] && [ -n "\$end_ms" ] && [[ "\$start_ms" != *[!0-9]* ]] && [[ "\$end_ms" != *[!0-9]* ]] && [ "\$end_ms" -ge "\$start_ms" ]; then
-					elapsed_ms=\$(( end_ms - start_ms ))
-					seconds=\$(( elapsed_ms / 1000 ))
-				fi
-				{
-					printf '%s\t%s\t%s\n' "\${round_barcode}" "\$phase" "\$seconds"
-				} >> "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" 2>/dev/null || true
-				{
-					printf '%s\t%s\t%s\t%s\n' "\${round_barcode}" "\$phase" "\$seconds" "\$elapsed_ms"
-				} >> "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" 2>/dev/null || true
-			}
-			append_sup_path_timing() {
-				local phase="\$1"
-				local start_ms="\$2"
-				local end_ms="\$3"
-				local elapsed_ms=0
-				local seconds=0
-				if [ -n "\$start_ms" ] && [ -n "\$end_ms" ] && [[ "\$start_ms" != *[!0-9]* ]] && [[ "\$end_ms" != *[!0-9]* ]] && [ "\$end_ms" -ge "\$start_ms" ]; then
-					elapsed_ms=\$(( end_ms - start_ms ))
-					seconds=\$(( elapsed_ms / 1000 ))
-				fi
-				{
-					printf '%s\t%s\t%s\t%s\n' "\${round_barcode}" "\$phase" "\$seconds" "\$elapsed_ms"
-				} >> "\$SUP_PATH_TIMINGS_MS_FILE" 2>/dev/null || true
-			}
+			OTU_REFINE_PHASE_TIMINGS_FILE="${barcode}_otu_refine_phase_timings.tsv"
+			OTU_REFINE_PHASE_TIMINGS_MS_FILE="${barcode}_otu_refine_phase_timings_ms.tsv"
+			OTU_REFINE_WORKLOAD_STATS_FILE="${barcode}_otu_refine_workload_stats.tsv"
+			OTU_REFINE_PROCESS_BREAKDOWN_FILE="${barcode}_otu_refine_process_breakdown.tsv"
+			OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE="${barcode}_otu_refine_process_breakdown_ms.tsv"
+			printf 'round_barcode\tphase\tseconds\n'     > "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE"
+			printf 'round_barcode\tphase\tseconds\tms\n' > "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE"
 
-			source "${baseDir}/bin/lib/db_sig_utils.sh"
+			source "\$LIB_DIR/db_sig_utils.sh"
 			# -- §2: OTU size pre-filter and protection re-injection --
 			_t_blast_prefilter_start=\$(date +%s)
 
@@ -2421,7 +2550,7 @@ process blast_OTU_pretax {
 				exit 1
 			fi
 			OTU_BLAST_EFFECTIVE_MODE_TSV="${barcode}_blast_filter_effective_mode.tsv"
-			${baseDir}/bin/otu_blast_effective_mode.sh \
+			"\$BIN_DIR/otu_blast_effective_mode.sh" \
 				"\$OTU_BLAST_FILTER_MODE" \
 				"\$OTU_BLAST_FILTER_SKIP_ROUNDS" \
 				"\$ROUND_INDEX" \
@@ -2476,11 +2605,11 @@ process blast_OTU_pretax {
 				if [ "\$OTU_BLAST_EFFECTIVE_MODE" = "enforce" ]; then
 					BLAST_FILTER_MISSING_POLICY="drop"
 				fi
-				${baseDir}/bin/otu_hash_map_from_fasta.pl \
+				"\$BIN_DIR/otu_hash_map_from_fasta.pl" \
 					"${fasta_hq_qced}" \
 					"\$ROUND_HASH_MAP" \
 					"\$ROUND_HASH_COUNTS"
-				perl "${baseDir}/bin/otu_filter_reads_by_otu_size.pl" \
+				perl "\$BIN_DIR/otu_filter_reads_by_otu_size.pl" \
 					"${qced_reads_nr}" \
 					"\$ROUND_HASH_MAP" \
 					"${fasta_hq_qced}" \
@@ -2489,7 +2618,7 @@ process blast_OTU_pretax {
 					"\$BLAST_FILTER_STATS" \
 					"\$BLAST_FILTER_KEPT_OTUS" \
 					"\$BLAST_FILTER_MISSING_POLICY"
-				${baseDir}/bin/otu_blast_filter_decide.sh \
+				"\$BIN_DIR/otu_blast_filter_decide.sh" \
 					"\$BLAST_FILTER_STATS" \
 					"\$OTU_BLAST_EFFECTIVE_MODE" \
 					"\$OTU_BLAST_ENFORCE_MISSING_MAX_FRAC" \
@@ -2527,7 +2656,7 @@ process blast_OTU_pretax {
 							local marker_name="\$2"
 							awk -F'|' -v marker="\$marker_name" '/^>/{hdr=substr(\$0,2); n=split(hdr,a,"|"); keep=(n>=2 && a[2]==marker)} keep{print}' "\$fasta_path"
 						}
-						MARKER_RESCUE_STATS="${ongoingStateDir}/${round_barcode}/${barcode}_blast_marker_rescue.tsv"
+						MARKER_RESCUE_STATS="\$ROUND_DIR/${barcode}_blast_marker_rescue.tsv"
 						: > "\$MARKER_RESCUE_STATS"
 						if [ "\$OTU_BLAST_MIN_MEMBERS" -gt 0 ]; then
 							_p_targets="${params.targets}"
@@ -2540,10 +2669,10 @@ process blast_OTU_pretax {
 								filtered_marker_count=\$(count_marker_reads "\$BLAST_INPUT_FASTA" "\$target_marker")
 								rescued_marker_count=0
 								if [ "\$orig_marker_count" -gt 0 ] && [ "\$filtered_marker_count" -lt "\$OTU_BLAST_MIN_MEMBERS" ]; then
-									MARKER_RESCUE_FASTA="${ongoingStateDir}/${round_barcode}/${barcode}_blast_marker_rescue_\${target_marker}.fasta"
+									MARKER_RESCUE_FASTA="\$ROUND_DIR/${barcode}_blast_marker_rescue_\${target_marker}.fasta"
 									extract_marker_reads "${fasta_hq_qced}" "\$target_marker" > "\$MARKER_RESCUE_FASTA" || : > "\$MARKER_RESCUE_FASTA"
 									if [ -s "\$MARKER_RESCUE_FASTA" ]; then
-										MARKER_RESCUE_MERGED="${ongoingStateDir}/${round_barcode}/${barcode}_blast_input_marker_rescue_\${target_marker}.fasta"
+										MARKER_RESCUE_MERGED="\$ROUND_DIR/${barcode}_blast_input_marker_rescue_\${target_marker}.fasta"
 										awk '/^>/{id=\$0; if(!(id in seen)){seen[id]=1; print; skip=0} else skip=1; next} !skip{print}' "\$BLAST_INPUT_FASTA" "\$MARKER_RESCUE_FASTA" > "\$MARKER_RESCUE_MERGED"
 										BLAST_INPUT_FASTA="\$MARKER_RESCUE_MERGED"
 										rescued_marker_count=\$(( orig_marker_count - filtered_marker_count ))
@@ -2559,22 +2688,22 @@ process blast_OTU_pretax {
 						rm -f "${barcode}_blast_filter_in_ids.list" "${barcode}_blast_filter_kept_ids.list"
 						# Preserve sticky protected reads: re-inject their current members into BLAST input
 						ASSIGNED_OTU_KEYS_EVER="\${STATE_DIR}/${barcode}_assigned_otu_keys_ever.list"
-						ASSIGNED_OTU_PRESERVE_PREBLAST="${ongoingStateDir}/${round_barcode}/${barcode}_assigned_otu_preserve_preblast.tsv"
+						ASSIGNED_OTU_PRESERVE_PREBLAST="\$ROUND_DIR/${barcode}_assigned_otu_preserve_preblast.tsv"
 						_assigned_keys_count=0
 						[ -s "\$ASSIGNED_OTU_KEYS_EVER" ] && _assigned_keys_count=\$(wc -l < "\$ASSIGNED_OTU_KEYS_EVER" | tr -d ' ')
 						_protected_ever_count=0
 						[ -s "\$PROTECTED_READ_IDS_EVER_STATE" ] && _protected_ever_count=\$(wc -l < "\$PROTECTED_READ_IDS_EVER_STATE" | tr -d ' ')
 						_protected_added=0
 						if [ -s "\$PROTECTED_READ_IDS_EVER_STATE" ]; then
-							_PROTECTED_IDS="${ongoingStateDir}/${round_barcode}/${barcode}_blast_protected_ids.list"
+							_PROTECTED_IDS="\$ROUND_DIR/${barcode}_blast_protected_ids.list"
 							cp "\$PROTECTED_READ_IDS_EVER_STATE" "\$_PROTECTED_IDS" 2>/dev/null || : > "\$_PROTECTED_IDS"
 							if [ -s "\$_PROTECTED_IDS" ]; then
-								_PROTECTED_FASTA="${ongoingStateDir}/${round_barcode}/${barcode}_blast_protected.fasta"
+								_PROTECTED_FASTA="\$ROUND_DIR/${barcode}_blast_protected.fasta"
 								# FASTA headers are UUID|TARGET|... but _PROTECTED_IDS has bare UUIDs;
 								# awk matches on UUID prefix (before first |) to extract protected reads.
 								awk 'NR==FNR{ids[\$1]=1; next} /^>/{uuid=substr(\$0,2); sub(/[|].*/,"",uuid); p=(uuid in ids); if(p)print; next} p{print}' "\$_PROTECTED_IDS" "${fasta_hq_qced}" > "\$_PROTECTED_FASTA" || : > "\$_PROTECTED_FASTA"
 								if [ -s "\$_PROTECTED_FASTA" ]; then
-									_MERGED="${ongoingStateDir}/${round_barcode}/${barcode}_blast_input_merged.fasta"
+									_MERGED="\$ROUND_DIR/${barcode}_blast_input_merged.fasta"
 									awk '/^>/{id=\$0; if(!(id in seen)){seen[id]=1; print; skip=0} else skip=1; next} !skip{print}' "\$BLAST_INPUT_FASTA" "\$_PROTECTED_FASTA" > "\$_MERGED"
 									BLAST_INPUT_FASTA="\$_MERGED"
 									_protected_added=\$(wc -l < "\$_PROTECTED_IDS" | tr -d ' ')
@@ -2607,7 +2736,7 @@ process blast_OTU_pretax {
 		IFS='|' read -ra _MEMTAX    <<< "\$_p_nonncbi_memtax"
 		# -- §3: Per-target BLAST --
 		_t_per_target_blast_start=\$(date +%s)
-		"${baseDir}/bin/blast_otu_pretax.sh" \
+		"\$BIN_DIR/blast_otu_pretax.sh" \
 			"${barcode}" \
 			"\$BLAST_INPUT_FASTA" \
 			"\$STATE_DIR" \
@@ -2615,7 +2744,7 @@ process blast_OTU_pretax {
 			"${baseDir}" \
 			"${db_dir}" \
 			"${taxdb_dir}" \
-			"${ongoingStateDir}/${round_barcode}" \
+			"\$ROUND_DIR" \
 			"\$_p_targets" \
 			"\$_p_blast_db_specs" \
 			"${params.blast_id_family}" \
@@ -2669,11 +2798,6 @@ process blast_OTU_pretax {
 		_t_blastreport_merge_end=\$(date +%s)
 		append_process_timing "blastreport_merge" "\$_t_blastreport_merge_start" "\$_t_blastreport_merge_end"
 		_t_otu_refine_start=\$(date +%s)
-		    OTU_REFINE_PHASE_TIMINGS_FILE="${barcode}_otu_refine_phase_timings.tsv"
-		    OTU_REFINE_PHASE_TIMINGS_MS_FILE="${barcode}_otu_refine_phase_timings_ms.tsv"
-		    OTU_REFINE_WORKLOAD_STATS_FILE="${barcode}_otu_refine_workload_stats.tsv"
-		    OTU_REFINE_PROCESS_BREAKDOWN_FILE="${barcode}_otu_refine_process_breakdown.tsv"
-		    OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE="${barcode}_otu_refine_process_breakdown_ms.tsv"
 		    SUP_PATH_STATS_FILE="${barcode}_sup_path_stats.tsv"
 		    SUP_PATH_TIMINGS_MS_FILE="${barcode}_sup_path_timings_ms.tsv"
 		    DORADO_SUMMARY_HEADER='input_filename\tbatch_id\tparent_read_id\tread_id\trun_id\tchannel\tmux\tminknow_events\tstart_time\tduration\tpasses_filtering\ttemplate_start\tnum_events_template\ttemplate_duration\tsequence_length_template\tmean_qscore_template\tpore_type\texperiment_id\tsample_id\tend_reason\n'
@@ -2774,7 +2898,7 @@ process blast_OTU_pretax {
 		             OTU_REFINE_PHASE_TIMINGS_FILE="\$OTU_REFINE_PHASE_TIMINGS_FILE" \
 		             OTU_REFINE_PHASE_TIMINGS_MS_FILE="\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" \
 		             OTU_REFINE_WORKLOAD_STATS_FILE="\$OTU_REFINE_WORKLOAD_STATS_FILE" \
-		             bash "${baseDir}/bin/otu_refine_blastreport_parallel.sh" \
+		             bash "\$BIN_DIR/otu_refine_blastreport_parallel.sh" \
 		             "${barcode}_blastreport_round.txt" \
 		             "${qced_reads_nr}" \
 		             "${baseDir}/${params.nonncbi_id2lineage_target}" \
@@ -2824,7 +2948,7 @@ process blast_OTU_pretax {
 			: > "\$NO_ADAPTER_POLICY_TSV"
 					_t_otu_refine_no_adapter_start=\$(now_ms)
 					if [ -s blast_report_annotated_otu_evidence.txt ]; then
-						if ! bash ${baseDir}/bin/detect_no_adapter_policy.sh blast_report_annotated_otu_evidence.txt > "\$NO_ADAPTER_POLICY_TSV"; then
+						if ! bash "\$BIN_DIR/detect_no_adapter_policy.sh" blast_report_annotated_otu_evidence.txt > "\$NO_ADAPTER_POLICY_TSV"; then
 							echo "ERROR: detect_no_adapter_policy.sh failed for ${barcode}/${round_barcode}" 1>&2
 							exit 1
 						fi
@@ -2850,8 +2974,8 @@ process blast_OTU_pretax {
 						validate_no_adapter_policy_value observed_non_no_adapter "\$OBSERVED_NON_NO_ADAPTER"
 						validate_no_adapter_policy_value separate_no_adapter "\$SEPARATE_NO_ADAPTER"
 					fi
-					mkdir -p "${ongoingStateDir}/\${round_barcode}" 2>/dev/null || true
-					cp "\$NO_ADAPTER_POLICY_TSV" "${ongoingStateDir}/\${round_barcode}/\$NO_ADAPTER_POLICY_TSV" 2>/dev/null || true
+					mkdir -p "\$ROUND_DIR" 2>/dev/null || true
+					copy_soft "\$NO_ADAPTER_POLICY_TSV" "\$ROUND_DIR/\$NO_ADAPTER_POLICY_TSV"
 			_t_otu_refine_no_adapter_end=\$(now_ms)
 			append_otu_refine_breakdown "no_adapter_policy" "\$_t_otu_refine_no_adapter_start" "\$_t_otu_refine_no_adapter_end"
 			echo "INFO: no_adapter_policy observed_no_adapter=\$OBSERVED_NO_ADAPTER observed_non_no_adapter=\$OBSERVED_NON_NO_ADAPTER separate_no_adapter=\$SEPARATE_NO_ADAPTER" 1>&2
@@ -2861,15 +2985,14 @@ process blast_OTU_pretax {
 		_t_assignment_state_updates_start=\$(date +%s)
 	: > ${barcode}_assigned_read_ids.list
 	if [ -s "${barcode}_blastreport_round.txt" ]; then
-		if ! perl ${baseDir}/bin/blast_assigned_read_ids.pl \
+		if ! perl "\$BIN_DIR/blast_assigned_read_ids.pl" \
 			"${barcode}_blastreport_round.txt" \
 			${barcode}_assigned_read_ids.list; then
-			echo "WARN: failed to compute assigned read IDs; disabling unassigned-cluster prune for this round" 1>&2
-			: > ${barcode}_assigned_read_ids.list
+			echo "ERROR: failed to compute assigned read IDs" 1>&2
+			exit 1
 		fi
 	fi
 	# Persist assigned read IDs (round snapshot + ever-assigned history).
-	ROUND_DIR="${ongoingStateDir}/${round_barcode}"
 	mkdir -p "\$ROUND_DIR" "\$STATE_DIR"
 	ASSIGNED_READ_IDS_RAW_ROUND="\$ROUND_DIR/${barcode}_assigned_read_ids_raw_current.list"
 	cp ${barcode}_assigned_read_ids.list "\$ASSIGNED_READ_IDS_RAW_ROUND" 2>/dev/null || true
@@ -2893,7 +3016,7 @@ process blast_OTU_pretax {
 			ASSIGNED_OTU_MEMBERS_EVER="\$ROUND_DIR/${barcode}_assigned_otu_member_ids_ever.list"
 			ASSIGNED_OTU_KEYS_PERSIST_STATS="\$ROUND_DIR/${barcode}_assigned_otu_keys_persist_stats.tsv"
 				ASSIGNED_OTU_PRESERVE_STATS="\$ROUND_DIR/${barcode}_assigned_otu_preserve_stats.tsv"
-				if ! perl ${baseDir}/bin/blast_assigned_otu_keys.pl \
+				if ! perl "\$BIN_DIR/blast_assigned_otu_keys.pl" \
 					blast_report_annotated_otu_evidence.txt \
 					"\$BLAST_ASSIGNED_OTU_KEYS_ROUND" \
 					"\$OTU_HASH_MAP_STATE" \
@@ -2901,14 +3024,14 @@ process blast_OTU_pretax {
 					echo "ERROR: failed to extract blast-assigned OTU keys" 1>&2
 					exit 1
 			fi
-			if ! perl ${baseDir}/bin/persist_otu_keys_ever.pl \
+			if ! perl "\$BIN_DIR/persist_otu_keys_ever.pl" \
 				"\$BLAST_ASSIGNED_OTU_KEYS_ROUND" \
 				"\$ASSIGNED_OTU_KEYS_EVER" \
 				"\$ASSIGNED_OTU_KEYS_PERSIST_STATS"; then
 				echo "ERROR: failed to persist blast-assigned OTU keys" 1>&2
 				exit 1
 			fi
-			if ! perl ${baseDir}/bin/expand_otu_keys_to_member_ids.pl \
+			if ! perl "\$BIN_DIR/expand_otu_keys_to_member_ids.pl" \
 				"\$BLAST_ASSIGNED_OTU_KEYS_ROUND" \
 				"\$ROUND_DIR/otu_members_round.tsv" \
 				"\$ASSIGNED_OTU_MEMBERS_CURRENT_RAW" \
@@ -2944,16 +3067,16 @@ process blast_OTU_pretax {
 		append_process_timing "assignment_state_updates" "\$_t_assignment_state_updates_start" "\$_t_assignment_state_updates_end"
 			if [ "\$SEPARATE_NO_ADAPTER" -eq 1 ]; then
 		    if [ -s blast_report_annotated_otu_evidence.txt ]; then
-		        if ! bash ${baseDir}/bin/filter_blast_rows_by_adapter_class.sh blast_report_annotated_otu_evidence.txt no_adapter > blast_report_annotated_otu_noadapter.txt; then
+		        if ! bash "\$BIN_DIR/filter_blast_rows_by_adapter_class.sh" blast_report_annotated_otu_evidence.txt no_adapter > blast_report_annotated_otu_noadapter.txt; then
 		        	echo "WARN: filter_blast_rows_by_adapter_class.sh failed for no_adapter split; continuing without split report" 1>&2
 		        	: > blast_report_annotated_otu_noadapter.txt
 		        fi
 		    else
 		        : > blast_report_annotated_otu_noadapter.txt
 		    fi
-	else
-	    : > blast_report_annotated_otu_noadapter.txt
-	fi
+	    else
+	        : > blast_report_annotated_otu_noadapter.txt
+	    fi
 			# -- §5: SUP/HAC selection and re-basecalling path --
 			_t_sup_selection_start=\$(date +%s)
 	    _t_read_pident_build_start=\$(now_ms)
@@ -2971,7 +3094,7 @@ process blast_OTU_pretax {
 	    _t_blocked_otu_build_start=\$(now_ms)
 	    CONSOLIDATED_OTU="${barcode}_consolidated_otu.tsv"
     : > "\$CONSOLIDATED_OTU"
-    if [ -s ${ongoingStateDir}/Consensus/consensus_otu_map.tsv ]; then
+    if [ -s "\$CONSENSUS_DIR/consensus_otu_map.tsv" ]; then
         awk 'BEGIN{FS=OFS="\t"} NR==1{next}
             {
                 otu_key=\$2; sample=\$3; cons=\$7+0;
@@ -2982,24 +3105,30 @@ process blast_OTU_pretax {
             }
             END{
                 for (k in seen) if (!any_non[k]) print k;
-            }' ${ongoingStateDir}/Consensus/consensus_otu_map.tsv > "\$CONSOLIDATED_OTU"
+            }' "\$CONSENSUS_DIR/consensus_otu_map.tsv" > "\$CONSOLIDATED_OTU"
     fi
     FROZEN_READS="${barcode}_frozen_read_ids.list"
     : > "\$FROZEN_READS"
-    if [ -s ${ongoingStateDir}/_state/otu_frozen_members.tsv ]; then
-        cut -f2 ${ongoingStateDir}/_state/otu_frozen_members.tsv | LC_ALL=C sort -u > "\$FROZEN_READS"
+    if [ -s "\$STATE_DIR/otu_frozen_members.tsv" ]; then
+        cut -f2 "\$STATE_DIR/otu_frozen_members.tsv" | LC_ALL=C sort -u > "\$FROZEN_READS"
     fi
     BLOCKED_OTU="${barcode}_sup_blocked_otu.tsv"
     : > "\$BLOCKED_OTU"
     if [ -s "\$FROZEN_READS" ] && [ -s "\$CONSOLIDATED_OTU" ] && [ -s blast_report_annotated_otu.txt ]; then
-        perl ${baseDir}/bin/build_blocked_otu.pl "\$CONSOLIDATED_OTU" "\$FROZEN_READS" blast_report_annotated_otu.txt > "\$BLOCKED_OTU"
+        perl "\$BIN_DIR/build_blocked_otu.pl" "\$CONSOLIDATED_OTU" "\$FROZEN_READS" blast_report_annotated_otu.txt > "\$BLOCKED_OTU"
 	    fi
 	    _t_blocked_otu_build_end=\$(now_ms)
 	    append_sup_path_timing "blocked_otu_build" "\$_t_blocked_otu_build_start" "\$_t_blocked_otu_build_end"
 
 		    _t_select_reads2sup_start=\$(now_ms)
 			    if [ -s "blast_report_annotated_otu.txt" ]; then
-			"${baseDir}/bin/select_reads2sup.pl" blast_report_annotated_otu.txt 50 keep_no_adapter ${barcode}_read_pident.tsv "\$BLOCKED_OTU" > tmp || :
+			if ! "\$BIN_DIR/select_reads2sup.pl" blast_report_annotated_otu.txt 50 keep_no_adapter ${barcode}_read_pident.tsv "\$BLOCKED_OTU" > tmp; then
+				echo "ERROR: select_reads2sup.pl failed for ${barcode}/${round_barcode}" 1>&2
+				exit 1
+			fi
+		    else
+		        : > tmp
+		    fi
 		    _t_select_reads2sup_end=\$(now_ms)
 		    append_sup_path_timing "select_reads2sup" "\$_t_select_reads2sup_start" "\$_t_select_reads2sup_end"
 		    _t_taxonomy_cleanup_emit_start=\$(now_ms)
@@ -3013,14 +3142,6 @@ process blast_OTU_pretax {
 	            : > blast_report_annotated_otu.txt
 	            : > blast_report_annotated.txt
 	        fi
-		    else
-		        : > tmp
-		        : > blast_report_annotated_otu.txt
-		        : > blast_report_annotated.txt
-		    _t_select_reads2sup_end=\$(now_ms)
-		    append_sup_path_timing "select_reads2sup" "\$_t_select_reads2sup_start" "\$_t_select_reads2sup_end"
-		    _t_taxonomy_cleanup_emit_start=\$(now_ms)
-		    fi
 
 	if [ "\$SEPARATE_NO_ADAPTER" -eq 1 ]; then
 	    if [ -s blast_report_annotated_otu_noadapter.txt ]; then
@@ -3076,16 +3197,16 @@ process blast_OTU_pretax {
 		    SUP_CACHE_DORADO_ARGS="${doradoSupBasecallerArgs}"
 		    SUP_CACHE_MIN_QSCORE="${params.hq_quality_score}"
 		    SUP_CACHE_SKIP_PERSIST=0
-		    source "${baseDir}/bin/blast_sup_path.sh"
+		    source "\$BIN_DIR/blast_sup_path.sh"
 		    sup_candidate_extract
 		    sup_cache_lookup
-				
+
 				_t_hac_fixed_extract_start=\$(now_ms)
 					cut -f1 blast_report_annotated.txt | grep hac_fixed | cut -f1 -d"|" > hac_fixed_readids.list || true
 					if [ -s hac_fixed_readids.list ]; then
-						echo "hac_fixed is being extracted" 1>&2
+						echo "INFO: hac_fixed reads detected" 1>&2
 					fi
-		
+
 			: > ${barcode}_qced_reads_hq_hac_fixed.fasta
 			_t_hac_fixed_extract_end=\$(now_ms)
 			append_sup_path_timing "hac_fixed_extract" "\$_t_hac_fixed_extract_start" "\$_t_hac_fixed_extract_end"
@@ -3111,7 +3232,7 @@ process blast_OTU_pretax {
 						if [ -s ${barcode}_blastreport_hac_missing.list ]; then
 							_t_dorado_sup_basecaller_start=\$(now_ms)
 							if dorado_basecall_retry "SUP basecalling" "${barcode}_blastreport_sup.sam" \
-							${baseDir}/bin/with_dorado_lock.sh "\$DORADO_LOCK" "\$DORADO_LOCK_WAIT" "blast_OTU_pretax:\$round_barcode:sup" -- \
+							"\$BIN_DIR/with_dorado_lock.sh" "\$DORADO_LOCK" "\$DORADO_LOCK_WAIT" "blast_OTU_pretax:\$round_barcode:sup" -- \
 							${doradoBin} basecaller -x ${params.dorado_device} \
 							${doradoSupBasecallerArgs} \
 							--min-qscore ${params.hq_quality_score} -l ${barcode}_blastreport_hac_missing.list \
@@ -3124,7 +3245,6 @@ process blast_OTU_pretax {
 								exit 1
 							fi
 						
-				#	recovers new sup reads 
 							_t_sup_fastq_recover_start=\$(now_ms)
 							samtools fastq -@ ${task.cpus} ${barcode}_blastreport_sup.sam > ${barcode}_blastreport_sup_new.fastq
 							_t_sup_fastq_recover_end=\$(now_ms)
@@ -3142,10 +3262,9 @@ process blast_OTU_pretax {
 						sup_cache_persist
 						sup_post_dorado
 				fi
-		#	copies el fastq of sup classified to temp for being processed in the next round
 			
-				mkdir -p ${ongoingStateDir}/${round_barcode}
-			cp ${barcode}_blastreport_sup_annotated_pre.fastq ${ongoingStateDir}/${round_barcode}/blastreport_sup_annotated_pre.fastq
+				mkdir -p "\$ROUND_DIR"
+				cp ${barcode}_blastreport_sup_annotated_pre.fastq "\$ROUND_DIR/blastreport_sup_annotated_pre.fastq"
 			if acquire_lock "\${SUPFASTQ_LOCK}"; then
 				SUP_DST="\${STATE_DIR}/blastreport_sup_annotated_pre.fastq"
 				rm -f "\$SUP_DST" "\${SUP_DST}.gz"
@@ -3167,32 +3286,27 @@ process blast_OTU_pretax {
 		_t_dorado_sup_end=\$(date +%s)
 		append_process_timing "dorado_sup" "\$_t_dorado_sup_start" "\$_t_dorado_sup_end"
 	
-	#	gets the blast results only for sup
 		grep -F "|sup|" ${barcode}_blastreport_join.txt > ${barcode}_preblastreport_sup.txt || :
-	if [ -s ${barcode}_preblastreport_sup.txt ]; then
-		echo "${barcode}_preblastreport_sup.txt obtained" 1>&2
-	fi
-	# All BLAST-hit reads (any model) for rolling pool retention
+		# All BLAST-hit reads (any model) for rolling pool retention
 	BLAST_HIT_REPORT="${barcode}_blastreport_join.txt"
 	_t_rolling_pool_update_start=\$(date +%s)
 	: > ${barcode}_tmp_focus_sup.fasta
 	: > ${barcode}_tmp_focus_hit.fasta
 	BLAST_HIT_EXTRACT_FAILED=0
 	if [ -s ${barcode}_preblastreport_sup.txt ]; then
-		perl ${baseDir}/bin/focus_hq_tax_fasta.pl ${barcode}_preblastreport_sup.txt ${fasta_hq_qced} > ${barcode}_tmp_focus_sup.fasta || : > ${barcode}_tmp_focus_sup.fasta
+		perl "\$BIN_DIR/focus_hq_tax_fasta.pl" ${barcode}_preblastreport_sup.txt ${fasta_hq_qced} > ${barcode}_tmp_focus_sup.fasta || : > ${barcode}_tmp_focus_sup.fasta
 	fi
 	if [ -s "\$BLAST_HIT_REPORT" ]; then
-		if ! perl ${baseDir}/bin/focus_hq_tax_fasta.pl "\$BLAST_HIT_REPORT" ${fasta_hq_qced} > ${barcode}_tmp_focus_hit.fasta; then
+		if ! perl "\$BIN_DIR/focus_hq_tax_fasta.pl" "\$BLAST_HIT_REPORT" ${fasta_hq_qced} > ${barcode}_tmp_focus_hit.fasta; then
 			BLAST_HIT_EXTRACT_FAILED=1
 			: > ${barcode}_tmp_focus_hit.fasta
 		fi
 	fi
 	
-#	gets the set of fasta sequences for the next OTUs (first hac and then only sup)
 			if acquire_lock "\${QCED_LOCK}"; then
 					if [ -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ];
 					then
-							if ! perl ${baseDir}/bin/filter_sup_non_no_adapter_fasta.pl "\$PROTECTED_READ_IDS_EVER_STATE" "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" > tmp; then
+							if ! perl "\$BIN_DIR/filter_sup_non_no_adapter_fasta.pl" "\$PROTECTED_READ_IDS_EVER_STATE" "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" > tmp; then
 								echo "WARN: filter_sup_non_no_adapter_fasta.pl failed; retaining existing rolling pool prior to append" 1>&2
 								: > tmp
 							fi
@@ -3246,7 +3360,6 @@ process blast_OTU_pretax {
 				rm -f "\$PROTECTED_POOL_FASTA"
 			fi
 			# Rolling pool stats (pre-dedup)
-			ROUND_DIR="${ongoingStateDir}/${round_barcode}"
 			ROLLING_POOL_STATS="\$ROUND_DIR/${barcode}_rolling_pool_stats.tsv"
 			: > "\$ROLLING_POOL_STATS"
 			if [ -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ]; then
@@ -3361,7 +3474,7 @@ process blast_OTU_pretax {
 							RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${replicateModeCanonical}" \
 							RTBIOSCAN_TRACK_ACTIVE_UNITS="${sampleInfoDir}/track_active_units.txt" \
 							RTBIOSCAN_TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv" \
-							${baseDir}/bin/otu_c1_prune_ids.sh \
+							"\$BIN_DIR/otu_c1_prune_ids.sh" \
 								"until_consolidated" \
 								"\${STATE_DIR}/qced_reads_hq_accumulated.fasta" \
 								"\${DEDUP_TMP}.active_ids" \
@@ -3393,7 +3506,7 @@ process blast_OTU_pretax {
 						SMALL_OTU_PRUNE_REASON="min_members_lt2"
 					else
 						OTU_BLAST_EFFECTIVE_MODE_TSV="${barcode}_blast_filter_effective_mode_prune.tsv"
-						${baseDir}/bin/otu_blast_effective_mode.sh \
+						"\$BIN_DIR/otu_blast_effective_mode.sh" \
 							"\$OTU_BLAST_FILTER_MODE" \
 							"\$OTU_BLAST_FILTER_SKIP_ROUNDS" \
 							"\$ROUND_INDEX" \
@@ -3432,7 +3545,24 @@ process blast_OTU_pretax {
 						PROTECTED_READ_IDS_EVER="\${STATE_DIR}/${barcode}_protected_read_ids_ever.list"
 						PROTECTED_READ_IDS_ROUND="\${ROUND_DIR}/${barcode}_assigned_otu_member_ids_ever.list"
 						PROTECTED_IDS="\${ROUND_DIR}/${barcode}_protected_prune_ids.list"
-										# Compute blast-unassigned read IDs (reads whose OTU never received a BLAST assignment).
+						# Compute current blast-unassigned read IDs for live reporting, independent of prune-mode suppression.
+						BLAST_UNASSIGNED_CURRENT_STATE="\${STATE_DIR}/${barcode}_blast_unassigned_current.list"
+						BLAST_UNASSIGNED_CURRENT_TMP="\${BLAST_UNASSIGNED_CURRENT_STATE}.tmp"
+						: > "\$BLAST_UNASSIGNED_CURRENT_TMP"
+						if [ -s blast_report_annotated_otu_evidence.txt ]; then
+							if ! perl "\$BIN_DIR/blast_unassigned_read_ids.pl" \
+								blast_report_annotated_otu_evidence.txt \
+								"\$BLAST_UNASSIGNED_CURRENT_TMP" \
+								--min-level "${assignProtLevelCanonical}"; then
+								echo "WARN: blast_unassigned_read_ids.pl failed; clearing live blast-unassigned report state" 1>&2
+								: > "\$BLAST_UNASSIGNED_CURRENT_TMP"
+							fi
+						fi
+						mv -f "\$BLAST_UNASSIGNED_CURRENT_TMP" "\$BLAST_UNASSIGNED_CURRENT_STATE" 2>/dev/null \
+							|| cp -f "\$BLAST_UNASSIGNED_CURRENT_TMP" "\$BLAST_UNASSIGNED_CURRENT_STATE" 2>/dev/null \
+							|| true
+						rm -f "\$BLAST_UNASSIGNED_CURRENT_TMP" 2>/dev/null || true
+						# Compute blast-unassigned read IDs (reads whose OTU never received a BLAST assignment).
 					BLAST_UNASSIGNED_IDS="${barcode}_blast_unassigned_reads_round.list"
 					: > "\$BLAST_UNASSIGNED_IDS"
 					BLAST_UNASSIGNED_STATUS="mode_off"
@@ -3441,7 +3571,7 @@ process blast_OTU_pretax {
 							BLAST_UNASSIGNED_STATUS="grace"
 						else
 							if [ -s blast_report_annotated_otu_evidence.txt ]; then
-								if ! perl ${baseDir}/bin/blast_unassigned_read_ids.pl \
+								if ! perl "\$BIN_DIR/blast_unassigned_read_ids.pl" \
 									blast_report_annotated_otu_evidence.txt \
 									"\$BLAST_UNASSIGNED_IDS" \
 									--min-level "${assignProtLevelCanonical}"; then
@@ -3466,7 +3596,7 @@ process blast_OTU_pretax {
 							awk '{split(\$0,a,"|"); if (a[1]!="") print a[1]}' "\${STATE_DIR}/${barcode}_pruned_unassigned_reads_last.list" | LC_ALL=C sort -u > "\$CONSENSUS_UNASSIGNED_PRUNE_IDS"
 					fi
 
-						if ! bash ${baseDir}/bin/prune_round_orchestrate.sh \
+						if ! bash "\$BIN_DIR/prune_round_orchestrate.sh" \
 							--protected-read-ids-ever "\$PROTECTED_READ_IDS_EVER" \
 							--protected-read-ids-round "\$PROTECTED_READ_IDS_ROUND" \
 							--protected-ids "\$PROTECTED_IDS" \
@@ -3491,9 +3621,7 @@ process blast_OTU_pretax {
 				exit 1
 		fi
 		rm -f ${barcode}_tmp_focus_sup.fasta ${barcode}_tmp_focus_hit.fasta
-	
-	
-	
+
 		# -- §7: Report dedup and state finalization --
 		# Deduplicate canonical annotated reports by read_id keeping best model (sup > hac > fast).
 			for f in blast_report_annotated.txt blast_report_annotated_otu.txt blast_report_annotated_noadapter.txt; do
@@ -3511,7 +3639,7 @@ process blast_OTU_pretax {
 				done
 
 			if [ -f "\${STATE_DIR}/blastreport.txt" ]; then
-				if ! "${baseDir}/bin/prefer_blast_rows_by_model.sh" \
+				if ! "\$BIN_DIR/prefer_blast_rows_by_model.sh" \
 					--input blast_report_annotated.txt \
 					--output blast_report_annotated_preferred.txt \
 					--policy sup_hac2sup_preferred; then
@@ -3524,7 +3652,7 @@ process blast_OTU_pretax {
 
 		# Diagnostic OTU membership export from evidence-tier BLAST OTU report.
 		if [ -s blast_report_annotated_otu_evidence.txt ]; then
-		if ! perl "${baseDir}/bin/otu_export_members_from_blastreport.pl" \
+		if ! perl "\$BIN_DIR/otu_export_members_from_blastreport.pl" \
 			blast_report_annotated_otu_evidence.txt \
 			"\$OTU_MEMBERS_BLASTDIAG" \
 			"\$OTU_SIZES_BLASTDIAG" \
@@ -3543,25 +3671,25 @@ process blast_OTU_pretax {
 		sed 's/^/INFO: otu_members_blastdiag\t/' "\$OTU_MEMBERS_BLASTDIAG_STATS" 1>&2 || true
 	fi
 	
-		mkdir -p ${ongoingStateDir}/${round_barcode}
-			cp blast_process_timings.tsv ${ongoingStateDir}/${round_barcode}/${barcode}_blast_process_timings.tsv 2>/dev/null || true
-			cp blast_process_timings.tsv "\${STATE_DIR}/${barcode}_blast_process_timings_last.tsv" 2>/dev/null || true
-			cp "\$OTU_REFINE_PHASE_TIMINGS_FILE" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_refine_phase_timings.tsv 2>/dev/null || true
-			cp "\$OTU_REFINE_PHASE_TIMINGS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_phase_timings_last.tsv" 2>/dev/null || true
-			cp "\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_refine_phase_timings_ms.tsv 2>/dev/null || true
-			cp "\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_phase_timings_ms_last.tsv" 2>/dev/null || true
-			cp "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_refine_process_breakdown.tsv 2>/dev/null || true
-			cp "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" "\${STATE_DIR}/${barcode}_otu_refine_process_breakdown_last.tsv" 2>/dev/null || true
-			cp "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_refine_process_breakdown_ms.tsv 2>/dev/null || true
-			cp "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_process_breakdown_ms_last.tsv" 2>/dev/null || true
-			cp "\$OTU_REFINE_WORKLOAD_STATS_FILE" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_refine_workload_stats.tsv 2>/dev/null || true
-			cp "\$OTU_REFINE_WORKLOAD_STATS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_workload_stats_last.tsv" 2>/dev/null || true
-			cp "\$SUP_PATH_STATS_FILE" ${ongoingStateDir}/${round_barcode}/${barcode}_sup_path_stats.tsv 2>/dev/null || true
-			cp "\$SUP_PATH_TIMINGS_MS_FILE" ${ongoingStateDir}/${round_barcode}/${barcode}_sup_path_timings_ms.tsv 2>/dev/null || true
-			cp "\$SUP_PATH_TIMINGS_MS_FILE" "\${STATE_DIR}/${barcode}_sup_path_timings_ms_last.tsv" 2>/dev/null || true
-			cp ${barcode}_blastreport_hac.list ${ongoingStateDir}/${round_barcode}/${barcode}_blastreport_hac.list 2>/dev/null || true
-			cp ${barcode}_blastreport_sup.list ${ongoingStateDir}/${round_barcode}/${barcode}_blastreport_sup.list 2>/dev/null || true
-			cp ${barcode}_blastreport_round.txt ${ongoingStateDir}/${round_barcode}/blastreport.txt
+		mkdir -p "\$ROUND_DIR"
+			copy_soft blast_process_timings.tsv "\$ROUND_DIR/${barcode}_blast_process_timings.tsv"
+			copy_soft blast_process_timings.tsv "\${STATE_DIR}/${barcode}_blast_process_timings_last.tsv"
+			copy_soft "\$OTU_REFINE_PHASE_TIMINGS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_phase_timings.tsv"
+			copy_soft "\$OTU_REFINE_PHASE_TIMINGS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_phase_timings_last.tsv"
+			copy_soft "\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_phase_timings_ms.tsv"
+			copy_soft "\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_phase_timings_ms_last.tsv"
+			copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" "\$ROUND_DIR/${barcode}_otu_refine_process_breakdown.tsv"
+			copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" "\${STATE_DIR}/${barcode}_otu_refine_process_breakdown_last.tsv"
+			copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_process_breakdown_ms.tsv"
+			copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_process_breakdown_ms_last.tsv"
+			copy_soft "\$OTU_REFINE_WORKLOAD_STATS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_workload_stats.tsv"
+			copy_soft "\$OTU_REFINE_WORKLOAD_STATS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_workload_stats_last.tsv"
+			copy_soft "\$SUP_PATH_STATS_FILE" "\$ROUND_DIR/${barcode}_sup_path_stats.tsv"
+			copy_soft "\$SUP_PATH_TIMINGS_MS_FILE" "\$ROUND_DIR/${barcode}_sup_path_timings_ms.tsv"
+			copy_soft "\$SUP_PATH_TIMINGS_MS_FILE" "\${STATE_DIR}/${barcode}_sup_path_timings_ms_last.tsv"
+			copy_soft ${barcode}_blastreport_hac.list "\$ROUND_DIR/${barcode}_blastreport_hac.list"
+			copy_soft ${barcode}_blastreport_sup.list "\$ROUND_DIR/${barcode}_blastreport_sup.list"
+			cp ${barcode}_blastreport_round.txt "\$ROUND_DIR/blastreport.txt"
 		if acquire_lock "\${BLASTREPORT_LOCK}"; then
 			STATE_BLASTREPORT_TMP="\${STATE_DIR}/blastreport.txt.tmp.\$\$"
 			cp ${barcode}_blastreport.txt "\$STATE_BLASTREPORT_TMP"
@@ -3570,15 +3698,15 @@ process blast_OTU_pretax {
 		else
 			exit 1
 		fi
-		cp "\$BLAST_FILTER_STATS" ${ongoingStateDir}/${round_barcode}/${barcode}_blast_filter_stats.tsv 2>/dev/null || true
-		cp "\$BLAST_FILTER_DROPPED_IDS" ${ongoingStateDir}/${round_barcode}/${barcode}_blast_filter_dropped_read_ids.list 2>/dev/null || true
-		cp "\$BLAST_FILTER_DROPPED_IDS" "\${STATE_DIR}/${barcode}_blast_filter_dropped_read_ids_last.list" 2>/dev/null || true
-		cp "\$OTU_MEMBERS_BLASTDIAG" ${ongoingStateDir}/${round_barcode}/otu_members_blastdiag.tsv 2>/dev/null || true
-	cp "\$OTU_SIZES_BLASTDIAG" ${ongoingStateDir}/${round_barcode}/otu_sizes_blastdiag.tsv 2>/dev/null || true
-	cp "\$OTU_MEMBERS_BLASTDIAG_STATS" ${ongoingStateDir}/${round_barcode}/otu_members_blastdiag_stats.tsv 2>/dev/null || true
-		cp "\$OTU_MEMBERS_BLASTDIAG" "\${STATE_DIR}/${barcode}_otu_members_blastdiag.tsv" 2>/dev/null || true
-		cp "\$OTU_SIZES_BLASTDIAG" "\${STATE_DIR}/${barcode}_otu_sizes_blastdiag.tsv" 2>/dev/null || true
-		cp "\$OTU_MEMBERS_BLASTDIAG_STATS" "\${STATE_DIR}/${barcode}_otu_members_blastdiag_stats_last.tsv" 2>/dev/null || true
+		copy_soft "\$BLAST_FILTER_STATS" "\$ROUND_DIR/${barcode}_blast_filter_stats.tsv"
+		copy_soft "\$BLAST_FILTER_DROPPED_IDS" "\$ROUND_DIR/${barcode}_blast_filter_dropped_read_ids.list"
+		copy_soft "\$BLAST_FILTER_DROPPED_IDS" "\${STATE_DIR}/${barcode}_blast_filter_dropped_read_ids_last.list"
+		copy_soft "\$OTU_MEMBERS_BLASTDIAG" "\$ROUND_DIR/otu_members_blastdiag.tsv"
+	copy_soft "\$OTU_SIZES_BLASTDIAG" "\$ROUND_DIR/otu_sizes_blastdiag.tsv"
+	copy_soft "\$OTU_MEMBERS_BLASTDIAG_STATS" "\$ROUND_DIR/otu_members_blastdiag_stats.tsv"
+		copy_soft "\$OTU_MEMBERS_BLASTDIAG" "\${STATE_DIR}/${barcode}_otu_members_blastdiag.tsv"
+		copy_soft "\$OTU_SIZES_BLASTDIAG" "\${STATE_DIR}/${barcode}_otu_sizes_blastdiag.tsv"
+		copy_soft "\$OTU_MEMBERS_BLASTDIAG_STATS" "\${STATE_DIR}/${barcode}_otu_members_blastdiag_stats_last.tsv"
 		"""
   }
 
@@ -3589,7 +3717,6 @@ report_blast_inputs = ChannelUtils.strictRoundJoin(report_blast, hac_read_contro
 // ============================================================
 process _reporting_blast_pretax {
   maxForks maxForksReportingVal
-//  publishDir "${params.outdir}/ongoing/", mode: 'copy', overwrite: true
   input:
     tuple val(barcode), val(round_barcode), file(round_sup_sam), file(round_sup_tsv), file(blast_sup_fastq), file(blast_read), file(blast_report_otu), file(blast_report_noadapter), file(blast_filter_stats) from report_blast_inputs
   output:
@@ -3600,13 +3727,18 @@ process _reporting_blast_pretax {
     script:
 
 		"""
-		set -euo pipefail
-		shopt -s nullglob
-		export LC_ALL=C
-		RESTART_TOKEN="${restartTokenForCache}"
-		# Define report header unconditionally (safe under `set -u`).
-		BLAST_HEADER='read_id	barcode_by_homology	basecalling_model	sample	hit_id	taxid	aln_length	perc_id	otu_id	otu_taxid	otu_kingdom	otu_phylum	otu_class	otu_order	otu_family	otu_genus	otu_species'
-		DORADO_SUMMARY_HEADER='input_filename\tbatch_id\tparent_read_id\tread_id\trun_id\tchannel\tmux\tminknow_events\tstart_time\tduration\tpasses_filtering\ttemplate_start\tnum_events_template\ttemplate_duration\tsequence_length_template\tmean_qscore_template\tpore_type\texperiment_id\tsample_id\tend_reason\n'
+			set -euo pipefail
+			shopt -s nullglob
+			export LC_ALL=C
+			RESTART_TOKEN="${restartTokenForCache}"
+			ROUND_FAILED_FILE="${ongoingStateDir}/${round_barcode}/ROUND_FAILED.txt"
+			ROUND_FAILED=0
+			if [ -f "\$ROUND_FAILED_FILE" ]; then
+				ROUND_FAILED=1
+			fi
+			# Define report header unconditionally (safe under `set -u`).
+			BLAST_HEADER='read_id	barcode_by_homology	basecalling_model	sample	hit_id	taxid	aln_length	perc_id	otu_id	otu_taxid	otu_kingdom	otu_phylum	otu_class	otu_order	otu_family	otu_genus	otu_species'
+			DORADO_SUMMARY_HEADER='input_filename\tbatch_id\tparent_read_id\tread_id\trun_id\tchannel\tmux\tminknow_events\tstart_time\tduration\tpasses_filtering\ttemplate_start\tnum_events_template\ttemplate_duration\tsequence_length_template\tmean_qscore_template\tpore_type\texperiment_id\tsample_id\tend_reason\n'
 	
 		# Helper: persist per-round SUP summary to rolling state
 		persist_sup_tsv() {
@@ -3623,7 +3755,7 @@ process _reporting_blast_pretax {
 
 		# Helper: run noadapter blast reporting when a noadapter report exists
 		run_noadapter_report() {
-			if [ -f ${blast_report_noadapter} ] && awk 'NR>1{exit 0} END{exit 1}' ${blast_report_noadapter}; then
+			if [ -f ${blast_report_noadapter} ] && awk 'NF{found=1; exit} END{exit(found ? 0 : 1)}' ${blast_report_noadapter}; then
 				cp ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt ${barcode}_noadapter_read_info_rpt.txt
 				export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
 				export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
@@ -3639,24 +3771,49 @@ process _reporting_blast_pretax {
 			if [ ! -s ${barcode}_round_sup.tsv ]; then
 				printf "%b" "\$DORADO_SUMMARY_HEADER" > ${barcode}_round_sup.tsv
 			fi
-			persist_sup_tsv ${barcode}_round_sup.tsv
-			_rpt_state="${ongoingStateDir}/_state/${barcode}_read_info_rpt.txt"
-			_rpt_round="${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt"
-			[ -f "\$_rpt_round" ] || cp "\$_rpt_state" "\$_rpt_round" 2>/dev/null || : > "\$_rpt_round"
-			export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
-			export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
-			perl ${baseDir}/bin/reporting_blast_otu.pl ${barcode}_round_sup.tsv ${blast_read} ${blast_report_otu} "\$_rpt_round" ${barcode}
-			# Persist read info for downstream qscore/consensus tracking.
-			# _state/ accumulation is handled solely by append_reports.pl; do NOT cp -f
-			# here or it overwrites historical data, breaking cumulative read counts.
-			cp -f ${barcode}_read_info_rpt.txt "\$_rpt_round" 2>/dev/null || true
-			if [ ! -f ${barcode}_blast_otu_pretax_rpt.txt ]; then
-				printf '%s\n' "\$BLAST_HEADER" > ${barcode}_blast_otu_pretax_rpt.txt
+				persist_sup_tsv ${barcode}_round_sup.tsv
+				_rpt_state="${ongoingStateDir}/_state/${barcode}_read_info_rpt.txt"
+				_rpt_round="${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt"
+				[ -f "\$_rpt_round" ] || cp "\$_rpt_state" "\$_rpt_round" 2>/dev/null || : > "\$_rpt_round"
+				export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
+				export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
+				if ! perl ${baseDir}/bin/reporting_blast_otu.pl ${barcode}_round_sup.tsv ${blast_read} ${blast_report_otu} "\$_rpt_round" ${barcode}; then
+					if [ "\$ROUND_FAILED" -eq 1 ]; then
+						cp "${failedRoundPlaceholderAssets.blastOtuPretaxRpt}" ${barcode}_blast_otu_pretax_rpt.txt
+						cp "${failedRoundPlaceholderAssets.readInfoRpt}" ${barcode}_read_info_rpt.txt
+						cp "${failedRoundPlaceholderAssets.blastOtuNoadapterRpt}" ${barcode}_blast_otu_noadapter_rpt.txt
+					else
+						exit 1
+					fi
+				fi
+				if [ ! -f ${barcode}_blast_otu_pretax_rpt.txt ] || [ ! -f ${barcode}_read_info_rpt.txt ]; then
+					if [ "\$ROUND_FAILED" -eq 1 ]; then
+						cp "${failedRoundPlaceholderAssets.blastOtuPretaxRpt}" ${barcode}_blast_otu_pretax_rpt.txt
+						cp "${failedRoundPlaceholderAssets.readInfoRpt}" ${barcode}_read_info_rpt.txt
+					else
+						echo "ERROR: BLAST reporting outputs are missing for round ${round_barcode}" 1>&2
+						exit 1
+					fi
+				fi
+				# Persist read info for downstream qscore/consensus tracking.
+				# _state/ accumulation is handled solely by append_reports.pl; do NOT cp -f
+				# here or it overwrites historical data, breaking cumulative read counts.
+				cp -f ${barcode}_read_info_rpt.txt "\$_rpt_round" 2>/dev/null || true
+				if [ ! -f ${barcode}_blast_otu_pretax_rpt.txt ]; then
+					printf '%s\n' "\$BLAST_HEADER" > ${barcode}_blast_otu_pretax_rpt.txt
+				fi
+				run_noadapter_report
+				if [ ! -f ${barcode}_blast_otu_noadapter_rpt.txt ]; then
+					if [ "\$ROUND_FAILED" -eq 1 ]; then
+						cp "${failedRoundPlaceholderAssets.blastOtuNoadapterRpt}" ${barcode}_blast_otu_noadapter_rpt.txt
+					else
+						echo "ERROR: BLAST noadapter report output is missing for round ${round_barcode}" 1>&2
+						exit 1
+					fi
 			fi
-			run_noadapter_report
-		
-		# ---- Update rolling best per-read model/quality (sup > hac > fast) ----
-		READ_INFO_SRC="${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt"
+
+			# ---- Update rolling best per-read model/quality (sup > hac > fast) ----
+			READ_INFO_SRC="${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt"
 		BEST_INFO="${ongoingStateDir}/_state/read_info_best.tsv"
 		ROLLING_QS="${ongoingStateDir}/_state/read_qscore_rolling.tsv"
 		TMP_BEST="read_info_best_round.tsv"
@@ -3727,10 +3884,8 @@ process _reporting_blast_pretax {
 				fi
 			fi
 		fi
-		
-		
-		
-	"""	
+
+	"""
 }
 
 consensus_inputs = ChannelUtils.strictRoundJoin(fastq_qced_consensus, blast2consensus)
@@ -3762,12 +3917,11 @@ process consensus {
 	    db_dir = "/tmp/"
 	    taxdb_dir = "/tmp/"
 	}
+		def consensusRscriptBin = params.rscript_bin.toString().trim()
 		// Per-target DB paths are now computed in the bash loop from params.blast_db_specs
 		
 		taxdb_dir = taxdb_dir + params.blast_taxdb
 		// taxonkit DB path removed; TaxonKit will use its default DB (or external env config) if invoked.
-
-    
 
     """
 	set -euo pipefail
@@ -3775,6 +3929,7 @@ process consensus {
 	export LC_ALL=C
 	RESTART_TOKEN="${restartTokenForCache}"
 	THREADS=${task.cpus}
+		export RTBIOSCAN_RSCRIPT="${consensusRscriptBin ?: 'Rscript'}"
 		export BLASTDB=${taxdb_dir}
 		STATE_DIR="${ongoingStateDir}/_state"
 		ASSIGNED_READ_IDS_EVER_STATE="\${STATE_DIR}/${barcode}_assigned_read_ids_ever.list"
@@ -3977,17 +4132,31 @@ process consensus {
 		if [ "\$_CONS_HAS_READS" -eq 1 ] || [ "\$_CONS_HAS_CACHE" -eq 1 ]; then
 			# Consensus script: pass clustering identity so vsearch clustering is configurable.
 			RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${replicateModeCanonical}" \
+			RTBIOSCAN_TARGET_TOKENS="${params.targets}" \
+			RTBIOSCAN_TARGET_TAXA="${params.target_taxa}" \
 			RTBIOSCAN_TRACK_ACTIVE_UNITS="${sampleInfoDir}/track_active_units.txt" \
+			RTBIOSCAN_TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv" \
 			CONSENSUS_CACHE_STATE_ROOT="\$CONSENSUS_CACHE_STATE_ROOT" \
 			CONSENSUS_CACHE_SYNC_SCRIPT="\$CONSENSUS_CACHE_SYNC_SCRIPT" \
 			CONSENSUS_ZERO_EMIT_POLICY="${consensusZeroEmitPolicyCanonical}" \
 			CONSENSUS_ID_MISMATCH_POLICY="${consensusIdMismatchPolicyCanonical}" \
 			CONSENSUS_CACHE_BELOW_MIN_POLICY="${consensusCacheBelowMinPolicyCanonical}" \
+			CONSENSUS_SELECTOR_RANKING="${consensusSelectorRankingCanonical}" \
+			CONSENSUS_ENFORCE_MAX_READS="${consensusEnforceMaxReads ? 1 : 0}" \
 			CONSENSUS_LOCK_ENABLED="${params.otu_consolidation_lock ? 1 : 0}" \
+			CONSENSUS_OTU_CONSOLIDATION_MODE="${otuConsolidationModeCanonical}" \
 			CONSENSUS_LOCK_RATIO="${otuLockRatioStr}" \
 			CONSENSUS_LOCK_MIN_CONS_READS="${otuLockMinConsReadsStr}" \
 			CONSENSUS_LOCK_MIN_STABLE_ROUNDS="${otuLockMinStableRoundsStr}" \
 			CONSENSUS_LOCK_REVALIDATE_EVERY_ROUNDS="${otuLockRevalidateEveryRoundsStr}" \
+			CONSENSUS_SIG_MIN_CLUSTER_READS="${otuSigMinClusterReadsStr}" \
+			CONSENSUS_SIG_MIN_CLUSTER_QSCORE="${otuSigMinClusterQscoreStr}" \
+			CONSENSUS_SIG_RULE="${otuSigRuleCanonical}" \
+			CONSENSUS_SIG_MIN_POOL_FRACTION="${otuSigMinPoolFractionStr}" \
+			CONSENSUS_SIG_MIN_TOP_FRACTION="${otuSigMinTopFractionStr}" \
+			CONSENSUS_SIG_TOP2_MIN_RATIO="${otuSigTop2MinRatioStr}" \
+			CONSENSUS_SIG_TOP2_MIN_DELTA_READS="${otuSigTop2MinDeltaReadsStr}" \
+			CONSENSUS_SIG_MIN_STABLE_ROUNDS="${otuSigMinStableRoundsStr}" \
 			CONSENSUS_LOCK_KEYS_PREV="${ongoingStateDir}/_state/otu_consolidated_keys.tsv" \
 			CONSENSUS_LOCK_RESET_KEYS="${params.otu_lock_reset_keys}" \
 			CONSENSUS_PRUNE_FROZEN_POLICY="${otuPruneFrozenPolicyCanonical}" \
@@ -4038,7 +4207,6 @@ process consensus {
 		# -- §4: Consensus BLAST annotation (per-target, parallel) --
 		_t_consensus_annotate_start=\$(timing_now_ms)
 
-		#Blast and consensus annotation:
 		_p_targets="${params.targets}"
 		IFS='|' read -ra _TARGETS   <<< "\$_p_targets"
 		_p_blast_db_specs="${params.blast_db_specs}"
@@ -4290,16 +4458,14 @@ process consensus {
 							printf '%s\n' "\$_TAXDB_SIG" > "\$TAXONKIT_CACHE_META" 2>/dev/null || true
 						fi
 							fi
-						# consensus provenance failfast start
-						if ! perl ${baseDir}/bin/emit_consensus_round_provenance.pl \
+										if ! perl ${baseDir}/bin/emit_consensus_round_provenance.pl \
 							--consensus-dir Consensus \
 							--round-barcode "${round_barcode}" \
 							--out consensus_round_provenance.tsv; then
 							echo "ERROR: failed to emit consensus round provenance" 1>&2
 							exit 1
 						fi
-						# consensus provenance failfast end
-					# Generate recovery list now: OriginalReads are removed by the collect step when keep=1.
+									# Generate recovery list now: OriginalReads are removed by the collect step when keep=1.
 					# -- §6: Consensus state update (assigned OTU keys, protected reads) --
 					RECOVERY_IDS="${round_barcode}_consensus_assigned_reads.list"
 					: > "\$RECOVERY_IDS"
@@ -4861,14 +5027,18 @@ process _reporting_consensus_tax {
     script:
 
 		"""
-		set -euo pipefail
-		shopt -s nullglob
-		export LC_ALL=C
-		RESTART_TOKEN="${restartTokenForCache}"
-		
-		#	perl ${baseDir}/bin/reporting_blast_consensus.pl ${blast_read} ${blast_report_consensus} ${barcode} $baseDir/${params.metazoa_spc_basics} $baseDir/${params.viridiplantae_spc_basics} $baseDir/${params.local_metazoa_gns} $baseDir/${params.local_viridiplantae_gns}
-			CONS_IDS_ROUND="${ongoingStateDir}/${round_barcode}/${barcode}_consensus_consolidated_ids.txt"
-			CONS_IDS_STATE="${ongoingStateDir}/_state/${barcode}_consensus_consolidated_ids.txt"
+			set -euo pipefail
+			shopt -s nullglob
+			export LC_ALL=C
+			RESTART_TOKEN="${restartTokenForCache}"
+			ROUND_FAILED_FILE="${ongoingStateDir}/${round_barcode}/ROUND_FAILED.txt"
+			ROUND_FAILED=0
+			if [ -f "\$ROUND_FAILED_FILE" ]; then
+				ROUND_FAILED=1
+			fi
+
+				CONS_IDS_ROUND="${ongoingStateDir}/${round_barcode}/${barcode}_consensus_consolidated_ids.txt"
+				CONS_IDS_STATE="${ongoingStateDir}/_state/${barcode}_consensus_consolidated_ids.txt"
 			CONS_IDS_CANON="${ongoingStateDir}/Consensus/consolidated_consensus_ids.txt"
 			CONS_IDS=""
 			if [ -s "\$CONS_IDS_ROUND" ]; then
@@ -4883,30 +5053,68 @@ process _reporting_consensus_tax {
 				cp "\$CONS_IDS_CANON" "\$CONS_IDS_ROUND" 2>/dev/null || true
 				cp "\$CONS_IDS_CANON" "\$CONS_IDS_STATE" 2>/dev/null || true
 			fi
-			if [ -n "\$CONS_IDS" ]; then
-				perl ${baseDir}/bin/reporting_blast_consensus.pl ${blast_read} ${blast_report_consensus} ${barcode} "\$CONS_IDS"
-			else
-				perl ${baseDir}/bin/reporting_blast_consensus.pl ${blast_read} ${blast_report_consensus} ${barcode}
-			fi
-			if [ -s "${consensus_round_provenance}" ]; then
-				if [ "${consensus_round_provenance}" != "consensus_round_provenance.tsv" ]; then
-					cp "${consensus_round_provenance}" consensus_round_provenance.tsv
+				if [ -n "\$CONS_IDS" ]; then
+					export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
+					export RTBIOSCAN_TARGET_TAXA="${params.target_taxa}"
+					if ! perl ${baseDir}/bin/reporting_blast_consensus.pl ${blast_read} ${blast_report_consensus} ${barcode} "\$CONS_IDS"; then
+						if [ "\$ROUND_FAILED" -eq 1 ]; then
+							cp "${failedRoundPlaceholderAssets.blastConsensusTaxRpt}" ${barcode}_blast_consensus_tax_rpt.txt
+						else
+							exit 1
+						fi
+					fi
+				else
+					export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
+					export RTBIOSCAN_TARGET_TAXA="${params.target_taxa}"
+					if ! perl ${baseDir}/bin/reporting_blast_consensus.pl ${blast_read} ${blast_report_consensus} ${barcode}; then
+						if [ "\$ROUND_FAILED" -eq 1 ]; then
+							cp "${failedRoundPlaceholderAssets.blastConsensusTaxRpt}" ${barcode}_blast_consensus_tax_rpt.txt
+						else
+							exit 1
+						fi
+					fi
 				fi
-			else
-				printf 'round_barcode\tsample\totu_key\tconsensus_id\treads_used_round\n' > consensus_round_provenance.tsv
-			fi
+				if [ ! -f ${barcode}_blast_consensus_tax_rpt.txt ]; then
+					if [ "\$ROUND_FAILED" -eq 1 ]; then
+						cp "${failedRoundPlaceholderAssets.blastConsensusTaxRpt}" ${barcode}_blast_consensus_tax_rpt.txt
+					else
+						echo "ERROR: consensus tax report output is missing for round ${round_barcode}" 1>&2
+						exit 1
+					fi
+				fi
+				if [ -s "${consensus_round_provenance}" ]; then
+					if [ "${consensus_round_provenance}" != "consensus_round_provenance.tsv" ]; then
+						cp "${consensus_round_provenance}" consensus_round_provenance.tsv
+					fi
+				else
+					if [ "\$ROUND_FAILED" -eq 1 ]; then
+						cp "${failedRoundPlaceholderAssets.consensusRoundProv}" consensus_round_provenance.tsv
+					else
+						printf 'round_barcode\tsample\totu_key\tconsensus_id\treads_used_round\n' > consensus_round_provenance.tsv
+					fi
+				fi
 			# Ensure consolidated report is always refreshed per round to avoid stale carry-over.
 			if [ ! -f ${barcode}_blast_consensus_tax_consolidated_rpt.txt ]; then
 				printf 'consensus_id\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample\ttaxid\tblast_hit\taln_length\tperc_id\tconsensus_kingdom\tconsensus_phylum\tconsensus_class\tconsensus_order\tconsensus_family\tconsensus_genus\tconsensus_species\n' > ${barcode}_blast_consensus_tax_consolidated_rpt.txt
 			fi
-	if cp ${barcode}_blast_consensus_tax_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_blast_consensus_tax_rpt.txt
-	then
-		echo "Copying ${barcode}_blast_consensus_tax_rpt.txt" 1>&2
-	fi
-	cp ${barcode}_blast_consensus_tax_consolidated_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_blast_consensus_tax_consolidated_rpt.txt 2>/dev/null || true
-	cp ${barcode}_blast_consensus_tax_consolidated_rpt.txt ${ongoingStateDir}/_state/${barcode}_blast_consensus_tax_consolidated_rpt.txt 2>/dev/null || true
+	cp ${barcode}_blast_consensus_tax_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_blast_consensus_tax_rpt.txt \
+		|| { echo "ERROR: failed to persist ${barcode}_blast_consensus_tax_rpt.txt to round dir" 1>&2; exit 1; }
+	cp ${barcode}_blast_consensus_tax_consolidated_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_blast_consensus_tax_consolidated_rpt.txt \
+		|| { echo "ERROR: failed to persist consolidated consensus-tax report to round dir" 1>&2; exit 1; }
+	cp ${barcode}_blast_consensus_tax_consolidated_rpt.txt ${ongoingStateDir}/_state/${barcode}_blast_consensus_tax_consolidated_rpt.txt \
+		|| { echo "ERROR: failed to persist consolidated consensus-tax report to _state" 1>&2; exit 1; }
 		"""	
 }
+
+blst_rpt_summary = preferRealRoundRows(blst_rpt_summary, failed_blst_rpt_summary, 'blst_rpt_summary')
+cons_rpt_summary = preferRealRoundRows(cons_rpt_summary, failed_cons_rpt_summary, 'cons_rpt_summary')
+otu_def_rpt_summary = preferRealRoundRows(otu_def_rpt_summary, failed_otu_def_rpt_summary, 'otu_def_rpt_summary')
+otu_def_rpt_sidecar_summary = preferRealRoundRows(otu_def_rpt_sidecar_summary, failed_otu_def_rpt_sidecar_summary, 'otu_def_rpt_sidecar_summary')
+demult_rpt_summary = preferRealRoundRows(demult_rpt_summary, failed_demult_rpt_summary, 'demult_rpt_summary')
+demult_rpt_sidecar_summary = preferRealRoundRows(demult_rpt_sidecar_summary, failed_demult_rpt_sidecar_summary, 'demult_rpt_sidecar_summary')
+target_rpt_summary = preferRealRoundRows(target_rpt_summary, failed_target_rpt_summary, 'target_rpt_summary')
+blast_agg_ch = preferRealRoundRows(blast_agg_ch, failed_blast_agg_ch, 'blast_agg_ch')
+cons_agg_ch = preferRealRoundRows(cons_agg_ch, failed_cons_agg_ch, 'cons_agg_ch')
 
 reports_blast = ChannelUtils.strictRoundJoin(blast_agg_ch, cons_agg_ch, 'reports_blast')
 
@@ -4932,17 +5140,7 @@ process getting_run_summary {
 	input:
 	tuple val(barcode), val(round_barcode), file(blast_otu_pretax_rpt), file(read_info_rpt), file(blast_otu_noadapter_rpt), file(blast_filter_stats), file(blast_consensus_tax), file(consensus_round_provenance), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round), file(otu_def_rpt_sidecar), file(demult_rpt), file(demult_rpt_sidecar), file(on_target_rpt), file(summary), file(summary_otu), val(read_path) from getting_run_summary_with_path
     output:
-		tuple val(barcode), val(round_barcode) into complete_round_ch	
-		/*file("${barcode}_read_info_rpt.txt")
-		file("${barcode}_on_target_rpt.txt")
-		file("${barcode}_blast_otu_pretax_rpt.txt")
-		file("${barcode}_blast_consensus_tax_rpt.txt")
-			file("${barcode}_otu_tax_gns_COI_treemap.png")
-			file("${barcode}_otu_tax_gns_ITS_treemap.png")
-			file("${barcode}_consensus_tax_spc_COI_treemap.png")
-			file("${barcode}_consensus_tax_spc_ITS_treemap.png")
-		file("${barcode}_reads_per_barcode.png")
-		file("${barcode}_reads_per_sample_log.png")*/
+		tuple val(barcode), val(round_barcode) into complete_round_ch
 
 		    def demuxModeValue = params.demultiplex_mode?.toString()?.toLowerCase()
 		    def generateDemuxReports = demuxEnabledInt
@@ -5004,9 +5202,20 @@ process getting_run_summary {
 		fi
 		return 1
 	}
-	copy_plot_outputs_and_commit() {
-		local plot_sig="\$1"
-		local plot_key="\$2"
+	ensure_local_round_alias() {
+		local src="\$1"
+		local dst="\$2"
+		if [ "\$src" = "\$dst" ]; then
+			return 0
+		fi
+		if ! cp -f "\$src" "\$dst"; then
+			echo "ERROR: unable to stage local round alias: \$src -> \$dst" 1>&2
+			exit 1
+		fi
+	}
+		copy_plot_outputs_and_commit() {
+			local plot_sig="\$1"
+			local plot_key="\$2"
 		shift 2
 		local copy_ok=1
 		local src=""
@@ -5019,21 +5228,24 @@ process getting_run_summary {
 				copy_ok=0
 			fi
 		done
-		if [ "\$#" -ne 0 ]; then
-			echo "WARN: copy_plot_outputs_and_commit received an unmatched copy argument" 1>&2
-			copy_ok=0
-		fi
-		if [ "\$copy_ok" -eq 1 ]; then
-			bash ${baseDir}/bin/plot_sig.sh commit "\$plot_sig" "\$plot_key"
-			return 0
-		fi
-		echo "WARN: skipping plot signature commit because one or more plot outputs were not copied" 1>&2
-		return 1
-	}
-	run_plot_with_sig() {
-		RUN_PLOT_WITH_SIG_RSCRIPT_OK=0
-		local plot_sig="\$1"
-		local plot_key="\$2"
+			if [ "\$#" -ne 0 ]; then
+				echo "WARN: copy_plot_outputs_and_commit received an unmatched copy argument" 1>&2
+				copy_ok=0
+			fi
+			if [ "\$copy_ok" -eq 1 ]; then
+				if ! bash ${baseDir}/bin/plot_sig.sh commit "\$plot_sig" "\$plot_key"; then
+					echo "WARN: plot signature commit failed: \$plot_sig" 1>&2
+					return 1
+				fi
+				return 0
+			fi
+			echo "WARN: skipping plot signature commit because one or more plot outputs were not copied" 1>&2
+			return 1
+		}
+		run_plot_with_sig() {
+			RUN_PLOT_WITH_SIG_RSCRIPT_OK=0
+			local plot_sig="\$1"
+			local plot_key="\$2"
 		local run_msg="\$3"
 		local skip_msg="\$4"
 		local success_msg="\$5"
@@ -5045,10 +5257,11 @@ process getting_run_summary {
 		local seen_copy=0
 		local check_outputs=()
 		local rscript_items=()
-		local copy_args=()
-		local rscript_path=""
-		local rscript_args=()
-		local i=0
+			local copy_args=()
+			local rscript_path=""
+			local rscript_args=()
+			local plot_check_rc=0
+			local i=0
 		while [ "\$#" -gt 0 ]; do
 			token="\$1"
 			shift
@@ -5154,21 +5367,31 @@ process getting_run_summary {
 			echo "ERROR: run_plot_with_sig odd number of --copy arguments" 1>&2
 			exit 1
 		fi
-		if bash ${baseDir}/bin/plot_sig.sh check "\$plot_sig" "\$plot_key" "\${check_outputs[@]}"; then
-			echo "\$run_msg" 1>&2
-			if Rscript "\$rscript_path" "\${rscript_args[@]}"; then
-				RUN_PLOT_WITH_SIG_RSCRIPT_OK=1
-				if copy_plot_outputs_and_commit "\$plot_sig" "\$plot_key" "\${copy_args[@]}"; then
-					if [ -n "\$success_msg" ]; then
-						echo "\$success_msg" 1>&2
+				if bash ${baseDir}/bin/plot_sig.sh check "\$plot_sig" "\$plot_key" "\${check_outputs[@]}"; then
+					echo "\$run_msg" 1>&2
+					if Rscript "\$rscript_path" "\${rscript_args[@]}"; then
+						RUN_PLOT_WITH_SIG_RSCRIPT_OK=1
+					if copy_plot_outputs_and_commit "\$plot_sig" "\$plot_key" "\${copy_args[@]}"; then
+						if [ -n "\$success_msg" ]; then
+							echo "\$success_msg" 1>&2
+						fi
+					else
+						return 1
+					fi
+					else
+						return 1
+					fi
+				else
+					plot_check_rc=\$?
+					if [ "\$plot_check_rc" -eq 1 ]; then
+						echo "\$skip_msg" 1>&2
+					else
+						echo "ERROR: plot_sig.sh check failed for \$plot_sig (rc=\$plot_check_rc)" 1>&2
+						return 1
 					fi
 				fi
-			fi
-		else
-			echo "\$skip_msg" 1>&2
-		fi
-		return 0
-	}
+				return 0
+		}
 		# -- §2: Rolling report + metadata ledger update (append_reports.pl) --
 		READ_PATH="${read_path}"
 		# Use a per-state ledger inside the state dir for plotting/reporting inputs.
@@ -5177,16 +5400,24 @@ process getting_run_summary {
 		# many hours before the current run).
 		LEDGER_PATH="${ongoingStateDir}/_state/${barcode}_reads_time_rpt.txt"
 		METADATA_LEDGER="${podBaseDir}/metadata/${barcode}_reads_time_rpt.txt"
+		ROUND_DEMULT_RPT_LOCAL="${barcode}_demult_rpt.txt"
+		ROUND_DEMULT_SIDECAR_LOCAL="${barcode}_demult_rpt.contract.tsv"
+		ROUND_OTU_RPT_LOCAL="${barcode}_otu_def_rpt.txt"
+		ROUND_OTU_SIDECAR_LOCAL="${barcode}_otu_def_rpt.contract.tsv"
+		ensure_local_round_alias "${demult_rpt}" "\$ROUND_DEMULT_RPT_LOCAL"
+		ensure_local_round_alias "${demult_rpt_sidecar}" "\$ROUND_DEMULT_SIDECAR_LOCAL"
+		ensure_local_round_alias "${otu_def_rpt}" "\$ROUND_OTU_RPT_LOCAL"
+		ensure_local_round_alias "${otu_def_rpt_sidecar}" "\$ROUND_OTU_SIDECAR_LOCAL"
 			export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
 			perl ${baseDir}/bin/reporting_parser_state_preflight.pl \
 				${ongoingStateDir}/_state \
 			${barcode} \
 			full_reports \
 			"${demuxIdentityContext}" \
-			${demult_rpt} \
-			${demult_rpt_sidecar} \
-			${otu_def_rpt} \
-			${otu_def_rpt_sidecar}
+			"\$ROUND_DEMULT_RPT_LOCAL" \
+			"\$ROUND_DEMULT_SIDECAR_LOCAL" \
+			"\$ROUND_OTU_RPT_LOCAL" \
+			"\$ROUND_OTU_SIDECAR_LOCAL"
 			if [ ! -f "\$LEDGER_PATH" ]; then
 				mkdir -p "\$(dirname \"\$LEDGER_PATH\")"
 				printf "run_id\ttime\tdata\treads\n" > "\$LEDGER_PATH"
@@ -5198,32 +5429,191 @@ process getting_run_summary {
 				fi
 			PLOT_SIG_DIR="${ongoingStateDir}/_state/plot_sigs"
 			mkdir -p "\$PLOT_SIG_DIR"
+			marker_file_token() {
+				case "\$1" in
+					COI) printf 'COI' ;;
+					ITS2) printf 'ITS' ;;
+					*)
+						printf '%s' "\$1" | perl -ne '\$_ = uc(\$_); s/[^A-Z0-9._-]/_/g; s/_{2,}/_/g; s/^_+//; s/_+\\z//; print \$_'
+						;;
+				esac
+			}
+			marker_slug() {
+					printf '%s' "\$1" | perl -ne '\$_ = lc(\$_); s/[^a-z0-9._-]/_/g; s/_{2,}/_/g; s/^_+//; s/_+\\z//; print \$_'
+			}
 			
-			# Append rolling summaries. Optional species/genus pre-classification is used (when provided)
-			# to restrict which taxa are shown in tables/plots. `min_reads_sample` controls the display threshold.
-				append_rc=0
-				set +e
-					perl ${baseDir}/bin/append_reports.pl ${round_barcode} ${ongoingStateDir}/_state/ "\$READ_PATH" ${barcode} "\$LEDGER_PATH" ${params.min_reads_sample} "${metazoaBasicsArg}" "${viridiplantaeBasicsArg}" "${localMetazoaGnsArg}" "${localViridiplantaeGnsArg}" "${ongoingStateDir}/_state/run_started_utc.txt"
-				append_rc=\$?
-				set -e
-				# ENOSPC ("No space left on device") can manifest as exit 28; treat it as non-fatal so
-				# snapshot/backup steps can still run and preserve already-computed results.
-					if [ "\$append_rc" -ne 0 ]; then
-						if [ "\$append_rc" -eq 28 ]; then
-							echo "WARN: append_reports.pl failed with exit 28 (likely ENOSPC). Continuing." 1>&2
-						else
+				# Append rolling summaries. Optional species/genus pre-classification is used (when provided)
+				# to restrict which taxa are shown in tables/plots. `min_reads_sample` controls the display threshold.
+					append_rc=0
+					set +e
+						export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
+						export RTBIOSCAN_TARGET_TAXA="${params.target_taxa}"
+						perl ${baseDir}/bin/append_reports.pl ${round_barcode} ${ongoingStateDir}/_state/ "\$READ_PATH" ${barcode} "\$LEDGER_PATH" ${params.min_reads_sample} "${metazoaBasicsArg}" "${viridiplantaeBasicsArg}" "${localMetazoaGnsArg}" "${localViridiplantaeGnsArg}" "${ongoingStateDir}/_state/run_started_utc.txt"
+					append_rc=\$?
+					set -e
+						if [ "\$append_rc" -ne 0 ]; then
 							echo "ERROR: append_reports.pl failed with exit \$append_rc" 1>&2
 							exit "\$append_rc"
 						fi
-					fi
 
 				# Update the persistent metadata ledger for external consumption.
 				mkdir -p "\$(dirname \"\$METADATA_LEDGER\")"
 				cp -f "\$LEDGER_PATH" "\$METADATA_LEDGER" 2>/dev/null || true
-		# -- §3: R plot generation (time-series, treemaps, circle trees) --
-		_plot_key="Time_reads|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_reads_time_rpt.txt\")"
-		_plot_sig="\$PLOT_SIG_DIR/Time_reads.sig"
-		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+		ROUND_DIR="${ongoingStateDir}/${round_barcode}"
+		STATE_DIR="${ongoingStateDir}/_state"
+		ROUND_REPORT_JSON="\$ROUND_DIR/round_report.json"
+		ROUND_REPORT_JSON_STAGED="${barcode}_round_report_pre_frozen.json"
+		ROUND_LIVE_STAGE="\$ROUND_DIR/report_live_stage"
+		REPORT_FIG_LIST="${baseDir}/assets/report/figures.tsv"
+		REPORT_SAMPLE_FIG_LIST="${baseDir}/assets/report/figures_sample.tsv"
+		REPORT_LIVE_ASSET_DIR="\$ROUND_LIVE_STAGE/report_assets"
+		REPORT_SAMPLE_STAGE_DIR="\$REPORT_LIVE_ASSET_DIR/samples"
+		REPORT_FIG_EXISTS_DIR="\$REPORT_LIVE_ASSET_DIR"
+		REPORT_FIG_URL_PREFIX="runs/${run_name}/report_assets/live_round"
+		REPORT_SAMPLE_FIG_URL_PREFIX="runs/${run_name}/report_assets/live_round/samples"
+		ROUND_INDEX_FILE="\$STATE_DIR/round_index.tsv"
+		ACTIVE_PRUNE_SIZE_STREAK_OUT="\$ROUND_DIR/active_prune_candidates_size_streak.list"
+		ACTIVE_PRUNE_SIZE_CANDIDATES_OUT="\$ROUND_DIR/active_prune_candidates_size_candidates.list"
+		ACTIVE_PRUNE_ALL_OUT="\$ROUND_DIR/active_prune_candidates_all.list"
+		ACTIVE_PRUNE_COUNTS_OUT="\$ROUND_DIR/active_prune_candidates_counts.tsv"
+		OTU_SIZE_STREAK_IDS_LAST="\$STATE_DIR/${barcode}_otu_size_streak_prune_ids_last.txt"
+		mkdir -p "\$ROUND_DIR" "\$STATE_DIR" "${params.outdir}"
+		rm -rf "\$ROUND_LIVE_STAGE"
+		mkdir -p "\$REPORT_SAMPLE_STAGE_DIR"
+		ROUND_TIMESTAMP_UTC="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		set +e
+		perl ${baseDir}/bin/active_prune_candidates.pl \
+			--otu-members-round "${otu_members_round}" \
+			--otu-sizes-round "${otu_sizes_round}" \
+			--size-streak-ids "\$OTU_SIZE_STREAK_IDS_LAST" \
+			--eligible-counts "\$ROUND_DIR/${barcode}_eligible_pool_counts.tsv" \
+			--otu-blast-min-members ${otuBlastMinMembersStr} \
+			--otu-blast-filter-mode "${otuBlastFilterModeCanonical}" \
+			--otu-blast-filter-skip-rounds "${otuBlastFilterSkipRoundsCanonical}" \
+			--force-use-filtered "${otuBlastForceUseFiltered ? 1 : 0}" \
+			--round-index-file "\$ROUND_INDEX_FILE" \
+			--round-barcode "${round_barcode}" \
+			--effective-mode-helper "${baseDir}/bin/otu_blast_effective_mode.sh" \
+			--out-size-streak "\$ACTIVE_PRUNE_SIZE_STREAK_OUT" \
+			--out-size-candidates "\$ACTIVE_PRUNE_SIZE_CANDIDATES_OUT" \
+			--out-all "\$ACTIVE_PRUNE_ALL_OUT" \
+			--out-counts "\$ACTIVE_PRUNE_COUNTS_OUT"
+		active_prune_rc=\$?
+		if [ "\$active_prune_rc" -ne 0 ]; then
+			echo "WARN: active_prune_candidates.pl failed (rc=\$active_prune_rc)" 1>&2
+		fi
+		set -e
+		REPORT_SAMPLE_ROSTER_ARG=""
+		REPORT_TRACK_IDENTITY_ARG=""
+		REPORT_IDENTITY_MODE_ARG=""
+		if [ "${replicateModeCanonical}" = "track" ]; then
+			_TRACK_ROSTER="${params.outdir}/sample_info/${run_name}/track_roster.tsv"
+			_TRACK_IDENTITY="${params.outdir}/sample_info/${run_name}/track_identity.tsv"
+			if [ ! -r "\$_TRACK_ROSTER" ]; then
+				echo "ERROR: identity-mode=track requires track_roster.tsv but it is missing or unreadable: \$_TRACK_ROSTER" >&2
+				exit 1
+			fi
+			if [ ! -r "\$_TRACK_IDENTITY" ]; then
+				echo "ERROR: identity-mode=track requires track_identity.tsv but it is missing or unreadable: \$_TRACK_IDENTITY" >&2
+				exit 1
+			fi
+			REPORT_SAMPLE_ROSTER_ARG="--sample-roster \$_TRACK_ROSTER"
+			REPORT_TRACK_IDENTITY_ARG="--track-identity \$_TRACK_IDENTITY"
+			REPORT_IDENTITY_MODE_ARG="--identity-mode track"
+		elif [ -s "${params.outdir}/sample_info/${run_name}/samples.txt" ]; then
+			REPORT_SAMPLE_ROSTER_ARG="--sample-roster ${params.outdir}/sample_info/${run_name}/samples.txt"
+			REPORT_IDENTITY_MODE_ARG="--identity-mode collapse"
+		fi
+		_CONS_IDS_ARG=""
+		if [ -s "\$ROUND_DIR/${barcode}_consensus_consolidated_ids.txt" ]; then
+			_CONS_IDS_ARG="--consensus-consolidated-ids \$ROUND_DIR/${barcode}_consensus_consolidated_ids.txt"
+		fi
+		_ROUND_FAILED_ARG=""
+		if [ -s "\$ROUND_DIR/ROUND_FAILED.txt" ]; then
+			_ROUND_FAILED_ARG="--round-failed-file \$ROUND_DIR/ROUND_FAILED.txt"
+		fi
+		render_round_report_json() {
+			local out_path="\$1"
+			perl ${baseDir}/bin/report_round_json.pl \
+			--run-id "${run_name}" \
+			--state-id "${stateId}" \
+			--barcode "${barcode}" \
+			--round-barcode "${round_barcode}" \
+			--targets "${params.targets}" \
+			--target-taxa "${params.target_taxa}" \
+			--schema-version "1.6" \
+			--asset-snapshot-policy "latest_only" \
+			--timestamp-utc "\$ROUND_TIMESTAMP_UTC" \
+			--out "\$out_path" \
+			--read-info "${read_info_rpt}" \
+			--on-target "${on_target_rpt}" \
+			--demult "${demult_rpt}" \
+			--read-fate-demult "${barcode}_read_fate_demult_first_seen.tsv" \
+			--otu-def "${otu_def_rpt}" \
+			--blast-otu "${blast_otu_pretax_rpt}" \
+			--read-fate-blast "${barcode}_read_fate_blast_first_seen.tsv" \
+			--blast-unassigned-ids "\$ROUND_DIR/${barcode}_blast_unassigned_reads_round.list" \
+			--blast-otu-cumulative "${ongoingStateDir}/_state/${barcode}_blast_otu_pretax_rpt.txt" \
+			--blast-noadapter "${blast_otu_noadapter_rpt}" \
+			--otu-sizes-round "${otu_sizes_round}" \
+			--blast-consensus "${blast_consensus_tax}" \
+			--consensus-round-provenance "${consensus_round_provenance}" \
+			--spec-basics-metazoa "${metazoaBasicsArg}" \
+			--spec-basics-viridiplantae "${viridiplantaeBasicsArg}" \
+			--summary "${summary}" \
+			--summary-otu "${summary_otu}" \
+		--otu-size-streak-stats "\$ROUND_DIR/${barcode}_otu_size_streak_stats.tsv" \
+			--otu-size-streak "\$ROUND_DIR/${barcode}_otu_size_streak.tsv" \
+		--otu-size-streak-mode "${otuSizeStreakModeCanonical}" \
+		--otu-size-streak-min-rounds "${otuSizeStreakMinRoundsStr}" \
+		--otu-lock-summary "\$ROUND_DIR/${barcode}_otu_lock_summary.tsv" \
+		--active-prune-counts "\$ACTIVE_PRUNE_COUNTS_OUT" \
+			--otu-blast-filter-stats "${blast_filter_stats}" \
+			--blast-filter-dropped-ids "\$ROUND_DIR/${barcode}_blast_filter_dropped_read_ids.list" \
+			--blast-filter-mode "${otuBlastFilterModeCanonical}" \
+			--blast-id-family "${params.blast_id_family}" \
+			--blast-id-genus "${params.blast_id_genus}" \
+			--blast-id-spec "${params.blast_id_spec}" \
+			--otu-blast-min-members "${otuBlastMinMembersStr}" \
+			--otu-blast-filter-skip-rounds "${otuBlastFilterSkipRoundsCanonical}" \
+		--otu-blast-unassigned-grace-rounds "${otuBlastUnassignedGraceRoundsStr}" \
+		--round-index-file "\$ROUND_DIR/round_index.tsv" \
+			--otu-members-blastdiag-stats "\$ROUND_DIR/otu_members_blastdiag_stats.tsv" \
+				\$_ROUND_FAILED_ARG \
+				\$_CONS_IDS_ARG \
+			--blast-consensus-consolidated "${ongoingStateDir}/_state/${barcode}_blast_consensus_tax_consolidated_rpt.txt" \
+				--debug-otu-out "\$ROUND_DIR/${barcode}_otu_assignment_debug.tsv" \
+				--fig-list "\$REPORT_FIG_LIST" \
+				--fig-dir "\$REPORT_FIG_EXISTS_DIR" \
+				--fig-url-prefix "\$REPORT_FIG_URL_PREFIX" \
+				--sample-fig-list "\$REPORT_SAMPLE_FIG_LIST" \
+				\$REPORT_SAMPLE_ROSTER_ARG \
+				\$REPORT_TRACK_IDENTITY_ARG \
+				--sample-fig-dir "\$REPORT_SAMPLE_STAGE_DIR" \
+				--sample-fig-url-prefix "\$REPORT_SAMPLE_FIG_URL_PREFIX" \
+				\$REPORT_IDENTITY_MODE_ARG
+		}
+			set +e
+			render_round_report_json "\$ROUND_REPORT_JSON_STAGED"
+			staged_json_rc=\$?
+			if [ "\$staged_json_rc" -ne 0 ]; then
+				echo "ERROR: staged report_round_json.pl failed (rc=\$staged_json_rc)" 1>&2
+				exit "\$staged_json_rc"
+			fi
+			set -e
+			if [ ! -s "\$ROUND_REPORT_JSON_STAGED" ]; then
+				echo "ERROR: staged report_round_json.pl did not produce output: \$ROUND_REPORT_JSON_STAGED" 1>&2
+				exit 1
+			fi
+			python3 ${baseDir}/bin/extract_frozen_tax_time.py \
+				--json "\$ROUND_REPORT_JSON_STAGED" \
+				--run-id "${barcode}" \
+				--out "${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt" || true
+			# -- §3+4: R plot generation — ALL PARALLEL --
+			_required_plot_pids=()
+			_plot_key="Time_reads|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_reads_time_rpt.txt\")"
+			_plot_sig="\$PLOT_SIG_DIR/Time_reads.sig"
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
 			"INFO: running plot Time_reads.R" \
 			"INFO: skipping plot Time_reads.R (signature unchanged)" \
 			"Creating production Vs time plot" \
@@ -5231,13 +5621,14 @@ process getting_run_summary {
 			"${ongoingStateDir}/_state/${barcode}_reads_time.png" \
 			"${ongoingStateDir}/_state/${barcode}_reads_time.pdf" \
 			--rscript \
-			"${baseDir}/bin/Time_reads.R" \
-			"${ongoingStateDir}/_state/${barcode}_reads_time_rpt.txt" \
-			--copy \
-			"${barcode}_reads_time.png" "${ongoingStateDir}/_state/${barcode}_reads_time.png" \
-			"${barcode}_reads_time.pdf" "${ongoingStateDir}/_state/${barcode}_reads_time.pdf"
-	if [ -f ${ongoingStateDir}/_state/${barcode}_reads_cumulative_rpt.txt ];
-	then
+				"${baseDir}/bin/Time_reads.R" \
+				"${ongoingStateDir}/_state/${barcode}_reads_time_rpt.txt" \
+				--copy \
+				"${barcode}_reads_time.png" "${ongoingStateDir}/_state/${barcode}_reads_time.png" \
+				"${barcode}_reads_time.pdf" "${ongoingStateDir}/_state/${barcode}_reads_time.pdf" &
+			_required_plot_pids+=("\$!")
+		if [ -f ${ongoingStateDir}/_state/${barcode}_reads_cumulative_rpt.txt ];
+		then
 		_plot_key="Time_reads_cumulative|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_reads_cumulative_rpt.txt\")"
 		_plot_sig="\$PLOT_SIG_DIR/Time_reads_cumulative.sig"
 		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
@@ -5248,90 +5639,89 @@ process getting_run_summary {
 			"${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.png" \
 			"${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.pdf" \
 			--rscript \
-			"${baseDir}/bin/Time_reads_cumulative.R" \
-			"${ongoingStateDir}/_state/${barcode}_reads_cumulative_rpt.txt" \
-			--copy \
-			"${barcode}_reads_cumulative_log.png" "${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.png" \
-			"${barcode}_reads_cumulative_log.pdf" "${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.pdf"
-	fi
-		_plot_key="Treemap_abundance_species|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_viridiplantae_treemap_rpt.txt\")"
-		_plot_sig="\$PLOT_SIG_DIR/Treemap_abundance_species.sig"
-		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
-			"INFO: running plot Treemap_abundance_species.R" \
-			"INFO: skipping plot Treemap_abundance_species.R (signature unchanged)" \
-			"Creating otu_tax Vs time plot" \
-			--check \
-			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.png" \
-			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.png" \
-			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.pdf" \
-			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.pdf" \
-			--rscript \
-			"${baseDir}/bin/Treemap_abundance_species.R" \
-			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_metazoa_treemap_rpt.txt" \
-			"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_viridiplantae_treemap_rpt.txt" \
-			--copy \
-			"${barcode}_otu_tax_spc_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.png" \
-			"${barcode}_otu_tax_spc_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.png" \
-			"${barcode}_otu_tax_spc_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_spc_COI_treemap.pdf" \
-			"${barcode}_otu_tax_spc_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_spc_ITS_treemap.pdf"
-			_plot_key="Treemap_abundance_genus|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_viridiplantae_treemap_rpt.txt\")"
-			_plot_sig="\$PLOT_SIG_DIR/Treemap_abundance_genus.sig"
-			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
-				"INFO: running plot Treemap_abundance_genus.R" \
-				"INFO: skipping plot Treemap_abundance_genus.R (signature unchanged)" \
-				"Creating otu_tax Vs time plot" \
-				--check \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.pdf" \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.pdf" \
-				--rscript \
-				"${baseDir}/bin/Treemap_abundance_genus.R" \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_metazoa_treemap_rpt.txt" \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_viridiplantae_treemap_rpt.txt" \
+				"${baseDir}/bin/Time_reads_cumulative.R" \
+				"${ongoingStateDir}/_state/${barcode}_reads_cumulative_rpt.txt" \
 				--copy \
-				"${barcode}_otu_tax_gns_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.png" \
-				"${barcode}_otu_tax_gns_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.png" \
-				"${barcode}_otu_tax_gns_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_gns_COI_treemap.pdf" \
-				"${barcode}_otu_tax_gns_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_gns_ITS_treemap.pdf"
-			perl ${baseDir}/bin/assignments_circle_tree_prep.pl \
-				--mode otu \
-				--blast "${blast_otu_pretax_rpt}" \
-				--otu-sizes-round "${otu_sizes_round}" \
-				--marker COI \
-				--top 200 \
-				--out ${barcode}_otu_circle_tree_COI.tsv
-			_plot_key="CircleTree_otu_COI|\$(file_sig \"${barcode}_otu_circle_tree_COI.tsv\")"
-			_plot_sig="\$PLOT_SIG_DIR/CircleTree_otu_COI.sig"
-			if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" "${ongoingStateDir}/_state/${barcode}_otu_circle_tree_COI.png"; then
-				echo "INFO: running plot TreeFan_cladogram.R (OTU COI)" 1>&2
-				if Rscript ${baseDir}/bin/TreeFan_cladogram.R ${barcode}_otu_circle_tree_COI.tsv ${barcode}_otu_circle_tree_COI.png "OTU Fan Cladogram (COI)" "Weight: reads in OTUs";
-				then
-					copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-						${barcode}_otu_circle_tree_COI.png ${ongoingStateDir}/_state/${barcode}_otu_circle_tree_COI.png
+				"${barcode}_reads_cumulative_log.png" "${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.png" \
+				"${barcode}_reads_cumulative_log.pdf" "${ongoingStateDir}/_state/${barcode}_reads_cumulative_log.pdf" &
+			_required_plot_pids+=("\$!")
+		fi
+		plot_markers="${params.targets}"
+		_old_ifs="\$IFS"
+		IFS='|'
+		set -f
+		for plot_marker in \$plot_markers; do
+			plot_token="\$(marker_file_token "\$plot_marker")"
+			plot_slug="\$(marker_slug "\$plot_marker")"
+			_plot_key="Treemap_abundance_species_\${plot_slug}|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_\${plot_token}_treemap_rpt.txt\")"
+			_plot_sig="\$PLOT_SIG_DIR/Treemap_abundance_species_\${plot_slug}.sig"
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+				"INFO: running plot Treemap_abundance_species.R (\${plot_marker})" \
+				"INFO: skipping plot Treemap_abundance_species.R (\${plot_marker}, signature unchanged)" \
+				"Creating otu species treemap plot" \
+				--check \
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_\${plot_token}_treemap.png" \
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_\${plot_token}_treemap.pdf" \
+				--rscript \
+					"${baseDir}/bin/Treemap_abundance_species.R" \
+					"${ongoingStateDir}/_state/${barcode}_otu_tax_spc_\${plot_token}_treemap_rpt.txt" \
+					"${barcode}_otu_tax_spc_\${plot_token}_treemap.png" \
+					--copy \
+					"${barcode}_otu_tax_spc_\${plot_token}_treemap.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_spc_\${plot_token}_treemap.png" \
+					"${barcode}_otu_tax_spc_\${plot_token}_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_spc_\${plot_token}_treemap.pdf" &
+				_required_plot_pids+=("\$!")
+				_plot_key="Treemap_abundance_genus_\${plot_slug}|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_\${plot_token}_treemap_rpt.txt\")"
+				_plot_sig="\$PLOT_SIG_DIR/Treemap_abundance_genus_\${plot_slug}.sig"
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+				"INFO: running plot Treemap_abundance_genus.R (\${plot_marker})" \
+				"INFO: skipping plot Treemap_abundance_genus.R (\${plot_marker}, signature unchanged)" \
+				"Creating otu genus treemap plot" \
+				--check \
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_\${plot_token}_treemap.png" \
+				"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_\${plot_token}_treemap.pdf" \
+				--rscript \
+					"${baseDir}/bin/Treemap_abundance_genus.R" \
+					"${ongoingStateDir}/_state/${barcode}_otu_tax_gns_\${plot_token}_treemap_rpt.txt" \
+					"${barcode}_otu_tax_gns_\${plot_token}_treemap.png" \
+					--copy \
+					"${barcode}_otu_tax_gns_\${plot_token}_treemap.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_gns_\${plot_token}_treemap.png" \
+					"${barcode}_otu_tax_gns_\${plot_token}_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_gns_\${plot_token}_treemap.pdf" &
+				_required_plot_pids+=("\$!")
+				(
+				if ! perl ${baseDir}/bin/assignments_circle_tree_prep.pl \
+					--mode otu \
+					--blast "${blast_otu_pretax_rpt}" \
+					--otu-sizes-round "${otu_sizes_round}" \
+					--marker "\$plot_marker" \
+					--top 200 \
+					--out ${barcode}_otu_circle_tree_\${plot_token}.tsv; then
+					echo "ERROR: assignments_circle_tree_prep.pl failed (OTU \$plot_marker)" >&2
+					exit 1
 				fi
-			else
-				echo "INFO: skipping plot TreeFan_cladogram.R (OTU COI, signature unchanged)" 1>&2
-			fi
-			perl ${baseDir}/bin/assignments_circle_tree_prep.pl \
-				--mode otu \
-				--blast "${blast_otu_pretax_rpt}" \
-				--otu-sizes-round "${otu_sizes_round}" \
-				--marker ITS2 \
-				--top 200 \
-				--out ${barcode}_otu_circle_tree_ITS.tsv
-			_plot_key="CircleTree_otu_ITS|\$(file_sig \"${barcode}_otu_circle_tree_ITS.tsv\")"
-			_plot_sig="\$PLOT_SIG_DIR/CircleTree_otu_ITS.sig"
-			if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" "${ongoingStateDir}/_state/${barcode}_otu_circle_tree_ITS.png"; then
-				echo "INFO: running plot TreeFan_cladogram.R (OTU ITS2)" 1>&2
-				if Rscript ${baseDir}/bin/TreeFan_cladogram.R ${barcode}_otu_circle_tree_ITS.tsv ${barcode}_otu_circle_tree_ITS.png "OTU Fan Cladogram (ITS2)" "Weight: reads in OTUs";
-				then
-					copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-						${barcode}_otu_circle_tree_ITS.png ${ongoingStateDir}/_state/${barcode}_otu_circle_tree_ITS.png
-				fi
-			else
-				echo "INFO: skipping plot TreeFan_cladogram.R (OTU ITS2, signature unchanged)" 1>&2
-			fi
+					_plot_key="CircleTree_otu_\${plot_slug}|\$(file_sig \"${barcode}_otu_circle_tree_\${plot_token}.tsv\")"
+					_plot_sig="\$PLOT_SIG_DIR/CircleTree_otu_\${plot_slug}.sig"
+					if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" "${ongoingStateDir}/_state/${barcode}_otu_circle_tree_\${plot_token}.png"; then
+						echo "INFO: running plot TreeFan_cladogram.R (OTU \${plot_marker})" 1>&2
+					Rscript ${baseDir}/bin/TreeFan_cladogram.R ${barcode}_otu_circle_tree_\${plot_token}.tsv ${barcode}_otu_circle_tree_\${plot_token}.png "OTU Fan Cladogram (\${plot_marker})" "Weight: reads in OTUs" \
+						|| { echo "ERROR: TreeFan_cladogram.R failed (OTU \${plot_marker})" 1>&2; exit 1; }
+						copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
+							${barcode}_otu_circle_tree_\${plot_token}.png ${ongoingStateDir}/_state/${barcode}_otu_circle_tree_\${plot_token}.png \
+							|| { echo "ERROR: TreeFan copy/sig failed (OTU \${plot_marker})" 1>&2; exit 1; }
+					else
+						plot_check_rc=\$?
+						if [ "\$plot_check_rc" -eq 1 ]; then
+							echo "INFO: skipping plot TreeFan_cladogram.R (OTU \${plot_marker}, signature unchanged)" 1>&2
+						else
+							echo "ERROR: plot_sig.sh check failed for TreeFan OTU \${plot_marker} (rc=\$plot_check_rc)" 1>&2
+							exit 1
+						fi
+					fi
+				) &
+				_required_plot_pids+=("\$!")
+			done
+			IFS="\$_old_ifs"
+			set +f
+			(
 			_plot_key="Time_taxonomy_otu|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_tax_time_rpt.txt\")"
 			_plot_sig="\$PLOT_SIG_DIR/Time_taxonomy_otu.sig"
 			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
@@ -5342,135 +5732,129 @@ process getting_run_summary {
 				"${ongoingStateDir}/_state/${barcode}_otu_tax_time.png" \
 				"${ongoingStateDir}/_state/${barcode}_otu_tax_time.pdf" \
 				--rscript \
-				"${baseDir}/bin/Time_taxonomy_otu.R" \
-				"${ongoingStateDir}/_state/${barcode}_otu_tax_time_rpt.txt" \
-				--copy \
-				"${barcode}_otu_tax_time.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_time.png" \
-				"${barcode}_otu_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_time.pdf"
+					"${baseDir}/bin/Time_taxonomy_otu.R" \
+					"${ongoingStateDir}/_state/${barcode}_otu_tax_time_rpt.txt" \
+					--copy \
+					"${barcode}_otu_tax_time.png" "${ongoingStateDir}/_state/${barcode}_otu_tax_time.png" \
+					"${barcode}_otu_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_otu_tax_time.pdf"
 			if [ "\$RUN_PLOT_WITH_SIG_RSCRIPT_OK" -eq 1 ]; then
 				# Optional additional plot produced by Time_taxonomy_otu.R when basecalling-model rows exist.
-				try_asset_copy ${barcode}_otu_tax_time_basecalling.png ${ongoingStateDir}/_state/${barcode}_otu_tax_time_basecalling.png || true
-			fi
-		_plot_key="Treemap_consensus_abundance_species|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_viridiplantae_treemap_rpt.txt\")"
-		_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_species.sig"
-		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
-			"INFO: running plot Treemap_consensus_abundance_species.R" \
-			"INFO: skipping plot Treemap_consensus_abundance_species.R (signature unchanged)" \
-			"Creating consensus_tax Vs time plot" \
-			--check \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.png" \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.png" \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.pdf" \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.pdf" \
-			--rscript \
-			"${baseDir}/bin/Treemap_consensus_abundance_species.R" \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_metazoa_treemap_rpt.txt" \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_viridiplantae_treemap_rpt.txt" \
-			--copy \
-			"${barcode}_consensus_tax_spc_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.png" \
-			"${barcode}_consensus_tax_spc_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.png" \
-			"${barcode}_consensus_tax_spc_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_COI_treemap.pdf" \
-			"${barcode}_consensus_tax_spc_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_ITS_treemap.pdf"
-			perl ${baseDir}/bin/assignments_circle_tree_prep.pl \
-				--mode consensus \
-				--blast "${blast_consensus_tax}" \
-				--marker COI \
-				--top 200 \
-				--out ${barcode}_consensus_circle_tree_COI.tsv
-			_plot_key="CircleTree_consensus_COI|\$(file_sig \"${barcode}_consensus_circle_tree_COI.tsv\")"
-			_plot_sig="\$PLOT_SIG_DIR/CircleTree_consensus_COI.sig"
-			if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" "${ongoingStateDir}/_state/${barcode}_consensus_circle_tree_COI.png"; then
-				echo "INFO: running plot TreeFan_cladogram.R (Consensus COI)" 1>&2
-				if Rscript ${baseDir}/bin/TreeFan_cladogram.R ${barcode}_consensus_circle_tree_COI.tsv ${barcode}_consensus_circle_tree_COI.png "Consensus Fan Cladogram (COI)" "Weight: consensus count";
-				then
-					copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-						${barcode}_consensus_circle_tree_COI.png ${ongoingStateDir}/_state/${barcode}_consensus_circle_tree_COI.png
+					try_asset_copy ${barcode}_otu_tax_time_basecalling.png ${ongoingStateDir}/_state/${barcode}_otu_tax_time_basecalling.png || true
 				fi
-			else
-				echo "INFO: skipping plot TreeFan_cladogram.R (Consensus COI, signature unchanged)" 1>&2
-			fi
-			perl ${baseDir}/bin/assignments_circle_tree_prep.pl \
-				--mode consensus \
-				--blast "${blast_consensus_tax}" \
-				--marker ITS2 \
-				--top 200 \
-				--out ${barcode}_consensus_circle_tree_ITS.tsv
-			_plot_key="CircleTree_consensus_ITS|\$(file_sig \"${barcode}_consensus_circle_tree_ITS.tsv\")"
-			_plot_sig="\$PLOT_SIG_DIR/CircleTree_consensus_ITS.sig"
-			if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" "${ongoingStateDir}/_state/${barcode}_consensus_circle_tree_ITS.png"; then
-				echo "INFO: running plot TreeFan_cladogram.R (Consensus ITS2)" 1>&2
-				if Rscript ${baseDir}/bin/TreeFan_cladogram.R ${barcode}_consensus_circle_tree_ITS.tsv ${barcode}_consensus_circle_tree_ITS.png "Consensus Fan Cladogram (ITS2)" "Weight: consensus count";
-				then
-					copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
-						${barcode}_consensus_circle_tree_ITS.png ${ongoingStateDir}/_state/${barcode}_consensus_circle_tree_ITS.png
+				) &
+			_required_plot_pids+=("\$!")
+			plot_markers="${params.targets}"
+		_old_ifs="\$IFS"
+		IFS='|'
+		set -f
+		for plot_marker in \$plot_markers; do
+			plot_token="\$(marker_file_token "\$plot_marker")"
+			plot_slug="\$(marker_slug "\$plot_marker")"
+			_plot_key="Treemap_consensus_abundance_species_\${plot_slug}|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_\${plot_token}_treemap_rpt.txt\")"
+			_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_species_\${plot_slug}.sig"
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+				"INFO: running plot Treemap_consensus_abundance_species.R (\${plot_marker})" \
+				"INFO: skipping plot Treemap_consensus_abundance_species.R (\${plot_marker}, signature unchanged)" \
+				"Creating consensus species treemap plot" \
+				--check \
+				"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_\${plot_token}_treemap.png" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_\${plot_token}_treemap.pdf" \
+				--rscript \
+					"${baseDir}/bin/Treemap_consensus_abundance_species.R" \
+					"${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_\${plot_token}_treemap_rpt.txt" \
+					"${barcode}_consensus_tax_spc_\${plot_token}_treemap.png" \
+					--copy \
+					"${barcode}_consensus_tax_spc_\${plot_token}_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_\${plot_token}_treemap.png" \
+					"${barcode}_consensus_tax_spc_\${plot_token}_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_spc_\${plot_token}_treemap.pdf" &
+				_required_plot_pids+=("\$!")
+				_plot_key="Treemap_consensus_abundance_genus_\${plot_slug}|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_\${plot_token}_treemap_rpt.txt\")"
+				_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_genus_\${plot_slug}.sig"
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+				"INFO: running plot Treemap_consensus_abundance_genus.R (\${plot_marker})" \
+				"INFO: skipping plot Treemap_consensus_abundance_genus.R (\${plot_marker}, signature unchanged)" \
+				"Creating consensus genus treemap plot" \
+				--check \
+				"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_\${plot_token}_treemap.png" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_\${plot_token}_treemap.pdf" \
+				--rscript \
+					"${baseDir}/bin/Treemap_consensus_abundance_genus.R" \
+					"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_\${plot_token}_treemap_rpt.txt" \
+					"${barcode}_consensus_tax_gns_\${plot_token}_treemap.png" \
+					--copy \
+					"${barcode}_consensus_tax_gns_\${plot_token}_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_\${plot_token}_treemap.png" \
+					"${barcode}_consensus_tax_gns_\${plot_token}_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_\${plot_token}_treemap.pdf" &
+				_required_plot_pids+=("\$!")
+				(
+				if ! perl ${baseDir}/bin/assignments_circle_tree_prep.pl \
+					--mode consensus \
+					--blast "${blast_consensus_tax}" \
+					--marker "\$plot_marker" \
+					--top 200 \
+					--out ${barcode}_consensus_circle_tree_\${plot_token}.tsv; then
+					echo "ERROR: assignments_circle_tree_prep.pl failed (consensus \$plot_marker)" >&2
+					exit 1
 				fi
-			else
-				echo "INFO: skipping plot TreeFan_cladogram.R (Consensus ITS2, signature unchanged)" 1>&2
-			fi
-			if [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_metazoa_treemap_rpt.txt ] || [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_viridiplantae_treemap_rpt.txt ]; then
-				_plot_key="Treemap_consensus_abundance_species_consolidated|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_viridiplantae_treemap_rpt.txt\")"
-				_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_species_consolidated.sig"
-			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
-				"INFO: running plot Treemap_consensus_abundance_species_consolidated.R" \
-				"INFO: skipping plot Treemap_consensus_abundance_species_consolidated.R (signature unchanged)" \
-				"Creating consolidated consensus species treemap plots" \
-				--check \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.pdf" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.pdf" \
-				--rscript \
-				"${baseDir}/bin/Treemap_consensus_abundance_species_consolidated.R" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_metazoa_treemap_rpt.txt" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_viridiplantae_treemap_rpt.txt" \
-				--copy \
-				"${barcode}_consensus_consolidated_tax_spc_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.png" \
-				"${barcode}_consensus_consolidated_tax_spc_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.png" \
-				"${barcode}_consensus_consolidated_tax_spc_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_COI_treemap.pdf" \
-				"${barcode}_consensus_consolidated_tax_spc_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_ITS_treemap.pdf"
-		fi
-		_plot_key="Treemap_consensus_abundance_genus|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_viridiplantae_treemap_rpt.txt\")"
-		_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_genus.sig"
-		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
-			"INFO: running plot Treemap_consensus_abundance_genus.R" \
-			"INFO: skipping plot Treemap_consensus_abundance_genus.R (signature unchanged)" \
-			"Creating consensus_tax Vs time plot" \
-			--check \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.png" \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.png" \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.pdf" \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.pdf" \
-			--rscript \
-			"${baseDir}/bin/Treemap_consensus_abundance_genus.R" \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_metazoa_treemap_rpt.txt" \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_viridiplantae_treemap_rpt.txt" \
-			--copy \
-			"${barcode}_consensus_tax_gns_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.png" \
-			"${barcode}_consensus_tax_gns_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.png" \
-			"${barcode}_consensus_tax_gns_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_COI_treemap.pdf" \
-			"${barcode}_consensus_tax_gns_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_gns_ITS_treemap.pdf"
-		if [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_metazoa_treemap_rpt.txt ] || [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_viridiplantae_treemap_rpt.txt ]; then
-			_plot_key="Treemap_consensus_abundance_genus_consolidated|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_metazoa_treemap_rpt.txt\")|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_viridiplantae_treemap_rpt.txt\")"
-			_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_genus_consolidated.sig"
-			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
-				"INFO: running plot Treemap_consensus_abundance_genus_consolidated.R" \
-				"INFO: skipping plot Treemap_consensus_abundance_genus_consolidated.R (signature unchanged)" \
-				"Creating consolidated consensus genus treemap plots" \
-				--check \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.png" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.pdf" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.pdf" \
-				--rscript \
-				"${baseDir}/bin/Treemap_consensus_abundance_genus_consolidated.R" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_metazoa_treemap_rpt.txt" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_viridiplantae_treemap_rpt.txt" \
-				--copy \
-				"${barcode}_consensus_consolidated_tax_gns_COI_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.png" \
-				"${barcode}_consensus_consolidated_tax_gns_ITS_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.png" \
-				"${barcode}_consensus_consolidated_tax_gns_COI_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_COI_treemap.pdf" \
-				"${barcode}_consensus_consolidated_tax_gns_ITS_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_ITS_treemap.pdf"
-		fi
+					_plot_key="CircleTree_consensus_\${plot_slug}|\$(file_sig \"${barcode}_consensus_circle_tree_\${plot_token}.tsv\")"
+					_plot_sig="\$PLOT_SIG_DIR/CircleTree_consensus_\${plot_slug}.sig"
+					if bash ${baseDir}/bin/plot_sig.sh check "\$_plot_sig" "\$_plot_key" "${ongoingStateDir}/_state/${barcode}_consensus_circle_tree_\${plot_token}.png"; then
+						echo "INFO: running plot TreeFan_cladogram.R (Consensus \${plot_marker})" 1>&2
+					Rscript ${baseDir}/bin/TreeFan_cladogram.R ${barcode}_consensus_circle_tree_\${plot_token}.tsv ${barcode}_consensus_circle_tree_\${plot_token}.png "Consensus Fan Cladogram (\${plot_marker})" "Weight: consensus count" \
+						|| { echo "ERROR: TreeFan_cladogram.R failed (Consensus \${plot_marker})" 1>&2; exit 1; }
+						copy_plot_outputs_and_commit "\$_plot_sig" "\$_plot_key" \
+							${barcode}_consensus_circle_tree_\${plot_token}.png ${ongoingStateDir}/_state/${barcode}_consensus_circle_tree_\${plot_token}.png \
+							|| { echo "ERROR: TreeFan copy/sig failed (Consensus \${plot_marker})" 1>&2; exit 1; }
+					else
+						plot_check_rc=\$?
+						if [ "\$plot_check_rc" -eq 1 ]; then
+							echo "INFO: skipping plot TreeFan_cladogram.R (Consensus \${plot_marker}, signature unchanged)" 1>&2
+						else
+							echo "ERROR: plot_sig.sh check failed for TreeFan Consensus \${plot_marker} (rc=\$plot_check_rc)" 1>&2
+							exit 1
+						fi
+					fi
+				) &
+				_required_plot_pids+=("\$!")
+				if [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_\${plot_token}_treemap_rpt.txt ]; then
+				_plot_key="Treemap_consensus_abundance_species_consolidated_\${plot_slug}|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_\${plot_token}_treemap_rpt.txt\")"
+				_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_species_consolidated_\${plot_slug}.sig"
+				run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+					"INFO: running plot Treemap_consensus_abundance_species_consolidated.R (\${plot_marker})" \
+					"INFO: skipping plot Treemap_consensus_abundance_species_consolidated.R (\${plot_marker}, signature unchanged)" \
+					"Creating consolidated consensus species treemap plot" \
+					--check \
+					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_\${plot_token}_treemap.png" \
+					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_\${plot_token}_treemap.pdf" \
+					--rscript \
+						"${baseDir}/bin/Treemap_consensus_abundance_species_consolidated.R" \
+						"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_\${plot_token}_treemap_rpt.txt" \
+						"${barcode}_consensus_consolidated_tax_spc_\${plot_token}_treemap.png" \
+						--copy \
+						"${barcode}_consensus_consolidated_tax_spc_\${plot_token}_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_\${plot_token}_treemap.png" \
+						"${barcode}_consensus_consolidated_tax_spc_\${plot_token}_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_spc_\${plot_token}_treemap.pdf" &
+					_required_plot_pids+=("\$!")
+				fi
+				if [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_\${plot_token}_treemap_rpt.txt ]; then
+				_plot_key="Treemap_consensus_abundance_genus_consolidated_\${plot_slug}|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_\${plot_token}_treemap_rpt.txt\")"
+				_plot_sig="\$PLOT_SIG_DIR/Treemap_consensus_abundance_genus_consolidated_\${plot_slug}.sig"
+				run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+					"INFO: running plot Treemap_consensus_abundance_genus_consolidated.R (\${plot_marker})" \
+					"INFO: skipping plot Treemap_consensus_abundance_genus_consolidated.R (\${plot_marker}, signature unchanged)" \
+					"Creating consolidated consensus genus treemap plot" \
+					--check \
+					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_\${plot_token}_treemap.png" \
+					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_\${plot_token}_treemap.pdf" \
+					--rscript \
+						"${baseDir}/bin/Treemap_consensus_abundance_genus_consolidated.R" \
+						"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_\${plot_token}_treemap_rpt.txt" \
+						"${barcode}_consensus_consolidated_tax_gns_\${plot_token}_treemap.png" \
+						--copy \
+						"${barcode}_consensus_consolidated_tax_gns_\${plot_token}_treemap.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_\${plot_token}_treemap.png" \
+						"${barcode}_consensus_consolidated_tax_gns_\${plot_token}_treemap.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_gns_\${plot_token}_treemap.pdf" &
+					_required_plot_pids+=("\$!")
+				fi
+			done
+		IFS="\$_old_ifs"
+		set +f
 		_plot_key="Time_taxonomy_consensus|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_tax_time_rpt.txt\")"
 		_plot_sig="\$PLOT_SIG_DIR/Time_taxonomy_consensus.sig"
 		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
@@ -5481,13 +5865,14 @@ process getting_run_summary {
 			"${ongoingStateDir}/_state/${barcode}_consensus_tax_time.png" \
 			"${ongoingStateDir}/_state/${barcode}_consensus_tax_time.pdf" \
 			--rscript \
-			"${baseDir}/bin/Time_taxonomy_consensus.R" \
-			"${ongoingStateDir}/_state/${barcode}_consensus_tax_time_rpt.txt" \
-			--copy \
-			"${barcode}_consensus_tax_time.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_time.png" \
-			"${barcode}_consensus_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_time.pdf"
-			if [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt ] \
-				&& awk 'NR>1{found=1; exit} END{exit !found}' ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt; then
+				"${baseDir}/bin/Time_taxonomy_consensus.R" \
+				"${ongoingStateDir}/_state/${barcode}_consensus_tax_time_rpt.txt" \
+				--copy \
+				"${barcode}_consensus_tax_time.png" "${ongoingStateDir}/_state/${barcode}_consensus_tax_time.png" \
+				"${barcode}_consensus_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_tax_time.pdf" &
+			_required_plot_pids+=("\$!")
+				if [ -f ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt ] \
+					&& awk 'NR>1{found=1; exit} END{exit !found}' ${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt; then
 			_plot_key="Time_taxonomy_consensus_consolidated|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt\")"
 			_plot_sig="\$PLOT_SIG_DIR/Time_taxonomy_consensus_consolidated.sig"
 			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
@@ -5498,33 +5883,26 @@ process getting_run_summary {
 				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.png" \
 				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.pdf" \
 				--rscript \
-				"${baseDir}/bin/Time_taxonomy_consensus_consolidated.R" \
-				"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt" \
-				--copy \
-				"${barcode}_consensus_consolidated_tax_time.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.png" \
-				"${barcode}_consensus_consolidated_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.pdf"
-		fi
-		if [ -f ${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt ] \
-				&& awk 'NR>1{found=1; exit} END{exit !found}' ${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt; then
-			_plot_key="Time_taxonomy_otu_frozen|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt\")"
-			_plot_sig="\$PLOT_SIG_DIR/Time_taxonomy_otu_frozen.sig"
-			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
-				"INFO: running plot Time_taxonomy_otu_frozen.R" \
-				"INFO: skipping plot Time_taxonomy_otu_frozen.R (signature unchanged)" \
-				"Creating frozen OTU time plot" \
-				--check \
-				"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.png" \
-				"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.pdf" \
-				--rscript \
-				"${baseDir}/bin/Time_taxonomy_otu_frozen.R" \
-				"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt" \
-				--copy \
-				"${barcode}_otu_frozen_tax_time.png" "${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.png" \
-				"${barcode}_otu_frozen_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.pdf"
-		fi
+					"${baseDir}/bin/Time_taxonomy_consensus_consolidated.R" \
+					"${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time_rpt.txt" \
+					--copy \
+					"${barcode}_consensus_consolidated_tax_time.png" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.png" \
+					"${barcode}_consensus_consolidated_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_consensus_consolidated_tax_time.pdf" &
+				_required_plot_pids+=("\$!")
+			fi
 			# -- §4: Demux-specific plots (Read_counts, Read_info_quality) --
 			if [ "\$GENERATE_DEMUX_REPORTS" -eq 1 ]; then
-				cp "${ongoingStateDir}/_state/${barcode}_demult_rpt.txt" "${barcode}_demult_rpt_cumulative.txt"
+				(
+				DEMULT_RPT_SOURCE="${ongoingStateDir}/_state/${barcode}_demult_rpt.txt"
+				if [ ! -f "\$DEMULT_RPT_SOURCE" ]; then
+					DEMULT_RPT_SOURCE="${demult_rpt}"
+				fi
+				if [ -f "\$DEMULT_RPT_SOURCE" ]; then
+					cp "\$DEMULT_RPT_SOURCE" "${barcode}_demult_rpt_cumulative.txt"
+				else
+					echo "WARN: demultiplex summary input missing; skipping demultiplex-specific summaries" 1>&2
+				fi
+				if [ -f "${barcode}_demult_rpt_cumulative.txt" ]; then
 				bash ${baseDir}/bin/demult_summary.sh ${barcode}_demult_rpt_cumulative.txt ${barcode}
 				cp "${barcode}_summary_demult_rpt.txt" "${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt"
 				_plot_key="Read_counts|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt\")"
@@ -5547,316 +5925,114 @@ process getting_run_summary {
 						"${barcode}_reads_per_barcode.png" "${ongoingStateDir}/_state/${barcode}_reads_per_barcode.png" \
 						"${barcode}_reads_per_sample_log.png" "${ongoingStateDir}/_state/${barcode}_reads_per_sample_log.png" \
 						"${barcode}_reads_per_sample.png" "${ongoingStateDir}/_state/${barcode}_reads_per_sample.png" \
-					"${barcode}_reads_per_barcode.pdf" "${ongoingStateDir}/_state/${barcode}_reads_per_barcode.pdf" \
-					"${barcode}_reads_per_sample_log.pdf" "${ongoingStateDir}/_state/${barcode}_reads_per_sample_log.pdf" \
-					"${barcode}_reads_per_sample.pdf" "${ongoingStateDir}/_state/${barcode}_reads_per_sample.pdf"
+						"${barcode}_reads_per_barcode.pdf" "${ongoingStateDir}/_state/${barcode}_reads_per_barcode.pdf" \
+						"${barcode}_reads_per_sample_log.pdf" "${ongoingStateDir}/_state/${barcode}_reads_per_sample_log.pdf" \
+						"${barcode}_reads_per_sample.pdf" "${ongoingStateDir}/_state/${barcode}_reads_per_sample.pdf"
 				else
 					echo "Skipping demultiplex-specific summaries (demultiplex_mode=\${DEMUX_MODE})" 1>&2
 				fi
-				if [ "\$GENERATE_DEMUX_REPORTS" -eq 1 ] && [ "\$HTML_REPORT_ENABLED" -eq 1 ] && [ "\$HTML_REPORT_SAMPLE_PLOT_MAX" -gt 0 ]; then
-					SAMPLE_REPORT_ASSET_DIR="${params.outdir}/runs/${run_name}/report_assets/samples"
-					mkdir -p "\$SAMPLE_REPORT_ASSET_DIR"
-					if ! bash ${baseDir}/bin/report_sample_read_counts_plots.sh \
-						--summary ${barcode}_summary_demult_rpt.txt \
-						--out-dir "\$SAMPLE_REPORT_ASSET_DIR" \
+					if [ "\$GENERATE_DEMUX_REPORTS" -eq 1 ] && [ "\$HTML_REPORT_ENABLED" -eq 1 ] && [ "\$HTML_REPORT_SAMPLE_PLOT_MAX" -gt 0 ]; then
+						if ! bash ${baseDir}/bin/report_sample_read_counts_plots.sh \
+							--summary ${barcode}_summary_demult_rpt.txt \
+						--out-dir "\$REPORT_SAMPLE_STAGE_DIR" \
 						--max "\$HTML_REPORT_SAMPLE_PLOT_MAX" \
 						--sig-dir "${params.outdir}/runs/${run_name}/report_assets/.private_signatures/read_counts"; then
-						echo "WARN: sample Read_counts figure generation failed" 1>&2
+							echo "WARN: sample Read_counts figure generation failed" 1>&2
+						fi
 					fi
+					) &
+				_required_plot_pids+=("\$!")
 				fi
-				_plot_key="Read_info_quality|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_read_info_rpt.txt\")"
-				_plot_sig="\$PLOT_SIG_DIR/Read_info_quality.sig"
-				run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
-					"INFO: running plot Read_info_quality.R" \
-					"INFO: skipping plot Read_info_quality.R (signature unchanged)" \
-					"Creating reads Vs time plot" \
-					--check \
-					"${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.png" \
-					"${ongoingStateDir}/_state/${barcode}_violin_length_read_info.png" \
-					"${ongoingStateDir}/_state/${barcode}_density_read_info.png" \
-					"${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.pdf" \
-					"${ongoingStateDir}/_state/${barcode}_violin_length_read_info.pdf" \
-					"${ongoingStateDir}/_state/${barcode}_density_read_info.pdf" \
-					--rscript \
-					"${baseDir}/bin/Read_info_quality.R" \
-					"${ongoingStateDir}/_state/${barcode}_read_info_rpt.txt" \
+		_plot_key="Read_info_quality|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_read_info_rpt.txt\")"
+		_plot_sig="\$PLOT_SIG_DIR/Read_info_quality.sig"
+		run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+			"INFO: running plot Read_info_quality.R" \
+			"INFO: skipping plot Read_info_quality.R (signature unchanged)" \
+			"Creating reads Vs time plot" \
+			--check \
+			"${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.png" \
+			"${ongoingStateDir}/_state/${barcode}_violin_length_read_info.png" \
+			"${ongoingStateDir}/_state/${barcode}_density_read_info.png" \
+			"${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.pdf" \
+			"${ongoingStateDir}/_state/${barcode}_violin_length_read_info.pdf" \
+			"${ongoingStateDir}/_state/${barcode}_density_read_info.pdf" \
+			--rscript \
+				"${baseDir}/bin/Read_info_quality.R" \
+				"${ongoingStateDir}/_state/${barcode}_read_info_rpt.txt" \
+				--copy \
+				"${barcode}_violin_quality_read_info.png" "${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.png" \
+				"${barcode}_violin_length_read_info.png" "${ongoingStateDir}/_state/${barcode}_violin_length_read_info.png" \
+				"${barcode}_density_read_info.png" "${ongoingStateDir}/_state/${barcode}_density_read_info.png" \
+			"${barcode}_violin_quality_read_info.pdf" "${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.pdf" \
+			"${barcode}_violin_length_read_info.pdf" "${ongoingStateDir}/_state/${barcode}_violin_length_read_info.pdf" \
+			"${barcode}_density_read_info.pdf" "${ongoingStateDir}/_state/${barcode}_density_read_info.pdf" &
+			_required_plot_pids+=("\$!")
+			if [ -f ${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt ] \
+					&& awk 'NR>1{found=1; exit} END{exit !found}' ${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt; then
+			_plot_key="Time_taxonomy_otu_frozen|\$(file_sig \"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt\")"
+			_plot_sig="\$PLOT_SIG_DIR/Time_taxonomy_otu_frozen.sig"
+			run_plot_with_sig "\$_plot_sig" "\$_plot_key" \
+				"INFO: running plot Time_taxonomy_otu_frozen.R" \
+				"INFO: skipping plot Time_taxonomy_otu_frozen.R (signature unchanged)" \
+				"Creating frozen OTU time plot" \
+				--check \
+				"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.png" \
+				"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.pdf" \
+				--rscript \
+					"${baseDir}/bin/Time_taxonomy_otu_frozen.R" \
+					"${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt" \
 					--copy \
-					"${barcode}_violin_quality_read_info.png" "${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.png" \
-					"${barcode}_violin_length_read_info.png" "${ongoingStateDir}/_state/${barcode}_violin_length_read_info.png" \
-					"${barcode}_density_read_info.png" "${ongoingStateDir}/_state/${barcode}_density_read_info.png" \
-				"${barcode}_violin_quality_read_info.pdf" "${ongoingStateDir}/_state/${barcode}_violin_quality_read_info.pdf" \
-				"${barcode}_violin_length_read_info.pdf" "${ongoingStateDir}/_state/${barcode}_violin_length_read_info.pdf" \
-				"${barcode}_density_read_info.pdf" "${ongoingStateDir}/_state/${barcode}_density_read_info.pdf"
-
-		# -- §5: HTML report assembly (round JSON, history append, render) --
-		# Incremental HTML report update (best-effort, never fails the round).
-		# Serving is external by design; use bin/serve_report.sh if needed.
-		ROUND_DIR="${ongoingStateDir}/${round_barcode}"
-		STATE_DIR="${ongoingStateDir}/_state"
-		ROUND_REPORT_JSON="\$ROUND_DIR/round_report.json"
-		REPORT_HISTORY_JSONL="\$STATE_DIR/report_history.jsonl"
-		REPORT_HISTORY_LOCK="\$STATE_DIR/.report_history.lock"
-		REPORT_RENDER_LOCK="\$STATE_DIR/.report_render.lock"
-		REPORT_HTML="${params.outdir}/report.html"
-		REPORT_STATE_JSON="${params.outdir}/report_state.json"
-		RUN_REPORT_JSON="\$ROUND_DIR/run_report.json"
-		RUN_INDEX_JSONL="${params.outdir}/runs_index.jsonl"
-		RUN_INDEX_LOCK="${params.outdir}/.runs_index.lock"
-			RUN_REPORT_DIR="${params.outdir}/runs/${run_name}"
-			RUN_REPORT_HTML="\$RUN_REPORT_DIR/report.html"
-			RUN_REPORT_STATE="\$RUN_REPORT_DIR/report_state.json"
-				RUN_REPORT_REL_PATH="runs/${run_name}/report.html"
-				REPORT_FIG_LIST="${baseDir}/assets/report/figures.tsv"
-			REPORT_SAMPLE_FIG_LIST="${baseDir}/assets/report/figures_sample.tsv"
-			REPORT_ASSET_DIR="${params.outdir}/runs/${run_name}/report_assets"
-			REPORT_SAMPLE_ASSET_DIR="\$REPORT_ASSET_DIR/samples"
-			REPORT_ASSET_OUTDIR="${params.outdir}/runs/${run_name}"
-			REPORT_FIG_EXISTS_DIR="${ongoingStateDir}/_state"
-			REPORT_FIG_URL_PREFIX="runs/${run_name}/report_assets"
-			REPORT_SAMPLE_FIG_URL_PREFIX="runs/${run_name}/report_assets/samples"
-			ROUND_INDEX_FILE="\$STATE_DIR/round_index.tsv"
-			ACTIVE_PRUNE_SIZE_STREAK_OUT="\$ROUND_DIR/active_prune_candidates_size_streak.list"
-			ACTIVE_PRUNE_SIZE_CANDIDATES_OUT="\$ROUND_DIR/active_prune_candidates_size_candidates.list"
-			ACTIVE_PRUNE_ALL_OUT="\$ROUND_DIR/active_prune_candidates_all.list"
-			ACTIVE_PRUNE_COUNTS_OUT="\$ROUND_DIR/active_prune_candidates_counts.tsv"
-			OTU_SIZE_STREAK_IDS_LAST="\$STATE_DIR/${barcode}_otu_size_streak_prune_ids_last.txt"
-			mkdir -p "\$ROUND_DIR" "\$STATE_DIR" "${params.outdir}"
-
-		set +e
-			perl ${baseDir}/bin/active_prune_candidates.pl \
-				--otu-members-round "${otu_members_round}" \
-				--otu-sizes-round "${otu_sizes_round}" \
-				--size-streak-ids "\$OTU_SIZE_STREAK_IDS_LAST" \
-				--eligible-counts "\$ROUND_DIR/${barcode}_eligible_pool_counts.tsv" \
-				--otu-blast-min-members ${otuBlastMinMembersStr} \
-				--otu-blast-filter-mode "${otuBlastFilterModeCanonical}" \
-				--otu-blast-filter-skip-rounds "${otuBlastFilterSkipRoundsCanonical}" \
-				--force-use-filtered "${otuBlastForceUseFiltered ? 1 : 0}" \
-				--round-index-file "\$ROUND_INDEX_FILE" \
-				--round-barcode "${round_barcode}" \
-				--effective-mode-helper "${baseDir}/bin/otu_blast_effective_mode.sh" \
-				--out-size-streak "\$ACTIVE_PRUNE_SIZE_STREAK_OUT" \
-				--out-size-candidates "\$ACTIVE_PRUNE_SIZE_CANDIDATES_OUT" \
-				--out-all "\$ACTIVE_PRUNE_ALL_OUT" \
-				--out-counts "\$ACTIVE_PRUNE_COUNTS_OUT"
-			active_prune_rc=\$?
-			if [ "\$active_prune_rc" -ne 0 ]; then
-				echo "WARN: active_prune_candidates.pl failed (rc=\$active_prune_rc)" 1>&2
+					"${barcode}_otu_frozen_tax_time.png" "${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.png" \
+					"${barcode}_otu_frozen_tax_time.pdf" "${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time.pdf" &
+				_required_plot_pids+=("\$!")
 			fi
+			_plot_fail=0
+			for _pid in "\${_required_plot_pids[@]}"; do
+				if ! wait "\$_pid"; then
+					_plot_fail=\$((_plot_fail + 1))
+				fi
+			done
+			wait || true
+			if [ "\$_plot_fail" -ne 0 ]; then
+				echo "ERROR: \$_plot_fail required plot task(s) failed" 1>&2
+				exit 1
+			fi
+			# -- §5: HTML report staging — post-parallel --
+			set +e
 			perl ${baseDir}/bin/report_sync_figures.pl \
 				--fig-list "\$REPORT_FIG_LIST" \
 				--barcode "${barcode}" \
 				--src-dir "${ongoingStateDir}/_state" \
-				--out-dir "\$REPORT_ASSET_OUTDIR" \
-				>/dev/null || true
-				REPORT_SAMPLE_ROSTER_ARG=""
-				REPORT_IDENTITY_MODE_ARG=""
-				if [ "${replicateModeCanonical}" = "track" ]; then
-					_TRACK_ROSTER="${params.outdir}/sample_info/${run_name}/track_roster.tsv"
-					if [ ! -r "\$_TRACK_ROSTER" ]; then
-						echo "ERROR: identity-mode=track requires track_roster.tsv but it is missing or unreadable: \$_TRACK_ROSTER" >&2
-						exit 1
-					fi
-					REPORT_SAMPLE_ROSTER_ARG="--sample-roster \$_TRACK_ROSTER"
-					REPORT_IDENTITY_MODE_ARG="--identity-mode track"
-				elif [ -s "${params.outdir}/sample_info/${run_name}/samples.txt" ]; then
-					REPORT_SAMPLE_ROSTER_ARG="--sample-roster ${params.outdir}/sample_info/${run_name}/samples.txt"
-					REPORT_IDENTITY_MODE_ARG="--identity-mode collapse"
-				fi
-				perl ${baseDir}/bin/report_round_json.pl \
-				--run-id "${run_name}" \
-				--state-id "${stateId}" \
+				--asset-dir "\$REPORT_LIVE_ASSET_DIR" \
+				>/dev/null
+			report_sync_rc=\$?
+			if [ "\$report_sync_rc" -ne 0 ]; then
+				echo "ERROR: report_sync_figures.pl failed (rc=\$report_sync_rc)" 1>&2
+				exit "\$report_sync_rc"
+			fi
+			bash ${baseDir}/bin/report_live_stage.sh \
+				--stage-root "\$ROUND_LIVE_STAGE" \
+				--round-dir "\$ROUND_DIR" \
+				--state-dir "\$STATE_DIR" \
+				--consensus-dir "${ongoingStateDir}/Consensus" \
 				--barcode "${barcode}" \
-				--round-barcode "${round_barcode}" \
-				--targets "${params.targets}" \
-				--schema-version "1.4" \
-				--out "\$ROUND_REPORT_JSON" \
-				--read-info "${read_info_rpt}" \
-				--on-target "${on_target_rpt}" \
-				--demult "${demult_rpt}" \
-				--otu-def "${otu_def_rpt}" \
-				--blast-otu "${blast_otu_pretax_rpt}" \
-				--blast-otu-cumulative "${ongoingStateDir}/_state/${barcode}_blast_otu_pretax_rpt.txt" \
-				--blast-noadapter "${blast_otu_noadapter_rpt}" \
-				--otu-sizes-round "${otu_sizes_round}" \
-				--blast-consensus "${blast_consensus_tax}" \
-				--consensus-round-provenance "${consensus_round_provenance}" \
-				--spec-basics-metazoa "${metazoaBasicsArg}" \
-				--spec-basics-viridiplantae "${viridiplantaeBasicsArg}" \
-				--summary "${summary}" \
-				--summary-otu "${summary_otu}" \
-			--otu-size-streak-stats "\$ROUND_DIR/${barcode}_otu_size_streak_stats.tsv" \
-				--otu-size-streak "\$ROUND_DIR/${barcode}_otu_size_streak.tsv" \
-			--otu-size-streak-mode "${otuSizeStreakModeCanonical}" \
-			--otu-size-streak-min-rounds "${otuSizeStreakMinRoundsStr}" \
-			--otu-lock-summary "\$ROUND_DIR/${barcode}_otu_lock_summary.tsv" \
-			--active-prune-counts "\$ACTIVE_PRUNE_COUNTS_OUT" \
-				--otu-blast-filter-stats "${blast_filter_stats}" \
-				--blast-filter-dropped-ids "\$ROUND_DIR/${barcode}_blast_filter_dropped_read_ids.list" \
-				--blast-filter-mode "${otuBlastFilterModeCanonical}" \
-				--blast-id-family "${params.blast_id_family}" \
-				--blast-id-genus "${params.blast_id_genus}" \
-				--blast-id-spec "${params.blast_id_spec}" \
-				--otu-blast-min-members "${otuBlastMinMembersStr}" \
-				--otu-blast-filter-skip-rounds "${otuBlastFilterSkipRoundsCanonical}" \
-			--otu-blast-unassigned-grace-rounds "${otuBlastUnassignedGraceRoundsStr}" \
-			--round-index-file "\$ROUND_DIR/round_index.tsv" \
-				--otu-members-blastdiag-stats "\$ROUND_DIR/otu_members_blastdiag_stats.tsv" \
-					--consensus-consolidated-ids "\$ROUND_DIR/${barcode}_consensus_consolidated_ids.txt" \
-				--blast-consensus-consolidated "${ongoingStateDir}/_state/${barcode}_blast_consensus_tax_consolidated_rpt.txt" \
-					--debug-otu-out "\$ROUND_DIR/${barcode}_otu_assignment_debug.tsv" \
-					--fig-list "\$REPORT_FIG_LIST" \
-					--fig-dir "\$REPORT_FIG_EXISTS_DIR" \
-					--fig-url-prefix "\$REPORT_FIG_URL_PREFIX" \
-					--sample-fig-list "\$REPORT_SAMPLE_FIG_LIST" \
-					\$REPORT_SAMPLE_ROSTER_ARG \
-					--sample-fig-dir "\$REPORT_SAMPLE_ASSET_DIR" \
-					--sample-fig-url-prefix "\$REPORT_SAMPLE_FIG_URL_PREFIX" \
-					\$REPORT_IDENTITY_MODE_ARG
-		round_json_rc=\$?
-		if [ "\$round_json_rc" -ne 0 ]; then
-			echo "WARN: report_round_json.pl failed (rc=\$round_json_rc)" 1>&2
-		fi
-
-		if [ "\$round_json_rc" -eq 0 ] && [ -s "\$ROUND_REPORT_JSON" ]; then
-			python3 ${baseDir}/bin/extract_frozen_tax_time.py \
-				--json "\$ROUND_REPORT_JSON" \
-				--run-id "${barcode}" \
-				--out "${ongoingStateDir}/_state/${barcode}_otu_frozen_tax_time_rpt.txt" || true
-			LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_history_append.sh "\$ROUND_REPORT_JSON" "\$REPORT_HISTORY_JSONL" "\$REPORT_HISTORY_LOCK"
-			history_rc=\$?
-			if [ "\$history_rc" -ne 0 ]; then
-				echo "WARN: report_history_append.sh failed (rc=\$history_rc)" 1>&2
+				--run-id "${run_name}"
+			stage_rc=\$?
+			if [ "\$stage_rc" -ne 0 ]; then
+				echo "ERROR: report_live_stage.sh failed (rc=\$stage_rc)" 1>&2
+				exit "\$stage_rc"
 			fi
-			if [ "\$history_rc" -eq 0 ]; then
-				perl ${baseDir}/bin/report_run_json.pl \
-					--history "\$REPORT_HISTORY_JSONL" \
-					--out "\$RUN_REPORT_JSON" \
-					--run-id "${run_name}" \
-					--barcode "${barcode}" \
-					--state-id "${stateId}" \
-					--outdir "${params.outdir}" \
-					--schema-version "1.4" \
-					--report-rel-path "\$RUN_REPORT_REL_PATH" \
-					--run-started-utc-file "${ongoingStateDir}/_state/run_started_utc.txt"
-				run_json_rc=\$?
-				if [ "\$run_json_rc" -ne 0 ]; then
-					echo "WARN: report_run_json.pl failed (rc=\$run_json_rc)" 1>&2
-				elif [ -s "\$RUN_REPORT_JSON" ]; then
-					LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_run_index_update.sh "\$RUN_REPORT_JSON" "\$RUN_INDEX_JSONL" "\$RUN_INDEX_LOCK"
-					run_index_rc=\$?
-					if [ "\$run_index_rc" -ne 0 ]; then
-						echo "WARN: report_run_index_update.sh failed (rc=\$run_index_rc)" 1>&2
-					fi
-				fi
+			render_round_report_json "\$ROUND_REPORT_JSON"
+			final_json_rc=\$?
+			if [ "\$final_json_rc" -ne 0 ]; then
+				echo "ERROR: final report_round_json.pl failed (rc=\$final_json_rc)" 1>&2
+				exit "\$final_json_rc"
 			fi
-		else
-			echo "WARN: skipping report history append (round report missing)" 1>&2
-		fi
-
-		if [ "\$HTML_REPORT_ENABLED" -eq 1 ]; then
-			if command -v python3 >/dev/null 2>&1; then
-				REPORT_RENDER_LOCK_DIR="\${REPORT_RENDER_LOCK}.lockdir"
-				render_lock_acquired=0
-				release_render_lock() {
-					if [ "\${render_lock_acquired:-0}" -eq 1 ]; then
-						rmdir "\$REPORT_RENDER_LOCK_DIR" 2>/dev/null || true
-						render_lock_acquired=0
-					fi
-				}
-				trap release_render_lock EXIT
-					render_waited=0
-					while true; do
-						if mkdir "\$REPORT_RENDER_LOCK_DIR" 2>/dev/null; then
-							render_lock_acquired=1
-							break
-						fi
-						sleep 1
-						render_waited=\$((render_waited + 1))
-						if [ "\$render_waited" -ge ${params.lock_wait_seconds} ]; then
-							echo "WARN: skipping HTML report render for round=${round_barcode}; lock timeout on \${REPORT_RENDER_LOCK}" 1>&2
-							break
-						fi
-					done
-					if [ "\$render_lock_acquired" -eq 1 ]; then
-						mkdir -p "\$RUN_REPORT_DIR"
-					# Write run config file (overwrite each round to keep in sync)
-					RUN_CONF_FILE="${params.outdir}/${run_name}.conf"
-					mkdir -p "\$(dirname "\$RUN_CONF_FILE")"
-					cat > "\$RUN_CONF_FILE" << 'RTBCONF'
-// Auto-generated run configuration: ${run_name}
-// Command: ${workflow.commandLine}
-params {
-${runConfigLines}
-}
-RTBCONF
-					# Write directory README.html files once (best-effort)
-					_render_readme() {
-						local dst="\$1" tmpl="\$2"
-						[ -f "\$dst" ] && return
-						mkdir -p "\$(dirname "\$dst")"
-						sed "s|{{RUN_NAME}}|${run_name}|g; s|{{STATE_ID}}|${stateId}|g" "\$tmpl" > "\$dst"
-					}
-					_render_readme "${params.outdir}/pod5/${run_name}/README.html"         "${baseDir}/assets/readme/pod5.html"
-					_render_readme "${currentResultsStateDir}/README.html"                 "${baseDir}/assets/readme/state.html"
-					_render_readme "${params.outdir}/sample_info/${run_name}/README.html"   "${baseDir}/assets/readme/sample_info.html"
-					# Write run config README.html (always overwrite to reflect latest conf)
-					python3 ${baseDir}/bin/render_run_config_readme.py \
-						--template "${baseDir}/assets/readme/run_config.html" \
-						--conf "${params.outdir}/${run_name}.conf" \
-						--out "${params.outdir}/${run_name}_config/README.html" \
-						--run-name "${run_name}" \
-						--state-id "${stateId}" \
-						--cmd-line "${workflow.commandLine}" || true
-
-						python3 ${baseDir}/bin/report_render.py \
-							--history "\$REPORT_HISTORY_JSONL" \
-							--run-index "\$RUN_INDEX_JSONL" \
-							--template "${baseDir}/assets/report/template.html" \
-						--css "${baseDir}/assets/report/report.css" \
-						--js "${baseDir}/assets/report/report.js" \
-						--schema-version "1.4" \
-						--state-out "\$REPORT_STATE_JSON" \
-						--auto-refresh-enabled "\$HTML_REPORT_AUTO_REFRESH" \
-						--auto-refresh-seconds "\$HTML_REPORT_REFRESH_SECONDS" \
-						--state-url "report_state.json" \
-						--url-prefix "\$HTML_REPORT_URL_PREFIX" \
-						--out "\$REPORT_HTML"
-					render_rc=\$?
-					if [ "\$render_rc" -ne 0 ]; then
-						echo "WARN: report_render.py failed (rc=\$render_rc) round=${round_barcode}" 1>&2
-					else
-						python3 ${baseDir}/bin/report_render.py \
-							--history "\$REPORT_HISTORY_JSONL" \
-							--run-index "\$RUN_INDEX_JSONL" \
-							--template "${baseDir}/assets/report/run_template.html" \
-							--css "${baseDir}/assets/report/report.css" \
-							--js "${baseDir}/assets/report/report.js" \
-							--schema-version "1.4" \
-							--state-out "\$RUN_REPORT_STATE" \
-							--auto-refresh-enabled "\$HTML_REPORT_AUTO_REFRESH" \
-							--auto-refresh-seconds "\$HTML_REPORT_REFRESH_SECONDS" \
-							--state-url "report_state.json" \
-							--url-prefix "\$HTML_REPORT_URL_PREFIX" \
-							--run-id-filter "${run_name}" \
-							--pod5-dir-url "../../pod5/${run_name}/README.html" \
-							--state-dir-url "../../current/state/${stateId}/README.html" \
-							--figures-dir-url "./figures/README.html" \
-							--sample-info-url "../../sample_info/${run_name}/README.html" \
-							--run-config-url "../../${run_name}_config/README.html" \
-							--out "\$RUN_REPORT_HTML"
-						run_render_rc=\$?
-						if [ "\$run_render_rc" -ne 0 ]; then
-							echo "WARN: report_render.py failed for run report (rc=\$run_render_rc) round=${round_barcode}" 1>&2
-						fi
-					fi
-					release_render_lock
-				fi
-			else
-				echo "WARN: python3 not found; skipping HTML report rendering" 1>&2
+			if [ ! -s "\$ROUND_REPORT_JSON" ]; then
+				echo "ERROR: final report_round_json.pl did not produce output: \$ROUND_REPORT_JSON" 1>&2
+				exit 1
 			fi
-		fi
-		set -e
+			set -e
 
 		"""
 }
@@ -5870,12 +6046,20 @@ complete_round_with_path = ChannelUtils.strictRoundJoin(complete_round_ch, close
 // ============================================================
 process backup_update_and_clean {
 	cache false
-//  publishDir "${params.outdir}/temp/ongoing/", mode: 'copy', overwrite: true
-//  publishDir "${params.outdir}/temp/ongoing/${round_barcode}/", mode: 'copy', overwrite: true
 	input:
 		tuple val(barcode), val(round_barcode), val(read_path) from complete_round_with_path
 	output:
 		file("done_pod5.txt")
+		tuple val(barcode), val(round_barcode), file("report_render.request") into report_render_request_ch
+	    def runConfigLines = params
+	        .sort { a, b -> a.key <=> b.key }
+	        .collect { k, v ->
+	            def fmtVal = (v == null) ? 'null'
+	                       : (v instanceof Boolean || v instanceof Number) ? v.toString()
+	                       : '"' + v.toString().replace('\\', '\\\\').replace('"', '\\"') + '"'
+	            "  ${k.padRight(35)} = ${fmtVal}"
+	        }
+	        .join('\n')
 	script:
 		"""
 			set -euo pipefail
@@ -5906,6 +6090,30 @@ process backup_update_and_clean {
 		
 			CURRENT_TEMP_ROOT="${currentStateDir}"
 			CURRENT_ROOT="${currentResultsStateDir}"
+			HTML_REPORT_ENABLED=${htmlReportEnabled ? 1 : 0}
+			HTML_REPORT_AUTO_REFRESH=${htmlReportAutoRefresh ? 1 : 0}
+			HTML_REPORT_REFRESH_SECONDS=${htmlReportRefreshSecondsStr}
+			HTML_REPORT_URL_PREFIX="${htmlReportUrlPrefix}"
+			ROUND_REPORT_JSON="\$ROUND_TMP/round_report.json"
+			ROUND_LIVE_STAGE="\$ROUND_TMP/report_live_stage"
+			REPORT_HISTORY_JSONL="\$STATE_TMP/report_history.jsonl"
+			REPORT_HISTORY_LOCK="\$STATE_TMP/.report_history.lock"
+			REPORT_RENDER_LOCK="\$STATE_TMP/.report_render.lock"
+			REPORT_LIVE_PUBLISH_LOCK="\$STATE_TMP/.report_live_publish.lock"
+			RUN_REPORT_JSON="\$ROUND_TMP/run_report.json"
+			RUN_INDEX_JSONL="${params.outdir}/report_html/runs_index.jsonl"
+			RUN_INDEX_LOCK="${params.outdir}/.runs_index.lock"
+			RUN_REPORT_DIR="${params.outdir}/report_html/runs/${run_name}"
+			RUN_REPORT_HTML="\$RUN_REPORT_DIR/report.html"
+			RUN_REPORT_STATE="\$RUN_REPORT_DIR/report_state.json"
+			RUN_REPORT_PENDING="\$RUN_REPORT_DIR/.report_render_pending"
+			RUN_REPORT_REL_PATH="runs/${run_name}/report.html"
+			REPORT_ASSET_DIR="${params.outdir}/report_html/runs/${run_name}/report_assets"
+			REPORT_SAMPLE_ASSET_DIR="\$REPORT_ASSET_DIR/samples"
+			RENDER_REQUEST_FILE="report_render.request"
+			FEEDER_METADATA_DIR="${podBaseDir}/metadata"
+			FEEDER_SLICE_SIDECAR="\$FEEDER_METADATA_DIR/${round_barcode}_slice.tsv"
+			FEEDER_GLOBAL_LEDGER_DIR="${feederGlobalLedgerDir}"
 
 					# -- §2: Rolling state publish (copy _rpt.txt + PNGs to ongoing results) --
 					# Copy rolling tables/plots to the "ongoing" results area.
@@ -5986,15 +6194,18 @@ process backup_update_and_clean {
 		fi
 
 	# -- §4: POD5 disposal (delete or move to done_round_pod5) --
-	if [ -n "\$READ_PATH" ] && [ "\$READ_PATH" != "null" ] && [ -e "\$READ_PATH" ];
-	then
-		if [ "\$DELETE_INPUT_FLAG" -eq 1 ]; then
+		if [ -n "\$READ_PATH" ] && [ "\$READ_PATH" != "null" ] && [ -e "\$READ_PATH" ];
+		then
+			if [ "\$DELETE_INPUT_FLAG" -eq 1 ]; then
 			# Prune mode: delete the POD5 immediately to free disk space.
 			# The pipeline has already fully processed this file; done_pod5.txt
 			# tracks completion by path+inode, not by presence in done_round_pod5/.
-			rm -f "\$READ_PATH" 2>/dev/null || true
-			echo "INFO: deleted processed POD5 \$(basename -- "\$READ_PATH") (delete_input_pod5=true)" 1>&2
-		else
+				if rm -f "\$READ_PATH" 2>/dev/null; then
+					echo "INFO: deleted processed POD5 \$(basename -- "\$READ_PATH") (delete_input_pod5=true)" 1>&2
+				else
+					echo "WARN: failed to delete processed POD5 \$(basename -- "\$READ_PATH"); file tracked in done_pod5.txt but remains in reads_rt - may stall feeder" 1>&2
+				fi
+			else
 			DONE_POD5_DIR="${podBaseDir}/done_round_pod5"
 			mkdir -p "\$DONE_POD5_DIR"
 			base="\$(basename -- "\$READ_PATH")"
@@ -6004,8 +6215,14 @@ process backup_update_and_clean {
 				cp -p "\$READ_PATH" "\$dest"
 				rm -f "\$READ_PATH"
 			fi
+			fi
 		fi
-	fi
+
+		if [ -f "\$FEEDER_SLICE_SIDECAR" ]; then
+			bash ${baseDir}/bin/feeder_notify_complete.sh \
+				--slice-sidecar "\$FEEDER_SLICE_SIDECAR" \
+				--global-ledger-dir "\$FEEDER_GLOBAL_LEDGER_DIR" || true
+		fi
 		
 		# Do NOT delete files under the Nextflow work directory here.
 		# Downstream tasks in subsequent rounds still rely on those staged inputs,
@@ -6111,14 +6328,20 @@ process backup_update_and_clean {
 					# as spool=1. With ready=1 (active symlink) the feeder's throttle
 					# (ready>=1 AND spool>=1) prevented pre-staging the next round, causing
 					# a full sleep_time (~5 min) delay at every round boundary.
-					# Moving empties ori_round_pod5 so the feeder pre-stages the next round
-					# while this one is still processing. Pod5 is preserved in done_round_pod5.
-					if ! mv -f -- "\$oldest" "\$dst" 2> cp_new_pod5.err; then
-						cp -p -- "\$oldest" "\$dst" 2> cp_new_pod5.err || { echo "WARNING: Failed to stage new pod5 file" >&2; cat cp_new_pod5.err >&2; }
-						rm -f -- "\$oldest" 2>/dev/null || { echo "WARNING: Failed to remove \$oldest from ori_round_pod5" >&2; }
+						# Moving empties ori_round_pod5 so the feeder pre-stages the next round
+						# while this one is still processing. Pod5 is preserved in done_round_pod5.
+						if ! mv -f -- "\$oldest" "\$dst" 2> cp_new_pod5.err; then
+							if cp -p -- "\$oldest" "\$dst" 2> cp_new_pod5.err; then
+								rm -f -- "\$oldest" 2>/dev/null || { echo "ERROR: Failed to remove \$oldest from ori_round_pod5; file exists in both ori_dir and reads_rt" >&2; exit 1; }
+							elif [ -e "\$dst" ]; then
+								:
+							else
+								echo "WARNING: Failed to stage new pod5 file; source preserved at \$oldest" >&2
+								cat cp_new_pod5.err >&2
+							fi
+						fi
+						break
 					fi
-					break
-				fi
 
 				 sleep 10
 			done
@@ -6156,13 +6379,13 @@ process backup_update_and_clean {
 
 
 		# -- §7: Post-lock heavy copies + disk-pressure cleanup --
-		mkdir -p "\$CURRENT_TEMP_ROOT/plots" "\$CURRENT_TEMP_ROOT/sequences"
-		mkdir -p "\$CURRENT_ROOT/plots"       "\$CURRENT_ROOT/sequences"
+		mkdir -p "\$CURRENT_TEMP_ROOT/plots/png" "\$CURRENT_TEMP_ROOT/sequences"
+		mkdir -p "\$CURRENT_ROOT/plots/png"       "\$CURRENT_ROOT/sequences"
 		rm -rf "\$CURRENT_TEMP_ROOT/.parser_state_txn" "\$CURRENT_ROOT/.parser_state_txn" 2>/dev/null || true
 
 			pngs=( "\$ROUND_TMP"/*.png )
 			if (( \${#pngs[@]} )); then
-				sync_changed_files "\$CURRENT_TEMP_ROOT/plots" "\${pngs[@]}"
+				sync_changed_files "\$CURRENT_TEMP_ROOT/plots/png" "\${pngs[@]}"
 			fi
 
 		# ---- Copy tables (TXT/TSV/CSV and gzipped variants) ----
@@ -6200,7 +6423,7 @@ process backup_update_and_clean {
 		# ---- Copy plots (PNGs) ----
 			pngs=( "\$ONGOING_FINAL"/*.png )
 			if (( \${#pngs[@]} )); then
-				sync_changed_files "\$CURRENT_ROOT/plots" "\${pngs[@]}"
+				sync_changed_files "\$CURRENT_ROOT/plots/png" "\${pngs[@]}"
 			fi
 
 		# ---- Copy tables (TXT/TSV/CSV and gzipped variants) ----
@@ -6211,6 +6434,32 @@ process backup_update_and_clean {
 				sync_changed_files "\$CURRENT_ROOT/tables" "\${tables[@]}"
 			fi
 
+		# ---- Create to_figures/ symlinks for figure-backing *_rpt.txt files (symlinks → real files in tables/) ----
+			_TO_FIG_DIR="\$CURRENT_ROOT/tables/to_figures"
+			mkdir -p "\$_TO_FIG_DIR" || echo "WARN: could not create tables/to_figures dir" >&2
+			if [ -d "\$_TO_FIG_DIR" ]; then
+				for _f in \
+					"\$CURRENT_ROOT/tables/"*_reads_time_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_reads_cumulative_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_read_info_rpt.txt.gz \
+					"\$CURRENT_ROOT/tables/"*_summary_demult_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_otu_tax_time_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_otu_frozen_tax_time_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_consensus_tax_time_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_consensus_consolidated_tax_time_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_otu_tax_spc_*_treemap_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_otu_tax_gns_*_treemap_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_consensus_tax_spc_*_treemap_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_consensus_tax_gns_*_treemap_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_consensus_consolidated_tax_spc_*_treemap_rpt.txt \
+					"\$CURRENT_ROOT/tables/"*_consensus_consolidated_tax_gns_*_treemap_rpt.txt; do
+					[ -f "\$_f" ] || continue       # skip unmatched patterns (defense-in-depth)
+					_fname=\$(basename "\$_f")
+					ln -sf "\$_f" "\$_TO_FIG_DIR/\$_fname" \
+						|| echo "WARN: to_figures symlink failed: \$_fname" >&2
+				done
+			fi
+
 		# ---- Copy sequences (FASTA/FASTQ and gzipped variants) ----
 			seqs=( "\$ONGOING_FINAL"/*.fa "\$ONGOING_FINAL"/*.fasta "\$ONGOING_FINAL"/*.fq "\$ONGOING_FINAL"/*.fastq \
 				"\$ONGOING_FINAL"/*.fa.gz "\$ONGOING_FINAL"/*.fasta.gz "\$ONGOING_FINAL"/*.fq.gz "\$ONGOING_FINAL"/*.fastq.gz )
@@ -6218,6 +6467,151 @@ process backup_update_and_clean {
 				sync_changed_files "\$CURRENT_ROOT/sequences" "\${seqs[@]}"
 			fi
 
+		# -- §8: Live-round publish + history/render publication --
+		history_lock_acquired=0
+		release_report_history_lock() {
+			if [ "\${history_lock_acquired:-0}" -eq 1 ]; then
+				rmdir "\${REPORT_HISTORY_LOCK}.lockdir" 2>/dev/null || true
+				history_lock_acquired=0
+			fi
+		}
+		acquire_report_history_lock() {
+			local waited=0
+			while ! mkdir "\${REPORT_HISTORY_LOCK}.lockdir" 2>/dev/null; do
+				sleep 1
+				waited=\$((waited + 1))
+				if [ "\$waited" -ge ${params.lock_wait_seconds} ]; then
+					echo "ERROR: failed to acquire report history lock: \${REPORT_HISTORY_LOCK}" 1>&2
+					return 2
+				fi
+			done
+			history_lock_acquired=1
+			return 0
+		}
+		publish_report_history() {
+			local publish_mode="append"
+			if ! publish_mode="\$(python3 ${baseDir}/bin/report_read_fate_repair.py \
+				--check-live-order \
+				--state-dir "${ongoingStateDir}" \
+				--current-round-barcode "${round_barcode}" \
+				--targets "${params.targets}" \
+				--target-taxa "${params.target_taxa}" 2>/dev/null)"; then
+				echo "WARN: report order check failed; forcing normalization for ${round_barcode}" 1>&2
+				publish_mode="normalize"
+			fi
+			if ! acquire_report_history_lock; then
+				return \$?
+			fi
+			trap 'release_report_history_lock' EXIT HUP INT TERM
+			local publish_rc=0
+			if [ "\$publish_mode" = "normalize" ]; then
+				echo "INFO: normalizing report history order for ${round_barcode}" 1>&2
+				python3 ${baseDir}/bin/report_read_fate_repair.py \
+					--live \
+					--skip-render \
+					--state-dir "${ongoingStateDir}" \
+					--current-round-barcode "${round_barcode}" \
+					--targets "${params.targets}" \
+					--target-taxa "${params.target_taxa}" \
+					--blast-unassigned-min-level "${assignProtLevelCanonical}" \
+					--outdir "${params.outdir}"
+				publish_rc=\$?
+			else
+				LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_history_append.sh --no-lock "\$ROUND_REPORT_JSON" "\$REPORT_HISTORY_JSONL" "\$REPORT_HISTORY_LOCK"
+				publish_rc=\$?
+			fi
+			release_report_history_lock
+			trap - EXIT HUP INT TERM
+			return "\$publish_rc"
+			}
+			report_live_publish_rc=0
+			if [ ! -s "\$ROUND_REPORT_JSON" ] || [ ! -d "\$ROUND_LIVE_STAGE" ]; then
+				echo "ERROR: invariant violated - required live-round publication inputs missing" 1>&2
+				exit 1
+			fi
+			set +e
+			LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_live_publish.sh \
+				--stage-root "\$ROUND_LIVE_STAGE" \
+				--state-root "\$CURRENT_ROOT" \
+				--run-asset-root "\$REPORT_ASSET_DIR" \
+				--round-barcode "${round_barcode}" \
+				--lock-path "\$REPORT_LIVE_PUBLISH_LOCK"
+			report_live_publish_rc=\$?
+			set -e
+			if [ "\$report_live_publish_rc" -ne 0 ]; then
+				echo "ERROR: live-round publication failed (rc=\$report_live_publish_rc)" 1>&2
+				exit "\$report_live_publish_rc"
+			fi
+			set +e
+			publish_report_history
+			history_rc=\$?
+			set -e
+			if [ "\$history_rc" -ne 0 ]; then
+				echo "WARN: report history publication failed (rc=\$history_rc)" 1>&2
+			fi
+			set +e
+			perl ${baseDir}/bin/report_run_json.pl \
+				--history "\$REPORT_HISTORY_JSONL" \
+				--out "\$RUN_REPORT_JSON" \
+				--run-id "${run_name}" \
+				--barcode "${barcode}" \
+				--state-id "${stateId}" \
+				--outdir "${params.outdir}" \
+				--schema-version "1.6" \
+				--report-rel-path "\$RUN_REPORT_REL_PATH" \
+				--run-started-utc-file "${ongoingStateDir}/_state/run_started_utc.txt"
+			run_json_rc=\$?
+			set -e
+			if [ "\$run_json_rc" -ne 0 ]; then
+				echo "ERROR: report_run_json.pl failed (rc=\$run_json_rc)" 1>&2
+				exit "\$run_json_rc"
+			fi
+			if [ ! -s "\$RUN_REPORT_JSON" ]; then
+				echo "ERROR: invariant violated - report_run_json.pl did not produce \$RUN_REPORT_JSON" 1>&2
+				exit 1
+			fi
+			set +e
+			LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_run_index_update.sh "\$RUN_REPORT_JSON" "\$RUN_INDEX_JSONL" "\$RUN_INDEX_LOCK"
+			run_index_rc=\$?
+			set -e
+			if [ "\$run_index_rc" -ne 0 ]; then
+				echo "ERROR: report_run_index_update.sh failed (rc=\$run_index_rc)" 1>&2
+				exit "\$run_index_rc"
+			fi
+			write_report_metadata_files() {
+					RUN_CONF_FILE="${params.outdir}/config/${run_name}/${run_name}.conf"
+					mkdir -p "\$(dirname "\$RUN_CONF_FILE")"
+					cat > "\$RUN_CONF_FILE" << 'RTBCONF'
+// Auto-generated run configuration: ${run_name}
+// Command: ${workflow.commandLine}
+params {
+${runConfigLines}
+}
+RTBCONF
+					_render_readme() {
+						local dst="\$1" tmpl="\$2"
+						[ -f "\$dst" ] && return
+						mkdir -p "\$(dirname "\$dst")"
+						sed "s|{{RUN_NAME}}|${run_name}|g; s|{{STATE_ID}}|${stateId}|g" "\$tmpl" > "\$dst"
+					}
+					_render_readme "${params.outdir}/pod5/${run_name}/README.html"         "${baseDir}/assets/readme/pod5.html"
+					_render_readme "${currentResultsStateDir}/README.html"                 "${baseDir}/assets/readme/state.html"
+					_render_readme "${params.outdir}/sample_info/${run_name}/README.html"   "${baseDir}/assets/readme/sample_info.html"
+					python3 ${baseDir}/bin/render_run_config_readme.py \
+						--template "${baseDir}/assets/readme/run_config.html" \
+						--conf "${params.outdir}/config/${run_name}/${run_name}.conf" \
+						--out "${params.outdir}/config/${run_name}/README.html" \
+					--run-name "${run_name}" \
+					--state-id "${stateId}" \
+					--cmd-line "${workflow.commandLine}" || true
+				}
+				write_report_metadata_files
+				printf 'render=0\nround_barcode=%s\n' "${round_barcode}" > "\$RENDER_REQUEST_FILE"
+				if [ "\$HTML_REPORT_ENABLED" -eq 1 ] && [ "\${history_rc:-1}" -eq 0 ]; then
+					mkdir -p "\$RUN_REPORT_DIR"
+					printf '%s\n' "queued:${round_barcode}" > "\$RUN_REPORT_PENDING"
+					printf 'render=1\nround_barcode=%s\n' "${round_barcode}" > "\$RENDER_REQUEST_FILE"
+				fi
 		
 			if [ -d \$ROUND_TMP/ ]
 			then
@@ -6231,16 +6625,350 @@ process backup_update_and_clean {
 					fi
 			fi
 			"""
-		}
+			}
 
 
+process async_report_render {
+	cache false
+	maxForks maxForksReportingVal
+	input:
+		tuple val(barcode), val(round_barcode), file(render_request_file) from report_render_request_ch
+	script:
+		"""
+			set -uo pipefail
+			shopt -s nullglob
+			export LC_ALL=C
 
-/*
- * STEP 3 - Output Description HTML
- */
-/*
- * Completion e-mail notification
- */
+			REQUEST_RENDER="\$(awk -F= '/^render=/{print \$2; exit}' "${render_request_file}" 2>/dev/null || true)"
+			if [ "\$REQUEST_RENDER" != "1" ]; then
+				exit 0
+			fi
+			if ! command -v python3 >/dev/null 2>&1; then
+				echo "WARN: python3 not found; skipping async HTML report rendering" 1>&2
+				exit 0
+			fi
+
+			STATE_TMP="${ongoingStateDir}/_state"
+			REPORT_HISTORY_JSONL="\$STATE_TMP/report_history.jsonl"
+			REPORT_HISTORY_LOCK="\$STATE_TMP/.report_history.lock"
+			REPORT_RENDER_LOCK="\$STATE_TMP/.report_render.lock"
+			REPORT_ROOT_RENDER_LOCK="${params.outdir}/.report_root_render.lock"
+			RUN_REPORT_DIR="${params.outdir}/report_html/runs/${run_name}"
+			RUN_REPORT_HTML="\$RUN_REPORT_DIR/report.html"
+			RUN_REPORT_STATE="\$RUN_REPORT_DIR/report_state.json"
+			RUN_REPORT_REPLICATES_HTML="\$RUN_REPORT_DIR/report_replicates.html"
+			RUN_REPORT_REPLICATES_STATE="\$RUN_REPORT_DIR/report_replicates_state.json"
+			RUN_REPORT_PRIMERS_HTML="\$RUN_REPORT_DIR/report_replicates_primers.html"
+			RUN_REPORT_PRIMERS_STATE="\$RUN_REPORT_DIR/report_replicates_primers_state.json"
+			RUN_REPORT_PENDING="\$RUN_REPORT_DIR/.report_render_pending"
+			REPORT_ASSET_DIR="${params.outdir}/report_html/runs/${run_name}/report_assets"
+			REPORT_ASSET_DIR_REPLICATES="${params.outdir}/report_html/runs/${run_name}/report_assets_replicates"
+			REPORT_ASSET_DIR_PRIMERS="${params.outdir}/report_html/runs/${run_name}/report_assets_replicates_primers"
+			REPORT_SAMPLE_ASSET_DIR="\$REPORT_ASSET_DIR/samples"
+			REPORT_IDENTITY_MODE="${replicateModeCanonical}"
+			HTML_REPORT_AUTO_REFRESH=${htmlReportAutoRefresh ? 1 : 0}
+			HTML_REPORT_REFRESH_SECONDS=${htmlReportRefreshSecondsStr}
+			HTML_REPORT_URL_PREFIX="${htmlReportUrlPrefix}"
+			HTML_REPORT_SAMPLE_PLOT_MAX=${htmlReportSamplePlotMaxStr}
+			RENDER_LOCK_WAIT=5
+			ROOT_LOCK_WAIT=1
+			SNAPSHOT_PATH="report_history.snapshot.jsonl"
+
+			render_lock_acquired=0
+			release_render_lock() {
+				if [ "\${render_lock_acquired:-0}" -eq 1 ]; then
+					rmdir "\${REPORT_RENDER_LOCK}.lockdir" 2>/dev/null || true
+					render_lock_acquired=0
+				fi
+			}
+			trap release_render_lock EXIT HUP INT TERM
+
+			acquire_lock_dir_wait() {
+				local lock_path="\$1"
+				local wait_limit="\$2"
+				local waited=0
+				local lock_dir="\${lock_path}.lockdir"
+				while ! mkdir "\$lock_dir" 2>/dev/null; do
+					if [ "\$waited" -ge "\$wait_limit" ]; then
+						return 1
+					fi
+					sleep 1
+					waited=\$((waited + 1))
+				done
+				return 0
+			}
+			release_lock_dir() {
+				local lock_path="\$1"
+				rmdir "\${lock_path}.lockdir" 2>/dev/null || true
+			}
+			calc_sha256() {
+				python3 - "\$1" <<'PY'
+import hashlib
+import sys
+path = sys.argv[1]
+try:
+    with open(path, "rb") as handle:
+        print(hashlib.sha256(handle.read()).hexdigest())
+except Exception:
+    print("")
+PY
+			}
+			clear_run_report_pending() {
+				rm -f "\$RUN_REPORT_PENDING"
+			}
+			check_run_report_publication() {
+				local report_html="\$1"
+				local report_state="\$2"
+				local expected_view="\$3"
+				python3 ${baseDir}/bin/report_publication_check.py \
+					--report-html "\$report_html" \
+					--report-state "\$report_state" \
+					--history "\$SNAPSHOT_PATH" \
+					--run-id "${run_name}" \
+					--expected-report-view "\$expected_view"
+			}
+			promote_report_assets() {
+				_PDF_LINK_DIR="${currentResultsStateDir}/plots/pdf"
+				_FIG_DIR="\$RUN_REPORT_DIR/figures"
+				_TABLES_DIR="${currentResultsStateDir}/tables"
+				_TO_FIG_EMBEDDED="${currentResultsStateDir}/tables/to_figures/embedded"
+				mkdir -p "\$_TO_FIG_EMBEDDED" || echo "WARN: could not create tables/to_figures/embedded: \$_TO_FIG_EMBEDDED" >&2
+				if [ -d "\$_TO_FIG_EMBEDDED" ] && [ -d "\$_FIG_DIR" ]; then
+					for _tsv in "\$_FIG_DIR"/*.tsv; do
+						[ -f "\$_tsv" ] || continue
+						[ -L "\$_tsv" ] && continue
+						_tsv_name=\$(basename "\$_tsv")
+						mv "\$_tsv" "\$_TO_FIG_EMBEDDED/\$_tsv_name" || { echo "WARN: promote figure TSV failed: \$_tsv_name" >&2; continue; }
+						ln -sf "\$_TO_FIG_EMBEDDED/\$_tsv_name" "\$_FIG_DIR/\$_tsv_name" || echo "WARN: figure TSV symlink (figures/) failed: \$_tsv_name" >&2
+					done
+					for _embedded_tsv in "\$_TO_FIG_EMBEDDED"/*.tsv; do
+						[ -f "\$_embedded_tsv" ] || continue
+						_tsv_name=\$(basename "\$_embedded_tsv")
+						ln -sf "\$_TO_FIG_EMBEDDED/\$_tsv_name" "\$_TABLES_DIR/\$_tsv_name" || echo "WARN: figure TSV symlink (tables/) failed: \$_tsv_name" >&2
+					done
+				fi
+				_EMBED_SRC="\$REPORT_ASSET_DIR/embedded"
+				_EMBED_DST="\$_PDF_LINK_DIR/embedded"
+				mkdir -p "\$_EMBED_DST" || echo "WARN: could not create plots/pdf/embedded dir" >&2
+				if [ -d "\$_EMBED_DST" ] && [ -d "\$_EMBED_SRC" ]; then
+					for _pdf in "\$_EMBED_SRC"/run_*.pdf; do
+						[ -f "\$_pdf" ] || continue
+						[ -L "\$_pdf" ] && continue
+						_pdf_name=\$(basename "\$_pdf")
+						mv "\$_pdf" "\$_EMBED_DST/\$_pdf_name" || { echo "WARN: promote embedded PDF failed: \$_pdf_name" >&2; continue; }
+						ln -sf "\$_EMBED_DST/\$_pdf_name" "\$_EMBED_SRC/\$_pdf_name" || echo "WARN: embedded PDF symlink failed: \$_pdf_name" >&2
+					done
+				fi
+				_EMBED_SAMP_SRC="\$REPORT_ASSET_DIR/embedded/samples"
+				_EMBED_SAMP_DST="\$_PDF_LINK_DIR/embedded/samples"
+				if [ -d "\$_EMBED_SAMP_SRC" ]; then
+					mkdir -p "\$_EMBED_SAMP_DST" || echo "WARN: could not create plots/pdf/embedded/samples dir" >&2
+					if [ -d "\$_EMBED_SAMP_DST" ]; then
+						for _pdf in "\$_EMBED_SAMP_SRC"/*.pdf; do
+							[ -f "\$_pdf" ] || continue
+							[ -L "\$_pdf" ] && continue
+							_pdf_name=\$(basename "\$_pdf")
+							mv "\$_pdf" "\$_EMBED_SAMP_DST/\$_pdf_name" || { echo "WARN: promote embed/samples PDF failed: \$_pdf_name" >&2; continue; }
+							ln -sf "\$_EMBED_SAMP_DST/\$_pdf_name" "\$_EMBED_SAMP_SRC/\$_pdf_name" || echo "WARN: embed/samples PDF symlink failed: \$_pdf_name" >&2
+						done
+					fi
+				fi
+				if [ -d "\$REPORT_SAMPLE_ASSET_DIR" ]; then
+					for _samp_src_dir in "\$REPORT_SAMPLE_ASSET_DIR"/*/; do
+						[ -d "\$_samp_src_dir" ] || continue
+						_sid=\$(basename "\$_samp_src_dir")
+						_samp_dst="\$_PDF_LINK_DIR/samples/\$_sid"
+						mkdir -p "\$_samp_dst" || { echo "WARN: could not create plots/pdf/samples/\$_sid" >&2; continue; }
+						for _pdf in "\$_samp_src_dir"*.pdf; do
+							[ -f "\$_pdf" ] || continue
+							[ -L "\$_pdf" ] && continue
+							_pdf_name=\$(basename "\$_pdf")
+							mv "\$_pdf" "\$_samp_dst/\$_pdf_name" || { echo "WARN: promote sample PDF failed: \$_pdf_name" >&2; continue; }
+							ln -sf "\$_samp_dst/\$_pdf_name" "\$_samp_src_dir\$_pdf_name" || echo "WARN: sample PDF symlink failed: \$_pdf_name" >&2
+						done
+					done
+				fi
+			}
+
+			if ! acquire_lock_dir_wait "\$REPORT_RENDER_LOCK" "\$RENDER_LOCK_WAIT"; then
+				echo "WARN: async render skipped for round=${round_barcode}; lock busy on \${REPORT_RENDER_LOCK}" 1>&2
+				exit 0
+			fi
+			render_lock_acquired=1
+
+			render_success=0
+			attempt=1
+			while [ "\$attempt" -le 2 ]; do
+				if ! acquire_lock_dir_wait "\$REPORT_HISTORY_LOCK" ${params.lock_wait_seconds}; then
+					echo "WARN: async render failed to acquire report history lock for round=${round_barcode}" 1>&2
+					break
+				fi
+				if [ ! -s "\$REPORT_HISTORY_JSONL" ]; then
+					echo "WARN: async render missing report history for round=${round_barcode}" 1>&2
+					release_lock_dir "\$REPORT_HISTORY_LOCK"
+					break
+				fi
+				if ! cp "\$REPORT_HISTORY_JSONL" "\$SNAPSHOT_PATH.tmp" 2>/dev/null; then
+					echo "WARN: async render could not snapshot report history for round=${round_barcode}" 1>&2
+					release_lock_dir "\$REPORT_HISTORY_LOCK"
+					break
+				fi
+				if ! mv "\$SNAPSHOT_PATH.tmp" "\$SNAPSHOT_PATH"; then
+					echo "WARN: async render could not finalize history snapshot for round=${round_barcode}" 1>&2
+					release_lock_dir "\$REPORT_HISTORY_LOCK"
+					break
+				fi
+				snapshot_revision="\$(calc_sha256 "\$SNAPSHOT_PATH")"
+				release_lock_dir "\$REPORT_HISTORY_LOCK"
+				if [ -z "\$snapshot_revision" ]; then
+					echo "WARN: async render computed empty snapshot revision for round=${round_barcode}" 1>&2
+					break
+				fi
+
+				if [ "\$REPORT_IDENTITY_MODE" = "track" ]; then
+					LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
+						--outdir "${params.outdir}" \
+						--state-id "${stateId}" \
+						--history "\$SNAPSHOT_PATH" \
+						--run-id "${run_name}" \
+						--skip-root-report \
+						--skip-run-json \
+						--group-view sample \
+						--run-html "\$RUN_REPORT_HTML" \
+						--run-state "\$RUN_REPORT_STATE" \
+						--figures-dir-name "figures" \
+						--report-assets-dir-name "report_assets" \
+						--url-prefix "\$HTML_REPORT_URL_PREFIX" \
+						--auto-refresh "\$HTML_REPORT_AUTO_REFRESH" \
+						--refresh-seconds "\$HTML_REPORT_REFRESH_SECONDS" \
+						--sample-plot-max "\$HTML_REPORT_SAMPLE_PLOT_MAX" &
+					sample_render_pid=\$!
+					LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
+						--outdir "${params.outdir}" \
+						--state-id "${stateId}" \
+						--history "\$SNAPSHOT_PATH" \
+						--run-id "${run_name}" \
+						--skip-root-report \
+						--skip-run-json \
+						--group-view replicate \
+						--run-html "\$RUN_REPORT_REPLICATES_HTML" \
+						--run-state "\$RUN_REPORT_REPLICATES_STATE" \
+						--figures-dir-name "figures_replicates" \
+						--report-assets-dir-name "report_assets_replicates" \
+						--url-prefix "\$HTML_REPORT_URL_PREFIX" \
+						--auto-refresh "\$HTML_REPORT_AUTO_REFRESH" \
+						--refresh-seconds "\$HTML_REPORT_REFRESH_SECONDS" \
+						--sample-plot-max "\$HTML_REPORT_SAMPLE_PLOT_MAX" &
+					replicate_render_pid=\$!
+					LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
+						--outdir "${params.outdir}" \
+						--state-id "${stateId}" \
+						--history "\$SNAPSHOT_PATH" \
+						--run-id "${run_name}" \
+						--skip-root-report \
+						--skip-run-json \
+						--group-view track_detail \
+						--run-html "\$RUN_REPORT_PRIMERS_HTML" \
+						--run-state "\$RUN_REPORT_PRIMERS_STATE" \
+						--figures-dir-name "figures_replicates_primers" \
+						--report-assets-dir-name "report_assets_replicates_primers" \
+						--url-prefix "\$HTML_REPORT_URL_PREFIX" \
+						--auto-refresh "\$HTML_REPORT_AUTO_REFRESH" \
+						--refresh-seconds "\$HTML_REPORT_REFRESH_SECONDS" \
+						--sample-plot-max "\$HTML_REPORT_SAMPLE_PLOT_MAX" &
+					track_detail_render_pid=\$!
+					wait "\$sample_render_pid"
+					sample_render_rc=\$?
+					wait "\$replicate_render_pid"
+					replicate_render_rc=\$?
+					wait "\$track_detail_render_pid"
+					track_detail_render_rc=\$?
+					if [ "\$sample_render_rc" -ne 0 ] || [ "\$replicate_render_rc" -ne 0 ] || [ "\$track_detail_render_rc" -ne 0 ]; then
+						echo "WARN: async report_rebuild.sh failed for round=${round_barcode} sample_rc=\$sample_render_rc replicate_rc=\$replicate_render_rc track_detail_rc=\$track_detail_render_rc" 1>&2
+						break
+					fi
+					if ! check_run_report_publication "\$RUN_REPORT_HTML" "\$RUN_REPORT_STATE" "sample"; then
+						echo "WARN: async sample run report publication check failed for round=${round_barcode}" 1>&2
+						break
+					fi
+					if ! check_run_report_publication "\$RUN_REPORT_REPLICATES_HTML" "\$RUN_REPORT_REPLICATES_STATE" "replicate"; then
+						echo "WARN: async replicate run report publication check failed for round=${round_barcode}" 1>&2
+						break
+					fi
+					if ! check_run_report_publication "\$RUN_REPORT_PRIMERS_HTML" "\$RUN_REPORT_PRIMERS_STATE" "track_detail"; then
+						echo "WARN: async track-detail run report publication check failed for round=${round_barcode}" 1>&2
+						break
+					fi
+				else
+					if ! LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
+						--outdir "${params.outdir}" \
+						--state-id "${stateId}" \
+						--history "\$SNAPSHOT_PATH" \
+						--run-id "${run_name}" \
+						--skip-root-report \
+						--skip-run-json \
+						--group-view sample \
+						--run-html "\$RUN_REPORT_HTML" \
+						--run-state "\$RUN_REPORT_STATE" \
+						--figures-dir-name "figures" \
+						--report-assets-dir-name "report_assets" \
+						--url-prefix "\$HTML_REPORT_URL_PREFIX" \
+						--auto-refresh "\$HTML_REPORT_AUTO_REFRESH" \
+						--refresh-seconds "\$HTML_REPORT_REFRESH_SECONDS" \
+						--sample-plot-max "\$HTML_REPORT_SAMPLE_PLOT_MAX"; then
+						echo "WARN: async report_rebuild.sh failed for round=${round_barcode}" 1>&2
+						break
+					fi
+					if ! check_run_report_publication "\$RUN_REPORT_HTML" "\$RUN_REPORT_STATE" "sample"; then
+						echo "WARN: async run report publication check failed for round=${round_barcode}" 1>&2
+						break
+					fi
+				fi
+
+				if ! acquire_lock_dir_wait "\$REPORT_HISTORY_LOCK" ${params.lock_wait_seconds}; then
+					echo "WARN: async render could not recheck report history for round=${round_barcode}" 1>&2
+					break
+				fi
+				live_revision="\$(calc_sha256 "\$REPORT_HISTORY_JSONL")"
+				release_lock_dir "\$REPORT_HISTORY_LOCK"
+				if [ "\$live_revision" = "\$snapshot_revision" ] && [ -n "\$live_revision" ]; then
+					render_success=1
+					break
+				fi
+				if [ "\$attempt" -ge 2 ]; then
+					echo "WARN: async render history changed twice for round=${round_barcode}; leaving report pending" 1>&2
+					break
+				fi
+				echo "WARN: async render detected newer history during round=${round_barcode}; retrying once" 1>&2
+				attempt=\$((attempt + 1))
+			done
+
+			if [ "\$render_success" -ne 1 ]; then
+				exit 0
+			fi
+
+			promote_report_assets
+			clear_run_report_pending
+
+			if acquire_lock_dir_wait "\$REPORT_ROOT_RENDER_LOCK" "\$ROOT_LOCK_WAIT"; then
+				if ! LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
+					--outdir "${params.outdir}" \
+					--state-id "${stateId}" \
+					--history "\$SNAPSHOT_PATH" \
+					--url-prefix "\$HTML_REPORT_URL_PREFIX" \
+					--auto-refresh "\$HTML_REPORT_AUTO_REFRESH" \
+					--refresh-seconds "\$HTML_REPORT_REFRESH_SECONDS" \
+					--sample-plot-max "\$HTML_REPORT_SAMPLE_PLOT_MAX"; then
+					echo "WARN: async root report rebuild failed for round=${round_barcode}" 1>&2
+				fi
+				release_lock_dir "\$REPORT_ROOT_RENDER_LOCK"
+			else
+				echo "WARN: async root report render skipped for round=${round_barcode}; lock busy on \${REPORT_ROOT_RENDER_LOCK}" 1>&2
+			fi
+		"""
+}
+
+
 workflow.onComplete {
     c_green = params.monochrome_logs ? '' : "\033[0;32m";
     c_purple = params.monochrome_logs ? '' : "\033[0;35m";
@@ -6268,32 +6996,17 @@ workflow.onComplete {
 // ============================================================
 
 def validateTimingLockParams() {
-    if ( !params.containsKey('file_wait_minutes') || params.file_wait_minutes == null ) {
-        params.file_wait_minutes = 30
-    }
     // How long to wait for the per-POD5 "round lock" (0 = wait indefinitely).
     // This lock is used to prevent Nextflow from overlapping rounds when multiple POD5s
     // are available at once, which can otherwise cause later rounds to read stale/partial
     // rolling state files under `${params.outdir}/temp/ongoing/state/<stateId>/_state`.
-    if ( !params.containsKey('round_lock_wait_minutes') || params.round_lock_wait_minutes == null ) {
-        params.round_lock_wait_minutes = 360
-    }
     // Stale lock reclaim TTL for the per-state "round lock" (minutes).
     // See the lock logic in `fast_on_target_detection`.
-    if ( !params.containsKey('stale_lock_ttl_minutes') || params.stale_lock_ttl_minutes == null ) {
-        params.stale_lock_ttl_minutes = 360
-    }
     def staleLockTtlMinutesStr = params.stale_lock_ttl_minutes.toString().trim()
     if (!(staleLockTtlMinutesStr ==~ /^\d+$/)) {
         exit 1, "Invalid --stale_lock_ttl_minutes '${params.stale_lock_ttl_minutes}'. Provide an integer >= 0."
     }
     // Used for portable (no `flock`) directory-based locking.
-    if ( !params.containsKey('lock_wait_seconds') || params.lock_wait_seconds == null ) {
-        params.lock_wait_seconds = 300
-    }
-    if ( !params.containsKey('round_lock_scope') || params.round_lock_scope == null ) {
-        params.round_lock_scope = 'full_round'
-    }
     def roundLockScopeCanonical = params.round_lock_scope.toString().trim().toLowerCase()
     if (!(roundLockScopeCanonical in ['full_round', 'dorado_only'])) {
         exit 1, "Invalid --round_lock_scope '${params.round_lock_scope}'. Allowed values: full_round, dorado_only"
@@ -6302,65 +7015,38 @@ def validateTimingLockParams() {
 }
 
 def validateForkParams() {
-    if ( !params.containsKey('maxforks_fast') || params.maxforks_fast == null ) {
-        params.maxforks_fast = 1
-    }
     def maxForksFastStr = params.maxforks_fast.toString().trim()
     if (!(maxForksFastStr ==~ /[0-9]+/) || maxForksFastStr.toInteger() < 1) {
         exit 1, "Invalid --maxforks_fast '${params.maxforks_fast}'. Provide an integer >= 1."
     }
     def maxForksFastVal = maxForksFastStr.toInteger()
-    if ( !params.containsKey('maxforks_reporting') || params.maxforks_reporting == null ) {
-        params.maxforks_reporting = 2
-    }
     def maxForksReportingStr = params.maxforks_reporting.toString().trim()
     if (!(maxForksReportingStr ==~ /[0-9]+/) || maxForksReportingStr.toInteger() < 1) {
         exit 1, "Invalid --maxforks_reporting '${params.maxforks_reporting}'. Provide an integer >= 1."
     }
     def maxForksReportingVal = maxForksReportingStr.toInteger()
-    if ( !params.containsKey('maxforks_consensus') || params.maxforks_consensus == null ) {
-        params.maxforks_consensus = 1
-    }
     def maxForksConsensusStr = params.maxforks_consensus.toString().trim()
     if (!(maxForksConsensusStr ==~ /[0-9]+/) || maxForksConsensusStr.toInteger() < 1) {
         exit 1, "Invalid --maxforks_consensus '${params.maxforks_consensus}'. Provide an integer >= 1."
     }
     def maxForksConsensusVal = maxForksConsensusStr.toInteger()
-    if ( !params.containsKey('maxforks_core_cpu') || params.maxforks_core_cpu == null ) {
-        params.maxforks_core_cpu = 1
+    def maxForksStatefulCoreStr = params.maxforks_stateful_core.toString().trim()
+    if (!(maxForksStatefulCoreStr ==~ /[0-9]+/) || maxForksStatefulCoreStr.toInteger() < 1) {
+        exit 1, "Invalid --maxforks_stateful_core '${params.maxforks_stateful_core}'. Provide an integer >= 1."
     }
-    def maxForksCoreCpuStr = params.maxforks_core_cpu.toString().trim()
-    if (!(maxForksCoreCpuStr ==~ /[0-9]+/) || maxForksCoreCpuStr.toInteger() < 1) {
-        exit 1, "Invalid --maxforks_core_cpu '${params.maxforks_core_cpu}'. Provide an integer >= 1."
-    }
-    def maxForksCoreCpuVal = maxForksCoreCpuStr.toInteger()
+    def maxForksStatefulCoreVal = maxForksStatefulCoreStr.toInteger()
     return [maxForksFastVal: maxForksFastVal, maxForksReportingVal: maxForksReportingVal,
-            maxForksConsensusVal: maxForksConsensusVal, maxForksCoreCpuVal: maxForksCoreCpuVal]
+            maxForksConsensusVal: maxForksConsensusVal, maxForksStatefulCoreVal: maxForksStatefulCoreVal]
 }
 
 def validateHtmlReportParams() {
-    if ( !params.containsKey('html_report_enabled') || params.html_report_enabled == null ) {
-        params.html_report_enabled = true
-    }
     def htmlReportEnabled = parseBoolStrict(params.html_report_enabled, true, 'html_report_enabled')
-    if ( !params.containsKey('html_report_auto_refresh') || params.html_report_auto_refresh == null ) {
-        params.html_report_auto_refresh = true
-    }
     def htmlReportAutoRefresh = parseBoolStrict(params.html_report_auto_refresh, true, 'html_report_auto_refresh')
-    if ( !params.containsKey('html_report_refresh_seconds') || params.html_report_refresh_seconds == null ) {
-        params.html_report_refresh_seconds = 15
-    }
     def htmlReportRefreshSecondsStr = params.html_report_refresh_seconds.toString().trim()
     if (!(htmlReportRefreshSecondsStr ==~ /[0-9]+/) || htmlReportRefreshSecondsStr.toInteger() < 1) {
         exit 1, "Invalid --html_report_refresh_seconds '${params.html_report_refresh_seconds}'. Provide an integer >= 1."
     }
-    if ( !params.containsKey('html_report_url_prefix') || params.html_report_url_prefix == null ) {
-        params.html_report_url_prefix = ""
-    }
     def htmlReportUrlPrefix = params.html_report_url_prefix.toString().trim()
-    if ( !params.containsKey('html_report_sample_plot_max') || params.html_report_sample_plot_max == null ) {
-        params.html_report_sample_plot_max = 10
-    }
     def htmlReportSamplePlotMaxStr = params.html_report_sample_plot_max.toString().trim()
     if (!(htmlReportSamplePlotMaxStr ==~ /[0-9]+/)) {
         exit 1, "Invalid --html_report_sample_plot_max '${params.html_report_sample_plot_max}'. Provide an integer >= 0."
@@ -6372,123 +7058,48 @@ def validateHtmlReportParams() {
 
 def validateOtuRecoveryPruneParams() {
     // Frozen-rep incremental OTU clustering defaults.
-    if ( !params.containsKey('otu_frozen_enabled') || params.otu_frozen_enabled == null ) {
-        params.otu_frozen_enabled = true
-    }
-    if ( !params.containsKey('otu_frozen_min_rounds') || params.otu_frozen_min_rounds == null ) {
-        params.otu_frozen_min_rounds = 3
-    }
-    if ( !params.containsKey('otu_frozen_min_reads') || params.otu_frozen_min_reads == null ) {
-        params.otu_frozen_min_reads = 50
-    }
-    if ( !params.containsKey('otu_frozen_growth_window') || params.otu_frozen_growth_window == null ) {
-        params.otu_frozen_growth_window = 3
-    }
-    if ( !params.containsKey('otu_frozen_drop_ratio') || params.otu_frozen_drop_ratio == null ) {
-        params.otu_frozen_drop_ratio = 0.25
-    }
-    if ( !params.containsKey('otu_frozen_min_frac') || params.otu_frozen_min_frac == null ) {
-        params.otu_frozen_min_frac = 0.0
-    }
-    if ( !params.containsKey('otu_incremental_min_new') || params.otu_incremental_min_new == null ) {
-        params.otu_incremental_min_new = 1
-    }
-    if ( !params.containsKey('otu_hashmap_mixed_policy') || params.otu_hashmap_mixed_policy == null ) {
-        params.otu_hashmap_mixed_policy = 'pipe_only'
-    }
-    if ( !params.containsKey('otu_allow_unsafe_recovery') || params.otu_allow_unsafe_recovery == null ) {
-        params.otu_allow_unsafe_recovery = false
-    }
-    if ( !params.containsKey('otu_strict_ids') || params.otu_strict_ids == null ) {
-        params.otu_strict_ids = true
-    }
-    if ( !params.containsKey('otu_commit_dropped_hashes') || params.otu_commit_dropped_hashes == null ) {
-        params.otu_commit_dropped_hashes = false
-    }
-    if ( !params.containsKey('otu_pool_decision_include_hash') || params.otu_pool_decision_include_hash == null ) {
-        params.otu_pool_decision_include_hash = false
-    }
-    if ( !params.containsKey('otu_frozen_db_only_policy') || params.otu_frozen_db_only_policy == null ) {
-        params.otu_frozen_db_only_policy = 'auto'
-    }
     def otuDbOnlyPolicyCanonical = params.otu_frozen_db_only_policy.toString().trim().toLowerCase()
     if (!(otuDbOnlyPolicyCanonical in ['auto', 'fail', 'warn_skip'])) {
         exit 1, "Invalid --otu_frozen_db_only_policy '${params.otu_frozen_db_only_policy}'. Allowed values: auto, fail, warn_skip"
-    }
-    if ( !params.containsKey('otu_pruned_recovery_enabled') || params.otu_pruned_recovery_enabled == null ) {
-        params.otu_pruned_recovery_enabled = false
     }
     def otuPrunedRecoveryEnabled = parseBoolStrict(params.otu_pruned_recovery_enabled, false, 'otu_pruned_recovery_enabled')
     if ( !params.containsKey('otu_pruned_recovery_identity') || params.otu_pruned_recovery_identity == null ) {
         params.otu_pruned_recovery_identity = params.otu_id
     }
     def otuPrunedRecoveryIdentity = formatOtuIdentity(params.otu_pruned_recovery_identity)
-    if ( !params.containsKey('otu_pruned_recovery_target_policy') || params.otu_pruned_recovery_target_policy == null ) {
-        params.otu_pruned_recovery_target_policy = 'same_target_only'
-    }
     def otuPrunedRecoveryTargetPolicyCanonical = params.otu_pruned_recovery_target_policy.toString().trim().toLowerCase()
     if (!(otuPrunedRecoveryTargetPolicyCanonical in ['same_target_only', 'any'])) {
         exit 1, "Invalid --otu_pruned_recovery_target_policy '${params.otu_pruned_recovery_target_policy}'. Allowed values: same_target_only, any"
-    }
-    if ( !params.containsKey('otu_pruned_recovery_failure_policy') || params.otu_pruned_recovery_failure_policy == null ) {
-        params.otu_pruned_recovery_failure_policy = 'warn_skip'
     }
     def otuPrunedRecoveryFailurePolicyCanonical = params.otu_pruned_recovery_failure_policy.toString().trim().toLowerCase()
     if (!(otuPrunedRecoveryFailurePolicyCanonical in ['warn_skip', 'fail'])) {
         exit 1, "Invalid --otu_pruned_recovery_failure_policy '${params.otu_pruned_recovery_failure_policy}'. Allowed values: warn_skip, fail"
     }
-    if ( !params.containsKey('prune_unassigned_clusters') || params.prune_unassigned_clusters == null ) {
-        params.prune_unassigned_clusters = false
-    }
     def pruneUnassignedClusters = parseBoolStrict(params.prune_unassigned_clusters, false, 'prune_unassigned_clusters')
-    if ( !params.containsKey('prune_unassigned_drop_reads') || params.prune_unassigned_drop_reads == null ) {
-        params.prune_unassigned_drop_reads = false
-    }
     def pruneUnassignedDropReads = parseBoolStrict(params.prune_unassigned_drop_reads, false, 'prune_unassigned_drop_reads')
     if (!pruneUnassignedClusters && pruneUnassignedDropReads) {
         pruneUnassignedDropReads = false
         params.prune_unassigned_drop_reads = false
         log.warn "prune_unassigned_drop_reads disabled because prune_unassigned_clusters is false"
     }
-    if ( !params.containsKey('prune_unassigned_grace_rounds') || params.prune_unassigned_grace_rounds == null ) {
-        params.prune_unassigned_grace_rounds = 3
-    }
     def pruneUnassignedGraceRoundsStr = params.prune_unassigned_grace_rounds.toString().trim()
     if (!(pruneUnassignedGraceRoundsStr ==~ /[0-9]+/)) {
         exit 1, "Invalid --prune_unassigned_grace_rounds '${params.prune_unassigned_grace_rounds}'. Provide an integer >= 0."
-    }
-    if ( !params.containsKey('prune_unassigned_keep_top') || params.prune_unassigned_keep_top == null ) {
-        params.prune_unassigned_keep_top = 5
     }
     def pruneUnassignedKeepTopStr = params.prune_unassigned_keep_top.toString().trim()
     if (!(pruneUnassignedKeepTopStr ==~ /[0-9]+/)) {
         exit 1, "Invalid --prune_unassigned_keep_top '${params.prune_unassigned_keep_top}'. Provide an integer >= 0."
     }
-    if ( !params.containsKey('otu_prune_frozen_policy') || params.otu_prune_frozen_policy == null ) {
-        params.otu_prune_frozen_policy = 'until_consolidated'
-    }
     def otuPruneFrozenPolicyCanonical = params.otu_prune_frozen_policy.toString().trim().toLowerCase()
     if (!(otuPruneFrozenPolicyCanonical in ['always', 'until_consolidated', 'never'])) {
         exit 1, "Invalid --otu_prune_frozen_policy '${params.otu_prune_frozen_policy}'. Allowed values: always, until_consolidated, never"
     }
-    if ( !params.containsKey('otu_prune_samples_file') || params.otu_prune_samples_file == null ) {
-        params.otu_prune_samples_file = ''
-    }
     def otuPruneSamplesFileValue = params.otu_prune_samples_file.toString().trim()
-    if ( !params.containsKey('otu_lock_force_prune_max_fasta_mb') || params.otu_lock_force_prune_max_fasta_mb == null ) {
-        params.otu_lock_force_prune_max_fasta_mb = 0
-    }
     def otuLockForcePruneMaxFastaMbStr = params.otu_lock_force_prune_max_fasta_mb.toString().trim()
     if (!(otuLockForcePruneMaxFastaMbStr ==~ /[0-9]+([.][0-9]+)?/)) {
         exit 1, "Invalid --otu_lock_force_prune_max_fasta_mb '${params.otu_lock_force_prune_max_fasta_mb}'. Provide a number >= 0."
     }
-    if ( !params.containsKey('otu_force_prune_override') || params.otu_force_prune_override == null ) {
-        params.otu_force_prune_override = false
-    }
     def otuForcePruneOverride = parseBoolStrict(params.otu_force_prune_override, false, 'otu_force_prune_override')
-    if ( !params.containsKey('otu_consolidated_keys_mixed_policy') || params.otu_consolidated_keys_mixed_policy == null ) {
-        params.otu_consolidated_keys_mixed_policy = 'sample_scoped_only'
-    }
     def otuConsolidatedKeysMixedPolicyCanonical = params.otu_consolidated_keys_mixed_policy.toString().trim().toLowerCase()
     if (!(otuConsolidatedKeysMixedPolicyCanonical in ['sample_scoped_only', 'warn_and_sample_scoped', 'fail'])) {
         exit 1, "Invalid --otu_consolidated_keys_mixed_policy '${params.otu_consolidated_keys_mixed_policy}'. Allowed values: sample_scoped_only, warn_and_sample_scoped, fail"
@@ -6511,71 +7122,57 @@ def validateOtuRecoveryPruneParams() {
 
 def validateConsensusAssignParams() {
     // Consensus generation: minimum reads per OTU to attempt consensus.
-    if ( !params.containsKey('consensus_min_reads') || params.consensus_min_reads == null ) {
-        params.consensus_min_reads = 5
+    def consensusReadsModeCanonical = params.consensus_reads_mode.toString().trim().toLowerCase()
+    if (!(consensusReadsModeCanonical in ['representative', 'cluster_total'])) {
+        exit 1, "Invalid --consensus_reads_mode '${params.consensus_reads_mode}'. Allowed values: representative, cluster_total"
     }
-    if ( !params.containsKey('consensus_max_reads') || params.consensus_max_reads == null ) {
-        params.consensus_max_reads = 15
-    }
-    if ( !params.containsKey('consensus_min_qscore') || params.consensus_min_qscore == null ) {
-        params.consensus_min_qscore = 15
-    }
-    if ( !params.containsKey('consensus_consolidated_min_qscore') || params.consensus_consolidated_min_qscore == null ) {
-        params.consensus_consolidated_min_qscore = 20
-    }
-    if ( !params.containsKey('consensus_reads_mode') || params.consensus_reads_mode == null ) {
-        params.consensus_reads_mode = 'representative'
-    }
-    if ( !params.containsKey('consensus_max_N') || params.consensus_max_N == null ) {
-        params.consensus_max_N = 4
-    }
-    if ( !params.containsKey('consensus_keep_original_reads') || params.consensus_keep_original_reads == null ) {
-        params.consensus_keep_original_reads = false
-    }
+    params.consensus_reads_mode = consensusReadsModeCanonical
     def consensusKeepOriginalReads = parseBoolStrict(params.consensus_keep_original_reads, false, 'consensus_keep_original_reads')
-    if ( !params.containsKey('consensus_zero_emit_policy') || params.consensus_zero_emit_policy == null ) {
-        params.consensus_zero_emit_policy = 'warn'
+    def consensusSelectorRankingCanonical = params.consensus_selector_ranking.toString().trim().toLowerCase()
+    if (!(consensusSelectorRankingCanonical in ['qscore_first', 'count_then_qscore'])) {
+        exit 1, "Invalid --consensus_selector_ranking '${params.consensus_selector_ranking}'. Allowed values: qscore_first, count_then_qscore"
+    }
+    def consensusEnforceMaxReads = parseBoolStrict(params.consensus_enforce_max_reads, false, 'consensus_enforce_max_reads')
+    if (consensusEnforceMaxReads) {
+        def consensusMinReadsStr = params.consensus_min_reads.toString().trim()
+        def consensusMaxReadsStr = params.consensus_max_reads.toString().trim()
+        if (!(consensusMinReadsStr ==~ /[0-9]+/)) {
+            exit 1, "Invalid --consensus_min_reads '${params.consensus_min_reads}'. Provide an integer >= 0 when --consensus_enforce_max_reads is enabled."
+        }
+        if (!(consensusMaxReadsStr ==~ /[0-9]+/)) {
+            exit 1, "Invalid --consensus_max_reads '${params.consensus_max_reads}'. Provide an integer >= 0 when --consensus_enforce_max_reads is enabled."
+        }
+        def consensusMinReadsValue = consensusMinReadsStr.toInteger()
+        def consensusMaxReadsValue = consensusMaxReadsStr.toInteger()
+        def selectorMinReadsValue = 10
+        def requiredMaxReadsValue = Math.max(consensusMinReadsValue, selectorMinReadsValue)
+        if (consensusMaxReadsValue < requiredMaxReadsValue) {
+            exit 1, "Invalid --consensus_max_reads '${params.consensus_max_reads}'. When --consensus_enforce_max_reads is enabled, provide a value >= ${requiredMaxReadsValue}."
+        }
     }
     def consensusZeroEmitPolicyCanonical = params.consensus_zero_emit_policy.toString().trim().toLowerCase()
     if (!(consensusZeroEmitPolicyCanonical in ['warn', 'fail'])) {
         exit 1, "Invalid --consensus_zero_emit_policy '${params.consensus_zero_emit_policy}'. Allowed values: warn, fail"
     }
-    if ( !params.containsKey('consensus_id_mismatch_policy') || params.consensus_id_mismatch_policy == null ) {
-        // Default to warn: 0-resolved eligible reads is a valid operational state when all reads for
-        // an OTU have been pruned in a previous round. resolve_ids_to_supreads uses multi-level
-        // fallback matching, so a genuine ID-format bug would surface as many warnings across all OTUs,
-        // not as a hard failure on a single OTU. Use --consensus_id_mismatch_policy fail to opt in.
-        params.consensus_id_mismatch_policy = 'warn'
-    }
     def consensusIdMismatchPolicyCanonical = params.consensus_id_mismatch_policy.toString().trim().toLowerCase()
     if (!(consensusIdMismatchPolicyCanonical in ['warn', 'fail'])) {
         exit 1, "Invalid --consensus_id_mismatch_policy '${params.consensus_id_mismatch_policy}'. Allowed values: warn, fail"
-    }
-    if ( !params.containsKey('consensus_cache_below_min_policy') || params.consensus_cache_below_min_policy == null ) {
-        params.consensus_cache_below_min_policy = 'keep'
     }
     def consensusCacheBelowMinPolicyCanonical = params.consensus_cache_below_min_policy.toString().trim().toLowerCase()
     if (!(consensusCacheBelowMinPolicyCanonical in ['keep', 'drop'])) {
         exit 1, "Invalid --consensus_cache_below_min_policy '${params.consensus_cache_below_min_policy}'. Allowed values: keep, drop"
     }
-    if ( !params.containsKey('otu_consolidation_lock') || params.otu_consolidation_lock == null ) {
-        params.otu_consolidation_lock = true
-    }
     def assignProtLevelCanonical = (params.containsKey('assign_protection_level') && params.assign_protection_level != null
         ? params.assign_protection_level.toString().trim().toLowerCase()
         : "genus")
     if (!(assignProtLevelCanonical in ['family', 'genus', 'species'])) {
-        log.warn "assign_protection_level '${params.assign_protection_level}' unknown; defaulting to 'genus'"
-        assignProtLevelCanonical = "genus"
+        exit 1, "Invalid --assign_protection_level '${params.assign_protection_level}'. Allowed values: family, genus, species"
     }
-    if ( !params.containsKey('prune_round_sequences') || params.prune_round_sequences == null ) {
-        params.prune_round_sequences = true
-    }
-    if ( !params.containsKey('prune_cumulative_pool_all') || params.prune_cumulative_pool_all == null ) {
-        params.prune_cumulative_pool_all = true
-    }
+    params.assign_protection_level = assignProtLevelCanonical
     def pruneCumulativePoolAll = parseBoolStrict(params.prune_cumulative_pool_all, true, 'prune_cumulative_pool_all')
     return [consensusKeepOriginalReads: consensusKeepOriginalReads,
+            consensusSelectorRankingCanonical: consensusSelectorRankingCanonical,
+            consensusEnforceMaxReads: consensusEnforceMaxReads,
             consensusZeroEmitPolicyCanonical: consensusZeroEmitPolicyCanonical,
             consensusIdMismatchPolicyCanonical: consensusIdMismatchPolicyCanonical,
             consensusCacheBelowMinPolicyCanonical: consensusCacheBelowMinPolicyCanonical,
@@ -6584,83 +7181,98 @@ def validateConsensusAssignParams() {
 }
 
 def validateOtuClusterLockParams() {
-    if ( !params.containsKey('otu_lock_small_cluster_ratio') || params.otu_lock_small_cluster_ratio == null ) {
-        params.otu_lock_small_cluster_ratio = 0.1
+    def otuConsolidationModeCanonical = params.otu_consolidation_mode.toString().trim().toLowerCase()
+    if (!(otuConsolidationModeCanonical in ['lock', 'significant_clusters'])) {
+        exit 1, "Invalid --otu_consolidation_mode '${params.otu_consolidation_mode}'. Allowed values: lock, significant_clusters"
     }
     def otuLockRatioStr = params.otu_lock_small_cluster_ratio.toString().trim()
     if (!(otuLockRatioStr ==~ /[0-9]+([.][0-9]+)?/)) {
         exit 1, "Invalid --otu_lock_small_cluster_ratio '${params.otu_lock_small_cluster_ratio}'. Provide a decimal ratio (e.g. 0.1)."
     }
-    if ( !params.containsKey('otu_lock_min_consolidated_reads') || params.otu_lock_min_consolidated_reads == null ) {
-        params.otu_lock_min_consolidated_reads = 10
-    }
     def otuLockMinConsReadsStr = params.otu_lock_min_consolidated_reads.toString().trim()
     if (!(otuLockMinConsReadsStr ==~ /[0-9]+/)) {
         exit 1, "Invalid --otu_lock_min_consolidated_reads '${params.otu_lock_min_consolidated_reads}'. Provide an integer >= 0."
-    }
-    if ( !params.containsKey('otu_lock_min_stable_rounds') || params.otu_lock_min_stable_rounds == null ) {
-        params.otu_lock_min_stable_rounds = 1
     }
     def otuLockMinStableRoundsStr = params.otu_lock_min_stable_rounds.toString().trim()
     if (!(otuLockMinStableRoundsStr ==~ /[0-9]+/) || otuLockMinStableRoundsStr.toInteger() < 1) {
         exit 1, "Invalid --otu_lock_min_stable_rounds '${params.otu_lock_min_stable_rounds}'. Provide an integer >= 1."
     }
-    if ( !params.containsKey('otu_lock_revalidate_every_rounds') || params.otu_lock_revalidate_every_rounds == null ) {
-        params.otu_lock_revalidate_every_rounds = 0
-    }
     def otuLockRevalidateEveryRoundsStr = params.otu_lock_revalidate_every_rounds.toString().trim()
     if (!(otuLockRevalidateEveryRoundsStr ==~ /[0-9]+/)) {
         exit 1, "Invalid --otu_lock_revalidate_every_rounds '${params.otu_lock_revalidate_every_rounds}'. Provide an integer >= 0."
     }
-    if ( !params.containsKey('otu_lock_reset_keys') || params.otu_lock_reset_keys == null ) {
-        params.otu_lock_reset_keys = ''
+    def otuSigMinClusterReadsStr = params.otu_sig_min_cluster_reads.toString().trim()
+    if (!(otuSigMinClusterReadsStr ==~ /[0-9]+/) || otuSigMinClusterReadsStr.toInteger() < 1) {
+        exit 1, "Invalid --otu_sig_min_cluster_reads '${params.otu_sig_min_cluster_reads}'. Provide an integer >= 1."
     }
-    if ( !params.containsKey('otu_size_streak_mode') || params.otu_size_streak_mode == null ) {
-        params.otu_size_streak_mode = 'enforce'
+    if ( !params.containsKey('otu_sig_min_cluster_qscore') || params.otu_sig_min_cluster_qscore == null ) {
+        params.otu_sig_min_cluster_qscore = params.consensus_consolidated_min_qscore
+    }
+    def otuSigMinClusterQscoreStr = params.otu_sig_min_cluster_qscore.toString().trim()
+    if (!(otuSigMinClusterQscoreStr ==~ /[0-9]+([.][0-9]+)?/)) {
+        exit 1, "Invalid --otu_sig_min_cluster_qscore '${params.otu_sig_min_cluster_qscore}'. Provide a decimal >= 0."
+    }
+    def otuSigRuleCanonical = params.otu_sig_rule.toString().trim().toLowerCase()
+    if (!(otuSigRuleCanonical in ['fraction', 'top_two_gap'])) {
+        exit 1, "Invalid --otu_sig_rule '${params.otu_sig_rule}'. Allowed values: fraction, top_two_gap"
+    }
+    def otuSigMinPoolFractionStr = params.otu_sig_min_pool_fraction.toString().trim()
+    if (!(otuSigMinPoolFractionStr ==~ /[0-9]+([.][0-9]+)?/) || new BigDecimal(otuSigMinPoolFractionStr) <= BigDecimal.ZERO || new BigDecimal(otuSigMinPoolFractionStr) > BigDecimal.ONE) {
+        exit 1, "Invalid --otu_sig_min_pool_fraction '${params.otu_sig_min_pool_fraction}'. Provide a decimal > 0 and <= 1."
+    }
+    def otuSigMinTopFractionStr = params.otu_sig_min_top_fraction.toString().trim()
+    if (!(otuSigMinTopFractionStr ==~ /[0-9]+([.][0-9]+)?/) || new BigDecimal(otuSigMinTopFractionStr) <= BigDecimal.ZERO || new BigDecimal(otuSigMinTopFractionStr) > BigDecimal.ONE) {
+        exit 1, "Invalid --otu_sig_min_top_fraction '${params.otu_sig_min_top_fraction}'. Provide a decimal > 0 and <= 1."
+    }
+    def otuSigTop2MinRatioStr = params.otu_sig_top2_min_ratio.toString().trim()
+    if (!(otuSigTop2MinRatioStr ==~ /[0-9]+([.][0-9]+)?/) || new BigDecimal(otuSigTop2MinRatioStr) <= BigDecimal.ONE) {
+        exit 1, "Invalid --otu_sig_top2_min_ratio '${params.otu_sig_top2_min_ratio}'. Provide a decimal > 1."
+    }
+    def otuSigTop2MinDeltaReadsStr = params.otu_sig_top2_min_delta_reads.toString().trim()
+    if (!(otuSigTop2MinDeltaReadsStr ==~ /[0-9]+/)) {
+        exit 1, "Invalid --otu_sig_top2_min_delta_reads '${params.otu_sig_top2_min_delta_reads}'. Provide an integer >= 0."
+    }
+    def otuSigMinStableRoundsStr = params.otu_sig_min_stable_rounds.toString().trim()
+    if (!(otuSigMinStableRoundsStr ==~ /[0-9]+/) || otuSigMinStableRoundsStr.toInteger() < 1) {
+        exit 1, "Invalid --otu_sig_min_stable_rounds '${params.otu_sig_min_stable_rounds}'. Provide an integer >= 1."
     }
     def otuSizeStreakModeCanonical = params.otu_size_streak_mode.toString().trim().toLowerCase()
     if (!(otuSizeStreakModeCanonical in ['off', 'observe', 'enforce'])) {
         exit 1, "Invalid --otu_size_streak_mode '${params.otu_size_streak_mode}'. Allowed values: off, observe, enforce"
     }
-    if ( !params.containsKey('otu_size_streak_min_rounds') || params.otu_size_streak_min_rounds == null ) {
-        params.otu_size_streak_min_rounds = 3
-    }
     def otuSizeStreakMinRoundsStr = params.otu_size_streak_min_rounds.toString().trim()
     if (!(otuSizeStreakMinRoundsStr ==~ /[0-9]+/) || otuSizeStreakMinRoundsStr.toInteger() < 1) {
         exit 1, "Invalid --otu_size_streak_min_rounds '${params.otu_size_streak_min_rounds}'. Provide an integer >= 1."
     }
-    return [otuLockRatioStr: otuLockRatioStr,
+    return [otuConsolidationModeCanonical: otuConsolidationModeCanonical,
+            otuLockRatioStr: otuLockRatioStr,
             otuLockMinConsReadsStr: otuLockMinConsReadsStr,
             otuLockMinStableRoundsStr: otuLockMinStableRoundsStr,
             otuLockRevalidateEveryRoundsStr: otuLockRevalidateEveryRoundsStr,
+            otuSigMinClusterReadsStr: otuSigMinClusterReadsStr,
+            otuSigMinClusterQscoreStr: otuSigMinClusterQscoreStr,
+            otuSigRuleCanonical: otuSigRuleCanonical,
+            otuSigMinPoolFractionStr: otuSigMinPoolFractionStr,
+            otuSigMinTopFractionStr: otuSigMinTopFractionStr,
+            otuSigTop2MinRatioStr: otuSigTop2MinRatioStr,
+            otuSigTop2MinDeltaReadsStr: otuSigTop2MinDeltaReadsStr,
+            otuSigMinStableRoundsStr: otuSigMinStableRoundsStr,
             otuSizeStreakModeCanonical: otuSizeStreakModeCanonical,
             otuSizeStreakMinRoundsStr: otuSizeStreakMinRoundsStr]
 }
 
 def validateOtuBlastParams() {
-    if ( !params.containsKey('otu_blast_min_members') || params.otu_blast_min_members == null ) {
-        params.otu_blast_min_members = 3
-    }
     def otuBlastMinMembersStr = params.otu_blast_min_members.toString().trim()
     if (!(otuBlastMinMembersStr ==~ /[0-9]+/)) {
         exit 1, "Invalid --otu_blast_min_members '${params.otu_blast_min_members}'. Provide an integer >= 0."
-    }
-    if ( !params.containsKey('otu_blast_filter_mode') || params.otu_blast_filter_mode == null ) {
-        params.otu_blast_filter_mode = 'enforce'
     }
     def otuBlastFilterModeCanonical = params.otu_blast_filter_mode.toString().trim().toLowerCase()
     if (!(otuBlastFilterModeCanonical in ['off', 'observe', 'enforce'])) {
         exit 1, "Invalid --otu_blast_filter_mode '${params.otu_blast_filter_mode}'. Allowed values: off, observe, enforce"
     }
-    if ( !params.containsKey('otu_blast_force_use_filtered') || params.otu_blast_force_use_filtered == null ) {
-        params.otu_blast_force_use_filtered = true
-    }
     def otuBlastForceUseFiltered = parseBoolStrict(params.otu_blast_force_use_filtered, false, 'otu_blast_force_use_filtered')
     if (otuBlastForceUseFiltered && otuBlastFilterModeCanonical != 'enforce') {
         exit 1, "Invalid --otu_blast_force_use_filtered with --otu_blast_filter_mode='${otuBlastFilterModeCanonical}'. Set --otu_blast_filter_mode enforce."
-    }
-    if ( !params.containsKey('otu_blast_filter_skip_rounds') || params.otu_blast_filter_skip_rounds == null ) {
-        params.otu_blast_filter_skip_rounds = '3'
     }
     def otuBlastFilterSkipRoundsRaw = params.otu_blast_filter_skip_rounds.toString().trim().toLowerCase()
     if (otuBlastFilterSkipRoundsRaw == '' || otuBlastFilterSkipRoundsRaw == '0') {
@@ -6678,15 +7290,9 @@ def validateOtuBlastParams() {
     } else {
         exit 1, "Invalid --otu_blast_filter_skip_rounds '${params.otu_blast_filter_skip_rounds}'. Allowed values: none, all, or integer >= 0."
     }
-    if ( !params.containsKey('otu_blast_unassigned_grace_rounds') || params.otu_blast_unassigned_grace_rounds == null ) {
-        params.otu_blast_unassigned_grace_rounds = 3
-    }
     def otuBlastUnassignedGraceRoundsStr = params.otu_blast_unassigned_grace_rounds.toString().trim()
     if (!(otuBlastUnassignedGraceRoundsStr ==~ /[0-9]+/)) {
         exit 1, "Invalid --otu_blast_unassigned_grace_rounds '${params.otu_blast_unassigned_grace_rounds}'. Provide an integer >= 0."
-    }
-    if ( !params.containsKey('otu_blast_enforce_missing_max_frac') || params.otu_blast_enforce_missing_max_frac == null ) {
-        params.otu_blast_enforce_missing_max_frac = 0.1
     }
     def otuBlastEnforceMissingMaxFracStr = params.otu_blast_enforce_missing_max_frac.toString().trim()
     if (!(otuBlastEnforceMissingMaxFracStr ==~ /[0-9]+([.][0-9]+)?/)) {
@@ -6699,38 +7305,17 @@ def validateOtuBlastParams() {
     if (otuBlastEnforceMissingMaxFracVal < 0 || otuBlastEnforceMissingMaxFracVal > 1) {
         exit 1, "Invalid --otu_blast_enforce_missing_max_frac '${params.otu_blast_enforce_missing_max_frac}'. Provide a decimal fraction in [0,1]."
     }
-    if ( !params.containsKey('otu_blast_enforce_no_clusters_policy') || params.otu_blast_enforce_no_clusters_policy == null ) {
-        params.otu_blast_enforce_no_clusters_policy = 'fallback_unfiltered'
-    }
     def otuBlastEnforceNoClustersPolicyCanonical = params.otu_blast_enforce_no_clusters_policy.toString().trim().toLowerCase()
     if (!(otuBlastEnforceNoClustersPolicyCanonical in ['fail', 'fallback_unfiltered', 'allow_empty'])) {
         exit 1, "Invalid --otu_blast_enforce_no_clusters_policy '${params.otu_blast_enforce_no_clusters_policy}'. Allowed values: fail, fallback_unfiltered, allow_empty"
-    }
-    if ( !params.containsKey('otu_blast_unassigned_mode') || params.otu_blast_unassigned_mode == null ) {
-        params.otu_blast_unassigned_mode = 'enforce'
     }
     def otuBlastUnassignedModeCanonical = params.otu_blast_unassigned_mode.toString().trim().toLowerCase()
     if (!(otuBlastUnassignedModeCanonical in ['off', 'observe', 'enforce'])) {
         exit 1, "Invalid --otu_blast_unassigned_mode '${params.otu_blast_unassigned_mode}'. Allowed values: off, observe, enforce"
     }
-    if ( !params.containsKey('otu_blast_unassigned_max_otu_size') || params.otu_blast_unassigned_max_otu_size == null ) {
-        params.otu_blast_unassigned_max_otu_size = 50
-    }
-    if ( !params.containsKey('otu_unassigned_streak_mode') || params.otu_unassigned_streak_mode == null ) {
-        params.otu_unassigned_streak_mode = 'enforce'
-    }
     def otuUnassignedStreakModeCanonical = params.otu_unassigned_streak_mode.toString().trim().toLowerCase()
     if (!(otuUnassignedStreakModeCanonical in ['off', 'observe', 'enforce'])) {
         exit 1, "Invalid --otu_unassigned_streak_mode '${params.otu_unassigned_streak_mode}'. Allowed values: off, observe, enforce"
-    }
-    if ( !params.containsKey('otu_unassigned_streak_min_rounds') || params.otu_unassigned_streak_min_rounds == null ) {
-        params.otu_unassigned_streak_min_rounds = 3
-    }
-    if ( !params.containsKey('otu_unassigned_streak_min_size') || params.otu_unassigned_streak_min_size == null ) {
-        params.otu_unassigned_streak_min_size = 2
-    }
-    if ( !params.containsKey('otu_unassigned_streak_max_size') || params.otu_unassigned_streak_max_size == null ) {
-        params.otu_unassigned_streak_max_size = 50
     }
     return [otuBlastMinMembersStr: otuBlastMinMembersStr,
             otuBlastFilterModeCanonical: otuBlastFilterModeCanonical,
@@ -6859,6 +7444,22 @@ void validateSampleInfoInventory(String demuxIdentityContext) {
 	def artifacts = getSampleInfoArtifactPaths()
 	switch (demuxIdentityContext) {
 		case 'full_collapse':
+			def normalizeDemuxPath = { rawPath ->
+				if (!rawPath) return null
+				def s = rawPath.toString()
+				try {
+					def f = s.startsWith('/') ? new File(s) : new File(System.getProperty("user.dir"), s)
+					return f.canonicalPath
+				} catch (Exception e) {
+					def f = s.startsWith('/') ? new File(s) : new File(System.getProperty("user.dir"), s)
+					return f.absolutePath
+				}
+			}
+			def userIdx = params.indexes?.toString()
+			def canonicalDemult = artifacts.demult?.toString()
+			if (userIdx && canonicalDemult && normalizeDemuxPath(userIdx) != normalizeDemuxPath(canonicalDemult)) {
+				log.warn "Note: --indexes '${userIdx}' differs from canonical sample_info path '${canonicalDemult}'. Both must exist for full demux mode."
+			}
 			requireSampleInfoFasta(artifacts.demult, 'demult.fasta', demuxIdentityContext)
 			requireSampleInfoFile(artifacts.replicateIdentity, 'replicate_identity.tsv', demuxIdentityContext)
 			requireSampleInfoFile(artifacts.replicateRoster, 'replicate_roster.tsv', demuxIdentityContext)
@@ -6882,6 +7483,18 @@ void validateSampleInfoInventory(String demuxIdentityContext) {
 	}
 }
 
+String getDemultiplexModeCanonical() {
+    def rawMode = params.demultiplex_mode?.toString()?.trim()?.toLowerCase()
+    if (!rawMode) {
+        rawMode = 'auto'
+    }
+    if (!(rawMode in ['auto', 'full', 'primers_only', 'off'])) {
+        exit 1, "Invalid --demultiplex_mode '${params.demultiplex_mode}'. Allowed values: auto, full, primers_only, off"
+    }
+    params.demultiplex_mode = rawMode
+    return rawMode
+}
+
 DemuxConfig getDemuxConfig() {
     // Always resolve to absolute so INDEXES_PATH/PRIMERS_PATH are correct when
     // used inside process scripts (which run from a work/ subdirectory).
@@ -6892,23 +7505,23 @@ DemuxConfig getDemuxConfig() {
     }
     def trackArtifacts = getTrackArtifactPaths()
     def replicateMode = getReplicateModeCanonical()
-    def mode = params.demultiplex_mode?.toString()?.toLowerCase()
+    def mode = getDemultiplexModeCanonical()
     def idx = absPath(params.indexes?.toString())
     def pri = absPath(params.primer_indexes?.toString())
     def trackIdx = absPath(trackArtifacts.trackIdx)
-    if (mode in ['on', 'true']) {
+    if (mode == 'full') {
         if (replicateMode == 'track') {
             requireTrackArtifactPath(trackIdx, 'track_demult.fasta', "before full demultiplexing can use ${trackIdx}")
         }
         return new DemuxConfig(true, 'full', replicateMode == 'track' ? trackIdx : idx, pri)
     }
-    if (mode in ['primers_only', 'primers-only', 'primer_only', 'primer-only']) {
+    if (mode == 'primers_only') {
         if (replicateMode == 'track') {
             exit 1, "replicate_mode=track is incompatible with demultiplex_mode=primers_only"
         }
         return new DemuxConfig(true, 'primers_only', null, absPath(params.primer_indexes?.toString()))
     }
-    if (mode in ['off', 'false']) {
+    if (mode == 'off') {
         if (replicateMode == 'track') {
             exit 1, "replicate_mode=track cannot use demultiplex_mode=off"
         }
@@ -6938,6 +7551,127 @@ String getReplicateModeCanonical() {
         exit 1, "Invalid --replicate_mode '${replicateModeRaw}'. Allowed values: collapse, track"
     }
     return replicateModeCanonical
+}
+
+String canonicalizeConfiguredMarkerToken(String rawValue, String paramName) {
+    def value = rawValue?.toString()?.trim()
+    if (!value) {
+        exit 1, "Invalid --${paramName}: empty marker token found. Provide a pipe-separated list of non-empty marker names."
+    }
+    if (value =~ /\s/) {
+        exit 1, "Invalid --${paramName} token '${rawValue}'. Marker tokens must not contain whitespace; use pipe-separated marker names such as COI|ITS2."
+    }
+    def canonical = value.toUpperCase()
+    if (canonical in ['ITS', 'ITS1', 'ITS2']) {
+        return 'ITS2'
+    }
+    return canonical
+}
+
+Map parseCanonicalPipeList(String rawValue, String paramName, boolean markerMode, boolean allowEmptyEntries) {
+    def trimmed = rawValue?.toString()
+    if (trimmed == null || trimmed.trim() == '') {
+        exit 1, "Invalid --${paramName}: value must not be empty. Provide a pipe-separated list."
+    }
+    def parts = trimmed.split(/\|/, -1)
+    def values = []
+    for (def idx = 0; idx < parts.length; idx++) {
+        def part = parts[idx]?.toString()
+        if (part == null || part.trim() == '') {
+            if (!allowEmptyEntries) {
+                exit 1, "Invalid --${paramName}: empty element found at position ${idx + 1}. Remove repeated, leading, or trailing '|'."
+            }
+            values << ''
+            continue
+        }
+        values << (markerMode
+            ? canonicalizeConfiguredMarkerToken(part, paramName)
+            : part.trim())
+    }
+    return [values: values, canonical: values.join('|')]
+}
+
+void validateIntegerPipeList(List values, String paramName, int minValue) {
+    for (def idx = 0; idx < values.size(); idx++) {
+        def value = values[idx]?.toString()?.trim()
+        if (!(value ==~ /[0-9]+/)) {
+            exit 1, "Invalid --${paramName}: entry ${idx + 1} must be an integer >= ${minValue}; received '${values[idx]}'."
+        }
+        if (value.toInteger() < minValue) {
+            exit 1, "Invalid --${paramName}: entry ${idx + 1} must be an integer >= ${minValue}; received '${values[idx]}'."
+        }
+    }
+}
+
+void validatePercentPipeList(List values, String paramName) {
+    for (def idx = 0; idx < values.size(); idx++) {
+        def value = values[idx]?.toString()?.trim()
+        if (!(value ==~ /[0-9]+([.][0-9]+)?/)) {
+            exit 1, "Invalid --${paramName}: entry ${idx + 1} must be a numeric percent in [0,100]; received '${values[idx]}'."
+        }
+        def numeric = new BigDecimal(value)
+        if (numeric < BigDecimal.ZERO || numeric > new BigDecimal('100')) {
+            exit 1, "Invalid --${paramName}: entry ${idx + 1} must be a numeric percent in [0,100]; received '${values[idx]}'."
+        }
+    }
+}
+
+Map validateAndCanonicalizeMarkerParams() {
+    def alignedSpecs = [
+        [name: 'targets', markerMode: true, allowEmptyEntries: false],
+        [name: 'target_taxa', markerMode: false, allowEmptyEntries: true],
+        [name: 'min_read_lengths', markerMode: false, allowEmptyEntries: false],
+        [name: 'max_read_lengths', markerMode: false, allowEmptyEntries: false],
+        [name: 'blast_db_specs', markerMode: false, allowEmptyEntries: false],
+        [name: 'blast_id_family', markerMode: false, allowEmptyEntries: false],
+        [name: 'blast_id_genus', markerMode: false, allowEmptyEntries: false],
+        [name: 'blast_id_spec', markerMode: false, allowEmptyEntries: false],
+        [name: 'nonncbi_memtax', markerMode: false, allowEmptyEntries: true],
+    ]
+    def parsed = [:]
+    for (def spec in alignedSpecs) {
+        def rawValue = params."${spec.name}"
+        if (rawValue == null) {
+            exit 1, "Missing required --${spec.name}. Provide a pipe-separated list aligned 1:1 with --targets."
+        }
+        parsed[spec.name] = parseCanonicalPipeList(rawValue.toString(), spec.name.toString(), spec.markerMode as boolean, spec.allowEmptyEntries as boolean)
+    }
+    def targetsCount = parsed.targets.values.size()
+    for (def spec in alignedSpecs) {
+        if (parsed[spec.name].values.size() != targetsCount) {
+            exit 1, "Invalid --${spec.name}: received ${parsed[spec.name].values.size()} value(s) for ${targetsCount} target(s). Provide one pipe-separated ${spec.name} entry per target."
+        }
+    }
+
+    validateIntegerPipeList(parsed.min_read_lengths.values, 'min_read_lengths', 0)
+    validateIntegerPipeList(parsed.max_read_lengths.values, 'max_read_lengths', 0)
+    validatePercentPipeList(parsed.blast_id_family.values, 'blast_id_family')
+    validatePercentPipeList(parsed.blast_id_genus.values, 'blast_id_genus')
+    validatePercentPipeList(parsed.blast_id_spec.values, 'blast_id_spec')
+
+    def minLengthValues = parsed.min_read_lengths.values.collect { it.toInteger() }
+    def maxLengthValues = parsed.max_read_lengths.values.collect { it.toInteger() }
+    for (def idx = 0; idx < targetsCount; idx++) {
+        if (maxLengthValues[idx] < minLengthValues[idx]) {
+            exit 1, "Invalid --min_read_lengths / --max_read_lengths for target '${parsed.targets.values[idx]}': max_read_lengths entry ${idx + 1} (${maxLengthValues[idx]}) must be >= min_read_lengths entry ${idx + 1} (${minLengthValues[idx]})."
+        }
+    }
+
+    alignedSpecs.each { spec ->
+        params."${spec.name}" = parsed[spec.name].canonical
+    }
+    def globalMinReadLength = minLengthValues.min()
+    def globalMaxReadLength = maxLengthValues.max()
+    params.min_read_length = globalMinReadLength
+    params.max_read_length = globalMaxReadLength
+    return [
+        targets: parsed.targets.values,
+        targetTaxa: parsed.target_taxa.values,
+        targetsCanonical: parsed.targets.canonical,
+        targetTaxaCanonical: parsed.target_taxa.canonical,
+        globalMinReadLength: globalMinReadLength,
+        globalMaxReadLength: globalMaxReadLength,
+    ]
 }
 
 // OTU identity normalizer — converts percent or decimal to plain decimal string (moved from §5).
@@ -6993,27 +7727,6 @@ def nfcoreHeader() {
 }
 
 def checkHostname() {
-    def c_reset = params.monochrome_logs ? '' : "\033[0m"
-    def c_white = params.monochrome_logs ? '' : "\033[0;37m"
-    def c_red = params.monochrome_logs ? '' : "\033[1;91m"
-    def c_yellow_bold = params.monochrome_logs ? '' : "\033[1;93m"
-    if (params.hostnames) {
-        def hostname = null
-        try {
-            hostname = java.net.InetAddress.getLocalHost().getHostName()
-        } catch (Exception e) {
-            hostname = System.getenv('HOSTNAME') ?: ''
-        }
-        params.hostnames.each { prof, hnames ->
-            hnames.each { hname ->
-                if (hostname.contains(hname) && !workflow.profile.contains(prof)) {
-                    log.error "====================================================\n" +
-                            "  ${c_red}WARNING!${c_reset} You are running with `-profile $workflow.profile`\n" +
-                            "  but your machine hostname is ${c_white}'$hostname'${c_reset}\n" +
-                            "  ${c_yellow_bold}It's highly recommended that you use `-profile $prof${c_reset}`\n" +
-                            "============================================================"
-                }
-            }
-        }
-    }
+    // Compatibility shim for legacy onComplete logging; keep failure reporting intact.
+    return null
 }

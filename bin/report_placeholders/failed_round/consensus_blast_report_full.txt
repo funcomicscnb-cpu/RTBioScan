@@ -1,0 +1,1 @@
+long_seq_id	consensus_taxid	kingdom	phylum	class	order	family	genus	species

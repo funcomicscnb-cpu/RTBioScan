@@ -1,0 +1,1 @@
+read_id	barcode_by_homology	basecalling_model	sample	platform	sampling_method	subsample	replicate	identity_scope	identity_value

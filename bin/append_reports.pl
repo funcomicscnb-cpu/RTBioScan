@@ -7,6 +7,9 @@ require "$FindBin::Bin/lib/taxon_util.pl";
 require "$FindBin::Bin/reporting_contract_sidecar.pl";
 require "$FindBin::Bin/reporting_parser_state_transaction.pl";
 *is_unassigned_taxon = \&TaxonUtil::is_unassigned_taxon;
+*marker_from_token = \&TaxonUtil::marker_from_token;
+*canonical_marker_token = \&TaxonUtil::canonical_marker_token;
+*marker_filename_token = \&TaxonUtil::marker_filename_token;
 
 sub run_cmd {
     my ($cmd, %opts) = @_;
@@ -151,6 +154,97 @@ sub replace_report_pair_atomically {
 
 	unlink $bak_report if -e $bak_report;
 	unlink $bak_sidecar if -e $bak_sidecar;
+}
+
+sub configured_markers {
+	my $raw = $ENV{RTBIOSCAN_TARGET_TOKENS} // '';
+	my @markers;
+	my %seen;
+	for my $part (split(/\|/, $raw, -1)) {
+		my $marker = canonical_marker_token($part);
+		next if !defined $marker || $marker eq '';
+		next if $seen{$marker}++;
+		push @markers, $marker;
+	}
+	@markers = qw(COI ITS2) if !@markers;
+	return @markers;
+}
+
+sub configured_marker_tax_map {
+	my $targets_raw = $ENV{RTBIOSCAN_TARGET_TOKENS} // '';
+	my $taxa_raw = $ENV{RTBIOSCAN_TARGET_TAXA} // '';
+	my @targets = split(/\|/, $targets_raw, -1);
+	my @taxa = split(/\|/, $taxa_raw, -1);
+	my %map;
+	for my $i (0 .. $#targets) {
+		my $marker = canonical_marker_token($targets[$i]);
+		next if !defined $marker || $marker eq '';
+		my $taxon = defined $taxa[$i] ? trim_text($taxa[$i]) : '';
+		next if $taxon eq '';
+		$map{$marker} = $taxon;
+	}
+	return %map;
+}
+
+sub configured_marker_file_tokens {
+	my %tokens;
+	for my $marker (configured_markers()) {
+		$tokens{$marker} = marker_filename_token($marker);
+	}
+	return %tokens;
+}
+
+sub emit_rank_marker_rows {
+	my ($fh, $run_id, $epoch, $counts_ref) = @_;
+	for my $rank (qw(species genus family)) {
+		for my $marker (configured_markers()) {
+			my $n = $counts_ref->{$rank}{$marker} // 0;
+			print $fh "$run_id\t$epoch\t${rank}_${marker}_reads\t$n\n";
+		}
+	}
+}
+
+sub emit_rank_marker_model_rows {
+	my ($fh, $run_id, $epoch, $counts_ref) = @_;
+	for my $rank (qw(species genus family)) {
+		for my $marker (configured_markers()) {
+			for my $bm (qw(fast hac sup)) {
+				my $n = $counts_ref->{$rank}{$marker}{$bm} // 0;
+				print $fh "$run_id\t$epoch\t${rank}_${marker}_${bm}_reads\t$n\n";
+			}
+		}
+	}
+}
+
+sub marker_matches_target_taxon {
+	my ($marker, $kingdom, $target_tax_map_ref) = @_;
+	return 0 if !defined $marker || $marker eq '';
+	return 0 if !defined $kingdom || trim_text($kingdom) eq '';
+	my $expected = $target_tax_map_ref->{$marker};
+	return 0 if !defined $expected || $expected eq '';
+	return lc(trim_text($expected)) eq lc(trim_text($kingdom)) ? 1 : 0;
+}
+
+sub write_dynamic_treemap_report {
+	my ($path, $header, $class_taxon_ref, $value_ref, $label_type, $target_taxon, $include_unassigned) = @_;
+	$include_unassigned = $include_unassigned ? 1 : 0;
+	open my $fh, '>', $path or die "I couldn't open $path\n";
+	print $fh $header, "\n";
+	for my $each_class (sort keys %{$class_taxon_ref || {}}) {
+		for my $taxon (sort keys %{ $class_taxon_ref->{$each_class} || {} }) {
+			next if !$include_unassigned && is_unassigned_taxon($taxon);
+			if ($label_type eq 'genus' && $use_local_gen && !is_unassigned_taxon($taxon) && defined $target_taxon && $target_taxon =~ /^(Metazoa|Viridiplantae)$/i) {
+				next if !exists $local_gen{$taxon};
+			}
+			if ($label_type eq 'species' && $use_spec_interest && !is_unassigned_taxon($taxon) && defined $target_taxon && $target_taxon =~ /^(Metazoa|Viridiplantae)$/i) {
+				next if !exists $spec_interest{$taxon};
+			}
+			my $n = $value_ref->{$each_class}{$taxon} // 0;
+			next unless $n && $n > 0;
+			print $fh "$each_class\t$taxon\t$n\n";
+		}
+	}
+	close $fh;
 }
 
 sub update_cumulative_report_pair {
@@ -379,17 +473,17 @@ sub t0_rows_for {
 		return ("$run_id\t$epoch\t0\t0\t0\t0\t0\t0\t0\t0\t0");
 	}
 	if ($kind eq 'tax_time') {
-		return (
+		my @rows = (
 			"$run_id\t$epoch\tspecies\t0",
 			"$run_id\t$epoch\tgenus\t0",
 			"$run_id\t$epoch\tfamily\t0",
-			"$run_id\t$epoch\tspecies_COI_reads\t0",
-			"$run_id\t$epoch\tspecies_ITS2_reads\t0",
-			"$run_id\t$epoch\tgenus_COI_reads\t0",
-			"$run_id\t$epoch\tgenus_ITS2_reads\t0",
-			"$run_id\t$epoch\tfamily_COI_reads\t0",
-			"$run_id\t$epoch\tfamily_ITS2_reads\t0",
 		);
+		for my $rank (qw(species genus family)) {
+			for my $marker (configured_markers()) {
+				push @rows, "$run_id\t$epoch\t${rank}_${marker}_reads\t0";
+			}
+		}
+		return @rows;
 	}
 	return ();
 }
@@ -445,6 +539,132 @@ sub atomic_write_lines {
 	}
 	close $out;
 	rename $tmp, $path or die "I couldn't replace $path\n";
+}
+
+sub normalize_read_id_for_read_fate {
+	my ($v) = @_;
+	$v = trim_text($v);
+	return '' if !defined $v || $v eq '' || uc($v) eq 'NA';
+	$v =~ s/\s.*$//;
+	$v =~ s/\|.*$//;
+	return $v;
+}
+
+sub derive_round_report_dir {
+	my ($temp_path, $round_path) = @_;
+	return '' unless defined $round_path && $round_path ne '';
+	return $round_path if $round_path =~ m{^/};
+	return $round_path if -d $round_path;
+	return '' unless defined $temp_path && $temp_path ne '';
+	my $base = $temp_path;
+	$base =~ s{/+$}{};
+	return '' unless $base =~ s{/+_state$}{};
+	return "$base/$round_path";
+}
+
+sub load_annotation_cache_sidecar {
+	my ($path, $expected_header) = @_;
+	my @rows = ();
+	my %seen = ();
+	return (\@rows, \%seen) unless defined $path && -f $path;
+	open my $fh, '<', $path or die "I couldn't open $path\n";
+	my $header = <$fh>;
+	if (defined $header) {
+		chomp $header;
+		$header =~ s/\r$//;
+		if ($header ne $expected_header) {
+			warn_once("demux annotation cache header mismatch: $path");
+			close $fh;
+			return (\@rows, \%seen);
+		}
+	}
+	while (my $line = <$fh>) {
+		chomp $line;
+		$line =~ s/\r$//;
+		next if $line =~ /^\s*$/;
+		my @tr = split /\t/, $line, -1;
+		my $rid = normalize_read_id_for_read_fate($tr[0]);
+		next if $rid eq '';
+		next if $seen{$rid}++;
+		push @rows, $line;
+	}
+	close $fh;
+	return (\@rows, \%seen);
+}
+
+sub write_named_snapshot_files {
+	my ($paths_ref, $lines_ref) = @_;
+	my %target_seen = ();
+	for my $path (@{$paths_ref || []}) {
+		next unless defined $path && $path ne '';
+		next if $target_seen{$path}++;
+		my $dir = '';
+		$dir = $1 if $path =~ m{^(.*)/[^/]+$};
+		if ($dir ne '' && !-d $dir) {
+			mkdir $dir unless -d $dir;
+		}
+		atomic_write_lines($path, $lines_ref);
+	}
+}
+
+sub build_first_seen_snapshot {
+	my (%args) = @_;
+	my $source_path = $args{source_path};
+	my $default_header = $args{default_header} // '';
+	my $seen_ref = $args{seen_ref} // {};
+	my $allowed_ids_ref = $args{allowed_ids_ref};
+	my $snapshot_paths_ref = $args{snapshot_paths} // [];
+	my $keep_all_rows_for_new_ids = $args{keep_all_rows_for_new_ids} ? 1 : 0;
+	my $cache_rows_ref = $args{cache_rows_ref};
+	my $cache_seen_ref = $args{cache_seen_ref};
+
+	my $header_line = $default_header;
+	my @snapshot_lines = ();
+	my %round_new_ids = ();
+
+	if (defined $source_path && -f $source_path) {
+		open my $fh, '<', $source_path or die "I couldn't open $source_path\n";
+		my $header = <$fh>;
+		if (defined $header) {
+			chomp $header;
+			$header =~ s/\r$//;
+			$header_line = $header if $header ne '';
+			my @header_cols = split /\t/, $header_line, -1;
+			my %idx = map { $header_cols[$_] => $_ } 0..$#header_cols;
+			my $read_id_idx = exists $idx{'read_id'} ? $idx{'read_id'} : undef;
+			while (my $line = <$fh>) {
+				chomp $line;
+				$line =~ s/\r$//;
+				next if $line =~ /^\s*$/;
+				next if defined $header && $line eq $header;
+				my @tr = split /\t/, $line, -1;
+				next if !defined $read_id_idx || $read_id_idx > $#tr;
+					my $rid = normalize_read_id_for_read_fate($tr[$read_id_idx]);
+					next if $rid eq '';
+
+					my $is_global_new = exists($seen_ref->{$rid}) ? 0 : 1;
+					my $is_round_allowed = !defined($allowed_ids_ref) ? 1 : exists($allowed_ids_ref->{$rid});
+					if ($is_global_new) {
+						$seen_ref->{$rid} = 1;
+						if ($is_round_allowed) {
+							$round_new_ids{$rid} = 1;
+							push @snapshot_lines, $line;
+						}
+					} elsif ($keep_all_rows_for_new_ids && exists $round_new_ids{$rid}) {
+						push @snapshot_lines, $line;
+					}
+
+				if (defined $cache_rows_ref && defined $cache_seen_ref && !exists $cache_seen_ref->{$rid}) {
+					$cache_seen_ref->{$rid} = 1;
+					push @{$cache_rows_ref}, join("\t", @tr);
+				}
+			}
+		}
+		close $fh;
+	}
+
+	unshift @snapshot_lines, $header_line;
+	write_named_snapshot_files($snapshot_paths_ref, \@snapshot_lines);
 }
 
 sub load_seen_ids_sidecar {
@@ -592,8 +812,8 @@ my ($run_start_epoc, $run_start_iso) = parse_run_start_epoch($run_started_utc_fi
 # Optional pre-classification: species/genus of interest.
 # If these files are provided and loadable, we filter taxa shown in treemap/time/read
 # summaries to those "of interest". If they are missing, we keep current behavior.
-my (%positive, %local_spec, %human_like_spec, %spec_interest, %local_gen);
-my ($use_spec_interest, $use_local_gen) = (0, 0);
+our (%positive, %local_spec, %human_like_spec, %spec_interest, %local_gen);
+our ($use_spec_interest, $use_local_gen) = (0, 0);
 
 sub load_spec_basics {
 	my ($path) = @_;
@@ -652,6 +872,13 @@ my $consensus_genus_reads_noadapter = 0;
 my %otu_reads_rank_marker = ();
 my %otu_reads_rank_marker_model = ();
 my %cons_reads_rank_marker = ();
+my %configured_marker_tax_map = configured_marker_tax_map();
+my %configured_marker_file_tokens = configured_marker_file_tokens();
+my (%otu_treemap_species, %otu_treemap_genus);
+my (%cons_treemap_species, %cons_treemap_genus);
+my (%cons_treemap_species_clusters, %cons_treemap_genus_clusters);
+my (%cons_consolidated_treemap_species, %cons_consolidated_treemap_genus);
+my (%cons_consolidated_treemap_species_clusters, %cons_consolidated_treemap_genus_clusters);
 my ($fast_reads, $hac_reads, $sup_reads) = (0, 0, 0);
 my $proc_reads = 0;
 
@@ -810,12 +1037,35 @@ close FILE_OUT;
 
 my $seen_ids_sidecar = "$temp_dir/$barcode_pipeline\_seen_read_ids.tsv";
 my $on_target_state_sidecar = "$temp_dir/$barcode_pipeline\_on_target_state.tsv";
+my $read_fate_demux_seen_sidecar = "$temp_dir/$barcode_pipeline\_read_fate_demux_seen.tsv";
+my $read_fate_blast_seen_sidecar = "$temp_dir/$barcode_pipeline\_read_fate_blast_seen.tsv";
+my $demux_annotation_cache_sidecar = "$temp_dir/$barcode_pipeline\_demux_annotation_cache.tsv";
 my $rolling_read_info = "$temp_dir/$barcode_pipeline\_read_info_rpt.txt";
 my $rolling_on_target = "$temp_dir/$barcode_pipeline\_on_target_rpt.txt";
 my $round_read_info = "$barcode_pipeline\_read_info_rpt.txt";
 my $round_on_target = "$barcode_pipeline\_on_target_rpt.txt";
+my $round_blast_otu = "$barcode_pipeline\_blast_otu_pretax_rpt.txt";
+my $round_read_fate_demux = "$barcode_pipeline\_read_fate_demult_first_seen.tsv";
+my $round_read_fate_blast = "$barcode_pipeline\_read_fate_blast_first_seen.tsv";
+my $round_report_dir = derive_round_report_dir($temp_dir, $round_dir);
+my @round_read_fate_demux_paths = ($round_read_fate_demux);
+my @round_read_fate_blast_paths = ($round_read_fate_blast);
+push @round_read_fate_demux_paths, "$round_report_dir/$round_read_fate_demux" if $round_report_dir ne '';
+push @round_read_fate_blast_paths, "$round_report_dir/$round_read_fate_blast" if $round_report_dir ne '';
+my $demult_snapshot_header = ReportingContractSidecar::canonical_header('demult_rpt');
+my $blast_snapshot_header = "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_taxid\totu_kingdom\totu_phylum\totu_class\totu_order\totu_family\totu_genus\totu_species";
 my $seen_ids_ref;
 my ($on_target_state_ref, $on_target_barcode_ref);
+my $round_read_info_ids_ref;
+my $read_fate_demux_seen_ref = load_seen_ids_sidecar($read_fate_demux_seen_sidecar);
+my $read_fate_blast_seen_ref = load_seen_ids_sidecar($read_fate_blast_seen_sidecar);
+my ($demux_annotation_cache_rows_ref, $demux_annotation_cache_seen_ref) =
+	load_annotation_cache_sidecar($demux_annotation_cache_sidecar, $demult_snapshot_header);
+
+if (-f $round_read_info) {
+	$round_read_info_ids_ref = {};
+	replay_read_info_seen_ids($round_read_info, $round_read_info_ids_ref);
+}
 
 if (!-e $seen_ids_sidecar || !-e $on_target_state_sidecar) {
 	$seen_ids_ref = {};
@@ -832,6 +1082,29 @@ if (!-e $seen_ids_sidecar || !-e $on_target_state_sidecar) {
 
 write_seen_ids_sidecar($seen_ids_sidecar, $seen_ids_ref);
 write_on_target_state_sidecar($on_target_state_sidecar, $on_target_state_ref, $on_target_barcode_ref);
+build_first_seen_snapshot(
+	source_path => $round_demult_report,
+	default_header => $demult_snapshot_header,
+	seen_ref => $read_fate_demux_seen_ref,
+	allowed_ids_ref => $round_read_info_ids_ref,
+	snapshot_paths => \@round_read_fate_demux_paths,
+	cache_rows_ref => $demux_annotation_cache_rows_ref,
+	cache_seen_ref => $demux_annotation_cache_seen_ref,
+);
+build_first_seen_snapshot(
+	source_path => $round_blast_otu,
+	default_header => $blast_snapshot_header,
+	seen_ref => $read_fate_blast_seen_ref,
+	allowed_ids_ref => $round_read_info_ids_ref,
+	snapshot_paths => \@round_read_fate_blast_paths,
+	keep_all_rows_for_new_ids => 1,
+);
+write_seen_ids_sidecar($read_fate_demux_seen_sidecar, $read_fate_demux_seen_ref);
+write_seen_ids_sidecar($read_fate_blast_seen_sidecar, $read_fate_blast_seen_ref);
+atomic_write_lines(
+	$demux_annotation_cache_sidecar,
+	[$demult_snapshot_header, @{$demux_annotation_cache_rows_ref}],
+);
 
 # Count per-round reads (prefer current round file over rolling temp)
 if (-f $round_read_info) {
@@ -987,8 +1260,8 @@ while(<FILE>)
 			if (exists($header{"barcode_by_homology"})) {
 				$marker = $tr[$header{"barcode_by_homology"}] // "";
 			}
-			$marker = "COI"  if $marker =~ /^COI/i;
-			$marker = "ITS2" if $marker =~ /^ITS/i;
+			$marker = marker_from_token($marker);
+			$marker = "" if !defined $marker || $marker eq 'OTHER';
 			my $bc_model = "";
 			if (exists($header{"basecalling_model"})) {
 				$bc_model = lc($tr[$header{"basecalling_model"}] // "");
@@ -1021,6 +1294,9 @@ while(<FILE>)
 					}
 					$species_per_sample{$sample_joined}{$tr[$header{"otu_species"}]}++;
 					$class_species_metazoa{$tr[$header{"otu_class"}]}{$tr[$header{"otu_species"}]}=1;
+					if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"otu_kingdom"}], \%configured_marker_tax_map)) {
+						$otu_treemap_species{$marker}{$tr[$header{"otu_class"}]}{$tr[$header{"otu_species"}]}++;
+					}
 				}
 				if($tr[$header{"otu_genus"}])
 #				if($tr[$header{"otu_genus"}] && exists($local_gen{$tr[$header{"otu_genus"}]}))
@@ -1040,6 +1316,9 @@ while(<FILE>)
 					}
 					$genus_per_sample{$sample_joined}{$tr[$header{"otu_genus"}]}++;
 					$class_genus_metazoa{$tr[$header{"otu_class"}]}{$tr[$header{"otu_genus"}]}=1;
+					if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"otu_kingdom"}], \%configured_marker_tax_map)) {
+						$otu_treemap_genus{$marker}{$tr[$header{"otu_class"}]}{$tr[$header{"otu_genus"}]}++;
+					}
 				}
 				if($tr[$header{"otu_family"}])
 				{
@@ -1082,6 +1361,9 @@ while(<FILE>)
 					}
 					$species_per_sample{$sample_joined}{$tr[$header{"otu_species"}]}++;
 					$class_species_viridiplantae{$tr[$header{"otu_class"}]}{$tr[$header{"otu_species"}]}=1;
+					if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"otu_kingdom"}], \%configured_marker_tax_map)) {
+						$otu_treemap_species{$marker}{$tr[$header{"otu_class"}]}{$tr[$header{"otu_species"}]}++;
+					}
 				}
 #				if($tr[$header{"otu_genus"}] && exists($local_gen{$tr[$header{"otu_genus"}]}))
 					if($tr[$header{"otu_genus"}])
@@ -1101,6 +1383,9 @@ while(<FILE>)
 					}
 					$genus_per_sample{$sample_joined}{$tr[$header{"otu_genus"}]}++;
 					$class_genus_viridiplantae{$tr[$header{"otu_class"}]}{$tr[$header{"otu_genus"}]}=1;
+					if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"otu_kingdom"}], \%configured_marker_tax_map)) {
+						$otu_treemap_genus{$marker}{$tr[$header{"otu_class"}]}{$tr[$header{"otu_genus"}]}++;
+					}
 				}
 					if($tr[$header{"otu_family"}])
 					{
@@ -1118,6 +1403,67 @@ while(<FILE>)
 					}
 					$family_per_sample{$sample_joined}{$tr[$header{"otu_family"}]}++;
 					$class_family_viridiplantae{$tr[$header{"otu_class"}]}{$tr[$header{"otu_family"}]}=1;
+				}
+			}
+		}else
+		{
+			if($tr[$header{"otu_class"}])
+			{
+				$class{$tr[$header{"otu_class"}]}++;
+				if($tr[$header{"otu_species"}])
+				{
+					$species{$tr[$header{"otu_species"}]}++;
+					if($marker ne "")
+					{
+						$otu_reads_rank_marker{"species"}{$marker}++;
+						$otu_reads_rank_marker_model{"species"}{$marker}{$bc_model}++ if $bc_model ne "";
+					}
+					$species_otu_sample{$tr[$header{"otu_species"}]}{$otu_id}{$sample_joined}++;
+					if($species_otu_sample{$tr[$header{"otu_species"}]}{$otu_id}{$sample_joined} == 5){$species_otu_sample5{$tr[$header{"otu_species"}]}=1;}
+					if($species_otu_sample{$tr[$header{"otu_species"}]}{$otu_id}{$sample_joined}>9)
+					{
+						$detected_species{$sample_joined}{$tr[$header{"otu_species"}]}=1;
+					}
+					$species_per_sample{$sample_joined}{$tr[$header{"otu_species"}]}++;
+					if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"otu_kingdom"}], \%configured_marker_tax_map)) {
+						$otu_treemap_species{$marker}{$tr[$header{"otu_class"}]}{$tr[$header{"otu_species"}]}++;
+					}
+				}
+				if($tr[$header{"otu_genus"}])
+				{
+					$genus{$tr[$header{"otu_genus"}]}++;
+					if($marker ne "")
+					{
+						$otu_reads_rank_marker{"genus"}{$marker}++;
+						$otu_reads_rank_marker_model{"genus"}{$marker}{$bc_model}++ if $bc_model ne "";
+					}
+					$genus_otu_sample{$tr[$header{"otu_genus"}]}{$otu_id}{$sample_joined}++;
+					if($is_no_adapter){ $otu_genus_reads_noadapter++; } else { $otu_genus_reads_demux++; }
+					if($genus_otu_sample{$tr[$header{"otu_genus"}]}{$otu_id}{$sample_joined} == 5){$genus_otu_sample5{$tr[$header{"otu_genus"}]}=1;}
+					if($genus_otu_sample{$tr[$header{"otu_genus"}]}{$otu_id}{$sample_joined}>9)
+					{
+						$detected_genus{$sample_joined}{$tr[$header{"otu_genus"}]}=1;
+					}
+					$genus_per_sample{$sample_joined}{$tr[$header{"otu_genus"}]}++;
+					if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"otu_kingdom"}], \%configured_marker_tax_map)) {
+						$otu_treemap_genus{$marker}{$tr[$header{"otu_class"}]}{$tr[$header{"otu_genus"}]}++;
+					}
+				}
+				if($tr[$header{"otu_family"}])
+				{
+					$family{$tr[$header{"otu_family"}]}++;
+					if($marker ne "")
+					{
+						$otu_reads_rank_marker{"family"}{$marker}++;
+						$otu_reads_rank_marker_model{"family"}{$marker}{$bc_model}++ if $bc_model ne "";
+					}
+					$family_otu_sample{$tr[$header{"otu_family"}]}{$otu_id}{$sample_joined}++;
+					if($family_otu_sample{$tr[$header{"otu_family"}]}{$otu_id}{$sample_joined} == 5){$family_otu_sample5{$tr[$header{"otu_family"}]}=1;}
+					if($family_otu_sample{$tr[$header{"otu_family"}]}{$otu_id}{$sample_joined}>9)
+					{
+						$detected_family{$sample_joined}{$tr[$header{"otu_family"}]}=1;
+					}
+					$family_per_sample{$sample_joined}{$tr[$header{"otu_family"}]}++;
 				}
 			}
 		}
@@ -1194,30 +1540,8 @@ if(!-f "$temp_dir/$barcode_pipeline\_otu_tax_time_rpt.txt")
 	print FILE "$barcode_pipeline\t$epoc\tspecies\t".@species_uniq."\n";
 	print FILE "$barcode_pipeline\t$epoc\tgenus\t".@genus_uniq."\n";
 	print FILE "$barcode_pipeline\t$epoc\tfamily\t".@family_uniq."\n";
-	my $otu_sp_coi  = $otu_reads_rank_marker{"species"}{"COI"}  // 0;
-	my $otu_sp_its2 = $otu_reads_rank_marker{"species"}{"ITS2"} // 0;
-	my $otu_gn_coi  = $otu_reads_rank_marker{"genus"}{"COI"}    // 0;
-	my $otu_gn_its2 = $otu_reads_rank_marker{"genus"}{"ITS2"}   // 0;
-	my $otu_fm_coi  = $otu_reads_rank_marker{"family"}{"COI"}   // 0;
-	my $otu_fm_its2 = $otu_reads_rank_marker{"family"}{"ITS2"}  // 0;
-	print FILE "$barcode_pipeline\t$epoc\tspecies_COI_reads\t$otu_sp_coi\n";
-	print FILE "$barcode_pipeline\t$epoc\tspecies_ITS2_reads\t$otu_sp_its2\n";
-	print FILE "$barcode_pipeline\t$epoc\tgenus_COI_reads\t$otu_gn_coi\n";
-	print FILE "$barcode_pipeline\t$epoc\tgenus_ITS2_reads\t$otu_gn_its2\n";
-	print FILE "$barcode_pipeline\t$epoc\tfamily_COI_reads\t$otu_fm_coi\n";
-	print FILE "$barcode_pipeline\t$epoc\tfamily_ITS2_reads\t$otu_fm_its2\n";
-	# Optional: basecalling-model breakdown for marker read support (fast/hac/sup).
-	for my $rk (qw(species genus family))
-	{
-		for my $mk (qw(COI ITS2))
-		{
-			for my $bm (qw(fast hac sup))
-			{
-				my $n = $otu_reads_rank_marker_model{$rk}{$mk}{$bm} // 0;
-				print FILE "$barcode_pipeline\t$epoc\t${rk}_${mk}_${bm}_reads\t$n\n";
-			}
-		}
-	}
+	emit_rank_marker_rows(\*FILE, $barcode_pipeline, $epoc, \%otu_reads_rank_marker);
+	emit_rank_marker_model_rows(\*FILE, $barcode_pipeline, $epoc, \%otu_reads_rank_marker_model);
 	close FILE;
 
 if(!-f "$temp_dir/$barcode_pipeline\_otu_tax_reads_rpt.txt")
@@ -1309,6 +1633,27 @@ print FILE "otu_class\totu_species\t#reads\n";
 	}
 close FILE;
 
+for my $marker (configured_markers()) {
+	my $file_token = $configured_marker_file_tokens{$marker} || marker_filename_token($marker);
+	my $target_taxon = $configured_marker_tax_map{$marker} // '';
+	write_dynamic_treemap_report(
+		"$temp_dir/$barcode_pipeline\_otu_tax_gns_${file_token}_treemap_rpt.txt",
+		"otu_class\totu_genus\t#reads",
+		$otu_treemap_genus{$marker} || {},
+		$otu_treemap_genus{$marker} || {},
+		'genus',
+		$target_taxon,
+	);
+	write_dynamic_treemap_report(
+		"$temp_dir/$barcode_pipeline\_otu_tax_spc_${file_token}_treemap_rpt.txt",
+		"otu_class\totu_species\t#reads",
+		$otu_treemap_species{$marker} || {},
+		$otu_treemap_species{$marker} || {},
+		'species',
+		$target_taxon,
+	);
+}
+
 my $consolidated_has_rows = 0;
 #####	CONSOLIDATED CONSENSUS REPORTS / PLOTS (high-quality cached consensus)
 if (-f "$temp_dir/$barcode_pipeline\_blast_consensus_tax_consolidated_rpt.txt") {
@@ -1388,8 +1733,8 @@ if (-f "$temp_dir/$barcode_pipeline\_blast_consensus_tax_consolidated_rpt.txt") 
 			if (exists($header{"barcode_by_homology"})) {
 				$marker = $tr[$header{"barcode_by_homology"}] // "";
 			}
-			$marker = "COI"  if $marker =~ /^COI/i;
-			$marker = "ITS2" if $marker =~ /^ITS/i;
+			$marker = marker_from_token($marker);
+			$marker = "" if !defined $marker || $marker eq 'OTHER';
 
 			if($tr[$header{"consensus_kingdom"}] eq "Metazoa")
 			{
@@ -1398,31 +1743,41 @@ if (-f "$temp_dir/$barcode_pipeline\_blast_consensus_tax_consolidated_rpt.txt") 
 					$class{$tr[$header{"consensus_class"}]} += $nreads;
 					$class_reads_metazoa{$tr[$header{"consensus_class"}]} += $nreads;
 					$class_clusters_metazoa{$tr[$header{"consensus_class"}]}++;
-					if($tr[$header{"consensus_species"}] && !is_unassigned_taxon($tr[$header{"consensus_species"}]))
+					if($tr[$header{"consensus_species"}])
 					{
 						$species{$tr[$header{"consensus_species"}]} += $nreads;
-						$cons_reads_rank_marker{"species"}{$marker} += $nreads if $marker ne "";
+						$cons_reads_rank_marker{"species"}{$marker} += $nreads if $marker ne "" && !is_unassigned_taxon($tr[$header{"consensus_species"}]);
 						$species_clusters{$tr[$header{"consensus_species"}]}++;
 						$class_species_clusters_metazoa{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}++;
 						$species_consensus_sample{$tr[$header{"consensus_species"}]}{$consensus_id}{$sample_joined} += $nreads;
 						$species_per_sample{$sample_joined}{$tr[$header{"consensus_species"}]} += $nreads;
 						$class_species_metazoa{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}=1;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_consolidated_treemap_species{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]} += $nreads;
+							$cons_consolidated_treemap_species_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}++;
+						}
 					}
-					if($tr[$header{"consensus_genus"}] && !is_unassigned_taxon($tr[$header{"consensus_genus"}]))
+					if($tr[$header{"consensus_genus"}])
 					{
 						$genus{$tr[$header{"consensus_genus"}]} += $nreads;
-						$cons_reads_rank_marker{"genus"}{$marker} += $nreads if $marker ne "";
+						$cons_reads_rank_marker{"genus"}{$marker} += $nreads if $marker ne "" && !is_unassigned_taxon($tr[$header{"consensus_genus"}]);
 						$genus_clusters{$tr[$header{"consensus_genus"}]}++;
 						$class_genus_clusters_metazoa{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}++;
 						$genus_consensus_sample{$tr[$header{"consensus_genus"}]}{$consensus_id}{$sample_joined} += $nreads;
-						if($is_no_adapter){ $consensus_genus_reads_noadapter += $nreads; } else { $consensus_genus_reads_demux += $nreads; }
+						if(!is_unassigned_taxon($tr[$header{"consensus_genus"}])) {
+							if($is_no_adapter){ $consensus_genus_reads_noadapter += $nreads; } else { $consensus_genus_reads_demux += $nreads; }
+						}
 						$genus_per_sample{$sample_joined}{$tr[$header{"consensus_genus"}]} += $nreads;
 						$class_genus_metazoa{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}=1;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_consolidated_treemap_genus{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]} += $nreads;
+							$cons_consolidated_treemap_genus_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}++;
+						}
 					}
-					if($tr[$header{"consensus_family"}] && !is_unassigned_taxon($tr[$header{"consensus_family"}]))
+					if($tr[$header{"consensus_family"}])
 					{
 						$family{$tr[$header{"consensus_family"}]} += $nreads;
-						$cons_reads_rank_marker{"family"}{$marker} += $nreads if $marker ne "";
+						$cons_reads_rank_marker{"family"}{$marker} += $nreads if $marker ne "" && !is_unassigned_taxon($tr[$header{"consensus_family"}]);
 						$family_consensus_sample{$tr[$header{"consensus_family"}]}{$consensus_id}{$sample_joined} += $nreads;
 						$family_per_sample{$sample_joined}{$tr[$header{"consensus_family"}]} += $nreads;
 						$class_family_metazoa{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_family"}]}=1;
@@ -1435,34 +1790,84 @@ if (-f "$temp_dir/$barcode_pipeline\_blast_consensus_tax_consolidated_rpt.txt") 
 					$class{$tr[$header{"consensus_class"}]} += $nreads;
 					$class_reads_viridiplantae{$tr[$header{"consensus_class"}]} += $nreads;
 					$class_clusters_viridiplantae{$tr[$header{"consensus_class"}]}++;
-					if($tr[$header{"consensus_species"}] && !is_unassigned_taxon($tr[$header{"consensus_species"}]))
+					if($tr[$header{"consensus_species"}])
 					{
 						$species{$tr[$header{"consensus_species"}]} += $nreads;
-						$cons_reads_rank_marker{"species"}{$marker} += $nreads if $marker ne "";
+						$cons_reads_rank_marker{"species"}{$marker} += $nreads if $marker ne "" && !is_unassigned_taxon($tr[$header{"consensus_species"}]);
 						$species_clusters{$tr[$header{"consensus_species"}]}++;
 						$class_species_clusters_viridiplantae{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}++;
 						$species_consensus_sample{$tr[$header{"consensus_species"}]}{$consensus_id}{$sample_joined} += $nreads;
 						$species_per_sample{$sample_joined}{$tr[$header{"consensus_species"}]} += $nreads;
 						$class_species_viridiplantae{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}=1;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_consolidated_treemap_species{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]} += $nreads;
+							$cons_consolidated_treemap_species_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}++;
+						}
 					}
-					if($tr[$header{"consensus_genus"}] && !is_unassigned_taxon($tr[$header{"consensus_genus"}]))
+					if($tr[$header{"consensus_genus"}])
 					{
 						$genus{$tr[$header{"consensus_genus"}]} += $nreads;
-						$cons_reads_rank_marker{"genus"}{$marker} += $nreads if $marker ne "";
+						$cons_reads_rank_marker{"genus"}{$marker} += $nreads if $marker ne "" && !is_unassigned_taxon($tr[$header{"consensus_genus"}]);
 						$genus_clusters{$tr[$header{"consensus_genus"}]}++;
 						$class_genus_clusters_viridiplantae{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}++;
 						$genus_consensus_sample{$tr[$header{"consensus_genus"}]}{$consensus_id}{$sample_joined} += $nreads;
-						if($is_no_adapter){ $consensus_genus_reads_noadapter += $nreads; } else { $consensus_genus_reads_demux += $nreads; }
+						if(!is_unassigned_taxon($tr[$header{"consensus_genus"}])) {
+							if($is_no_adapter){ $consensus_genus_reads_noadapter += $nreads; } else { $consensus_genus_reads_demux += $nreads; }
+						}
 						$genus_per_sample{$sample_joined}{$tr[$header{"consensus_genus"}]} += $nreads;
 						$class_genus_viridiplantae{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}=1;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_consolidated_treemap_genus{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]} += $nreads;
+							$cons_consolidated_treemap_genus_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}++;
+						}
 					}
-					if($tr[$header{"consensus_family"}] && !is_unassigned_taxon($tr[$header{"consensus_family"}]))
+					if($tr[$header{"consensus_family"}])
 					{
 						$family{$tr[$header{"consensus_family"}]} += $nreads;
-						$cons_reads_rank_marker{"family"}{$marker} += $nreads if $marker ne "";
+						$cons_reads_rank_marker{"family"}{$marker} += $nreads if $marker ne "" && !is_unassigned_taxon($tr[$header{"consensus_family"}]);
 						$family_consensus_sample{$tr[$header{"consensus_family"}]}{$consensus_id}{$sample_joined} += $nreads;
 						$family_per_sample{$sample_joined}{$tr[$header{"consensus_family"}]} += $nreads;
 						$class_family_viridiplantae{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_family"}]}=1;
+					}
+				}
+			}else
+			{
+				if($tr[$header{"consensus_class"}])
+				{
+					$class{$tr[$header{"consensus_class"}]} += $nreads;
+					if($tr[$header{"consensus_species"}])
+					{
+						$species{$tr[$header{"consensus_species"}]} += $nreads;
+						$cons_reads_rank_marker{"species"}{$marker} += $nreads if $marker ne "" && !is_unassigned_taxon($tr[$header{"consensus_species"}]);
+						$species_clusters{$tr[$header{"consensus_species"}]}++;
+						$species_consensus_sample{$tr[$header{"consensus_species"}]}{$consensus_id}{$sample_joined} += $nreads;
+						$species_per_sample{$sample_joined}{$tr[$header{"consensus_species"}]} += $nreads;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_consolidated_treemap_species{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]} += $nreads;
+							$cons_consolidated_treemap_species_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}++;
+						}
+					}
+					if($tr[$header{"consensus_genus"}])
+					{
+						$genus{$tr[$header{"consensus_genus"}]} += $nreads;
+						$cons_reads_rank_marker{"genus"}{$marker} += $nreads if $marker ne "" && !is_unassigned_taxon($tr[$header{"consensus_genus"}]);
+						$genus_clusters{$tr[$header{"consensus_genus"}]}++;
+						$genus_consensus_sample{$tr[$header{"consensus_genus"}]}{$consensus_id}{$sample_joined} += $nreads;
+						if(!is_unassigned_taxon($tr[$header{"consensus_genus"}])) {
+							if($is_no_adapter){ $consensus_genus_reads_noadapter += $nreads; } else { $consensus_genus_reads_demux += $nreads; }
+						}
+						$genus_per_sample{$sample_joined}{$tr[$header{"consensus_genus"}]} += $nreads;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_consolidated_treemap_genus{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]} += $nreads;
+							$cons_consolidated_treemap_genus_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}++;
+						}
+					}
+					if($tr[$header{"consensus_family"}])
+					{
+						$family{$tr[$header{"consensus_family"}]} += $nreads;
+						$cons_reads_rank_marker{"family"}{$marker} += $nreads if $marker ne "" && !is_unassigned_taxon($tr[$header{"consensus_family"}]);
+						$family_consensus_sample{$tr[$header{"consensus_family"}]}{$consensus_id}{$sample_joined} += $nreads;
+						$family_per_sample{$sample_joined}{$tr[$header{"consensus_family"}]} += $nreads;
 					}
 				}
 			}
@@ -1505,11 +1910,11 @@ if (-f "$temp_dir/$barcode_pipeline\_blast_consensus_tax_consolidated_rpt.txt" &
 	}
 	if($use_spec_interest)
 	{
-		@species_uniq = grep { exists($spec_interest{$_}) } @species_uniq;
+		@species_uniq = grep { is_unassigned_taxon($_) || exists($spec_interest{$_}) } @species_uniq;
 	}
 	if($use_local_gen)
 	{
-		@genus_uniq = grep { exists($local_gen{$_}) } @genus_uniq;
+		@genus_uniq = grep { is_unassigned_taxon($_) || exists($local_gen{$_}) } @genus_uniq;
 	}
 	@class_metazoa=sort keys(%class_species_metazoa);
 	@class_viridiplantae=sort keys(%class_species_viridiplantae);
@@ -1528,18 +1933,7 @@ if (-f "$temp_dir/$barcode_pipeline\_blast_consensus_tax_consolidated_rpt.txt" &
 		print FILE "$barcode_pipeline\t$epoc\tspecies\t".@species_uniq."\n";
 		print FILE "$barcode_pipeline\t$epoc\tgenus\t".@genus_uniq."\n";
 		print FILE "$barcode_pipeline\t$epoc\tfamily\t".@family_uniq."\n";
-		my $cs_sp_coi  = $cons_reads_rank_marker{"species"}{"COI"}  // 0;
-		my $cs_sp_its2 = $cons_reads_rank_marker{"species"}{"ITS2"} // 0;
-		my $cs_gn_coi  = $cons_reads_rank_marker{"genus"}{"COI"}    // 0;
-		my $cs_gn_its2 = $cons_reads_rank_marker{"genus"}{"ITS2"}   // 0;
-		my $cs_fm_coi  = $cons_reads_rank_marker{"family"}{"COI"}   // 0;
-		my $cs_fm_its2 = $cons_reads_rank_marker{"family"}{"ITS2"}  // 0;
-		print FILE "$barcode_pipeline\t$epoc\tspecies_COI_reads\t$cs_sp_coi\n";
-		print FILE "$barcode_pipeline\t$epoc\tspecies_ITS2_reads\t$cs_sp_its2\n";
-		print FILE "$barcode_pipeline\t$epoc\tgenus_COI_reads\t$cs_gn_coi\n";
-		print FILE "$barcode_pipeline\t$epoc\tgenus_ITS2_reads\t$cs_gn_its2\n";
-		print FILE "$barcode_pipeline\t$epoc\tfamily_COI_reads\t$cs_fm_coi\n";
-		print FILE "$barcode_pipeline\t$epoc\tfamily_ITS2_reads\t$cs_fm_its2\n";
+		emit_rank_marker_rows(\*FILE, $barcode_pipeline, $epoc, \%cons_reads_rank_marker);
 		close FILE;
 
 	if(!-f "$temp_dir/$barcode_pipeline\_consensus_consolidated_tax_reads_rpt.txt")
@@ -1567,12 +1961,7 @@ if (-f "$temp_dir/$barcode_pipeline\_blast_consensus_tax_consolidated_rpt.txt" &
 	print FILE "$barcode_pipeline\t$epoc\tspecies\t0\n";
 	print FILE "$barcode_pipeline\t$epoc\tgenus\t0\n";
 	print FILE "$barcode_pipeline\t$epoc\tfamily\t0\n";
-	print FILE "$barcode_pipeline\t$epoc\tspecies_COI_reads\t0\n";
-	print FILE "$barcode_pipeline\t$epoc\tspecies_ITS2_reads\t0\n";
-	print FILE "$barcode_pipeline\t$epoc\tgenus_COI_reads\t0\n";
-	print FILE "$barcode_pipeline\t$epoc\tgenus_ITS2_reads\t0\n";
-	print FILE "$barcode_pipeline\t$epoc\tfamily_COI_reads\t0\n";
-	print FILE "$barcode_pipeline\t$epoc\tfamily_ITS2_reads\t0\n";
+	emit_rank_marker_rows(\*FILE, $barcode_pipeline, $epoc, {});
 	close FILE;
 
 	if(!-f "$temp_dir/$barcode_pipeline\_consensus_consolidated_tax_reads_rpt.txt")
@@ -1598,11 +1987,10 @@ if ($consolidated_has_rows) {
 				if (exists($class_genus_metazoa{$each_class})) {
 				foreach $each_genus(sort keys(%{$class_genus_metazoa{$each_class}}))
 				{
-					next if is_unassigned_taxon($each_genus);
 					if(exists($genus{$each_genus}))
 					{
 						my $n = $genus{$each_genus} // 0;
-					next if ($use_local_gen && !exists($local_gen{$each_genus}));
+					next if ($use_local_gen && !is_unassigned_taxon($each_genus) && !exists($local_gen{$each_genus}));
 						print FILE "$each_class\t$each_genus\t$n\n";
 					}
 				}
@@ -1617,11 +2005,10 @@ if ($consolidated_has_rows) {
 				if (exists($class_genus_viridiplantae{$each_class})) {
 				foreach $each_genus(sort keys(%{$class_genus_viridiplantae{$each_class}}))
 				{
-					next if is_unassigned_taxon($each_genus);
 					if(exists($genus{$each_genus}))
 					{
 						my $n = $genus{$each_genus} // 0;
-					next if ($use_local_gen && !exists($local_gen{$each_genus}));
+					next if ($use_local_gen && !is_unassigned_taxon($each_genus) && !exists($local_gen{$each_genus}));
 						print FILE "$each_class\t$each_genus\t$n\n";
 					}
 				}
@@ -1636,7 +2023,6 @@ if ($consolidated_has_rows) {
 				if (exists($class_species_metazoa{$each_class})) {
 				foreach $each_species(sort keys(%{$class_species_metazoa{$each_class}}))
 				{
-					next if is_unassigned_taxon($each_species);
 					if(exists($species{$each_species}))
 					{
 						my $n = $species{$each_species} // 0;
@@ -1654,7 +2040,6 @@ if ($consolidated_has_rows) {
 				if (exists($class_species_viridiplantae{$each_class})) {
 				foreach $each_species(sort keys(%{$class_species_viridiplantae{$each_class}}))
 				{
-					next if is_unassigned_taxon($each_species);
 					if(exists($species{$each_species}))
 					{
 						my $n = $species{$each_species} // 0;
@@ -1662,8 +2047,31 @@ if ($consolidated_has_rows) {
 					}
 				}
 				}
-		}
+	}
 	close FILE;
+
+	for my $marker (configured_markers()) {
+		my $file_token = $configured_marker_file_tokens{$marker} || marker_filename_token($marker);
+		my $target_taxon = $configured_marker_tax_map{$marker} // '';
+		write_dynamic_treemap_report(
+			"$temp_dir/$barcode_pipeline\_consensus_consolidated_tax_gns_${file_token}_treemap_rpt.txt",
+			"consensus_class\tconsensus_genus\t#reads",
+			$cons_consolidated_treemap_genus{$marker} || {},
+			$cons_consolidated_treemap_genus{$marker} || {},
+			'genus',
+			$target_taxon,
+			1,
+		);
+		write_dynamic_treemap_report(
+			"$temp_dir/$barcode_pipeline\_consensus_consolidated_tax_spc_${file_token}_treemap_rpt.txt",
+			"consensus_class\tconsensus_species\t#reads",
+			$cons_consolidated_treemap_species{$marker} || {},
+			$cons_consolidated_treemap_species{$marker} || {},
+			'species',
+			$target_taxon,
+			1,
+		);
+	}
 
 ##### TREEMAPS (CONSOLIDATED CONSENSUS CLUSTERS; counts of consensus sequences, not reads)
 	open FILE, ">$temp_dir/$barcode_pipeline\_consensus_consolidated_tax_gns_metazoa_treemap_clusters_rpt.txt" or die "I couldn't open $temp_dir/$barcode_pipeline\_consensus_consolidated_tax_gns_metazoa_treemap_clusters_rpt.txt\n";
@@ -1674,8 +2082,7 @@ if ($consolidated_has_rows) {
 				if (exists($class_genus_clusters_metazoa{$each_class})) {
 				foreach $each_genus(sort keys(%{$class_genus_clusters_metazoa{$each_class}}))
 				{
-					next if is_unassigned_taxon($each_genus);
-					next if ($use_local_gen && !exists($local_gen{$each_genus}));
+					next if ($use_local_gen && !is_unassigned_taxon($each_genus) && !exists($local_gen{$each_genus}));
 					my $c = $class_genus_clusters_metazoa{$each_class}{$each_genus} // 0;
 					next unless $c && $c > 0;
 					$class_with_genus_clusters += $c;
@@ -1693,8 +2100,7 @@ if ($consolidated_has_rows) {
 				if (exists($class_genus_clusters_viridiplantae{$each_class})) {
 				foreach $each_genus(sort keys(%{$class_genus_clusters_viridiplantae{$each_class}}))
 				{
-					next if is_unassigned_taxon($each_genus);
-					next if ($use_local_gen && !exists($local_gen{$each_genus}));
+					next if ($use_local_gen && !is_unassigned_taxon($each_genus) && !exists($local_gen{$each_genus}));
 					my $c = $class_genus_clusters_viridiplantae{$each_class}{$each_genus} // 0;
 					next unless $c && $c > 0;
 					$class_with_genus_clusters += $c;
@@ -1712,7 +2118,6 @@ if ($consolidated_has_rows) {
 				if (exists($class_species_clusters_metazoa{$each_class})) {
 				foreach $each_species(sort keys(%{$class_species_clusters_metazoa{$each_class}}))
 				{
-					next if is_unassigned_taxon($each_species);
 					my $c = $class_species_clusters_metazoa{$each_class}{$each_species} // 0;
 					next unless $c && $c > 0;
 					$class_with_species_clusters += $c;
@@ -1730,15 +2135,37 @@ if ($consolidated_has_rows) {
 				if (exists($class_species_clusters_viridiplantae{$each_class})) {
 				foreach $each_species(sort keys(%{$class_species_clusters_viridiplantae{$each_class}}))
 				{
-					next if is_unassigned_taxon($each_species);
 					my $c = $class_species_clusters_viridiplantae{$each_class}{$each_species} // 0;
 					next unless $c && $c > 0;
 					$class_with_species_clusters += $c;
 					print FILE "$each_class\t$each_species\t$c\n";
 				}
 				}
-			}
+	}
 	close FILE;
+
+	for my $marker (configured_markers()) {
+		my $file_token = $configured_marker_file_tokens{$marker} || marker_filename_token($marker);
+		my $target_taxon = $configured_marker_tax_map{$marker} // '';
+		write_dynamic_treemap_report(
+			"$temp_dir/$barcode_pipeline\_consensus_consolidated_tax_gns_${file_token}_treemap_clusters_rpt.txt",
+			"consensus_class\tconsensus_genus\t#clusters",
+			$cons_consolidated_treemap_genus_clusters{$marker} || {},
+			$cons_consolidated_treemap_genus_clusters{$marker} || {},
+			'genus',
+			$target_taxon,
+			1,
+		);
+		write_dynamic_treemap_report(
+			"$temp_dir/$barcode_pipeline\_consensus_consolidated_tax_spc_${file_token}_treemap_clusters_rpt.txt",
+			"consensus_class\tconsensus_species\t#clusters",
+			$cons_consolidated_treemap_species_clusters{$marker} || {},
+			$cons_consolidated_treemap_species_clusters{$marker} || {},
+			'species',
+			$target_taxon,
+			1,
+		);
+	}
 }
 
 	undef @species_uniq;
@@ -1842,8 +2269,8 @@ while(<FILE>)
 						if (exists($header{"barcode_by_homology"})) {
 							$marker = $tr[$header{"barcode_by_homology"}] // "";
 						}
-						$marker = "COI"  if $marker =~ /^COI/i;
-						$marker = "ITS2" if $marker =~ /^ITS/i;
+						$marker = marker_from_token($marker);
+						$marker = "" if !defined $marker || $marker eq 'OTHER';
 
 					# Representative consensus IDs (best by number_of_reads) for species/genus.
 					# This reproduces the old "representative-only" consensus table, but is now derived
@@ -1913,6 +2340,10 @@ while(<FILE>)
 						}
 						$species_per_sample{$sample_joined}{$tr[$header{"consensus_species"}]} += $nreads;
 						$class_species_metazoa{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}=1;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_treemap_species{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]} += $nreads;
+							$cons_treemap_species_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}++;
+						}
 					}
 		#				if($tr[$header{"consensus_genus"}] && exists($local_gen{$tr[$header{"consensus_genus"}]}))
 							if($tr[$header{"consensus_genus"}] && !is_unassigned_taxon($tr[$header{"consensus_genus"}]))
@@ -1930,6 +2361,10 @@ while(<FILE>)
 						}
 						$genus_per_sample{$sample_joined}{$tr[$header{"consensus_genus"}]} += $nreads;
 						$class_genus_metazoa{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}=1;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_treemap_genus{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]} += $nreads;
+							$cons_treemap_genus_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}++;
+						}
 					}
 						if($tr[$header{"consensus_family"}] && !is_unassigned_taxon($tr[$header{"consensus_family"}]))
 						{
@@ -1968,6 +2403,10 @@ while(<FILE>)
 						}
 						$species_per_sample{$sample_joined}{$tr[$header{"consensus_species"}]} += $nreads;
 						$class_species_viridiplantae{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}=1;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_treemap_species{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]} += $nreads;
+							$cons_treemap_species_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}++;
+						}
 					}
 		#				if($tr[$header{"consensus_genus"}] && exists($local_gen{$tr[$header{"consensus_genus"}]}))
 							if($tr[$header{"consensus_genus"}] && !is_unassigned_taxon($tr[$header{"consensus_genus"}]))
@@ -1985,6 +2424,10 @@ while(<FILE>)
 						}
 						$genus_per_sample{$sample_joined}{$tr[$header{"consensus_genus"}]} += $nreads;
 						$class_genus_viridiplantae{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}=1;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_treemap_genus{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]} += $nreads;
+							$cons_treemap_genus_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}++;
+						}
 					}
 						if($tr[$header{"consensus_family"}] && !is_unassigned_taxon($tr[$header{"consensus_family"}]))
 						{
@@ -1998,6 +2441,59 @@ while(<FILE>)
 						}
 						$family_per_sample{$sample_joined}{$tr[$header{"consensus_family"}]} += $nreads;
 						$class_family_viridiplantae{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_family"}]}=1;
+					}
+				}
+				}else
+				{
+					if($tr[$header{"consensus_class"}])
+					{
+						$class{$tr[$header{"consensus_class"}]} += $nreads;
+						if($tr[$header{"consensus_species"}] && !is_unassigned_taxon($tr[$header{"consensus_species"}]))
+						{
+							$species{$tr[$header{"consensus_species"}]} += $nreads;
+							$cons_reads_rank_marker{"species"}{$marker} += $nreads if $marker ne "";
+							$species_clusters{$tr[$header{"consensus_species"}]}++;
+							$species_consensus_sample{$tr[$header{"consensus_species"}]}{$consensus_id}{$sample_joined} += $nreads;
+						if($species_consensus_sample{$tr[$header{"consensus_species"}]}{$consensus_id}{$sample_joined} == 5){$species_consensus_sample5{$tr[$header{"consensus_species"}]}=1;}
+						if($species_consensus_sample{$tr[$header{"consensus_species"}]}{$consensus_id}{$sample_joined}>9)
+						{
+							$detected_species{$sample_joined}{$tr[$header{"consensus_species"}]}=1;
+						}
+						$species_per_sample{$sample_joined}{$tr[$header{"consensus_species"}]} += $nreads;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_treemap_species{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]} += $nreads;
+							$cons_treemap_species_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_species"}]}++;
+						}
+					}
+							if($tr[$header{"consensus_genus"}] && !is_unassigned_taxon($tr[$header{"consensus_genus"}]))
+							{
+								$genus{$tr[$header{"consensus_genus"}]} += $nreads;
+								$cons_reads_rank_marker{"genus"}{$marker} += $nreads if $marker ne "";
+								$genus_clusters{$tr[$header{"consensus_genus"}]}++;
+								$genus_consensus_sample{$tr[$header{"consensus_genus"}]}{$consensus_id}{$sample_joined} += $nreads;
+							if($is_no_adapter){ $consensus_genus_reads_noadapter += $nreads; } else { $consensus_genus_reads_demux += $nreads; }
+						if($genus_consensus_sample{$tr[$header{"consensus_genus"}]}{$consensus_id}{$sample_joined} == 5){$genus_consensus_sample5{$tr[$header{"consensus_genus"}]}=1;}
+						if($genus_consensus_sample{$tr[$header{"consensus_genus"}]}{$consensus_id}{$sample_joined}>9)
+						{
+							$detected_genus{$sample_joined}{$tr[$header{"consensus_genus"}]}=1;
+						}
+						$genus_per_sample{$sample_joined}{$tr[$header{"consensus_genus"}]} += $nreads;
+						if ($marker ne "" && marker_matches_target_taxon($marker, $tr[$header{"consensus_kingdom"}], \%configured_marker_tax_map)) {
+							$cons_treemap_genus{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]} += $nreads;
+							$cons_treemap_genus_clusters{$marker}{$tr[$header{"consensus_class"}]}{$tr[$header{"consensus_genus"}]}++;
+						}
+					}
+						if($tr[$header{"consensus_family"}] && !is_unassigned_taxon($tr[$header{"consensus_family"}]))
+						{
+							$family{$tr[$header{"consensus_family"}]} += $nreads;
+							$cons_reads_rank_marker{"family"}{$marker} += $nreads if $marker ne "";
+							$family_consensus_sample{$tr[$header{"consensus_family"}]}{$consensus_id}{$sample_joined} += $nreads;
+							if($family_consensus_sample{$tr[$header{"consensus_family"}]}{$consensus_id}{$sample_joined} == 5){$family_consensus_sample5{$tr[$header{"consensus_family"}]}=1;}
+							if($family_consensus_sample{$tr[$header{"consensus_family"}]}{$consensus_id}{$sample_joined}>9)
+							{
+							$detected_family{$sample_joined}{$tr[$header{"consensus_family"}]}=1;
+						}
+						$family_per_sample{$sample_joined}{$tr[$header{"consensus_family"}]} += $nreads;
 					}
 				}
 			}
@@ -2247,18 +2743,7 @@ if(!-f "$temp_dir/$barcode_pipeline\_consensus_tax_time_rpt.txt")
 	print FILE "$barcode_pipeline\t$epoc\tspecies\t".@species_uniq."\n";
 	print FILE "$barcode_pipeline\t$epoc\tgenus\t".@genus_uniq."\n";
 	print FILE "$barcode_pipeline\t$epoc\tfamily\t".@family_uniq."\n";
-	my $cs_sp_coi  = $cons_reads_rank_marker{"species"}{"COI"}  // 0;
-	my $cs_sp_its2 = $cons_reads_rank_marker{"species"}{"ITS2"} // 0;
-	my $cs_gn_coi  = $cons_reads_rank_marker{"genus"}{"COI"}    // 0;
-	my $cs_gn_its2 = $cons_reads_rank_marker{"genus"}{"ITS2"}   // 0;
-	my $cs_fm_coi  = $cons_reads_rank_marker{"family"}{"COI"}   // 0;
-	my $cs_fm_its2 = $cons_reads_rank_marker{"family"}{"ITS2"}  // 0;
-	print FILE "$barcode_pipeline\t$epoc\tspecies_COI_reads\t$cs_sp_coi\n";
-	print FILE "$barcode_pipeline\t$epoc\tspecies_ITS2_reads\t$cs_sp_its2\n";
-	print FILE "$barcode_pipeline\t$epoc\tgenus_COI_reads\t$cs_gn_coi\n";
-	print FILE "$barcode_pipeline\t$epoc\tgenus_ITS2_reads\t$cs_gn_its2\n";
-	print FILE "$barcode_pipeline\t$epoc\tfamily_COI_reads\t$cs_fm_coi\n";
-	print FILE "$barcode_pipeline\t$epoc\tfamily_ITS2_reads\t$cs_fm_its2\n";
+	emit_rank_marker_rows(\*FILE, $barcode_pipeline, $epoc, \%cons_reads_rank_marker);
 	close FILE;
 if (defined $run_start_epoc) {
 	my @_cons_tax_t0 = t0_rows_for('tax_time', $barcode_pipeline, $run_start_epoc, $run_start_iso);
@@ -2386,6 +2871,43 @@ print FILE "consensus_class\tconsensus_genus\t#clusters\n";
 			}
 		}
 close FILE;
+
+for my $marker (configured_markers()) {
+	my $file_token = $configured_marker_file_tokens{$marker} || marker_filename_token($marker);
+	my $target_taxon = $configured_marker_tax_map{$marker} // '';
+	write_dynamic_treemap_report(
+		"$temp_dir/$barcode_pipeline\_consensus_tax_gns_${file_token}_treemap_rpt.txt",
+		"consensus_class\tconsensus_genus\t#reads",
+		$cons_treemap_genus{$marker} || {},
+		$cons_treemap_genus{$marker} || {},
+		'genus',
+		$target_taxon,
+	);
+	write_dynamic_treemap_report(
+		"$temp_dir/$barcode_pipeline\_consensus_tax_spc_${file_token}_treemap_rpt.txt",
+		"consensus_class\tconsensus_species\t#reads",
+		$cons_treemap_species{$marker} || {},
+		$cons_treemap_species{$marker} || {},
+		'species',
+		$target_taxon,
+	);
+	write_dynamic_treemap_report(
+		"$temp_dir/$barcode_pipeline\_consensus_tax_gns_${file_token}_treemap_clusters_rpt.txt",
+		"consensus_class\tconsensus_genus\t#clusters",
+		$cons_treemap_genus_clusters{$marker} || {},
+		$cons_treemap_genus_clusters{$marker} || {},
+		'genus',
+		$target_taxon,
+	);
+	write_dynamic_treemap_report(
+		"$temp_dir/$barcode_pipeline\_consensus_tax_spc_${file_token}_treemap_clusters_rpt.txt",
+		"consensus_class\tconsensus_species\t#clusters",
+		$cons_treemap_species_clusters{$marker} || {},
+		$cons_treemap_species_clusters{$marker} || {},
+		'species',
+		$target_taxon,
+	);
+}
 
 open FILE, ">$temp_dir/$barcode_pipeline\_consensus_tax_gns_viridiplantae_treemap_clusters_rpt.txt" or die "I couldn't open $temp_dir/$barcode_pipeline\_consensus_tax_gns_viridiplantae_treemap_clusters_rpt.txt\n";
 print FILE "consensus_class\tconsensus_genus\t#clusters\n";

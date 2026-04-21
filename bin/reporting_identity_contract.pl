@@ -67,9 +67,9 @@ sub _is_supported_nonkeyed_family {
 }
 
 sub _sample_dimensions {
-	my ($sample) = @_;
+	my ($sample, $context) = @_;
 	return ('unknown', 'unknown', 'unknown', 'unknown')
-		if !defined $sample || $sample eq '' || $sample eq 'no_adapter';
+		if !defined $sample || $sample eq '' || $sample eq 'no_adapter' || $context eq 'full_track';
 	my @parts = split /_/, $sample, -1;
 	return (
 		defined($parts[0]) && $parts[0] ne '' ? $parts[0] : 'unknown',
@@ -137,7 +137,7 @@ sub parse_header {
 		}
 		$barcode = $target_token ne '' ? $target_token : 'no_adapter_1';
 	}
-	my ($platform, $sampling_method, $subsample, $replicate) = _sample_dimensions($sample);
+	my ($platform, $sampling_method, $subsample, $replicate) = _sample_dimensions($sample, $context);
 
 	if ($context eq 'off') {
 		return {

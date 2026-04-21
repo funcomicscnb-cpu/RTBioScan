@@ -1,0 +1,1 @@
+consensus_id	barcode_by_homology	basecalling_model	number_of_reads	sample	taxid	blast_hit	aln_length	perc_id	consensus_kingdom	consensus_phylum	consensus_class	consensus_order	consensus_family	consensus_genus	consensus_species

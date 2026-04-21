@@ -439,6 +439,10 @@ def load_on_target_state(temp_dir: Path) -> dict[str, tuple[str, str]]:
     return state
 
 
+def load_nonempty_lines(path: Path) -> list[str]:
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 @pytest.mark.parametrize("include_noadapter", [True, False])
 def test_reads_cumulative_tracks_branch_counts(tmp_path, include_noadapter):
     temp_dir = run_append_reports(tmp_path, include_noadapter)
@@ -547,6 +551,201 @@ def test_reads_cumulative_uses_unique_read_ids_across_rounds(tmp_path):
     assert int(entry["matched_reads"]) == 1
     assert load_seen_read_ids(temp_dir) == ["demux_read"]
     assert load_on_target_state(temp_dir)["demux_read"] == ("ON_TARGET", DEMUX_SAMPLE)
+
+
+def test_append_reports_emits_first_seen_read_fate_snapshots_and_cache(tmp_path):
+    temp_dir = run_append_reports(tmp_path, include_noadapter=False)
+    round_demux = tmp_path / ROUND_DIR / f"{BARCODE}_read_fate_demult_first_seen.tsv"
+    round_blast = tmp_path / ROUND_DIR / f"{BARCODE}_read_fate_blast_first_seen.tsv"
+    demux_seen = temp_dir / f"{BARCODE}_read_fate_demux_seen.tsv"
+    blast_seen = temp_dir / f"{BARCODE}_read_fate_blast_seen.tsv"
+    demux_cache = temp_dir / f"{BARCODE}_demux_annotation_cache.tsv"
+
+    demux_lines = load_nonempty_lines(round_demux)
+    blast_lines = load_nonempty_lines(round_blast)
+    assert len(demux_lines) == 1
+    assert len(blast_lines) == 2
+    assert blast_lines[1].startswith("demux_read\t")
+    assert load_nonempty_lines(demux_seen) == ["demux_boundary_row"]
+    assert load_nonempty_lines(blast_seen) == ["demux_read"]
+    cache_lines = load_nonempty_lines(demux_cache)
+    assert len(cache_lines) == 2
+    assert cache_lines[1].startswith("demux_boundary_row\t")
+
+    temp_dir = run_append_reports(tmp_path, include_noadapter=False)
+    demux_lines = load_nonempty_lines(round_demux)
+    blast_lines = load_nonempty_lines(round_blast)
+    cache_lines = load_nonempty_lines(demux_cache)
+    assert len(demux_lines) == 1
+    assert len(blast_lines) == 1
+    assert len(cache_lines) == 2
+
+
+def test_append_reports_only_snapshots_reads_from_current_round_read_info(tmp_path):
+    temp_dir = tmp_path / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "round_001").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "round_002").mkdir(parents=True, exist_ok=True)
+    seq_file = tmp_path / "sequencing_template.tsv"
+    sequencing_template(seq_file)
+    env = dict(os.environ)
+    env["RTBIOSCAN_DEMUX_IDENTITY_CONTEXT"] = DEMUX_IDENTITY_CONTEXT
+
+    def run_round(round_dir: str, read_info_rows, on_target_rows, demult_rows, blast_rows) -> None:
+        write_tsv(tmp_path / f"{BARCODE}_read_info_rpt.txt", READ_INFO_HEADER, read_info_rows)
+        write_tsv(tmp_path / f"{BARCODE}_on_target_rpt.txt", ON_TARGET_HEADER, on_target_rows)
+        write_tsv(tmp_path / f"{BARCODE}_blast_otu_pretax_rpt.txt", BLAST_OTU_HEADER, blast_rows)
+        write_tsv(tmp_path / f"{BARCODE}_blast_consensus_tax_rpt.txt", CONSENSUS_HEADER, [])
+        write_boundary_report_pair(
+            tmp_path / f"{BARCODE}_demult_rpt.txt",
+            "demult_rpt",
+            DEMULT_REPORT_HEADER,
+            demult_rows,
+            DEMUX_IDENTITY_CONTEXT,
+        )
+        write_boundary_report_pair(
+            tmp_path / f"{BARCODE}_otu_def_rpt.txt",
+            "otu_def_rpt",
+            OTU_REPORT_HEADER,
+            make_otu_rows(blast_rows),
+            DEMUX_IDENTITY_CONTEXT,
+        )
+        pod5_path = tmp_path / f"{round_dir}.pod5"
+        pod5_path.write_bytes(b"test")
+        subprocess.run(
+            [
+                "perl",
+                str(APPEND_REPORTS),
+                round_dir,
+                str(temp_dir),
+                str(pod5_path),
+                BARCODE,
+                str(seq_file),
+            ],
+            check=True,
+            cwd=tmp_path,
+            env=env,
+        )
+
+    run_round(
+        "round_001",
+        [
+            {
+                "read_id": "r_old",
+                "filename": "round1.pod5",
+                "run_id": "run001",
+                "barcode": DEMUX_SAMPLE,
+                "fast_length": 100,
+                "fast_mean_qscore": 10,
+                "hac_length": 100,
+                "hac_mean_qscore": 12,
+                "sup_length": 100,
+                "sup_mean_qscore": 15,
+            }
+        ],
+        [{"read_id": "r_old", "barcode": DEMUX_SAMPLE, "on_target_kingdom": "ON_TARGET"}],
+        [],
+        [],
+    )
+
+    run_round(
+        "round_002",
+        [
+            {
+                "read_id": "r_new",
+                "filename": "round2.pod5",
+                "run_id": "run001",
+                "barcode": DEMUX_SAMPLE,
+                "fast_length": 101,
+                "fast_mean_qscore": 10,
+                "hac_length": 101,
+                "hac_mean_qscore": 12,
+                "sup_length": 101,
+                "sup_mean_qscore": 15,
+            }
+        ],
+        [{"read_id": "r_new", "barcode": DEMUX_SAMPLE, "on_target_kingdom": "ON_TARGET"}],
+        [
+            {
+                "read_id": "r_old",
+                "barcode_by_homology": "COI",
+                "basecalling_model": "hac",
+                "sample": DEMUX_SAMPLE,
+                "platform": "nanopore",
+                "sampling_method": "grab",
+                "subsample": "sub1",
+                "replicate": "1",
+                "identity_scope": "sample",
+                "identity_value": DEMUX_SAMPLE,
+            },
+            {
+                "read_id": "r_new",
+                "barcode_by_homology": "COI",
+                "basecalling_model": "hac",
+                "sample": DEMUX_SAMPLE,
+                "platform": "nanopore",
+                "sampling_method": "grab",
+                "subsample": "sub1",
+                "replicate": "1",
+                "identity_scope": "sample",
+                "identity_value": DEMUX_SAMPLE,
+            },
+        ],
+        [
+            {
+                "read_id": "r_old",
+                "barcode_by_homology": "COI",
+                "basecalling_model": "hac",
+                "sample": DEMUX_SAMPLE,
+                "hit_id": "hit_old",
+                "taxid": "123",
+                "aln_length": 500,
+                "perc_id": 99.1,
+                "otu_id": "OTUB_1-COI",
+                "otu_taxid": "201",
+                "otu_kingdom": "Metazoa",
+                "otu_phylum": "Chordata",
+                "otu_class": "Aves",
+                "otu_order": "Accipitriformes",
+                "otu_family": "Accipitridae",
+                "otu_genus": "GenusOld",
+                "otu_species": "SpeciesOld",
+            },
+            {
+                "read_id": "r_new",
+                "barcode_by_homology": "COI",
+                "basecalling_model": "hac",
+                "sample": DEMUX_SAMPLE,
+                "hit_id": "hit_new",
+                "taxid": "NA",
+                "aln_length": 480,
+                "perc_id": 97.0,
+                "otu_id": "OTUB_2-COI",
+                "otu_taxid": "NA",
+                "otu_kingdom": "Unassigned",
+                "otu_phylum": "Unassigned",
+                "otu_class": "Unassigned",
+                "otu_order": "Unassigned",
+                "otu_family": "Unassigned",
+                "otu_genus": "Unassigned",
+                "otu_species": "Unassigned",
+            },
+        ],
+    )
+
+    round1_demux = load_nonempty_lines(tmp_path / "round_001" / f"{BARCODE}_read_fate_demult_first_seen.tsv")
+    round1_blast = load_nonempty_lines(tmp_path / "round_001" / f"{BARCODE}_read_fate_blast_first_seen.tsv")
+    round2_demux = load_nonempty_lines(tmp_path / "round_002" / f"{BARCODE}_read_fate_demult_first_seen.tsv")
+    round2_blast = load_nonempty_lines(tmp_path / "round_002" / f"{BARCODE}_read_fate_blast_first_seen.tsv")
+
+    assert len(round1_demux) == 1
+    assert len(round1_blast) == 1
+    assert len(round2_demux) == 2
+    assert len(round2_blast) == 2
+    assert round2_demux[1].startswith("r_new\t")
+    assert round2_blast[1].startswith("r_new\t")
+    assert not any(line.startswith("r_old\t") for line in round2_demux[1:])
+    assert not any(line.startswith("r_old\t") for line in round2_blast[1:])
 
 
 def test_matched_reads_cumulative_is_sticky_on_target(tmp_path):
