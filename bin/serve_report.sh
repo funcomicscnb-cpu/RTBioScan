@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: serve_report.sh [--dir DIR] [--port PORT] [--host HOST] [--report FILE] [--wait-for-report] [--open] [--open-all|--open-last N] [--quiet|--verbose]
+Usage: serve_report.sh [--dir DIR] [--port PORT] [--host HOST] [--report FILE] [--wait-for-report] [--open] [--open-all|--open-last N] [--quiet|--verbose] [--ready-file FILE]
 
 Serve the RTBioScan HTML report with a local HTTP server.
 
@@ -28,6 +28,7 @@ OPEN=0
 QUIET=0
 OPEN_ALL=0
 OPEN_LAST=""
+READY_FILE=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -70,6 +71,10 @@ while [ "$#" -gt 0 ]; do
     --verbose)
       QUIET=0
       shift
+      ;;
+    --ready-file)
+      READY_FILE="${2:-}"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -116,6 +121,14 @@ REPORT_PATH="${DIR%/}/${REPORT}"
 if [ "$WAIT_FOR_REPORT" -ne 1 ] && [ ! -f "$REPORT_PATH" ]; then
   echo "ERROR: report not found: $REPORT_PATH" 1>&2
   exit 2
+fi
+if [ -n "$READY_FILE" ]; then
+  case "$READY_FILE" in
+    /*) ;;
+    *) READY_FILE="$(pwd -P)/$READY_FILE" ;;
+  esac
+  mkdir -p "$(dirname "$READY_FILE")"
+  rm -f "$READY_FILE"
 fi
 
 BIND_HOST="$HOST"
@@ -286,13 +299,15 @@ cleanup() {
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
+  [ -n "${READY_FILE:-}" ] && rm -f "$READY_FILE" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 cd "$DIR"
-"$PY" - <<PY &
+RTBIOSCAN_READY_FILE="$READY_FILE" "$PY" - <<PY &
 import errno
 import http.server
+import os
 import socket
 import socketserver
 import sys
@@ -330,9 +345,38 @@ class ReportServer(socketserver.TCPServer):
         super().handle_error(request, client_address)
 
 with ReportServer((host, port), ReportHandler) as httpd:
+    ready_file = os.environ.get("RTBIOSCAN_READY_FILE", "")
+    if ready_file:
+        with open(ready_file, "w", encoding="utf-8") as fh:
+            fh.write(f"{host}\t{port}\n")
     httpd.serve_forever()
 PY
 SERVER_PID=$!
+
+if [ -n "$OPEN_CMD" ]; then
+  # Do not open browser tabs until the HTTP server has actually bound its port.
+  # If binding fails, the wrapper may retry another port; opening here would
+  # launch a stale refused-connection URL for the failed attempt.
+  if [ -n "$READY_FILE" ]; then
+    open_waited=0
+    while [ ! -s "$READY_FILE" ] && kill -0 "$SERVER_PID" 2>/dev/null; do
+      sleep 1
+      open_waited=$((open_waited + 1))
+      [ "$open_waited" -lt 5 ] || break
+    done
+    if [ ! -s "$READY_FILE" ]; then
+      kill "$SERVER_PID" 2>/dev/null || true
+      wait "$SERVER_PID" 2>/dev/null || true
+      exit 1
+    fi
+  else
+    sleep 1
+  fi
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    wait "$SERVER_PID"
+    exit "$?"
+  fi
+fi
 
 launch_open_helper
 

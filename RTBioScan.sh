@@ -811,8 +811,8 @@ _canonical_serve_dir() {
 
 # Append to global index + write per-dir pid file
 _register_server() {    # args: pid canonical_dir
-  mkdir -p "$(dirname "$_RTBIOSCAN_SERVER_INDEX")"
-  printf '%s\t%s\n' "$1" "$2" >> "$_RTBIOSCAN_SERVER_INDEX"
+  mkdir -p "$(dirname "$_RTBIOSCAN_SERVER_INDEX")" 2>/dev/null || true
+  printf '%s\t%s\n' "$1" "$2" >> "$_RTBIOSCAN_SERVER_INDEX" 2>/dev/null || true
   printf '%s\n' "$1" > "$2/server.pid"
 }
 
@@ -823,7 +823,7 @@ _unregister_server() {  # args: pid canonical_dir
     _tmp="$(mktemp)"
     awk -v pid="$1" 'BEGIN{FS="\t"} $1 != pid' \
         "$_RTBIOSCAN_SERVER_INDEX" > "$_tmp" 2>/dev/null \
-      && mv "$_tmp" "$_RTBIOSCAN_SERVER_INDEX" \
+      && mv "$_tmp" "$_RTBIOSCAN_SERVER_INDEX" 2>/dev/null \
       || rm -f "$_tmp"
   fi
   rm -f "$2/server.pid" 2>/dev/null || true
@@ -2113,11 +2113,14 @@ if [[ $serve -eq 1 ]]; then
   server_log="${serve_dir_path}/server.log"
   server_port_file="${serve_dir_path}/server.port"
   server_url_file="${serve_dir_path}/server.url"
+  server_ready_file=""
   rm -f "$server_port_file" "$server_url_file" "$serve_dir_path/server.pid"
   SERVER_PID=""
   while :; do
+    server_ready_file="$(mktemp "${serve_dir_path}/.server.ready.XXXXXX")"
+    rm -f "$server_ready_file"
     server_url="http://${serve_host_display}:${serve_port}/report_html/report.html"
-    server_args=(--dir "$serve_dir_path" --port "$serve_port" --host "$serve_bind_host" --wait-for-report)
+    server_args=(--dir "$serve_dir_path" --port "$serve_port" --host "$serve_bind_host" --wait-for-report --ready-file "$server_ready_file")
     [[ $serve_open     -eq 1 ]] && server_args+=(--open)
     [[ $serve_open_all -eq 1 ]] && server_args+=(--open-all)
     [[ -n "$serve_open_last" ]] && server_args+=(--open-last "$serve_open_last")
@@ -2130,10 +2133,26 @@ if [[ $serve -eq 1 ]]; then
     SERVER_PID=$!
     LAUNCH_IN_PROGRESS=0
     finalize_pending_signal_if_needed
-    # Brief liveness check: give the server ~1 s to bind, then verify it's still up.
-    sleep 1
-    if kill -0 "$SERVER_PID" 2>/dev/null; then
+    # Wait for serve_report.sh to confirm that the Python HTTP server bound the port.
+    server_ready=0
+    server_wait_remaining=5
+    while [[ "$server_wait_remaining" -gt 0 ]]; do
+      if [[ -s "$server_ready_file" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        server_ready=1
+        break
+      fi
+      if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+      server_wait_remaining=$((server_wait_remaining - 1))
+    done
+    if [[ "$server_ready" -eq 1 ]]; then
       break
+    fi
+    rm -f "$server_ready_file" 2>/dev/null || true
+    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+      terminate_tracked_tree "$SERVER_PID" "report server" TERM 2
     fi
     SERVER_PID=""
     if [[ $serve_port_explicit -ne 1 ]] && [[ -f "$server_log" ]] && grep -q "Address already in use" "$server_log"; then

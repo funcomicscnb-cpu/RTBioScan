@@ -71,13 +71,20 @@ def _install_python_shim(tmp_path: Path, *, mode: str) -> tuple[dict[str, str], 
         "#!/usr/bin/env bash\n"
         "set -eu\n"
         "script=\"$(cat)\"\n"
+        "mark_ready() {\n"
+        "  if [ -n \"${PYTHON_SHIM_MARKER:-}\" ]; then\n"
+        "    printf 'server_started\\n' >> \"$PYTHON_SHIM_MARKER\"\n"
+        "  fi\n"
+        "  if [ -n \"${RTBIOSCAN_READY_FILE:-}\" ]; then\n"
+        "    mkdir -p \"$(dirname \"$RTBIOSCAN_READY_FILE\")\"\n"
+        "    printf '127.0.0.1\\t0\\n' > \"$RTBIOSCAN_READY_FILE\"\n"
+        "  fi\n"
+        "}\n"
         "case \"$script\" in\n"
         "  *\"import http.server\"*)\n"
         "    case \"${PYTHON_SHIM_SERVER_MODE:-delegate}\" in\n"
         "      hold)\n"
-        "        if [ -n \"${PYTHON_SHIM_MARKER:-}\" ]; then\n"
-        "          printf 'server_started\\n' >> \"$PYTHON_SHIM_MARKER\"\n"
-        "        fi\n"
+        "        mark_ready\n"
         "        trap 'exit 0' TERM INT\n"
         "        while :; do\n"
         "          sleep 1\n"
@@ -91,9 +98,7 @@ def _install_python_shim(tmp_path: Path, *, mode: str) -> tuple[dict[str, str], 
         "            exit 1\n"
         "            ;;\n"
         "          *)\n"
-        "            if [ -n \"${PYTHON_SHIM_MARKER:-}\" ]; then\n"
-        "              printf 'server_started\\n' >> \"$PYTHON_SHIM_MARKER\"\n"
-        "            fi\n"
+        "            mark_ready\n"
         "            trap 'exit 0' TERM INT\n"
         "            while :; do\n"
         "              sleep 1\n"
@@ -109,9 +114,7 @@ def _install_python_shim(tmp_path: Path, *, mode: str) -> tuple[dict[str, str], 
         "            exit 1\n"
         "            ;;\n"
         "          *)\n"
-        "            if [ -n \"${PYTHON_SHIM_MARKER:-}\" ]; then\n"
-        "              printf 'server_started\\n' >> \"$PYTHON_SHIM_MARKER\"\n"
-        "            fi\n"
+        "            mark_ready\n"
         "            trap 'exit 0' TERM INT\n"
         "            while :; do\n"
         "              sleep 1\n"
@@ -549,10 +552,6 @@ def test_rtbioscan_wrapper_sigterm_stops_feeder_and_report_server_promptly(tmp_p
             feeder_log.write_text(original_feeder_log, encoding="utf-8")
 
 
-@pytest.mark.xfail(
-    reason="Reliable second-signal pipeline escalation in the bash wrapper needs a policy decision on fallback escalation timing.",
-    strict=False,
-)
 def test_rtbioscan_wrapper_second_sigint_escalates_pipeline_with_report_server(tmp_path: Path) -> None:
     run_id = f"ServeWrapperIntTwice_{tmp_path.name}"
     input_dir = tmp_path / "input"
