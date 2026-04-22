@@ -54,12 +54,17 @@ sub parse_consensus_headers {
       $otu_key = trim_text($1);
       $otu_key = 'NA' if $otu_key eq '';
     }
+    my $header_reads;
+    if ($line =~ /\|reads-(\d+)/) {
+      $header_reads = $1 + 0;
+    }
 
     push @rows, {
       sample       => $sample,
       otu_key      => $otu_key,
       consensus_id => $parsed->{consensus_id},
       cons_token   => $cons_token,
+      header_reads => $header_reads,
     };
   }
   close $FH;
@@ -115,7 +120,9 @@ if (-d $opt{consensus_dir}) {
     for my $row (@cons_rows) {
       my $reads_list = "$sample_dir/OriginalReads/$row->{cons_token}_reads.list";
       my $reads_used_round = count_unique_reads($reads_list);
-      my $reads_value = defined($reads_used_round) ? $reads_used_round : 'NA';
+      my $reads_value = defined($reads_used_round)
+        ? $reads_used_round
+        : (defined($row->{header_reads}) ? $row->{header_reads} : 'NA');
       my $key = join("\t", $row->{sample}, $row->{otu_key}, $row->{consensus_id});
       if (exists $rows{$key}) {
         my $prev = $rows{$key};

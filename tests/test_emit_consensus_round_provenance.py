@@ -79,7 +79,7 @@ def test_emit_consensus_round_provenance_warns_on_missing_reads_list(tmp_path: P
     cons_dir.mkdir(parents=True)
     merged = cons_dir / "s1_Merged_Consensus.fasta"
     merged.write_text(
-        ">s1|Consensus0|COI|reads-4|OTU=OTUB_1-COI\nACGT\n",
+        ">s1|Consensus0|COI|OTU=OTUB_1-COI\nACGT\n",
         encoding="utf-8",
     )
     out = tmp_path / "consensus_round_provenance.tsv"
@@ -97,6 +97,33 @@ def test_emit_consensus_round_provenance_warns_on_missing_reads_list(tmp_path: P
     assert "consensus_provenance_missing_reads_list:" in result.stderr
     lines = out.read_text(encoding="utf-8").strip().splitlines()
     assert "round_001\ts1\tOTUB_1-COI\tConsensus0_s1\tNA" in lines[1:]
+
+
+def test_emit_consensus_round_provenance_uses_header_count_when_reads_list_missing(
+    tmp_path: Path,
+) -> None:
+    cons_dir = tmp_path / "Consensus" / "s1"
+    cons_dir.mkdir(parents=True)
+    merged = cons_dir / "s1_Merged_Consensus.fasta"
+    merged.write_text(
+        ">s1|Consensus0|COI|reads-4|OTU=OTUB_1-COI\nACGT\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "consensus_round_provenance.tsv"
+    result = _run(
+        [
+            "--consensus-dir",
+            str(tmp_path / "Consensus"),
+            "--round-barcode",
+            "round_001",
+            "--out",
+            str(out),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    assert "consensus_provenance_missing_reads_list:" in result.stderr
+    lines = out.read_text(encoding="utf-8").strip().splitlines()
+    assert "round_001\ts1\tOTUB_1-COI\tConsensus0_s1\t4" in lines[1:]
 
 
 def test_emit_consensus_round_provenance_normalizes_no_adapter_labels(tmp_path: Path) -> None:

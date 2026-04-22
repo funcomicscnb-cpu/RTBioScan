@@ -136,6 +136,7 @@ if [ -n "$selected_otu" ]; then
 		fi
 		rm -f "$tmp_reads" "$tmp_sup"
 	else
+		: > "$originalreads"
 		if [ -f "$out_dir/${selected_otu}_all_reads.list" ]; then
 			cat "$out_dir/${selected_otu}_all_reads.list" >> "$originalreads"
 		fi

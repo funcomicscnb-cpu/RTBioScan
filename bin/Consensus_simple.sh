@@ -933,6 +933,7 @@ _best_consensus_addition() {
 			[ -s "$_bca_ts" ] && awk 'BEGIN{RS=">"; ORS=""} NR>1 {h=$1; sub(/\n.*/, "", h); if(!seen[h]++){print ">"$0}}' "$_bca_ts" > "$_bca_sup"
 			rm -f "$_bca_tr" "$_bca_ts"
 		else
+			: > "$_bca_orig"
 			[ -f "$_bca_out_dir/${_bca_sel_otu}_all_reads.list"  ] && cat "$_bca_out_dir/${_bca_sel_otu}_all_reads.list"  >> "$_bca_orig"
 			[ -f "$_bca_out_dir/${_bca_sel_otu}_reads_sup.fasta" ] && cat "$_bca_out_dir/${_bca_sel_otu}_reads_sup.fasta" >  "$_bca_sup"
 		fi
