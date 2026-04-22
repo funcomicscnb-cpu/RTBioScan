@@ -666,6 +666,15 @@ ul#warnings li {
 .otu-assign-table-inner th {
   background: #f1f5ec;
 }
+.otu-assign-action-link {
+  color: #2c6e49;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-weight: 600;
+}
+.otu-assign-action-link:hover {
+  color: #204f36;
+}
 .otu-assign-table-inner td.sequence-cell {
   font-family: "Menlo", "Consolas", monospace;
   font-size: 11px;

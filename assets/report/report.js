@@ -1262,16 +1262,50 @@
     return `${baseHeader}|${suffix.join("|")}`;
   }
 
+  function buildConsensusFastaRecord(row) {
+    const header = buildConsensusFastaHeader(row);
+    const seq = formatFastaSequence(row && row.sequence ? row.sequence : "");
+    if (!header || !seq) return "";
+    return `>${header}\n${seq}`;
+  }
+
   function makeFasta(records) {
     return (Array.isArray(records) ? records : [])
-      .map((row) => {
-        const header = buildConsensusFastaHeader(row);
-        const seq = formatFastaSequence(row && row.sequence ? row.sequence : "");
-        if (!header || !seq) return "";
-        return `>${header}\n${seq}`;
-      })
+      .map((row) => buildConsensusFastaRecord(row))
       .filter(Boolean)
       .join("\n");
+  }
+
+  function openConsensusSequenceWindow(row, options = {}) {
+    const fasta = buildConsensusFastaRecord(row);
+    if (!fasta) return;
+    const baseTitle = options && options.title ? String(options.title) : "Consensus Sequence";
+    const sequenceLabel = row && row.consensus_id ? String(row.consensus_id) : baseTitle;
+    const win = window.open("", "rtbioscan-consensus-sequence", "popup=yes,width=720,height=520,resizable=yes,scrollbars=yes");
+    if (!win) return;
+
+    const doc = win.document;
+    doc.open();
+    doc.write("<!doctype html><html><head><meta charset=\"utf-8\"><title></title></head><body></body></html>");
+    doc.close();
+    doc.title = `${baseTitle}: ${sequenceLabel}`;
+
+    const style = doc.createElement("style");
+    style.textContent = [
+      "body { margin: 0; padding: 16px; font-family: \"IBM Plex Sans\", \"Segoe UI\", Arial, sans-serif; background: #f7f8f4; color: #1b2417; }",
+      "h1 { margin: 0 0 12px; font-size: 18px; }",
+      "pre { margin: 0; padding: 12px; border: 1px solid #d7dfd1; border-radius: 8px; background: #ffffff; white-space: pre-wrap; word-break: break-word; font-family: \"SFMono-Regular\", Consolas, \"Liberation Mono\", Menlo, monospace; font-size: 12px; line-height: 1.5; }",
+    ].join(" ");
+    doc.head.appendChild(style);
+
+    const heading = doc.createElement("h1");
+    heading.textContent = `${baseTitle}: ${sequenceLabel}`;
+    doc.body.appendChild(heading);
+
+    const pre = doc.createElement("pre");
+    pre.textContent = fasta;
+    doc.body.appendChild(pre);
+    win.focus();
   }
 
   function renderConsensusSequenceTable(round, mountNode = charts, options = {}) {
@@ -1368,6 +1402,9 @@
         th.title = "OTU reads by replicate (total cluster members, may exceed reads used for consensus)";
         trh.appendChild(th);
       });
+      const actionTh = document.createElement("th");
+      actionTh.textContent = "Sequence";
+      trh.appendChild(actionTh);
       thead.appendChild(trh);
       table.appendChild(thead);
 
@@ -1393,6 +1430,17 @@
           td.textContent = String(replicateCountForLabel(row, label));
           tr.appendChild(td);
         });
+        const actionTd = document.createElement("td");
+        const actionLink = document.createElement("a");
+        actionLink.href = "#";
+        actionLink.className = "otu-assign-action-link";
+        actionLink.textContent = "View FASTA";
+        actionLink.addEventListener("click", (event) => {
+          event.preventDefault();
+          openConsensusSequenceWindow(row, { title });
+        });
+        actionTd.appendChild(actionLink);
+        tr.appendChild(actionTd);
         tbody.appendChild(tr);
       });
       table.appendChild(tbody);
