@@ -9,3 +9,28 @@ __pycache__/
 .DS_Store
 .codex_backups/
 *.swp
+
+# Bioinformatics data - never commit raw sequencing data
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.fa.gz
+*.fasta.gz
+*.pod5
+*.fast5
+*.bam
+*.bam.bai
+
+# BLAST/reference databases
+*.nhr
+*.nin
+*.nsq
+*.nal
+*.nsi
+*.nsd
+*.nog
+*.not
+*.ntf
+*.nto
+*.njs
