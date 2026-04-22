@@ -5095,7 +5095,7 @@ process _reporting_consensus_tax {
 				fi
 			# Ensure consolidated report is always refreshed per round to avoid stale carry-over.
 			if [ ! -f ${barcode}_blast_consensus_tax_consolidated_rpt.txt ]; then
-				printf 'consensus_id\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample\ttaxid\tblast_hit\taln_length\tperc_id\tconsensus_kingdom\tconsensus_phylum\tconsensus_class\tconsensus_order\tconsensus_family\tconsensus_genus\tconsensus_species\n' > ${barcode}_blast_consensus_tax_consolidated_rpt.txt
+				printf 'consensus_id\totu_key\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample\ttaxid\tblast_hit\taln_length\tperc_id\tconsensus_kingdom\tconsensus_phylum\tconsensus_class\tconsensus_order\tconsensus_family\tconsensus_genus\tconsensus_species\n' > ${barcode}_blast_consensus_tax_consolidated_rpt.txt
 			fi
 	cp ${barcode}_blast_consensus_tax_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_blast_consensus_tax_rpt.txt \
 		|| { echo "ERROR: failed to persist ${barcode}_blast_consensus_tax_rpt.txt to round dir" 1>&2; exit 1; }

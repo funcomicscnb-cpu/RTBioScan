@@ -53,6 +53,7 @@ if (%consolidated) {
 }
 print $OUT join("\t",
     "consensus_id",
+    "otu_key",
     "barcode_by_homology",
     "basecalling_model",
     "number_of_reads",
@@ -72,6 +73,7 @@ print $OUT join("\t",
 if ($OUTC) {
     print $OUTC join("\t",
         "consensus_id",
+        "otu_key",
         "barcode_by_homology",
         "basecalling_model",
         "number_of_reads",
@@ -155,8 +157,9 @@ while (my $line = <$IN>) {
     $sample = SampleLabel::normalize_sample_label($sample);
     next unless $sample ne '' && $consensus ne '' && $reads ne '';
     my $barcode_1 = '';
+    my $otu_key = '';
     if ($qseqid =~ /\|OTU=([^|]+)/) {
-        my $otu_key = $1;
+        $otu_key = $1;
         if ($otu_key =~ /-(.+)$/) { $barcode_1 = $1; }
     }
     if ($barcode_1 eq '') {
@@ -196,6 +199,7 @@ while (my $line = <$IN>) {
 
     my $out_line = join("\t",
         $consensus_id,
+        $otu_key,
         $barcode_1,
         $model,
         $reads,

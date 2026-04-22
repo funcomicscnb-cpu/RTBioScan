@@ -21,7 +21,7 @@ EXPECTED_SHARED_CONTENT = {
     ),
     "blast_filter_stats.tsv": "kept_reads\t0\nkept_otus\t0\nmissing_policy\tfailed_round_placeholder\n",
     "blast_consensus_tax_rpt.txt": (
-        "consensus_id\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample\ttaxid\tblast_hit\t"
+        "consensus_id\totu_key\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample\ttaxid\tblast_hit\t"
         "aln_length\tperc_id\tconsensus_kingdom\tconsensus_phylum\tconsensus_class\tconsensus_order\t"
         "consensus_family\tconsensus_genus\tconsensus_species\n"
     ),

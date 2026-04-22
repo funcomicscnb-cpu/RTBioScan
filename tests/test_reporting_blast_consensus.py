@@ -47,6 +47,12 @@ def run_report(tmp_path: Path, consolidated_ids):
     return qseqid, consolidated_out
 
 
+def row_by_header(lines):
+    header = lines[0].split("\t")
+    row = lines[1].split("\t")
+    return dict(zip(header, row))
+
+
 def test_consolidated_accepts_full_header(tmp_path):
     _, consolidated_out = run_report(tmp_path, consolidated_ids=None)
     data = consolidated_out.read_text(encoding="utf-8")
@@ -95,8 +101,9 @@ def test_marker_extracted_from_otu_tag(tmp_path):
     consolidated_out = tmp_path / "RTBioScan_blast_consensus_tax_consolidated_rpt.txt"
     data = consolidated_out.read_text(encoding="utf-8").splitlines()
     assert len(data) > 1
-    fields = data[1].split("\t")
-    assert fields[1] == "rbcL"
+    row = row_by_header(data)
+    assert row["otu_key"] == "OTUB_1-rbcL"
+    assert row["barcode_by_homology"] == "rbcL"
 
 
 def test_numeric_sseqid_is_reported_not_dropped(tmp_path):
@@ -116,7 +123,7 @@ def test_numeric_sseqid_is_reported_not_dropped(tmp_path):
     report = tmp_path / "RTBioScan_blast_consensus_tax_rpt.txt"
     lines = report.read_text(encoding="utf-8").splitlines()
     assert len(lines) > 1
-    row = lines[1].split("\t")
-    assert row[0] == "Consensus1_sampleA"
-    assert row[5] == "1234"
-    assert row[6] == "1234"
+    row = row_by_header(lines)
+    assert row["consensus_id"] == "Consensus1_sampleA"
+    assert row["taxid"] == "1234"
+    assert row["blast_hit"] == "1234"
