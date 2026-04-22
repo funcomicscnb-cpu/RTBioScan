@@ -398,6 +398,18 @@ The environmental workflow is optimised for **monitoring biodiversity of taxa th
 
 BLAST assignment in the voucher mode is provided as a suggestion only: the most common scenario is a specimen from a species not yet in the reference database, so the absence of a BLAST match is informative rather than problematic.
 
+For the bundled `test` and `voucher` profiles, the main assigned/unassigned OTU differences are:
+
+| Aspect | `-profile test` | `-profile voucher` |
+|---|---|---|
+| **Assigned OTU protection threshold** | Inherits default `assign_protection_level = genus` | Inherits default `assign_protection_level = genus` |
+| **Taxonomy support for assignment** | No memtax side tables (`nonncbi_memtax = "|"`); relies on the standard DB outputs | Uses per-marker memtax tables to improve assignment coverage |
+| **Assigned-OTU BLAST filtering** | Enforced: `otu_blast_filter_mode = enforce` and `otu_blast_force_use_filtered = true` | Observed only: `otu_blast_filter_mode = observe` and `otu_blast_force_use_filtered = false` |
+| **BLAST-unassigned OTUs** | Enforced pruning path: `otu_blast_unassigned_mode = enforce` | Observed only: `otu_blast_unassigned_mode = observe` |
+| **Repeated unassigned OTUs across rounds** | Enforced pruning path: `otu_unassigned_streak_mode = enforce` | Observed only: `otu_unassigned_streak_mode = observe` |
+| **Consensus-time unassigned cluster pruning** | Disabled by default (`prune_unassigned_clusters = false`) | Disabled by default (`prune_unassigned_clusters = false`) |
+| **If consensus-time unassigned pruning is enabled manually** | Inherits default `prune_unassigned_grace_rounds = 3` and `prune_unassigned_keep_top = 5` | Tightens to `prune_unassigned_grace_rounds = 1` and `prune_unassigned_keep_top = 1` |
+
 > **Keeping unassigned clusters in the environmental workflow**
 >
 > By default (`--prune_unassigned_clusters false`) all clusters are retained regardless of BLAST assignment. This is appropriate for exploratory or discovery runs where unknown sequences are of interest, but it means the OTU pool grows unboundedly, which can substantially increase consensus and BLAST runtimes as the run progresses — especially for long multi-day runs with many samples.
@@ -2045,7 +2057,7 @@ Enable or disable incremental HTML report rendering (`${params.outdir}/report_ht
      - run report: `${params.outdir}/report_html/runs/<run_id>/report.html`
 - History dedupe key is `run_id + barcode + round_barcode` (resume-safe).
 - Missing source TSVs are recorded in `warnings[]`; report generation does not fail the round.
-- Report schema version is `1.6`.
+- Report schema version is `1.7`.
 - `otu.canonical.active` is a unique OTU count (`OTU_id`/`otu_id`), not read rows.
 - `blast.mode` reflects pipeline mode (`off|observe|enforce`); `blast.missing_policy` reports `keep|drop`.
 - HTML rendering sorts rounds by `timestamp_utc` (missing timestamps last), then `round_barcode`, then `barcode`.
