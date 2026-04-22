@@ -1,6 +1,6 @@
 # RTBioScan: Output
 
-> **Docs:** [Index](README.md) · [Installation](installation.md) · [Usage](usage.md) · **Output** · [Report Schema](report_schema.md) · [Pipeline Overview](pipeline.md)
+> **Docs:** [Index](README.md) · [Pipeline Overview](pipeline.md) · [Concepts](concepts.md) · [Installation](installation.md) · [Usage](usage.md) · **Output** · [Report Schema](report_schema.md)
 
 This page describes the output produced by the pipeline. The default output directory is `results/` (configurable with `--outdir`).
 
@@ -55,6 +55,51 @@ All per-run views share the same top-level page sections:
 - **Sample Details** — the main grouped-entity section. The heading stays the same, but the contents are grouped by sample, primer, or sample+replicate depending on the current report view.
 - **Rounds Info** — round-level charts and the rounds table.
 - **Additional Info** — figure gallery and exported visual assets.
+
+### How to read the reports
+[back to Top](#rtbioscan-output)
+
+The reports are intended to answer three external-user questions:
+
+1. **How much usable sequence data has the run produced?** Read-count plots and cards show how many reads were generated, how many were on-target, how many were assigned to samples, and how many reached the taxonomic-assignment stage.
+2. **Which biological groups were detected?** OTU and consensus plots summarize assigned taxa by marker and taxonomic level. They are designed for screening and monitoring, not as a substitute for expert taxonomic review.
+3. **How stable are the results as the run progresses?** Round-evolution plots show how reads, OTUs, consensus sequences, and assignments accumulate or stabilize over time.
+
+RTBioScan is a round-based pipeline. Each round processes the reads available at that point, updates the cumulative state, and refreshes the reports. Later rounds can carry forward evidence from earlier rounds, so the latest report is usually the best entry point for interpreting the run.
+
+### Report terminology
+[back to Top](#rtbioscan-output)
+
+Report labels use the shared RTBioScan terminology for runs, rounds, state, samples, barcodes, primers, markers, reads, OTUs, consensus sequences, taxonomic levels, and read-fate categories. See [Concepts](concepts.md) for the canonical definitions.
+
+### Main plots and tables
+[back to Top](#rtbioscan-output)
+
+**Global Overview** summarizes the whole run. The read-evolution plots show whether the run is still accumulating data and whether enough reads are reaching downstream analysis. OTU and consensus panels show how many taxonomic units or representative sequences are currently assigned or unassigned for each marker.
+
+**Read-fate charts** describe where reads end up in the pipeline. The categories distinguish reads assigned by marker, reads that reached BLAST but remained unassigned, reads skipped before BLAST, reads that were on-target but not demultiplexed, and off-target reads. These charts are useful for diagnosing whether missing taxa are more likely caused by low input, demultiplexing, target filtering, or database assignment.
+
+**Assignments by Sample** compares taxa across samples or tracked groups. Users can switch between OTU counts, OTU-supported reads, consensus counts, and consensus-supported reads, then choose species, genus, or family level. In this matrix, larger values indicate stronger evidence in that sample. Low-read OTU assignments are shown separately from supported assignments, because they may need more cautious interpretation.
+
+**Taxonomic sunbursts, treemaps, and fan cladograms** provide visual summaries of taxonomic composition. Sunbursts show hierarchy from broader to narrower ranks. Treemaps emphasize abundant taxa. Fan cladograms show taxonomic structure with weights based on OTUs, reads, or consensus counts depending on the plot.
+
+**Sample Details** provides the same concepts at sample, primer, or replicate level. Use this section to check whether a taxon is broadly present across the run or concentrated in one sample or tracked group.
+
+**Rounds Info** lists each processed round and the metrics recorded at that point. Use it to see whether detections are persistent across rounds or only appear transiently.
+
+**Additional Info** contains the exported figures and links to downloadable plot assets. These are useful for reports, presentations, and external review.
+
+### Interpreting taxonomic results
+[back to Top](#rtbioscan-output)
+
+Taxonomic names in the reports come from the configured barcoding databases and taxonomy resources. Observational resources such as GBIF or iNaturalist-derived lists can support filtering, highlighting, or ecological context, but they do not replace the primary sequence-based assignment.
+
+External users should interpret the reports as evidence summaries:
+
+- A taxon supported by multiple reads, OTUs, consensus sequences, samples, or rounds is generally stronger evidence than a taxon seen once.
+- Species-level labels depend on marker resolution and database coverage. Genus or family-level interpretation may be more appropriate when species-level matches are weak or ambiguous.
+- Unassigned reads and OTUs are informative: they can indicate poor database coverage, low-quality sequence, off-target amplification, or taxa outside the configured reference scope.
+- Round-based reports can change as more reads arrive. The latest completed round is the most current view, while earlier rounds explain how the result developed.
 
 ---
 

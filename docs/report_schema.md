@@ -1,10 +1,12 @@
 # Report Schema (`round_report.json`)
 
-> **Docs:** [Index](README.md) · [Installation](installation.md) · [Usage](usage.md) · [Output](output.md) · **Report Schema** · [Pipeline Overview](pipeline.md)
+> **Docs:** [Index](README.md) · [Pipeline Overview](pipeline.md) · [Concepts](concepts.md) · [Installation](installation.md) · [Usage](usage.md) · [Output](output.md) · **Report Schema**
 
 Each round writes one JSON object with `schema_version`.
 
 Current schema version: `1.6`.
+
+This page is the machine-readable JSON contract. For biological and report terminology, see [Concepts](concepts.md). For user-facing report interpretation and output locations, see [Output](output.md).
 
 ## Required top-level keys
 [back to Top](#report-schema-round-reportjson)

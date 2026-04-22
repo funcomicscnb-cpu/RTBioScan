@@ -1,6 +1,6 @@
 # RTBioScan: Release Preparation
 
-> **Internal Docs:** [Index](internal/README.md)
+> **Internal Docs:** [Index](README.md) · [Public Release Manifest](public_release_manifest.md)
 
 > **Audience:** Maintainers and developers. This page is not intended for the final end-user documentation set.
 
@@ -12,7 +12,7 @@ bin/prepare_public_release.sh
 
 The script is used **before** publishing a release. It assembles a clean release directory from the working repository, following the rules in [public_release_manifest.md](public_release_manifest.md).
 
-This script is **not intended to be included inside the final public release bundle**. The documentation is kept under `docs/` so maintainers can still reproduce the packaging process later.
+This script is **not intended to be included inside the final public release bundle**. The documentation is kept under `docs/internal/` so maintainers can still reproduce the packaging process later.
 
 ## Purpose
 

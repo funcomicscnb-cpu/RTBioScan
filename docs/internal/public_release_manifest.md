@@ -25,12 +25,14 @@ Nextflow config and Groovy support:
 Docs to keep with the public release:
 
 - `docs/README.md`
+- `docs/concepts.md`
 - `docs/installation.md`
 - `docs/usage.md`
 - `docs/output.md`
 - `docs/report_schema.md`
 - `docs/pipeline.md`
 - `docs/params_reference.json`
+- `docs/assets/`
 
 Report/readme assets:
 
@@ -173,9 +175,6 @@ If you bundle Dorado, the following model directories are not used by the curren
 - `AGENTS.md`
 - `CLAUDE.md`
 - `docs/internal/`
-- `docs/performance_pr_backlog.md`
-- `docs/public_release_manifest.md`
-- `docs/release_preparation.md`
 
 ## Missing before a complete public release
 

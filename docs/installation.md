@@ -1,6 +1,6 @@
 # RTBioScan: Installation
 
-> **Docs:** [Index](README.md) · [**Installation**](installation.md) · [Usage](usage.md) · [Output](output.md) · [Report Schema](report_schema.md) · [Pipeline Overview](pipeline.md)
+> **Docs:** [Index](README.md) · [Pipeline Overview](pipeline.md) · [Concepts](concepts.md) · **Installation** · [Usage](usage.md) · [Output](output.md) · [Report Schema](report_schema.md)
 
 ## Table of contents
 [back to Top](#rtbioscan-installation)
@@ -362,6 +362,8 @@ dorado_device = "cpu"
 [back to Top](#rtbioscan-installation)
 
 The BLAST databases are **not included in the repository** due to their size. They must be placed in the `db/` directory before running the pipeline.
+
+For the conceptual role of marker-specific barcoding databases and taxonomy resources, see [Concepts](concepts.md#taxonomy-and-reporting-aids). For parameter behavior and examples, see [Database parameters](usage.md#database-parameters).
 
 The pipeline expects, relative to the RTBioScan root:
 

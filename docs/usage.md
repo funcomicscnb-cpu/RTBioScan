@@ -1,6 +1,6 @@
 # RTBioScan: Usage
 
-> **Docs:** [Index](README.md) · [Installation](installation.md) · **Usage** · [Output](output.md) · [Report Schema](report_schema.md) · [Pipeline Overview](pipeline.md)
+> **Docs:** [Index](README.md) · [Pipeline Overview](pipeline.md) · [Concepts](concepts.md) · [Installation](installation.md) · **Usage** · [Output](output.md) · [Report Schema](report_schema.md)
 
 ## Table of contents
 [back to Top](#rtbioscan-usage)
@@ -724,6 +724,8 @@ SampleB SampleB_r1 1 B1 Plate1 Run42 >B1_Plate1
 ## Main arguments
 [back to Top](#rtbioscan-usage)
 
+This section is the source of truth for command-line behavior. For the conceptual difference between a run, round, state, and report view, see [Concepts](concepts.md#workflow-and-state) and [Pipeline Overview](pipeline.md#round-based-design).
+
 ### `-name`
 [back to Top](#rtbioscan-usage)
 
@@ -792,6 +794,7 @@ In real-time mode (`--run_mode realtime`, the default), the pipeline watches thi
 [back to Top](#rtbioscan-usage)
 
 The following parameters define the BLAST databases used for taxonomic classification.
+For the role of markers, taxonomy resources, and observational reporting aids, see [Concepts](concepts.md#taxonomy-and-reporting-aids) and [Pipeline Overview](pipeline.md#2-markers-targets-and-reference-databases).
 
 ### `--blast_db_specs`
 [back to Top](#rtbioscan-usage)
@@ -1029,6 +1032,7 @@ Advanced advisory map used to warn when a run is launched on a hostname that usu
 [back to Top](#rtbioscan-usage)
 
 *Applies to `fast_on_target_detection` and HAC/SUP basecalling.*
+For the concepts behind reads, on-target filtering, and read-fate categories, see [Concepts](concepts.md#reads-and-read-fate).
 
 #### `--demultiplex_mode`
 [back to Top](#rtbioscan-usage)
@@ -1179,6 +1183,8 @@ Pipe-separated per-marker read-length thresholds, in the same order as `--target
 
 ### OTU definition
 [back to Top](#rtbioscan-usage)
+
+For OTU, frozen OTU, informative OTU, and consolidated OTU terminology, see [Concepts](concepts.md#otus-and-consensus) and [Pipeline Overview](pipeline.md#5-otu-definition).
 
 #### C1 read archiving
 [back to Top](#rtbioscan-usage)
@@ -1371,6 +1377,8 @@ Include sequence hashes in active-pool decision audit output.
 
 ### Taxonomic assignment
 [back to Top](#rtbioscan-usage)
+
+For assignment depth, taxonomic levels, and BLAST-assigned/BLAST-unassigned terminology, see [Concepts](concepts.md#taxonomy-and-reporting-aids) and [Pipeline Overview](pipeline.md#6-taxonomic-assignment).
 
 #### `--otu_blast_min_members`
 [back to Top](#rtbioscan-usage)
@@ -1590,6 +1598,8 @@ Size bounds for OTUs eligible for unassigned-streak pruning.
 
 ### Consensus generation
 [back to Top](#rtbioscan-usage)
+
+For consensus sequence, consolidated consensus, and `reads-N` terminology, see [Concepts](concepts.md#otus-and-consensus) and [Pipeline Overview](pipeline.md#8-consensus-generation).
 
 #### `--consensus_id`
 [back to Top](#rtbioscan-usage)
@@ -2016,6 +2026,8 @@ Age threshold for reclaiming a stale per-state round lock.
 
 ### HTML report and summaries
 [back to Top](#rtbioscan-usage)
+
+For the purpose of report sections and plot categories, see [Output](output.md#html-reports) and [Concepts](concepts.md#report-sections).
 
 #### `--html_report_enabled`
 [back to Top](#rtbioscan-usage)

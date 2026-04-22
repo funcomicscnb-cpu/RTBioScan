@@ -1,6 +1,6 @@
 # RTBioScan: Internal Performance Backlog (PR1-PR6)
 
-> **Internal Docs:** [Index](internal/README.md) · [Architecture](internal/pipeline_architecture.md) · **Performance Backlog**
+> **Internal Docs:** [Index](README.md) · [Architecture](pipeline_architecture.md) · **Performance Backlog**
 
 > **Audience:** Maintainers and developers. This page is not intended for the public end-user documentation set.
 

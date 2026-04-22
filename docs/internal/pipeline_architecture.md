@@ -1,6 +1,6 @@
 # RTBioScan: Internal Pipeline Architecture
 
-> **Internal Docs:** [Index](README.md) · **Architecture** · [Performance Backlog](../performance_pr_backlog.md) · [Release Preparation](../release_preparation.md)
+> **Internal Docs:** [Index](README.md) · **Architecture** · [Performance Backlog](performance_pr_backlog.md) · [Release Preparation](release_preparation.md)
 
 > **Audience:** Maintainers and developers. This page is not intended for the public end-user documentation set.
 
@@ -103,4 +103,4 @@ When adding tests, prioritize:
 - report-schema stability for public outputs
 - helper-artifact stability only when the change directly touches internal machinery
 
-The active improvement queue is kept in [../performance_pr_backlog.md](../performance_pr_backlog.md).
+The active improvement queue is kept in [performance_pr_backlog.md](performance_pr_backlog.md).

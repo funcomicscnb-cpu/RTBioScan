@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-MANIFEST_REL="docs/public_release_manifest.md"
+MANIFEST_REL="docs/internal/public_release_manifest.md"
 
 OUTDIR="${REPO_ROOT}/release/RTBioScan_public"
 PROFILES=""
@@ -19,7 +19,7 @@ usage() {
 	cat <<'EOF'
 Usage: prepare_public_release.sh [options]
 
-Create a clean RTBioScan release directory based on docs/public_release_manifest.md.
+Create a clean RTBioScan release directory based on docs/internal/public_release_manifest.md.
 
 Options:
   --outdir DIR         Output directory for the assembled release
@@ -300,6 +300,9 @@ CORE_DOCS=(
 	docs/output.md
 	docs/report_schema.md
 	docs/pipeline.md
+	docs/concepts.md
+	docs/assets/pipeline_overview_public.svg
+	docs/assets/pipeline_overview_public.png
 	docs/params_reference.json
 )
 
