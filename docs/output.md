@@ -98,6 +98,8 @@ Run-level summary generated after `round_report.json` is appended into history. 
 
 Key top-level fields include `run_id`, `barcode`, `state_id`, `identity_mode`, `rounds_count`, `started_utc`, `last_updated_utc`, `last_round_barcode`, `report_rel_path`, `report_url`, `report_views`, `status`, `status_label`, `status_color`, and `run_summary`.
 
+When `--serve` starts before the first completed round, `run_report.json` can be present with `rounds_count: 0` and `status_label: "Fresh"`.
+
 ### Consensus sequences
 [back to Top](#rtbioscan-output)
 

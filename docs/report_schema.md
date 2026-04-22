@@ -255,7 +255,7 @@ Each entry in `figures[]` may include:
 ## Run Report (`run_report.json`)
 [back to Top](#report-schema-round-reportjson)
 
-Each round directory also contains `run_report.json`, a run-level aggregate derived from `report_history.jsonl`.
+Each round directory also contains `run_report.json`, a run-level aggregate derived from `report_history.jsonl`. During `--serve` startup it may be seeded before the first completed round with `rounds_count: 0` and `status_label: "Fresh"`.
 
 Required keys:
 - `schema_version` (string)

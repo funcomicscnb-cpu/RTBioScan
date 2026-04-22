@@ -458,23 +458,257 @@ nextflow_arg_value() {
   local _opt="$1"
   local _i=0
   local _arg=""
+  local _value=""
+  local _found=1
   for (( _i=0; _i<${#nf_args[@]}; _i++ )); do
     _arg="${nf_args[$_i]}"
     if [[ "$_arg" == "$_opt" ]]; then
       if (( _i + 1 < ${#nf_args[@]} )); then
-        printf '%s\n' "${nf_args[$((_i+1))]}"
-        return 0
+        _value="${nf_args[$((_i+1))]}"
+        _found=0
+        continue
       fi
-      return 1
+      continue
     fi
     case "$_arg" in
       "$_opt"=*)
-        printf '%s\n' "${_arg#*=}"
-        return 0
+        _value="${_arg#*=}"
+        _found=0
         ;;
     esac
   done
+  if [[ $_found -eq 0 ]]; then
+    printf '%s\n' "$_value"
+    return 0
+  fi
   return 1
+}
+
+resolve_outdir_path() {
+  local _dir="$1"
+  if [[ "$_dir" == /* ]]; then
+    printf '%s\n' "$_dir"
+  else
+    printf '%s/%s\n' "$SCRIPT_DIR" "$_dir"
+  fi
+}
+
+sanitize_state_id() {
+  perl -e '
+    use strict;
+    use warnings;
+    my $value = shift // q{};
+    $value =~ s/[^A-Za-z0-9_.-]+/_/g;
+    print $value;
+  ' "${1:-}"
+}
+
+effective_nextflow_run_name() {
+  local _name=""
+  _name="$(nextflow_arg_value "-name" || true)"
+  if [[ -n "$_name" ]]; then
+    printf '%s\n' "$_name"
+  else
+    printf '%s\n' "${run_id:-}"
+  fi
+}
+
+seed_initial_run_status_if_needed() {
+  local _outdir=""
+  local _outdir_path=""
+  local _run_name=""
+  local _state_id_raw=""
+  local _state_id=""
+  local _run_started_utc=""
+  local _history=""
+  local _run_dir=""
+  local _run_json=""
+  local _run_index=""
+  local _run_index_lock=""
+  local _root_html=""
+  local _root_state=""
+  local _html_enabled=""
+  local _html_enabled_norm=""
+  local _auto_refresh=""
+  local _refresh_seconds=""
+  local _url_prefix=""
+  local _barcode=""
+
+  INITIAL_RUN_STATUS_SEEDED=0
+  [[ -n "${run_id:-}" ]] || return 0
+  [[ $cleanup_modes -eq 0 && $dry_run -eq 0 && $view_only -eq 0 ]] || return 0
+
+  _run_name="$(effective_nextflow_run_name)"
+  [[ -n "$_run_name" ]] || return 0
+
+  _outdir="$(nextflow_arg_value "--outdir" || true)"
+  _outdir="${_outdir:-results}"
+  _outdir_path="$(resolve_outdir_path "$_outdir")"
+
+  _state_id_raw="$(nextflow_arg_value "--state_id" || true)"
+  _state_id_raw="${_state_id_raw:-$_run_name}"
+  _state_id="$(sanitize_state_id "$_state_id_raw")"
+  _state_id="${_state_id:-$_run_name}"
+
+  _run_started_utc="${_outdir_path}/temp/ongoing/state/${_state_id}/_state/run_started_utc.txt"
+  _history="${_outdir_path}/temp/ongoing/state/${_state_id}/_state/report_history.jsonl"
+  _run_dir="${_outdir_path}/report_html/runs/${_run_name}"
+  _run_json="${_run_dir}/run_report.json"
+  _run_index="${_outdir_path}/report_html/runs_index.jsonl"
+  _run_index_lock="${_outdir_path}/.runs_index.lock"
+  _root_html="${_outdir_path}/report_html/report.html"
+  _root_state="${_outdir_path}/report_html/report_state.json"
+
+  if [[ -s "$_history" || -s "$_run_json" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$_run_started_utc")" "$_run_dir" "${_outdir_path}/report_html"
+  ( set -C; date -u '+%Y-%m-%dT%H:%M:%SZ' > "$_run_started_utc" ) 2>/dev/null || true
+  : > "$_history"
+
+  _barcode="$(basename "$SCRIPT_DIR")"
+  if ! perl "${SCRIPT_DIR}/bin/report_run_json.pl" \
+      --history "$_history" \
+      --out "$_run_json" \
+      --run-id "$_run_name" \
+      --barcode "$_barcode" \
+      --state-id "$_state_id" \
+      --outdir "$_outdir" \
+      --schema-version "1.6" \
+      --report-rel-path "runs/${_run_name}/report.html" \
+      --run-started-utc-file "$_run_started_utc"; then
+    echo "WARN: failed to seed initial run status entry for '${_run_name}'." >&2
+    return 0
+  fi
+  INITIAL_RUN_STATUS_SEEDED=1
+
+  if ! LOCK_WAIT="${LOCK_WAIT:-300}" bash "${SCRIPT_DIR}/bin/report_run_index_update.sh" \
+      "$_run_json" "$_run_index" "$_run_index_lock"; then
+    echo "WARN: failed to seed initial run index entry for '${_run_name}'." >&2
+    return 0
+  fi
+
+  _html_enabled="$(nextflow_arg_value "--html_report_enabled" || true)"
+  _html_enabled="${_html_enabled:-true}"
+  _html_enabled_norm="$(printf '%s' "$_html_enabled" | tr '[:upper:]' '[:lower:]')"
+  case "$_html_enabled_norm" in
+    false|0)
+      return 0
+      ;;
+  esac
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "WARN: python3 not found; skipping initial root report seed for '${_run_name}'." >&2
+    return 0
+  fi
+
+  _auto_refresh="$(nextflow_arg_value "--html_report_auto_refresh" || true)"
+  _auto_refresh="${_auto_refresh:-true}"
+  _auto_refresh="$(printf '%s' "$_auto_refresh" | tr '[:upper:]' '[:lower:]')"
+  case "$_auto_refresh" in
+    true|1) _auto_refresh="1" ;;
+    *) _auto_refresh="0" ;;
+  esac
+  _refresh_seconds="$(nextflow_arg_value "--html_report_refresh_seconds" || true)"
+  _refresh_seconds="${_refresh_seconds:-15}"
+  _url_prefix="$(nextflow_arg_value "--html_report_url_prefix" || true)"
+  _url_prefix="${_url_prefix:-}"
+
+  if ! python3 "${SCRIPT_DIR}/bin/report_render.py" \
+      --history "$_history" \
+      --template "${SCRIPT_DIR}/assets/report/template.html" \
+      --css "${SCRIPT_DIR}/assets/report/report.css" \
+      --js "${SCRIPT_DIR}/assets/report/report.js" \
+      --schema-version "1.6" \
+      --state-out "$_root_state" \
+      --auto-refresh-enabled "$_auto_refresh" \
+      --auto-refresh-seconds "$_refresh_seconds" \
+      --state-url "report_state.json" \
+      --url-prefix "$_url_prefix" \
+      --run-index "$_run_index" \
+      --out "$_root_html"; then
+    echo "WARN: failed to seed initial root report for '${_run_name}'." >&2
+  fi
+}
+
+prune_seeded_run_status_if_stale() {
+  local _outdir=""
+  local _outdir_path=""
+  local _run_name=""
+  local _state_id_raw=""
+  local _state_id=""
+  local _history=""
+  local _run_dir=""
+  local _run_json=""
+  local _run_index=""
+  local _root_html=""
+  local _root_state=""
+
+  [[ "${INITIAL_RUN_STATUS_SEEDED:-0}" -eq 1 ]] || return 0
+  [[ -n "${run_id:-}" ]] || return 0
+  [[ $cleanup_modes -eq 0 && $dry_run -eq 0 && $view_only -eq 0 ]] || return 0
+
+  _run_name="$(effective_nextflow_run_name)"
+  [[ -n "$_run_name" ]] || return 0
+
+  _outdir="$(nextflow_arg_value "--outdir" || true)"
+  _outdir="${_outdir:-results}"
+  _outdir_path="$(resolve_outdir_path "$_outdir")"
+
+  _state_id_raw="$(nextflow_arg_value "--state_id" || true)"
+  _state_id_raw="${_state_id_raw:-$_run_name}"
+  _state_id="$(sanitize_state_id "$_state_id_raw")"
+  _state_id="${_state_id:-$_run_name}"
+
+  _history="${_outdir_path}/temp/ongoing/state/${_state_id}/_state/report_history.jsonl"
+  _run_dir="${_outdir_path}/report_html/runs/${_run_name}"
+  _run_json="${_run_dir}/run_report.json"
+  _run_index="${_outdir_path}/report_html/runs_index.jsonl"
+  _root_html="${_outdir_path}/report_html/report.html"
+  _root_state="${_outdir_path}/report_html/report_state.json"
+
+  [[ -f "$_run_json" ]] || return 0
+  if [[ -s "$_history" ]]; then
+    return 0
+  fi
+
+  rm -f "$_run_json" 2>/dev/null || true
+  rm -rf "$_run_dir" 2>/dev/null || true
+
+  if [[ -f "$_run_index" ]] && command -v python3 >/dev/null 2>&1; then
+    local _tmp=""
+    _tmp="$(mktemp "${_run_index}.tmp.XXXXXX")"
+    if python3 - "${_run_name}" "$_run_index" <<'PYEOF' > "$_tmp"; then
+import sys, json
+rid, path = sys.argv[1], sys.argv[2]
+for line in open(path, encoding="utf-8"):
+    try:
+        if json.loads(line).get('run_id') != rid:
+            sys.stdout.write(line)
+    except Exception:
+        sys.stdout.write(line)
+PYEOF
+      mv "$_tmp" "$_run_index"
+    else
+      rm -f "$_tmp"
+    fi
+  fi
+
+  if [[ -f "$_root_html" && -f "${SCRIPT_DIR}/assets/report/template.html" ]] && command -v python3 >/dev/null 2>&1; then
+    local _render_args=(
+      --history /dev/null
+      --template "${SCRIPT_DIR}/assets/report/template.html"
+      --css "${SCRIPT_DIR}/assets/report/report.css"
+      --js "${SCRIPT_DIR}/assets/report/report.js"
+      --schema-version "1.6"
+      --state-out "$_root_state"
+      --state-url "report_state.json"
+      --out "$_root_html"
+    )
+    [[ -f "$_run_index" ]] && _render_args+=(--run-index "$_run_index")
+    python3 "${SCRIPT_DIR}/bin/report_render.py" "${_render_args[@]}" >/dev/null 2>&1 || true
+  fi
 }
 
 serve_browser_host() {
@@ -1460,7 +1694,7 @@ if [[ -n "$run_id" && $cleanup_modes -eq 0 && $dry_run -eq 0 && $view_only -eq 0
   if [[ $feeder -eq 1 ]]; then
     preflight_orphan_feeders_for_run "$run_id"
   fi
-  preflight_run_name_or_die "$run_id"
+  preflight_run_name_or_die "$(effective_nextflow_run_name)"
 fi
 
 # Derive serve-dir from --outdir in nextflow args if not set explicitly
@@ -1769,6 +2003,8 @@ cleanup_children() {
   elif [[ -n "$_server_pid" ]]; then
     SERVER_PID=""
   fi
+
+  prune_seeded_run_status_if_stale
 }
 
 finalize_pending_signal_if_needed() {
@@ -1811,6 +2047,10 @@ trap 'cleanup_children' EXIT
 trap 'handle_wrapper_signal INT 130' INT
 trap 'handle_wrapper_signal TERM 143' TERM
 trap 'handle_wrapper_signal HUP 129' HUP
+
+if [[ $serve -eq 1 && $cleanup_modes -eq 0 && $dry_run -eq 0 && $view_only -eq 0 ]]; then
+  seed_initial_run_status_if_needed
+fi
 
 # ── start feeder in background ────────────────────────────────────────────────
 if [[ $feeder -eq 1 ]]; then

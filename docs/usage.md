@@ -147,7 +147,7 @@ Use this pattern only when you intentionally want to reuse the same `results/pod
 
 | Option | Default | Description |
 |---|---|---|
-| `--serve` | off | Start the HTTP report server alongside the pipeline. If the report does not exist yet, the server stays up and waits for the first generated `report_html/report.html`. |
+| `--serve` | off | Start the HTTP report server alongside the pipeline. If the report does not exist yet, the server stays up and waits for the first generated `report_html/report.html`; a run-level report may be available with Fresh status before round 1 completes. |
 | `--view` | off | Start the report server for an existing output directory and wait — no pipeline or feeder is started. Useful for browsing results from a previous run. Incompatible with `--feeder`, `--do_metadata`, and pipeline pass-through arguments. Exits when the server stops (Ctrl-C). |
 | `--serve-port <n>` | `8000` | Port for the HTTP server. If the port is busy, the next free port up to 8099 is chosen automatically (unless `--serve-port` is set explicitly). |
 | `--serve-host <addr>` | `127.0.0.1` | Bind address. |

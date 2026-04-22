@@ -190,6 +190,15 @@ my $record = {
     status => $status,
 };
 
+if ($rounds_count == 0) {
+    $record->{last_round_barcode} = '0';
+    $record->{last_updated_utc} = $started_utc ne '' ? $started_utc : $now_utc;
+    $record->{status_label} = 'Fresh';
+    $record->{status_color} = 'green';
+    $record->{report_rel_path} = '';
+    $record->{report_url} = '';
+}
+
 if ($identity_mode eq 'track' && defined $report_rel_path && $report_rel_path ne '') {
     $record->{report_views} = [
         {

@@ -100,6 +100,43 @@ def test_report_run_json_missing_timestamps_uses_numeric_round(tmp_path: Path) -
     assert data["last_round_barcode"] == "round_10"
 
 
+def test_report_run_json_empty_history_emits_zero_round_fresh_status(tmp_path: Path) -> None:
+    history = tmp_path / "history.jsonl"
+    history.write_text("", encoding="utf-8")
+    started = tmp_path / "run_started_utc.txt"
+    started.write_text("2026-03-06T00:00:00Z\n", encoding="utf-8")
+    out = tmp_path / "run_report.json"
+    cmd = [
+        "perl",
+        str(SCRIPT),
+        "--history",
+        str(history),
+        "--out",
+        str(out),
+        "--run-id",
+        "runA",
+        "--barcode",
+        "B1",
+        "--outdir",
+        "results",
+        "--report-rel-path",
+        "runs/runA/report.html",
+        "--run-started-utc-file",
+        str(started),
+    ]
+    rc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    assert rc.returncode == 0, rc.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["rounds_count"] == 0
+    assert data["last_round_barcode"] == "0"
+    assert data["started_utc"] == "2026-03-06T00:00:00Z"
+    assert data["last_updated_utc"] == "2026-03-06T00:00:00Z"
+    assert data["status_label"] == "Fresh"
+    assert data["status_color"] == "green"
+    assert data["report_rel_path"] == ""
+    assert data["report_url"] == ""
+
+
 def test_report_run_json_mixed_timestamps_prefers_logical_latest_round(tmp_path: Path) -> None:
     history = tmp_path / "history.jsonl"
     rows = [

@@ -522,7 +522,7 @@
         a.textContent = "report";
         linkCell.appendChild(a);
       } else {
-        linkCell.textContent = "-";
+        linkCell.textContent = "N/A";
       }
       tr.appendChild(linkCell);
       runTableBody.appendChild(tr);
