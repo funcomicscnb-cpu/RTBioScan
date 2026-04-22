@@ -17,7 +17,7 @@ require "$FindBin::Bin/lib/taxon_util.pl";
 *is_numeric_taxid    = \&TaxonUtil::is_numeric_taxid;
 
 my %opt = (
-  schema_version => '1.6',
+  schema_version => '1.7',
 );
 
 GetOptions(
@@ -2278,6 +2278,26 @@ sub load_otu_replicate_reads {
   return \%map;
 }
 
+sub load_frozen_sample_reads {
+  return undef unless defined $opt{otu_def} && $opt{otu_def} ne '';
+  my $rows = get_parsed_rows($opt{otu_def});
+  return undef unless defined $rows && @$rows;
+  my %map;  # { normalized_lock_otu_key => { reporting_identity => count } }
+  for my $row (@$rows) {
+    next unless defined $row && ref($row) eq 'HASH';
+    my $otu = trim_text($row->{OTU_id} // $row->{otu_id} // '');
+    next if $otu eq '' || uc($otu) eq 'NA';
+    my $lock_key = normalize_lock_otu_key($otu);
+    next if $lock_key eq '';
+    my $raw = trim_text($row->{sample} // '');
+    next if $raw eq '';
+    my $label = resolve_reporting_identity($raw);
+    next if !defined $label || $label eq '';
+    $map{$lock_key}{$label}++;
+  }
+  return \%map;
+}
+
 sub load_otu_sizes_round {
   my ($path) = @_;
   my %sizes;
@@ -2323,7 +2343,7 @@ sub load_otu_sizes_round {
 }
 
 sub collect_otu_assignments_by_level {
-  my ($blast_otu_path, $otu_sizes_path, $spec_interest_ref, $spec_interest_enabled, $lock_frozen_ref, $thresholds_by_level) = @_;
+  my ($blast_otu_path, $otu_sizes_path, $spec_interest_ref, $spec_interest_enabled, $lock_frozen_ref, $thresholds_by_level, $frozen_sample_reads_ref) = @_;
   my %by_level = (species => [], genus => [], family => []);
   my %otu_rep_reads;           # { otu => { collapsed_sample => { rep_label => count } } }
   my %sample_marker_rep_reads; # { collapsed_sample => { marker => { rep_label => count } } }
@@ -2522,6 +2542,7 @@ sub collect_otu_assignments_by_level {
         reads_any => 0,
         frozen_reads_total => 0,
         frozen_reads_any => 0,
+        frozen_sample_reads_total => 0,
         perc_min => undef,
         perc_max => undef,
         aln_min => undef,
@@ -2541,10 +2562,18 @@ sub collect_otu_assignments_by_level {
       if (defined $row->{reads}) {
         $g->{reads_total} += $row->{reads};
         $g->{reads_any} = 1;
-        my $lock_key = normalize_lock_otu_key($row->{otu_id});
-        if ($lock_key ne '' && defined $lock_frozen_ref && exists $lock_frozen_ref->{$lock_key}) {
+      }
+      my $lock_key = normalize_lock_otu_key($row->{otu_id});
+      if ($lock_key ne '' && defined $lock_frozen_ref && exists $lock_frozen_ref->{$lock_key}) {
+        if (defined $row->{reads}) {
           $g->{frozen_reads_total} += $row->{reads};
           $g->{frozen_reads_any} = 1;
+        }
+        if (defined $frozen_sample_reads_ref && exists $frozen_sample_reads_ref->{$lock_key}) {
+          my $sample_key = $row->{sample} // '';
+          if ($sample_key ne '' && exists $frozen_sample_reads_ref->{$lock_key}{$sample_key}) {
+            $g->{frozen_sample_reads_total} += $frozen_sample_reads_ref->{$lock_key}{$sample_key};
+          }
         }
       }
       if (defined $row->{perc_id}) {
@@ -2577,6 +2606,7 @@ sub collect_otu_assignments_by_level {
         otu_count => $otu_count,
         frozen_otu_count => $frozen_otu_n,
         frozen_otu_reads_total => ($g->{reads_any} ? $g->{frozen_reads_total} : undef),
+        (defined $frozen_sample_reads_ref ? (frozen_otu_reads_sample_total => 0 + $g->{frozen_sample_reads_total}) : ()),
         reads_total => ($g->{reads_any} ? $g->{reads_total} : undef),
         perc_id_min => $g->{perc_min},
         perc_id_max => $g->{perc_max},
@@ -4270,7 +4300,8 @@ my $otu_informative_assigned_by_marker = $informative_source_available
   ? otu_assigned_by_marker_from_blast_otu($_blast_otu_for_sunburst, \%otu_informative_set)
   : undef;
 my $consolidated_cons_set = load_id_set($opt{consensus_consolidated_ids});
-my ($otu_assignments_by_level, $otu_rep_reads, $sample_marker_rep_reads) = collect_otu_assignments_by_level($_blast_otu_for_sunburst, $opt{otu_sizes_round}, \%spec_interest, $spec_interest_enabled, $lock_frozen_set, $otu_assignment_thresholds);
+my $frozen_sample_reads = load_frozen_sample_reads();
+my ($otu_assignments_by_level, $otu_rep_reads, $sample_marker_rep_reads) = collect_otu_assignments_by_level($_blast_otu_for_sunburst, $opt{otu_sizes_round}, \%spec_interest, $spec_interest_enabled, $lock_frozen_set, $otu_assignment_thresholds, $frozen_sample_reads);
 my $consensus_assignments_by_level = collect_consensus_assignments_by_level($opt{blast_consensus}, \%spec_interest, $spec_interest_enabled, $consolidated_cons_set, $opt{identity_mode}, $sample_marker_rep_reads);
 my %otu_active_by_marker_taxon = (
   assigned => blank_marker_count_map(),

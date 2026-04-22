@@ -36,6 +36,60 @@ def _write_lock_summary(
     )
 
 
+def _run_frozen_assignment_case(
+    tmp_path: Path,
+    *,
+    blast_rows: str,
+    otu_def_rows: str | None = None,
+    extra_args: list[str] | None = None,
+    otu_size: int = 7,
+) -> dict:
+    blast_otu = tmp_path / "blast_otu.tsv"
+    blast_otu.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        f"{blast_rows}",
+        encoding="utf-8",
+    )
+    otu_sizes_round = tmp_path / "otu_sizes_round.tsv"
+    otu_sizes_round.write_text(f"otu_id\tsize\nOTUB_F-COI\t{otu_size}\n", encoding="utf-8")
+    lock_summary = tmp_path / "lock.tsv"
+    lock_summary.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n"
+        "OTUB_F-COI\t0\t1\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "round_report.json"
+    args = [
+        "--run-id", "runA",
+        "--barcode", "RTBioScan",
+        "--round-barcode", "output_round_1",
+        "--out", str(out),
+        "--blast-otu", str(blast_otu),
+        "--otu-sizes-round", str(otu_sizes_round),
+        "--otu-lock-summary", str(lock_summary),
+    ]
+    if otu_def_rows is not None:
+        otu_def = tmp_path / "otu_def.tsv"
+        otu_def.write_text(
+            "read_id\tsample\tOTU_id\n"
+            f"{otu_def_rows}",
+            encoding="utf-8",
+        )
+        args.extend(["--otu-def", str(otu_def)])
+    if extra_args:
+        args.extend(extra_args)
+    result = _run(args)
+    assert result.returncode == 0, result.stderr
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def _otu_species_row_by_sample(data: dict, sample_label: str) -> dict:
+    for row in data["otu"]["assignments_by_level"]["species"]:
+        if row.get("sample") == sample_label:
+            return row
+    raise AssertionError(f"Missing OTU species row for sample {sample_label}: {data['otu']['assignments_by_level']['species']}")
+
+
 def test_report_round_json_basic(tmp_path: Path) -> None:
     read_info = tmp_path / "read_info.tsv"
     read_info.write_text(
@@ -190,7 +244,7 @@ def test_report_round_json_basic(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["run_id"] == "runA"
-    assert data["schema_version"] == "1.6"
+    assert data["schema_version"] == "1.7"
     assert data["barcode"] == "RTBioScan"
     assert data["round_barcode"] == "output_round_1"
     assert data["reads"]["total"] == 2
@@ -675,6 +729,7 @@ def test_report_round_json_emits_frozen_and_consolidated_read_totals(tmp_path: P
     assert otu_row["frozen_otu_count"] == 1
     assert otu_row["reads_total"] == 8
     assert otu_row["frozen_otu_reads_total"] == 5
+    assert "frozen_otu_reads_sample_total" not in otu_row
 
     cons_row = data["consensus"]["assignments_by_level"]["species"][0]
     assert cons_row["taxon"] == "S"
@@ -682,6 +737,112 @@ def test_report_round_json_emits_frozen_and_consolidated_read_totals(tmp_path: P
     assert cons_row["consolidated_consensus_count"] == 1
     assert cons_row["reads_total"] == 14
     assert cons_row["consolidated_consensus_reads_total"] == 10
+
+
+def test_frozen_otu_reads_sample_total_per_sample(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_B\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "a1\tsample_A\tOTUB_F-COI\n"
+            "a2\tsample_A\tOTUB_F-COI\n"
+            "b1\tsample_B\tOTUB_F-COI\n"
+            "b2\tsample_B\tOTUB_F-COI\n"
+            "b3\tsample_B\tOTUB_F-COI\n"
+        ),
+    )
+
+    sample_a_row = _otu_species_row_by_sample(data, "sample_A")
+    sample_b_row = _otu_species_row_by_sample(data, "sample_B")
+    assert sample_a_row["frozen_otu_reads_sample_total"] == 2
+    assert sample_b_row["frozen_otu_reads_sample_total"] == 3
+    assert sample_a_row["frozen_otu_reads_total"] == 7
+    assert sample_b_row["frozen_otu_reads_total"] == 7
+
+
+def test_frozen_otu_reads_sample_total_collapse_mode(tmp_path: Path) -> None:
+    roster = tmp_path / "samples.txt"
+    roster.write_text("sample_A\n", encoding="utf-8")
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A_1\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_A_2\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "a1\tsample_A_1\tOTUB_F-COI\n"
+            "a2\tsample_A_1\tOTUB_F-COI\n"
+            "b1\tsample_A_2\tOTUB_F-COI\n"
+            "b2\tsample_A_2\tOTUB_F-COI\n"
+            "b3\tsample_A_2\tOTUB_F-COI\n"
+        ),
+        extra_args=["--identity-mode", "collapse", "--sample-roster", str(roster)],
+    )
+
+    collapsed_row = _otu_species_row_by_sample(data, "sample_A")
+    assert collapsed_row["frozen_otu_reads_sample_total"] == 5
+    assert collapsed_row["frozen_otu_reads_total"] == 7
+
+
+def test_frozen_otu_reads_sample_total_track_mode(tmp_path: Path) -> None:
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text("track_id\nsample_A_1\nsample_A_2\n", encoding="utf-8")
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A_1\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_A_2\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "a1\tsample_A_1\tOTUB_F-COI\n"
+            "a2\tsample_A_1\tOTUB_F-COI\n"
+            "b1\tsample_A_2\tOTUB_F-COI\n"
+            "b2\tsample_A_2\tOTUB_F-COI\n"
+            "b3\tsample_A_2\tOTUB_F-COI\n"
+        ),
+        extra_args=["--identity-mode", "track", "--sample-roster", str(roster)],
+    )
+
+    sample_a_row = _otu_species_row_by_sample(data, "sample_A_1")
+    sample_b_row = _otu_species_row_by_sample(data, "sample_A_2")
+    assert sample_a_row["frozen_otu_reads_sample_total"] == 2
+    assert sample_b_row["frozen_otu_reads_sample_total"] == 3
+
+
+def test_frozen_otu_reads_sample_total_keeps_no_adapter_reads(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tno_adapter\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tno_adapter_1\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "a1\tno_adapter\tOTUB_F-COI\n"
+            "a2\tno_adapter\tOTUB_F-COI\n"
+            "b1\tno_adapter_1\tOTUB_F-COI\n"
+            "b2\tno_adapter_1\tOTUB_F-COI\n"
+            "b3\tno_adapter_1\tOTUB_F-COI\n"
+        ),
+    )
+
+    row = _otu_species_row_by_sample(data, "no_adapter")
+    assert row["frozen_otu_reads_sample_total"] == 5
+    assert row["frozen_otu_reads_total"] == 7
+
+
+def test_frozen_otu_reads_sample_total_absent_with_empty_otu_def(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_def_rows="",
+    )
+
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert "frozen_otu_reads_sample_total" not in row
+    assert row["frozen_otu_reads_total"] == 7
 
 
 def test_fate_size_streak_enforce_missing_file(tmp_path: Path) -> None:

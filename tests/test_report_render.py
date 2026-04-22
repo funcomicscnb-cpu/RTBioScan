@@ -1314,7 +1314,9 @@ def test_report_js_contains_marker_split_read_fate_mapping() -> None:
     assert "Consensus assignments: consensus" in js_text
     assert "Assignments by ${groupEntityLabel()}" in js_text
     assert "buildAssignmentSampleMatrix" in js_text
+    assert "frozen_otu_reads_sample_total" in js_text
     assert "frozen_otu_reads_total" in js_text
+    assert "specialFallbackField" in js_text
     assert "consolidated_consensus_reads_total" in js_text
     assert "assignment-special-count" in js_text
     assert "samplesWithReadEvidence" in js_text

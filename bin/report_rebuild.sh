@@ -284,7 +284,7 @@ render_root_report() {
     --template "$TEMPLATE"
     --css "$CSS"
     --js "$JS"
-    --schema-version "1.6"
+    --schema-version "1.7"
     --state-out "$REPORT_STATE"
     --auto-refresh-enabled "$AUTO_REFRESH"
     --auto-refresh-seconds "$REFRESH_SECONDS"
@@ -329,7 +329,7 @@ rebuild_run_json() {
     state_id="$history_state_id"
   fi
   if [ -z "$schema_version" ]; then
-    schema_version="1.6"
+    schema_version="1.7"
   fi
   run_started_utc_file="$(dirname "$run_history")/run_started_utc.txt"
 
@@ -418,7 +418,7 @@ render_run_report() {
       --template "$RUN_TEMPLATE" \
       --css "$CSS" \
       --js "$JS" \
-      --schema-version "1.6" \
+      --schema-version "1.7" \
       --state-out "$run_state" \
       --auto-refresh-enabled "$AUTO_REFRESH" \
       --auto-refresh-seconds "$REFRESH_SECONDS" \

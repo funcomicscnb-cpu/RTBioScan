@@ -3402,7 +3402,7 @@
     panel.appendChild(section);
   }
 
-  function buildAssignmentSampleMatrix(lastRound, sourceKey, level, metricField, samplesWithReads, specialField) {
+  function buildAssignmentSampleMatrix(lastRound, sourceKey, level, metricField, samplesWithReads, specialField, specialFallbackField) {
     const rows = get(lastRound, [sourceKey, "assignments_by_level", level], []);
     const sampleMetrics = (reportIdentityMode === "track" && hasTrackUnitMetrics(lastRound))
       ? get(lastRound, ["track_unit_metrics"], {})
@@ -3501,7 +3501,13 @@
         cell.frozenReads += num(row.frozen_otu_reads_total);
         cell.consolidated += num(row.consolidated_consensus_count);
         cell.consolidatedReads += num(row.consolidated_consensus_reads_total);
-        if (specialField) cell.special += num(row[specialField]);
+        if (specialField) {
+          const hasSpecialField = Object.prototype.hasOwnProperty.call(row, specialField);
+          const specialVal = (!hasSpecialField && specialFallbackField)
+            ? num(row[specialFallbackField])
+            : num(row[specialField]);
+          cell.special += specialVal;
+        }
         if (Array.isArray(row.replicate_reads) && row.replicate_reads.length > 1) {
           cell.repReads = cell.repReads || {};
           row.replicate_reads.forEach((r) => {
@@ -3626,8 +3632,9 @@
         label: "OTU assignments: reads",
         sourceKey: "otu",
         metricField: "reads_total",
-        specialField: "frozen_otu_reads_total",
-        specialUnit: "reads from frozen OTUs",
+        specialField: "frozen_otu_reads_sample_total",
+        specialFallbackField: "frozen_otu_reads_total",
+        specialUnit: "reads from frozen OTUs (this sample/group)",
         emptyLabel: "No OTU read totals available for this level.",
       },
       {
@@ -3736,7 +3743,15 @@
       viewButtons.forEach(({ view, btn }) => btn.classList.toggle("active", view.id === activeView.id));
       levelButtons.forEach(({ level, btn }) => btn.classList.toggle("active", level === activeLevel));
 
-      const matrix = buildAssignmentSampleMatrix(lastRound, activeView.sourceKey, activeLevel, activeView.metricField, samplesWithReads, activeView.specialField);
+      const matrix = buildAssignmentSampleMatrix(
+        lastRound,
+        activeView.sourceKey,
+        activeLevel,
+        activeView.metricField,
+        samplesWithReads,
+        activeView.specialField,
+        activeView.specialFallbackField,
+      );
       const highlightSpec = assignmentSunburstHighlightSpec(activeView.sourceKey);
       status.textContent = `${activeView.label} at ${activeLevel} level.`;
       if (matrix.hasSpecialCounts) {
@@ -3745,7 +3760,7 @@
         status.textContent += ` Cells show total values. No ${highlightSpec.label} are present in this view.`;
       }
       if (activeView.sourceKey === "otu") {
-        status.textContent += `. Purple cells contain frozen OTUs. Light orange cells mark OTU assignments with fewer than ${OTU_ASSIGNMENT_MIN_READS} supporting reads (not counted as supported).`;
+        status.textContent += `. Purple cells contain frozen OTUs. In the read view, parenthesized frozen-read values are for this ${groupEntityLabel().toLowerCase()}/group only. Light orange cells mark OTU assignments with fewer than ${OTU_ASSIGNMENT_MIN_READS} supporting reads (not counted as supported).`;
       } else if (activeView.sourceKey === "consensus") {
         status.textContent += `. Amber cells contain consolidated consensus sequences.`;
       }

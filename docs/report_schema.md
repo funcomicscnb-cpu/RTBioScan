@@ -4,7 +4,7 @@
 
 Each round writes one JSON object with `schema_version`.
 
-Current schema version: `1.6`.
+Current schema version: `1.7`.
 
 This page is the machine-readable JSON contract. For biological and report terminology, see [Concepts](concepts.md). For user-facing report interpretation and output locations, see [Output](output.md).
 
@@ -178,7 +178,8 @@ Each row includes:
 - `marker` (string; COI/ITS2/Other)
 - `otu_count` (integer)
 - `frozen_otu_count` (integer)
-- `frozen_otu_reads_total` (integer or null; reads assigned to frozen OTUs in this row)
+- `frozen_otu_reads_total` (integer or null; OTU-wide reads assigned to frozen OTUs in this row across all samples/groups)
+- `frozen_otu_reads_sample_total` (integer; reads in frozen OTUs from this row's sample/group only; absent in schema versions older than `1.7` or when `otu_def` input is unavailable)
 - `reads_total` (integer or null)
 - `perc_id_min` / `perc_id_max` (number or null)
 - `aln_length_min` / `aln_length_max` (number or null)
@@ -319,7 +320,7 @@ Required keys:
 - `rounds_count` (integer)
 
 Optional keys:
-- `schema_version` (string; current writer uses `1.6`)
+- `schema_version` (string; current writer uses `1.7`)
 - `barcode` (string)
 - `state_id` (string)
 - `identity_mode` (string; `collapse|track`)
