@@ -3,6 +3,8 @@
 use strict;
 use warnings;
 use FindBin;
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
 
 require "$FindBin::Bin/reporting_identity_contract.pl";
 require "$FindBin::Bin/reporting_contract_sidecar.pl";
@@ -17,6 +19,13 @@ my $sidecar_file = $barcode_pipeline . "_demult_rpt.contract.tsv";
 my $context = lc($ENV{"RTBIOSCAN_DEMUX_IDENTITY_CONTEXT"} || '');
 die "ERROR: RTBIOSCAN_DEMUX_IDENTITY_CONTEXT is required\n" if $context eq '';
 
+sub ensure_dir {
+	my ($dir) = @_;
+	return if -d $dir;
+	eval { make_path($dir); 1 } or die "ERROR: failed to create directory $dir\n";
+	die "ERROR: failed to create directory $dir\n" if !-d $dir;
+}
+
 sub ensure_dirs {
 	for my $dir (
 		"single_exp/fastq/hac",
@@ -29,15 +38,55 @@ sub ensure_dirs {
 		"$results_dir/single_exp/fasta/sup",
 		"$results_dir/single_exp/fasta/fast",
 	) {
-		next if -d $dir;
-		system("mkdir", "-p", $dir) == 0 or die "ERROR: failed to create directory $dir\n";
+		ensure_dir($dir);
 	}
+}
+
+sub open_output_file {
+	my ($path) = @_;
+	ensure_dir(dirname($path));
+	if (open my $fh, '>', $path) {
+		return $fh;
+	}
+	ensure_dir(dirname($path));
+	open my $fh, '>', $path or die "I couldn't open $path\n";
+	return $fh;
+}
+
+sub open_append_file {
+	my ($path) = @_;
+	ensure_dir(dirname($path));
+	if (open my $fh, '>>', $path) {
+		return $fh;
+	}
+	ensure_dir(dirname($path));
+	open my $fh, '>>', $path or die "I couldn't open $path\n";
+	return $fh;
+}
+
+sub append_gzip_file {
+	my ($source, $destination) = @_;
+	my $out_fh = open_append_file($destination);
+	open my $gz_fh, '-|', 'gzip', '-c', $source
+		or die "I couldn't gzip $source\n";
+	binmode $gz_fh;
+	binmode $out_fh;
+	my $buffer;
+	while (1) {
+		my $bytes = read($gz_fh, $buffer, 65536);
+		die "I couldn't read gzip output for $source\n" if !defined $bytes;
+		last if $bytes == 0;
+		print {$out_fh} $buffer or die "I couldn't write $destination\n";
+	}
+	close $out_fh or die "I couldn't close $destination\n";
+	close $gz_fh or die "gzip failed for $source\n";
 }
 
 ensure_dirs();
 
 open my $out_fh, '>', $report_file or die "I couldn't open $report_file\n";
-print $out_fh ReportingContractSidecar::canonical_header('demult_rpt'), "\n";
+print $out_fh ReportingContractSidecar::canonical_header('demult_rpt'), "\n"
+	or die "I couldn't write $report_file\n";
 
 my %fastq_files;
 my %fasta_files;
@@ -70,7 +119,7 @@ if (-e $fastq_file && -s $fastq_file) {
 			$parsed->{replicate},
 			$parsed->{identity_scope},
 			$parsed->{identity_value},
-		), "\n";
+		), "\n" or die "I couldn't write $report_file\n";
 		$row_count++;
 
 		push @{$fastq_files{$parsed->{basecalling_model}}{$parsed->{sample}}}, $h . $seq . $plus . $qual;
@@ -78,30 +127,26 @@ if (-e $fastq_file && -s $fastq_file) {
 		chomp $seq;
 		push @{$fasta_files{$parsed->{basecalling_model}}{$parsed->{sample}}}, $fasta_header . $seq . "\n";
 	}
-	close $in_fh;
+	close $in_fh or die "I couldn't close $fastq_file\n";
 }
 
-close $out_fh;
+close $out_fh or die "I couldn't close $report_file\n";
 
 for my $model (keys %fastq_files) {
 	for my $sample (keys %{$fastq_files{$model}}) {
 		my $round_fastq = "single_exp/fastq/$model/${barcode_pipeline}_${sample}_${model}.fastq";
-		open my $fq_fh, '>', $round_fastq or die "I couldn't open $round_fastq\n";
-		print {$fq_fh} @{$fastq_files{$model}{$sample}};
-		close $fq_fh;
+		my $fq_fh = open_output_file($round_fastq);
+		print {$fq_fh} @{$fastq_files{$model}{$sample}} or die "I couldn't write $round_fastq\n";
+		close $fq_fh or die "I couldn't close $round_fastq\n";
 
 		my $round_fasta = "$results_dir/single_exp/fasta/$model/${barcode_pipeline}_${sample}_${model}.fasta";
-		open my $fa_fh, '>', $round_fasta or die "I couldn't open $round_fasta\n";
-		print {$fa_fh} @{$fasta_files{$model}{$sample}};
-		close $fa_fh;
+		my $fa_fh = open_output_file($round_fasta);
+		print {$fa_fh} @{$fasta_files{$model}{$sample}} or die "I couldn't write $round_fasta\n";
+		close $fa_fh or die "I couldn't close $round_fasta\n";
 
 		my $rolling_gz = "$results_dir/single_exp/fastq/$model/${sample}_${model}.fastq.gz";
-		if (!-f $rolling_gz) {
-			system "gzip -c $round_fastq > $rolling_gz";
-		} else {
-			system "gzip -c $round_fastq >> $rolling_gz";
-		}
-		system "rm $round_fastq";
+		append_gzip_file($round_fastq, $rolling_gz);
+		unlink $round_fastq or die "I couldn't remove $round_fastq\n";
 	}
 }
 
