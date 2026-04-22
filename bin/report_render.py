@@ -2163,6 +2163,28 @@ def append_generated_sample_figures(sorted_rounds, latest_round, out_path, run_i
 
     generated_ids = {spec["id"] for spec in figure_specs}
 
+    def build_sample_taxonomy_tree_compat(round_obj, sample_label, source_key, marker, include_row=None, match_mode="exact"):
+        try:
+            return build_sample_taxonomy_tree(
+                round_obj,
+                sample_label,
+                source_key,
+                marker,
+                include_row=include_row,
+                match_mode=match_mode,
+            )
+        except TypeError as exc:
+            # Test stubs and older helper overrides may still use the pre-match_mode signature.
+            if "match_mode" not in str(exc):
+                raise
+            return build_sample_taxonomy_tree(
+                round_obj,
+                sample_label,
+                source_key,
+                marker,
+                include_row=include_row,
+            )
+
     for sample_id, raw, _reads_key, _label_key, _sample_key in ordered_samples:
         sample_label = str(raw.get("label") or sample_id or "sample")
         figures = [copy.deepcopy(fig) for fig in raw.get("figures", []) if isinstance(fig, dict) and fig.get("id") not in generated_ids]
@@ -2197,7 +2219,7 @@ def append_generated_sample_figures(sorted_rounds, latest_round, out_path, run_i
                     source_payload = history_rows
                 else:
                     include_row = is_supported_otu_assignment_row if spec["source_key"] == "otu" else None
-                    tree = build_sample_taxonomy_tree(
+                    tree = build_sample_taxonomy_tree_compat(
                         latest_round,
                         sample_label,
                         spec["source_key"],
@@ -2571,17 +2593,35 @@ def collect_sample_replicate_bars(latest_round, sample_entry, collapse_track_uni
     if collapse_track_units:
         if latest_round.get("identity_mode") == "track":
             track_unit_metrics = latest_round.get("track_unit_metrics")
-            if not isinstance(track_unit_metrics, dict):
-                return []
             target_label = str(sample_entry.get("label") or "").strip()
+            if isinstance(track_unit_metrics, dict):
+                replicate_totals = {}
+                for raw in track_unit_metrics.values():
+                    if not isinstance(raw, dict):
+                        continue
+                    if track_sample_label_value(raw) != target_label:
+                        continue
+                    replicate_label = concise_track_replicate_label(raw) or str(raw.get("track_replicate_id") or raw.get("track_unit_id") or "Barcode")
+                    replicate_totals[replicate_label] = replicate_totals.get(replicate_label, 0.0) + max(0.0, num_any(raw.get("reads_demux")))
+                if replicate_totals:
+                    return [
+                        {"label": label, "value": value}
+                        for label, value in sorted(
+                            replicate_totals.items(),
+                            key=lambda item: (natural_round_key(item[0]), natural_round_key(item[0])),
+                        )
+                    ]
+            sample_metrics = latest_round.get("sample_metrics")
+            if not isinstance(sample_metrics, dict):
+                return []
             replicate_totals = {}
-            for raw in track_unit_metrics.values():
+            for sample_id, raw in sample_metrics.items():
                 if not isinstance(raw, dict):
                     continue
-                if track_sample_label_value(raw) != target_label:
+                raw_label = str(raw.get("label") or sample_id or "Barcode").strip()
+                if sample_group_label(raw_label, collapse_track_units=True) != target_label:
                     continue
-                replicate_label = concise_track_replicate_label(raw) or str(raw.get("track_replicate_id") or raw.get("track_unit_id") or "Barcode")
-                replicate_totals[replicate_label] = replicate_totals.get(replicate_label, 0.0) + max(0.0, num_any(raw.get("reads_demux")))
+                replicate_totals[raw_label] = replicate_totals.get(raw_label, 0.0) + max(0.0, num_any(raw.get("reads_demux")))
             return [
                 {"label": label, "value": value}
                 for label, value in sorted(
