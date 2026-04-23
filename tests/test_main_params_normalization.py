@@ -2523,6 +2523,12 @@ def test_main_nf_guards_round_barcode_collisions_before_round_dir_use() -> None:
     assert 'if [ "\\$reclaim_status" -eq 10 ]; then' in fast_block
 
 
+def test_main_nf_report_lock_stale_ttl_uses_stale_lock_ttl_minutes() -> None:
+    text = MAIN_NF.read_text(encoding="utf-8")
+    assert 'REPORT_LOCK_STALE_TTL_SECONDS="\\$(( ${staleLockTtlMinutesStr} * 60 ))"' in text
+    assert 'REPORT_LOCK_STALE_TTL_SECONDS=${params.lock_wait_seconds}' not in text
+
+
 def test_main_nf_wires_size_streak_phase_b_in_reporting_otu_definition() -> None:
     text = MAIN_NF.read_text(encoding="utf-8")
     assert text.count('OTU_SIZE_STREAK_MODE="${otuSizeStreakModeCanonical}"') >= 1
