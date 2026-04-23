@@ -55,8 +55,13 @@
     return 0;
   }
 
+  function otuSampleReads(row) {
+    if (row == null) return null;
+    return row.otu_reads_sample_total != null ? row.otu_reads_sample_total : row.reads_total;
+  }
+
   function isSupportedOtuAssignment(row) {
-    return numAny(row && row.reads_total) >= OTU_ASSIGNMENT_MIN_READS;
+    return numAny(otuSampleReads(row)) >= OTU_ASSIGNMENT_MIN_READS;
   }
 
   function finiteNumberOrNull(v) {
@@ -1207,6 +1212,7 @@
       countLabel: "OTUs",
       emptyText: "No assignments available for this level.",
       mountNode,
+      readValueFn: otuSampleReads,
       extraCols: [
         { header: "Frozen OTUs", key: "frozen_otu_count" },
       ],
@@ -1501,7 +1507,7 @@
     return entry ? (entry.count || 0) : 0;
   }
 
-  function renderAssignmentsTable({ title, dataRoot, countKey, countLabel, emptyText, extraCols = [], mountNode = charts }) {
+  function renderAssignmentsTable({ title, dataRoot, countKey, countLabel, emptyText, extraCols = [], mountNode = charts, readValueFn = null }) {
     if (!mountNode) return;
     const levels = ["species", "genus", "family"];
     const card = document.createElement("div");
@@ -1580,13 +1586,14 @@
       const tbody = document.createElement("tbody");
       pageRows.forEach((row) => {
         const tr = document.createElement("tr");
+        const readValue = typeof readValueFn === "function" ? readValueFn(row) : row.reads_total;
         const values = [
           row.taxon || "",
           row.sample || "",
           row.marker || "",
           row[countKey] != null ? row[countKey] : "N/A",
           ...extraCols.map((c) => (row[c.key] != null ? row[c.key] : "")),
-          row.reads_total != null ? row.reads_total : "N/A",
+          readValue != null ? readValue : "N/A",
           (row.perc_id_min != null && row.perc_id_min >= 0 && row.perc_id_min <= 100) ? row.perc_id_min : "",
           (row.perc_id_max != null && row.perc_id_max >= 0 && row.perc_id_max <= 100) ? row.perc_id_max : "",
           (row.aln_length_min != null && row.aln_length_min >= 1) ? row.aln_length_min : "",
@@ -1667,6 +1674,7 @@
       return rows.map((row) => {
         const extra = {};
         extraCols.forEach((c) => { extra[c.key] = row[c.key] != null ? row[c.key] : ""; });
+        const readValue = typeof readValueFn === "function" ? readValueFn(row) : row.reads_total;
         return {
           level: lvl,
           taxon: row.taxon || "",
@@ -1677,7 +1685,7 @@
           marker: row.marker || "",
           count: row[countKey] != null ? row[countKey] : "",
           ...extra,
-          reads_total: row.reads_total != null ? row.reads_total : "",
+          reads_value: readValue != null ? readValue : "",
           perc_id_min: row.perc_id_min != null ? row.perc_id_min : "",
           perc_id_max: row.perc_id_max != null ? row.perc_id_max : "",
           aln_length_min: row.aln_length_min != null ? row.aln_length_min : "",
@@ -1715,7 +1723,7 @@
       row.marker,
       row.count,
       ...extraCols.map((c) => row[c.key]),
-      row.reads_total,
+      row.reads_value,
       row.perc_id_min,
       row.perc_id_max,
       row.aln_length_min,
@@ -2199,7 +2207,7 @@
       if (!row || assignmentGroupLabel(row) !== sampleLabel) return;
       const taxon = row.taxon || row[level] || "";
       const family = row.family || "";
-      const reads = num(row.reads_total);
+      const reads = sourceKey === "otu" ? num(otuSampleReads(row)) : num(row.reads_total);
       if (!taxon) return;
       if (!byTaxon.has(taxon)) byTaxon.set(taxon, { taxon, family, reads_total: 0 });
       byTaxon.get(taxon).reads_total += reads;
@@ -2313,7 +2321,7 @@
     return { field: "", label: "", tone: "" };
   }
 
-  function buildAssignmentTaxonomyTree(assignments, marker, includeRow, highlightSpec) {
+  function buildAssignmentTaxonomyTree(assignments, marker, includeRow, highlightSpec, sourceKey = "otu", readValueFn = null) {
     const markerName = canonicalMarkerToken(marker);
     const highlightField = highlightSpec && highlightSpec.field ? highlightSpec.field : "";
     const highlightLabel = highlightSpec && highlightSpec.label ? highlightSpec.label : "";
@@ -2358,7 +2366,9 @@
       rows.forEach((row) => {
         if (!row || (typeof includeRow === "function" && !includeRow(row))) return;
         if (canonicalMarkerToken(row.marker) !== markerName) return;
-        const reads = num(row.reads_total);
+        const reads = typeof readValueFn === "function"
+          ? num(readValueFn(row))
+          : (sourceKey === "otu" ? num(otuSampleReads(row)) : num(row.reads_total));
         if (reads <= 0) return;
         const highlightCount = highlightField ? num(row[highlightField]) : 0;
         const family = (row.family || "").toString().trim() || "Unassigned family";
@@ -2457,6 +2467,7 @@
       marker,
       (row) => assignmentGroupLabel(row) === expectedLabel && (typeof includeRow !== "function" || includeRow(row)),
       assignmentSunburstHighlightSpec(sourceKey),
+      sourceKey,
     );
   }
 
@@ -2467,6 +2478,7 @@
       marker,
       typeof includeRow === "function" ? includeRow : () => true,
       assignmentSunburstHighlightSpec(sourceKey),
+      sourceKey,
     );
   }
 
@@ -3103,11 +3115,11 @@
     flatMapCompat(markerOrderFromData([round]), (marker) => {
       const suffix = marker === "COI" || marker === "ITS2" ? marker : markerSlug(marker);
       return [
-        { id: `run_frozen_otu_sunburst_${suffix}`, title: `Frozen OTUs (${marker})`, sourceKey: "otu", marker, countField: "frozen_otu_count" },
-        { id: `run_consolidated_consensus_sunburst_${suffix}`, title: `Consolidated Consensus (${marker})`, sourceKey: "consensus", marker, countField: "consolidated_consensus_count" },
+        { id: `run_frozen_otu_sunburst_${suffix}`, title: `Frozen OTUs (${marker})`, sourceKey: "otu", marker, countField: "frozen_otu_count", valueField: "frozen_otu_reads_sample_total" },
+        { id: `run_consolidated_consensus_sunburst_${suffix}`, title: `Consolidated Consensus (${marker})`, sourceKey: "consensus", marker, countField: "consolidated_consensus_count", valueField: "consolidated_consensus_reads_total" },
       ];
     }).forEach((spec) => {
-      specs.push({ ...spec, tree: buildFilteredAssignmentTree(round, spec.sourceKey, spec.countField, spec.marker, null) });
+      specs.push({ ...spec, tree: buildFilteredAssignmentTree(round, spec.sourceKey, spec.countField, spec.marker, null, spec.valueField) });
     });
     const validSpecs = specs.filter((spec) => spec.tree && num(spec.tree.value) > 0);
     if (!validSpecs.length) return;
@@ -3149,7 +3161,7 @@
 
   // ── Frozen OTU / Consolidated Consensus sections ─────────────────────────
 
-  function buildFilteredAssignmentTree(round, sourceKey, countField, marker, sampleFilter) {
+  function buildFilteredAssignmentTree(round, sourceKey, countField, marker, sampleFilter, valueField) {
     const assignments = get(round, [sourceKey, "assignments_by_level"], null);
     return buildAssignmentTaxonomyTree(
       assignments,
@@ -3160,6 +3172,8 @@
         return true;
       },
       assignmentSunburstHighlightSpec(sourceKey),
+      sourceKey,
+      valueField ? (row) => row[valueField] : null,
     );
   }
 
@@ -3402,7 +3416,7 @@
     panel.appendChild(section);
   }
 
-  function buildAssignmentSampleMatrix(lastRound, sourceKey, level, metricField, samplesWithReads, specialField, specialFallbackField) {
+  function buildAssignmentSampleMatrix(lastRound, sourceKey, level, metricField, samplesWithReads, specialField, specialFallbackField, metricFallbackField, displayTotal) {
     const rows = get(lastRound, [sourceKey, "assignments_by_level", level], []);
     const sampleMetrics = (reportIdentityMode === "track" && hasTrackUnitMetrics(lastRound))
       ? get(lastRound, ["track_unit_metrics"], {})
@@ -3472,19 +3486,23 @@
         const sampleLabel = assignmentGroupLabel(row);
         const taxon = (row.taxon || row[level] || "").toString().trim();
         const marker = canonicalMarkerToken(row.marker);
-        const value = num(row[metricField]);
+        const hasMetricField = Object.prototype.hasOwnProperty.call(row, metricField);
+        const value = hasMetricField
+          ? num(row[metricField])
+          : (metricFallbackField ? num(row[metricFallbackField]) : 0);
+        const readEvidenceValue = sourceKey === "otu" ? num(otuSampleReads(row)) : num(row.reads_total);
         if (!sampleLabel || !taxon || value <= 0) return;
         sampleSet.add(sampleLabel);
-        if (num(row.reads_total) > 0 || value > 0) samplesWithReadEvidence.add(sampleLabel);
+        if (readEvidenceValue > 0 || value > 0) samplesWithReadEvidence.add(sampleLabel);
         recordTrackGroupSortMeta(sampleLabel, row, sampleLabel);
         if (!matrixMap.has(sampleLabel)) matrixMap.set(sampleLabel, new Map());
         const sampleMap = matrixMap.get(sampleLabel);
-        const cell = sampleMap.get(taxon) || { supported: 0, unsupported: 0, frozen: 0, frozenReads: 0, consolidated: 0, consolidatedReads: 0, special: 0 };
+        const cell = sampleMap.get(taxon) || { supported: 0, unsupported: 0, total: 0, frozen: 0, frozenReads: 0, consolidated: 0, consolidatedReads: 0, special: 0 };
         const supported = sourceKey !== "otu" || isSupportedOtuAssignment(row);
         if (!taxonMarkers.has(taxon)) taxonMarkers.set(taxon, new Set());
         if (marker && (supported || markerKingdomFiltered(marker))) taxonMarkers.get(taxon).add(marker);
         taxonTotals.set(taxon, (taxonTotals.get(taxon) || 0) + value);
-        taxonReadTotals.set(taxon, (taxonReadTotals.get(taxon) || 0) + num(row.reads_total));
+        taxonReadTotals.set(taxon, (taxonReadTotals.get(taxon) || 0) + readEvidenceValue);
         if (!taxonSampleSets.has(taxon)) taxonSampleSets.set(taxon, new Set());
         taxonSampleSets.get(taxon).add(sampleLabel);
         if (supported) {
@@ -3497,8 +3515,9 @@
         } else {
           cell.unsupported += value;
         }
+        cell.total += value;
         cell.frozen += num(row.frozen_otu_count);
-        cell.frozenReads += num(row.frozen_otu_reads_total);
+        cell.frozenReads += num(row.frozen_otu_reads_sample_total);
         cell.consolidated += num(row.consolidated_consensus_count);
         cell.consolidatedReads += num(row.consolidated_consensus_reads_total);
         if (specialField) {
@@ -3578,8 +3597,8 @@
     let maxVal = 0;
     sampleList.forEach((sampleLabel) => {
       taxonList.forEach((taxon) => {
-        const cell = (matrixMap.get(sampleLabel) || new Map()).get(taxon) || { supported: 0, unsupported: 0 };
-        const v = cell.supported > 0 ? cell.supported : cell.unsupported;
+        const cell = (matrixMap.get(sampleLabel) || new Map()).get(taxon) || { supported: 0, unsupported: 0, total: 0 };
+        const v = displayTotal ? cell.total : (cell.supported > 0 ? cell.supported : cell.unsupported);
         if (v > maxVal) maxVal = v;
       });
     });
@@ -3598,8 +3617,13 @@
     const hasSpecialCounts = Array.from(matrixMap.values()).some((sampleMap) =>
       Array.from(sampleMap.values()).some((cell) => num(cell.special) > 0),
     );
+    const hasSpecialPresence = Array.from(matrixMap.values()).some((sampleMap) =>
+      Array.from(sampleMap.values()).some((cell) =>
+        sourceKey === "otu" ? num(cell.frozen) > 0 : num(cell.consolidated) > 0
+      ),
+    );
 
-    return { matrixMap, sampleList, taxonList, maxVal, taxonMarkerMap, sampleIdByLabel, noReadsSamples, hasSpecialCounts };
+    return { matrixMap, sampleList, taxonList, maxVal, taxonMarkerMap, sampleIdByLabel, noReadsSamples, hasSpecialCounts, hasSpecialPresence };
   }
 
   // ── Assignments × sample heatmap ──────────────────────────────────────────
@@ -3631,10 +3655,11 @@
         id: "otu_reads_total",
         label: "OTU assignments: reads",
         sourceKey: "otu",
-        metricField: "reads_total",
+        metricField: "otu_reads_sample_total",
+        metricFallbackField: "reads_total",
         specialField: "frozen_otu_reads_sample_total",
-        specialFallbackField: "frozen_otu_reads_total",
-        specialUnit: "reads from frozen OTUs (this sample/group)",
+        specialUnit: "sample-specific frozen OTU reads",
+        displayTotal: true,
         emptyLabel: "No OTU read totals available for this level.",
       },
       {
@@ -3653,6 +3678,7 @@
         metricField: "reads_total",
         specialField: "consolidated_consensus_reads_total",
         specialUnit: "reads from consolidated consensus",
+        displayTotal: true,
         emptyLabel: "No consensus read totals available for this level.",
       },
     ];
@@ -3751,16 +3777,20 @@
         samplesWithReads,
         activeView.specialField,
         activeView.specialFallbackField,
+        activeView.metricFallbackField,
+        activeView.displayTotal,
       );
       const highlightSpec = assignmentSunburstHighlightSpec(activeView.sourceKey);
       status.textContent = `${activeView.label} at ${activeLevel} level.`;
       if (matrix.hasSpecialCounts) {
         status.textContent += ` Cells show total values; bold values in parentheses show ${activeView.specialUnit}.`;
+      } else if (matrix.hasSpecialPresence && activeView.sourceKey === "consensus" && activeView.id === "consensus_reads_total") {
+        status.textContent += ` Cells show total values. Consolidated consensus sequences are present, but consolidated read counts are unavailable in this view.`;
       } else {
         status.textContent += ` Cells show total values. No ${highlightSpec.label} are present in this view.`;
       }
       if (activeView.sourceKey === "otu") {
-        status.textContent += `. Purple cells contain frozen OTUs. In the read view, parenthesized frozen-read values are for this ${groupEntityLabel().toLowerCase()}/group only. Light orange cells mark OTU assignments with fewer than ${OTU_ASSIGNMENT_MIN_READS} supporting reads (not counted as supported).`;
+        status.textContent += `. Purple cells contain frozen OTUs. In the read view, parenthesized frozen-read values appear only when sample-specific frozen-read counts are known. Light orange cells mark OTU assignments with fewer than ${OTU_ASSIGNMENT_MIN_READS} supporting reads (not counted as supported).`;
       } else if (activeView.sourceKey === "consensus") {
         status.textContent += `. Amber cells contain consolidated consensus sequences.`;
       }
@@ -3776,11 +3806,14 @@
       }
 
       const columns = [groupEntityLabel(), ...matrix.taxonList];
+      const cellDisplayValue = (cell) => (
+        activeView.displayTotal ? num(cell.total) : (cell.supported > 0 ? cell.supported : cell.unsupported)
+      );
       const tsvRows = matrix.sampleList.map((sampleLabel) => [
         sampleLabel,
         ...matrix.taxonList.map((taxon) => {
-          const cell = (matrix.matrixMap.get(sampleLabel) || new Map()).get(taxon) || { supported: 0, unsupported: 0 };
-          return cell.supported > 0 ? cell.supported : cell.unsupported;
+          const cell = (matrix.matrixMap.get(sampleLabel) || new Map()).get(taxon) || { supported: 0, unsupported: 0, total: 0 };
+          return cellDisplayValue(cell);
         }),
       ]);
       downloads.appendChild(
@@ -3889,8 +3922,8 @@
         }
 
         matrix.taxonList.forEach((taxon) => {
-          const cell = (matrix.matrixMap.get(sampleLabel) || new Map()).get(taxon) || { supported: 0, unsupported: 0 };
-          const v = cell.supported > 0 ? cell.supported : cell.unsupported;
+          const cell = (matrix.matrixMap.get(sampleLabel) || new Map()).get(taxon) || { supported: 0, unsupported: 0, total: 0 };
+          const v = cellDisplayValue(cell);
           const specialValue = num(cell.special);
           const td = document.createElement("td");
           td.title = `${sampleLabel} / ${taxon}: ${v || 0}`;

@@ -130,7 +130,7 @@ Additional audit and diagnostic files may also be present in the round directory
 ### `round_report.json`
 [back to Top](#rtbioscan-output)
 
-Machine-readable metrics for each round, consumed by the HTML report renderer. Schema version: `1.7`. Key namespaces: `reads`, `otu`, `blast`, `consensus`, `read_fate`, `sample_metrics`, and `figures`. See `report_schema.md` for the full field reference.
+Machine-readable metrics for each round, consumed by the HTML report renderer. Schema version: `2.0`. Key namespaces: `reads`, `otu`, `blast`, `consensus`, `read_fate`, `sample_metrics`, and `figures`. See `report_schema.md` for the full field reference.
 
 ### `run_report.json`
 [back to Top](#rtbioscan-output)

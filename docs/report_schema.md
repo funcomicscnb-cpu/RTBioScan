@@ -4,7 +4,7 @@
 
 Each round writes one JSON object with `schema_version`.
 
-Current schema version: `1.7`.
+Current schema version: `2.0`.
 
 This page is the machine-readable JSON contract. For biological and report terminology, see [Concepts](concepts.md). For user-facing report interpretation and output locations, see [Output](output.md).
 
@@ -178,9 +178,12 @@ Each row includes:
 - `marker` (string; COI/ITS2/Other)
 - `otu_count` (integer)
 - `frozen_otu_count` (integer)
-- `frozen_otu_reads_total` (integer or null; OTU-wide reads assigned to frozen OTUs in this row across all samples/groups)
-- `frozen_otu_reads_sample_total` (integer; reads in frozen OTUs from this row's sample/group only; absent in schema versions older than `1.7` or when `otu_def` input is unavailable)
-- `reads_total` (integer or null)
+- `frozen_otu_reads_total` (integer or null; frozen-OTU reads from this row's sample/group only; since schema `2.0`, frozen OTUs appear in a row only when frozen provenance provides positive reads for that sample/group)
+- `frozen_otu_reads_sample_total` (integer; same sample/group-scoped frozen-OTU read total as `frozen_otu_reads_total`, kept for compatibility; absent in schema versions older than `1.7`)
+- `otu_reads_sample_total` (integer; reads in OTUs contributing to this row that originate from this row's sample/group only; since schema `2.0`, this is the same sample/group-scoped quantity used by `reads_total` for OTU rows)
+- `reads_total` (integer or null; sample/group-scoped reads contributing to this OTU row; since schema `2.0`, no longer OTU-wide/global)
+- `otu_reads_global_total` (integer or null; diagnostic OTU-wide/global total for OTUs contributing to this row)
+- `frozen_otu_reads_global_total` (integer or null; diagnostic OTU-wide/global total for frozen OTUs contributing to this row)
 - `perc_id_min` / `perc_id_max` (number or null)
 - `aln_length_min` / `aln_length_max` (number or null)
 - `species_interest` (boolean; only present on species-level rows when a species-of-interest list is provided)
@@ -320,7 +323,7 @@ Required keys:
 - `rounds_count` (integer)
 
 Optional keys:
-- `schema_version` (string; current writer uses `1.7`)
+- `schema_version` (string; current writer uses `2.0`)
 - `barcode` (string)
 - `state_id` (string)
 - `identity_mode` (string; `collapse|track`)

@@ -5541,7 +5541,7 @@ process getting_run_summary {
 			--round-barcode "${round_barcode}" \
 			--targets "${params.targets}" \
 			--target-taxa "${params.target_taxa}" \
-			--schema-version "1.7" \
+			--schema-version "2.0" \
 			--asset-snapshot-policy "latest_only" \
 			--timestamp-utc "\$ROUND_TIMESTAMP_UTC" \
 			--out "\$out_path" \
@@ -6557,7 +6557,7 @@ process backup_update_and_clean {
 				--barcode "${barcode}" \
 				--state-id "${stateId}" \
 				--outdir "${params.outdir}" \
-				--schema-version "1.7" \
+				--schema-version "2.0" \
 				--report-rel-path "\$RUN_REPORT_REL_PATH" \
 				--run-started-utc-file "${ongoingStateDir}/_state/run_started_utc.txt"
 			run_json_rc=\$?

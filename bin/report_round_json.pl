@@ -17,7 +17,7 @@ require "$FindBin::Bin/lib/taxon_util.pl";
 *is_numeric_taxid    = \&TaxonUtil::is_numeric_taxid;
 
 my %opt = (
-  schema_version => '1.7',
+  schema_version => '2.0',
 );
 
 GetOptions(
@@ -527,7 +527,8 @@ sub resolve_reporting_identity {
 sub normalize_track_reporting_identity {
   my ($label_raw) = @_;
   my $label = SampleLabel::normalize_sample_label($label_raw);
-  return $label if !defined $label || $label eq '' || $label eq 'unknown';
+  return $label if !defined $label || $label eq '';
+  return 'unknown' if lc($label) eq 'unknown';
   return $label if SampleLabel::is_no_adapter_label($label);
   my $marker_pattern = SampleLabel::configured_marker_suffix_pattern();
   $label =~ s/${marker_pattern}$//i if defined $marker_pattern && $marker_pattern ne '';
@@ -2248,54 +2249,264 @@ sub _rep_reads_array {
   return \@sorted;
 }
 
-# Build { OTU_id => { collapsed_sample => { rep_label => count } } } from
-# otu_def rows (current round). Scoped per collapsed sample so that replicates
-# from different samples never mix under the same rep_N label.
-# Only meaningful in collapse mode; returns {} otherwise.
-sub load_otu_replicate_reads {
-  return {} unless $opt{identity_mode} eq 'collapse';
-  return {} unless defined $opt{otu_def} && $opt{otu_def} ne '';
-  my $rows = $_parsed_rows{$opt{otu_def}};
-  return {} unless defined $rows && @$rows;
-  my %map;  # { OTU_id => { collapsed_sample => { rep_label => count } } }
-  for my $row (@$rows) {
-    my $otu = trim_text($row->{OTU_id} // '');
-    next if $otu eq '' || uc($otu) eq 'NA';
-    my $raw = trim_text($row->{sample} // '');
-    next if $raw eq '' || SampleLabel::is_no_adapter_label($raw);
-    my $collapsed = resolve_reporting_identity($raw);
-    next if $collapsed eq '';
-    my $rep = adapter_to_rep_label($raw);
-    $map{$otu}{$collapsed}{$rep}++;
-  }
-  # Drop sample entries with only one distinct replicate label — no breakdown to show.
-  for my $otu (keys %map) {
-    for my $smp (keys %{$map{$otu}}) {
-      delete $map{$otu}{$smp} if scalar(keys %{$map{$otu}{$smp}}) <= 1;
-    }
-    delete $map{$otu} unless %{$map{$otu}};
-  }
-  return \%map;
-}
-
-sub load_frozen_sample_reads {
-  return undef unless defined $opt{otu_def} && $opt{otu_def} ne '';
+sub load_otu_membership_maps {
+  return ({}, {}, {}) unless defined $opt{otu_def} && $opt{otu_def} ne '';
   my $rows = get_parsed_rows($opt{otu_def});
-  return undef unless defined $rows && @$rows;
-  my %map;  # { normalized_lock_otu_key => { reporting_identity => count } }
+  return ({}, {}, {}) unless defined $rows && @$rows;
+  my (%member_counts, %rep_reads_map, %total_members);
   for my $row (@$rows) {
     next unless defined $row && ref($row) eq 'HASH';
     my $otu = trim_text($row->{OTU_id} // $row->{otu_id} // '');
     next if $otu eq '' || uc($otu) eq 'NA';
     my $lock_key = normalize_lock_otu_key($otu);
     next if $lock_key eq '';
-    my $raw = trim_text($row->{sample} // '');
-    next if $raw eq '';
-    my $label = resolve_reporting_identity($raw);
-    next if !defined $label || $label eq '';
-    $map{$lock_key}{$label}++;
+    $total_members{$otu}++;
+
+    my $raw_sample = trim_text($row->{sample} // '');
+    my $raw_label = resolve_reporting_identity($raw_sample);
+    my $label = trim_text($row->{identity_value} // '');
+    $label = resolve_reporting_identity($label) if $label ne '';
+    $label = $raw_label if ($label eq '' || lc($label) eq 'unknown') && defined $raw_label && $raw_label ne '';
+    if (defined $label && $label ne '') {
+      $member_counts{$lock_key}{$label}++;
+    }
+
+    next unless $opt{identity_mode} eq 'collapse';
+    next if $raw_sample eq '' || SampleLabel::is_no_adapter_label($raw_sample);
+    my $collapsed = resolve_reporting_identity($raw_sample);
+    next if $collapsed eq '';
+    my $rep = adapter_to_rep_label($raw_sample);
+    $rep_reads_map{$otu}{$collapsed}{$rep}++;
   }
-  return \%map;
+
+  for my $otu (keys %rep_reads_map) {
+    for my $sample (keys %{$rep_reads_map{$otu}}) {
+      delete $rep_reads_map{$otu}{$sample}
+        if scalar(keys %{$rep_reads_map{$otu}{$sample}}) <= 1;
+    }
+    delete $rep_reads_map{$otu} unless %{$rep_reads_map{$otu}};
+  }
+  return (\%member_counts, \%rep_reads_map, \%total_members);
+}
+
+sub load_canonical_otu_taxonomy {
+  my ($blast_otu_path) = @_;
+  return undef unless defined $blast_otu_path && $blast_otu_path ne '' && -e $blast_otu_path && -s $blast_otu_path;
+
+  my $FH = open_cached_text_handle($blast_otu_path);
+  return undef unless defined $FH;
+  my $header = <$FH>;
+  if (!defined $header) {
+    close $FH;
+    return undef;
+  }
+  chomp $header;
+  my @cols = split /\t/, $header, -1;
+  my %idx;
+  for my $i (0 .. $#cols) {
+    my $k = trim_text($cols[$i]);
+    $idx{lc($k)} = $i if $k ne '';
+  }
+  my $otu_idx = header_index_fallback(\%idx, 'otu_id', 'OTU_id');
+  my $taxid_idx = header_index_fallback(\%idx, 'otu_taxid', 'taxid');
+  my $marker_idx = header_index_fallback(\%idx, 'barcode_by_homology');
+  my $hit_idx = header_index_fallback(\%idx, 'hit_id', 'blast_hit');
+  my $perc_idx = header_index_fallback(\%idx, 'perc_id');
+  my $aln_idx = header_index_fallback(\%idx, 'aln_length');
+  my $family_idx = header_index_fallback(\%idx, 'otu_family');
+  my $genus_idx = header_index_fallback(\%idx, 'otu_genus');
+  my $species_idx = header_index_fallback(\%idx, 'otu_species');
+  my $kingdom_idx = header_index_fallback(\%idx, 'otu_kingdom');
+  if (!defined $otu_idx) {
+    close $FH;
+    return undef;
+  }
+
+  my %best;
+  while (my $line = <$FH>) {
+    chomp $line;
+    next if $line =~ /^\s*$/;
+    next if is_repeated_header_line($line, $header);
+    my @f = split /\t/, $line, -1;
+    next if $otu_idx > $#f;
+    my $otu = trim_text($f[$otu_idx]);
+    next if $otu eq '' || uc($otu) eq 'NA';
+    my $marker = (defined $marker_idx && $marker_idx <= $#f) ? marker_from_token($f[$marker_idx]) : marker_from_token($otu);
+    my $kingdom = (defined $kingdom_idx && $kingdom_idx <= $#f) ? trim_text($f[$kingdom_idx]) : '';
+    next unless is_kingdom_consistent($kingdom, $marker, $CONFIGURED_TARGET_TAX_MAP);
+
+    my $taxid = (defined $taxid_idx && $taxid_idx <= $#f) ? trim_text($f[$taxid_idx]) : '';
+    my $hit = (defined $hit_idx && $hit_idx <= $#f) ? trim_text($f[$hit_idx]) : '';
+    my $perc = (defined $perc_idx && $perc_idx <= $#f) ? trim_text($f[$perc_idx]) : '';
+    my $aln = (defined $aln_idx && $aln_idx <= $#f) ? trim_text($f[$aln_idx]) : '';
+    my $family = (defined $family_idx && $family_idx <= $#f) ? normalize_taxon($f[$family_idx]) : undef;
+    my $genus = (defined $genus_idx && $genus_idx <= $#f) ? normalize_taxon($f[$genus_idx]) : undef;
+    my $species = (defined $species_idx && $species_idx <= $#f) ? normalize_taxon($f[$species_idx]) : undef;
+    my $_perc_raw = ($perc ne '' ? $perc + 0 : undef);
+    my $_aln_raw  = ($aln  ne '' ? $aln  + 0 : undef);
+    my $_perc_valid = defined $_perc_raw && $_perc_raw >= 0 && $_perc_raw <= 100;
+    my $_aln_valid  = defined $_aln_raw  && $_aln_raw  >= 1;
+    my $row = {
+      marker => $marker,
+      taxid => ($taxid ne '' ? $taxid : undef),
+      blast_hit => ($hit ne '' ? $hit : undef),
+      perc_id => ($_perc_valid ? $_perc_raw : undef),
+      aln_length => ($_aln_valid ? $_aln_raw : undef),
+      family => $family,
+      genus => $genus,
+      species => $species,
+    };
+    if (!exists $best{$otu}) {
+      $best{$otu} = $row;
+      next;
+    }
+    my $prev = $best{$otu};
+    my $prev_perc = defined $prev->{perc_id} ? $prev->{perc_id} : -1;
+    my $new_perc = defined $row->{perc_id} ? $row->{perc_id} : -1;
+    my $prev_aln = defined $prev->{aln_length} ? $prev->{aln_length} : -1;
+    my $new_aln = defined $row->{aln_length} ? $row->{aln_length} : -1;
+    my $prev_hit = defined $prev->{blast_hit} ? $prev->{blast_hit} : '';
+    my $new_hit = defined $row->{blast_hit} ? $row->{blast_hit} : '';
+    if ($new_perc > $prev_perc
+        || ($new_perc == $prev_perc && $new_aln > $prev_aln)
+        || ($new_perc == $prev_perc && $new_aln == $prev_aln && $new_hit lt $prev_hit)) {
+      $best{$otu} = $row;
+    }
+  }
+  close $FH;
+  return %best ? \%best : undef;
+}
+
+sub _path_dirname {
+  my ($path) = @_;
+  return '' unless defined $path && $path ne '';
+  my $dir = $path;
+  $dir =~ s{/+[^/]+$}{};
+  return ($dir eq $path) ? '.' : ($dir eq '' ? '.' : $dir);
+}
+
+sub _candidate_state_dirs_for_round_dir {
+  my ($round_dir) = @_;
+  return () unless defined $round_dir && $round_dir ne '';
+  my @dirs;
+  push @dirs, $round_dir if $round_dir =~ m{(?:^|/)_state$};
+  push @dirs, "$round_dir/_state";
+  my $parent = _path_dirname($round_dir);
+  push @dirs, "$parent/_state" if defined $parent && $parent ne '';
+  my %seen;
+  return grep { defined $_ && $_ ne '' && !$seen{$_}++ } @dirs;
+}
+
+sub _extract_adapter_from_member_id {
+  my ($member_id) = @_;
+  return undef unless defined $member_id && $member_id ne '';
+  return $1 if $member_id =~ /(?:^|\|)adapter=([^|]+)/;
+  return undef;
+}
+
+sub load_frozen_sample_reads {
+  return {} unless defined $opt{otu_lock_summary} && $opt{otu_lock_summary} ne '';
+
+  my $round_dir = _path_dirname($opt{otu_lock_summary});
+  my @state_dirs = _candidate_state_dirs_for_round_dir($round_dir);
+  my ($state_dir) = grep {
+    -s "$_/otu_frozen_meta.tsv" && -s "$_/otu_frozen_members.tsv"
+  } @state_dirs;
+  return {} unless defined $state_dir && $state_dir ne '';
+  return {} unless defined $opt{otu_def} && $opt{otu_def} ne '';
+
+  my $otu_def_rows = get_parsed_rows($opt{otu_def});
+  return {} unless defined $otu_def_rows && @$otu_def_rows;
+
+  my %rep_read_by_otu;
+  for my $row (@$otu_def_rows) {
+    next unless defined $row && ref($row) eq 'HASH';
+    my $otu = trim_text($row->{OTU_id} // $row->{otu_id} // '');
+    next if $otu eq '' || uc($otu) eq 'NA';
+    my $role = trim_text($row->{OTU_role} // $row->{otu_role} // $row->{role} // '');
+    next unless uc($role) eq 'REPRESENTATIVE';
+    my $rid = normalize_read_id($row->{read_id});
+    next if $rid eq '';
+    my $lock_key = normalize_lock_otu_key($otu);
+    next if $lock_key eq '';
+    $rep_read_by_otu{$lock_key} = $rid unless exists $rep_read_by_otu{$lock_key};
+  }
+  return {} unless %rep_read_by_otu;
+
+  my %hashes_by_read;
+  my @hash_map_paths = (
+    "$round_dir/$opt{barcode}_otu_nr_hash_map.tsv",
+    "$round_dir/$opt{barcode}_otu_hash_map.tsv",
+    "$state_dir/$opt{barcode}_otu_nr_hash_map.tsv",
+    "$state_dir/$opt{barcode}_otu_hash_map.tsv",
+  );
+  my %seen_hash_map_path;
+  for my $path (@hash_map_paths) {
+    next if !defined $path || $path eq '' || $seen_hash_map_path{$path}++;
+    next unless -s $path;
+    my $FH = open_cached_text_handle($path);
+    next unless defined $FH;
+    while (my $line = <$FH>) {
+      chomp $line;
+      next if $line =~ /^\s*$/;
+      my ($rid_raw, $hash) = split /\t/, $line, 3;
+      my $rid = normalize_read_id($rid_raw);
+      next if $rid eq '' || !defined $hash || trim_text($hash) eq '';
+      $hashes_by_read{$rid}{trim_text($hash)} = 1;
+    }
+    close $FH;
+  }
+
+  my %frozen_id_by_hash;
+  my $meta_fh = open_cached_text_handle("$state_dir/otu_frozen_meta.tsv");
+  if (!defined $meta_fh) {
+    return {};
+  }
+  while (my $line = <$meta_fh>) {
+    chomp $line;
+    next if $line =~ /^\s*$/;
+    my ($frozen_id, undef, $hash) = split /\t/, $line, 4;
+    next unless defined $frozen_id && defined $hash;
+    $frozen_id = trim_text($frozen_id);
+    $hash = trim_text($hash);
+    next if $frozen_id eq '' || $hash eq '';
+    $frozen_id_by_hash{$hash} = $frozen_id;
+  }
+  close $meta_fh;
+
+  my %counts_by_frozen;
+  my $members_fh = open_cached_text_handle("$state_dir/otu_frozen_members.tsv");
+  if (!defined $members_fh) {
+    return {};
+  }
+  while (my $line = <$members_fh>) {
+    chomp $line;
+    next if $line =~ /^\s*$/;
+    my ($frozen_id, $member_id) = split /\t/, $line, 3;
+    next unless defined $frozen_id && defined $member_id;
+    $frozen_id = trim_text($frozen_id);
+    next if $frozen_id eq '';
+    my $adapter = _extract_adapter_from_member_id($member_id);
+    next unless defined $adapter && $adapter ne '';
+    my $label = resolve_reporting_identity($adapter);
+    next unless defined $label && $label ne '';
+    $counts_by_frozen{$frozen_id}{$label}++;
+  }
+  close $members_fh;
+
+  my %map;
+  for my $otu (keys %rep_read_by_otu) {
+    my $rid = $rep_read_by_otu{$otu};
+    next unless exists $hashes_by_read{$rid};
+    my @hashes = sort keys %{$hashes_by_read{$rid}};
+    next unless @hashes == 1;
+    my $hash = $hashes[0];
+    next unless exists $frozen_id_by_hash{$hash};
+    my $frozen_id = $frozen_id_by_hash{$hash};
+    next unless exists $counts_by_frozen{$frozen_id};
+    $map{$otu} = { %{$counts_by_frozen{$frozen_id}} };
+  }
+  return %map ? \%map : {};
 }
 
 sub load_otu_sizes_round {
@@ -2343,7 +2554,7 @@ sub load_otu_sizes_round {
 }
 
 sub collect_otu_assignments_by_level {
-  my ($blast_otu_path, $otu_sizes_path, $spec_interest_ref, $spec_interest_enabled, $lock_frozen_ref, $thresholds_by_level, $frozen_sample_reads_ref) = @_;
+  my ($blast_otu_path, $otu_sizes_path, $spec_interest_ref, $spec_interest_enabled, $lock_frozen_ref, $thresholds_by_level, $frozen_sample_reads_ref, $otu_all_sample_reads_ref, $canonical_otu_ref, $otu_membership_maps_ref) = @_;
   my %by_level = (species => [], genus => [], family => []);
   my %otu_rep_reads;           # { otu => { collapsed_sample => { rep_label => count } } }
   my %sample_marker_rep_reads; # { collapsed_sample => { marker => { rep_label => count } } }
@@ -2351,6 +2562,7 @@ sub collect_otu_assignments_by_level {
 
   my $size_map = load_otu_sizes_round($otu_sizes_path);
   my %counts_fallback;
+  my %counts_fallback_by_otu;
   my %best;
   my %otu_seen;
   my %raw_otu_sample_rep;    # { otu => { raw_sample => count } } — for OTU-level rep breakdown
@@ -2416,13 +2628,12 @@ sub collect_otu_assignments_by_level {
     next unless is_kingdom_consistent($kingdom, $marker, $CONFIGURED_TARGET_TAX_MAP);
     my $key = join("\t", $sample, $marker, $otu);
 
-    if (!defined $size_map->{$otu}) {
-      if (defined $read_idx && $read_idx <= $#f) {
-        my $rid = trim_text($f[$read_idx]);
-        $rid =~ s/\|.*$//;
-        if ($rid ne '') {
-          $counts_fallback{$key}{$rid} = 1;
-        }
+    if (defined $read_idx && $read_idx <= $#f) {
+      my $rid = trim_text($f[$read_idx]);
+      $rid =~ s/\|.*$//;
+      if ($rid ne '') {
+        $counts_fallback{$key}{$rid} = 1;
+        $counts_fallback_by_otu{$otu}{$rid} = 1;
       }
     }
 
@@ -2468,22 +2679,67 @@ sub collect_otu_assignments_by_level {
   }
   close $FH;
 
-  # Convert raw-sample counts to { otu => { collapsed_sample => { rep_label => count } } }.
-  for my $otu (keys %raw_otu_sample_rep) {
-    for my $raw (keys %{$raw_otu_sample_rep{$otu}}) {
-      my $collapsed = resolve_reporting_identity($raw);
-      next if $collapsed eq '';
-      my $rep = adapter_to_rep_label($raw);
-      $otu_rep_reads{$otu}{$collapsed}{$rep} += $raw_otu_sample_rep{$otu}{$raw};
+  if (defined $canonical_otu_ref && defined $otu_all_sample_reads_ref) {
+    for my $key (keys %best) {
+      my $row = $best{$key};
+      my $otu = $row->{otu_id} // '';
+      next if $otu eq '' || !exists $canonical_otu_ref->{$otu};
+      my $canon = $canonical_otu_ref->{$otu};
+      @{$row}{qw(perc_id aln_length taxid blast_hit family genus species)} =
+        @{$canon}{qw(perc_id aln_length taxid blast_hit family genus species)};
     }
   }
-  # Prune entries with ≤1 distinct replicate label per sample — no breakdown to show.
-  for my $otu (keys %otu_rep_reads) {
-    for my $smp (keys %{$otu_rep_reads{$otu}}) {
-      delete $otu_rep_reads{$otu}{$smp}
-        if scalar(keys %{$otu_rep_reads{$otu}{$smp}}) <= 1;
+
+  if (defined $canonical_otu_ref && defined $otu_all_sample_reads_ref) {
+    for my $otu (keys %$canonical_otu_ref) {
+      my $canon = $canonical_otu_ref->{$otu};
+      my $marker = $canon->{marker};
+      my $lock_key = normalize_lock_otu_key($otu);
+      next if $lock_key eq '';
+      my $sample_reads_map;
+      if (defined $lock_frozen_ref && exists $lock_frozen_ref->{$lock_key}) {
+        next unless defined $frozen_sample_reads_ref && exists $frozen_sample_reads_ref->{$lock_key};
+        $sample_reads_map = $frozen_sample_reads_ref->{$lock_key};
+      } else {
+        next unless defined $otu_all_sample_reads_ref && exists $otu_all_sample_reads_ref->{$lock_key};
+        $sample_reads_map = $otu_all_sample_reads_ref->{$lock_key};
+      }
+      for my $sample (keys %$sample_reads_map) {
+        next unless defined $sample_reads_map->{$sample} && $sample_reads_map->{$sample} > 0;
+        my $key = join("\t", $sample, $marker, $otu);
+        next if exists $best{$key};
+        $best{$key} = {
+          otu_id => $otu,
+          sample => $sample,
+          marker => $marker,
+          map { $_ => $canon->{$_} } qw(perc_id aln_length taxid blast_hit family genus species),
+        };
+      }
     }
-    delete $otu_rep_reads{$otu} unless %{$otu_rep_reads{$otu}};
+  }
+
+  if (defined $otu_membership_maps_ref
+      && defined $otu_membership_maps_ref->{rep_reads_map}
+      && %{$otu_membership_maps_ref->{rep_reads_map}}) {
+    %otu_rep_reads = %{$otu_membership_maps_ref->{rep_reads_map}};
+  } else {
+    # Convert raw-sample counts to { otu => { collapsed_sample => { rep_label => count } } }.
+    for my $otu (keys %raw_otu_sample_rep) {
+      for my $raw (keys %{$raw_otu_sample_rep{$otu}}) {
+        my $collapsed = resolve_reporting_identity($raw);
+        next if $collapsed eq '';
+        my $rep = adapter_to_rep_label($raw);
+        $otu_rep_reads{$otu}{$collapsed}{$rep} += $raw_otu_sample_rep{$otu}{$raw};
+      }
+    }
+    # Prune entries with ≤1 distinct replicate label per sample — no breakdown to show.
+    for my $otu (keys %otu_rep_reads) {
+      for my $smp (keys %{$otu_rep_reads{$otu}}) {
+        delete $otu_rep_reads{$otu}{$smp}
+          if scalar(keys %{$otu_rep_reads{$otu}{$smp}}) <= 1;
+      }
+      delete $otu_rep_reads{$otu} unless %{$otu_rep_reads{$otu}};
+    }
   }
 
   # Build { collapsed_sample => { marker => { rep_label => count } } } for consensus-level breakdown.
@@ -2508,10 +2764,44 @@ sub collect_otu_assignments_by_level {
   for my $key (keys %best) {
     my $row = $best{$key};
     my $otu = $row->{otu_id};
-    my $reads = defined $size_map->{$otu}
+    my $lock_key = normalize_lock_otu_key($otu);
+    my $sample = $row->{sample} // '';
+    my $is_frozen = ($lock_key ne '' && defined $lock_frozen_ref && exists $lock_frozen_ref->{$lock_key}) ? 1 : 0;
+    my $global_reads = defined $size_map->{$otu}
       ? $size_map->{$otu}
-      : (exists $counts_fallback{$key} ? scalar(keys %{$counts_fallback{$key}}) : undef);
-    $row->{reads} = defined $reads ? $reads : undef;
+      : (defined $otu_membership_maps_ref
+        && exists $otu_membership_maps_ref->{total_members}{$otu}
+        ? $otu_membership_maps_ref->{total_members}{$otu}
+        : (exists $counts_fallback_by_otu{$otu}
+          ? scalar(keys %{$counts_fallback_by_otu{$otu}})
+          : undef));
+    my $sample_reads;
+    if ($is_frozen) {
+      next unless $lock_key ne ''
+        && defined $frozen_sample_reads_ref
+        && exists $frozen_sample_reads_ref->{$lock_key}
+        && $sample ne ''
+        && exists $frozen_sample_reads_ref->{$lock_key}{$sample};
+      $sample_reads = 0 + $frozen_sample_reads_ref->{$lock_key}{$sample};
+    } else {
+      if ($lock_key ne ''
+          && defined $otu_all_sample_reads_ref
+          && exists $otu_all_sample_reads_ref->{$lock_key}
+          && $sample ne ''
+          && exists $otu_all_sample_reads_ref->{$lock_key}{$sample}) {
+        $sample_reads = 0 + $otu_all_sample_reads_ref->{$lock_key}{$sample};
+      } elsif ((!defined $otu_all_sample_reads_ref || $lock_key eq '' || !exists $otu_all_sample_reads_ref->{$lock_key})
+          && exists $counts_fallback{$key}) {
+        $sample_reads = scalar(keys %{$counts_fallback{$key}});
+      }
+    }
+    next unless defined $sample_reads && $sample_reads > 0;
+    $row->{reads} = $sample_reads;
+    $row->{otu_sample_reads} = $sample_reads;
+    $row->{global_reads} = defined $global_reads ? 0 + $global_reads : undef;
+    $row->{is_frozen_assignment} = $is_frozen ? 1 : 0;
+    $row->{frozen_reads} = $is_frozen ? $sample_reads : 0;
+    $row->{frozen_global_reads} = ($is_frozen && defined $global_reads) ? (0 + $global_reads) : undef;
     push @rows, $row;
   }
 
@@ -2543,6 +2833,14 @@ sub collect_otu_assignments_by_level {
         frozen_reads_total => 0,
         frozen_reads_any => 0,
         frozen_sample_reads_total => 0,
+        frozen_sample_reads_any => 0,
+        otu_sample_reads_total => 0,
+        otu_sample_reads_any => 0,
+        otu_global_reads_total => 0,
+        otu_global_reads_any => 0,
+        frozen_global_reads_total => 0,
+        frozen_global_reads_any => 0,
+        frozen_otu_ids => {},
         perc_min => undef,
         perc_max => undef,
         aln_min => undef,
@@ -2563,17 +2861,25 @@ sub collect_otu_assignments_by_level {
         $g->{reads_total} += $row->{reads};
         $g->{reads_any} = 1;
       }
-      my $lock_key = normalize_lock_otu_key($row->{otu_id});
-      if ($lock_key ne '' && defined $lock_frozen_ref && exists $lock_frozen_ref->{$lock_key}) {
-        if (defined $row->{reads}) {
-          $g->{frozen_reads_total} += $row->{reads};
+      if (defined $row->{otu_sample_reads}) {
+        $g->{otu_sample_reads_total} += $row->{otu_sample_reads};
+        $g->{otu_sample_reads_any} = 1;
+      }
+      if (defined $row->{global_reads}) {
+        $g->{otu_global_reads_total} += $row->{global_reads};
+        $g->{otu_global_reads_any} = 1;
+      }
+      if ($row->{is_frozen_assignment}) {
+        $g->{frozen_otu_ids}{$row->{otu_id}} = 1 if defined $row->{otu_id};
+        if (defined $row->{frozen_reads} && $row->{frozen_reads} > 0) {
+          $g->{frozen_reads_total} += $row->{frozen_reads};
           $g->{frozen_reads_any} = 1;
+          $g->{frozen_sample_reads_total} += $row->{frozen_reads};
+          $g->{frozen_sample_reads_any} = 1;
         }
-        if (defined $frozen_sample_reads_ref && exists $frozen_sample_reads_ref->{$lock_key}) {
-          my $sample_key = $row->{sample} // '';
-          if ($sample_key ne '' && exists $frozen_sample_reads_ref->{$lock_key}{$sample_key}) {
-            $g->{frozen_sample_reads_total} += $frozen_sample_reads_ref->{$lock_key}{$sample_key};
-          }
+        if (defined $row->{frozen_global_reads}) {
+          $g->{frozen_global_reads_total} += $row->{frozen_global_reads};
+          $g->{frozen_global_reads_any} = 1;
         }
       }
       if (defined $row->{perc_id}) {
@@ -2589,12 +2895,7 @@ sub collect_otu_assignments_by_level {
     for my $gkey (keys %groups) {
       my $g = $groups{$gkey};
       my $otu_count = scalar keys %{$g->{otu_ids}};
-      my $frozen_otu_n = 0;
-      for my $otu_id (keys %{$g->{otu_ids}}) {
-        my $key = normalize_lock_otu_key($otu_id);
-        next if $key eq '';
-        $frozen_otu_n++ if defined $lock_frozen_ref && exists $lock_frozen_ref->{$key};
-      }
+      my $frozen_otu_n = scalar keys %{$g->{frozen_otu_ids}};
       my $_otu_rep_arr = _rep_reads_array($g->{rep_reads});
       my $row_out = {
         taxon => $g->{taxon},
@@ -2605,9 +2906,12 @@ sub collect_otu_assignments_by_level {
         species => ($g->{species} // ($level eq 'species' ? $g->{taxon} : undef)),
         otu_count => $otu_count,
         frozen_otu_count => $frozen_otu_n,
-        frozen_otu_reads_total => ($g->{reads_any} ? $g->{frozen_reads_total} : undef),
-        (defined $frozen_sample_reads_ref ? (frozen_otu_reads_sample_total => 0 + $g->{frozen_sample_reads_total}) : ()),
-        reads_total => ($g->{reads_any} ? $g->{reads_total} : undef),
+        frozen_otu_reads_total => ($g->{frozen_reads_any} ? 0 + $g->{frozen_reads_total} : undef),
+        ($g->{frozen_sample_reads_any} ? (frozen_otu_reads_sample_total => 0 + $g->{frozen_sample_reads_total}) : ()),
+        ($g->{otu_sample_reads_any} ? (otu_reads_sample_total => 0 + $g->{otu_sample_reads_total}) : ()),
+        ($g->{otu_global_reads_any} ? (otu_reads_global_total => 0 + $g->{otu_global_reads_total}) : ()),
+        ($g->{frozen_global_reads_any} ? (frozen_otu_reads_global_total => 0 + $g->{frozen_global_reads_total}) : ()),
+        reads_total => ($g->{reads_any} ? 0 + $g->{reads_total} : undef),
         perc_id_min => $g->{perc_min},
         perc_id_max => $g->{perc_max},
         aln_length_min => $g->{aln_min},
@@ -2622,6 +2926,28 @@ sub collect_otu_assignments_by_level {
       if ($opt{identity_mode} eq 'track') {
         my $track_entry = resolve_track_unit_metrics_entry($g->{sample}, $g->{sample}, $g->{marker});
         add_track_identity_fields($row_out, $track_entry);
+      }
+      if (defined $row_out->{frozen_otu_reads_total}
+          && defined $row_out->{reads_total}
+          && $row_out->{frozen_otu_reads_total} > $row_out->{reads_total}) {
+        die "ERROR: invariant:frozen_otu_reads_total_gt_reads_total"
+          . ":$level:$g->{taxon}:$g->{sample}:$g->{marker}\n";
+      }
+      if (defined $row_out->{frozen_otu_reads_sample_total}
+          && defined $row_out->{otu_reads_sample_total}
+          && $row_out->{frozen_otu_reads_sample_total} > $row_out->{otu_reads_sample_total}) {
+        die "ERROR: invariant:frozen_otu_reads_sample_total_gt_otu_reads_sample_total"
+          . ":$level:$g->{taxon}:$g->{sample}:$g->{marker}\n";
+      }
+      if ($row_out->{frozen_otu_count} > 0
+          && (!defined $row_out->{frozen_otu_reads_sample_total}
+              || $row_out->{frozen_otu_reads_sample_total} == 0)) {
+        die "ERROR: invariant:frozen_otu_count_nonzero_but_zero_frozen_sample_reads"
+          . ":$level:$g->{taxon}:$g->{sample}:$g->{marker}\n";
+      }
+      if ($row_out->{frozen_otu_count} > $row_out->{otu_count}) {
+        die "ERROR: invariant:frozen_otu_count_gt_otu_count"
+          . ":$level:$g->{taxon}:$g->{sample}:$g->{marker}\n";
       }
       push @agg, $row_out;
     }
@@ -4300,8 +4626,25 @@ my $otu_informative_assigned_by_marker = $informative_source_available
   ? otu_assigned_by_marker_from_blast_otu($_blast_otu_for_sunburst, \%otu_informative_set)
   : undef;
 my $consolidated_cons_set = load_id_set($opt{consensus_consolidated_ids});
+my ($otu_member_counts, $otu_def_rep_reads, $otu_def_totals) = load_otu_membership_maps();
+my $canonical_otu_tax = load_canonical_otu_taxonomy($_blast_otu_for_sunburst);
+my $otu_all_sample_reads = %$otu_member_counts ? $otu_member_counts : undef;
 my $frozen_sample_reads = load_frozen_sample_reads();
-my ($otu_assignments_by_level, $otu_rep_reads, $sample_marker_rep_reads) = collect_otu_assignments_by_level($_blast_otu_for_sunburst, $opt{otu_sizes_round}, \%spec_interest, $spec_interest_enabled, $lock_frozen_set, $otu_assignment_thresholds, $frozen_sample_reads);
+my ($otu_assignments_by_level, $otu_rep_reads, $sample_marker_rep_reads) = collect_otu_assignments_by_level(
+  $_blast_otu_for_sunburst,
+  $opt{otu_sizes_round},
+  \%spec_interest,
+  $spec_interest_enabled,
+  $lock_frozen_set,
+  $otu_assignment_thresholds,
+  $frozen_sample_reads,
+  $otu_all_sample_reads,
+  $canonical_otu_tax,
+  {
+    rep_reads_map => $otu_def_rep_reads,
+    total_members => $otu_def_totals,
+  },
+);
 my $consensus_assignments_by_level = collect_consensus_assignments_by_level($opt{blast_consensus}, \%spec_interest, $spec_interest_enabled, $consolidated_cons_set, $opt{identity_mode}, $sample_marker_rep_reads);
 my %otu_active_by_marker_taxon = (
   assigned => blank_marker_count_map(),

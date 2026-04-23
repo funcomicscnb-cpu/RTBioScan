@@ -41,8 +41,13 @@ def _run_frozen_assignment_case(
     *,
     blast_rows: str,
     otu_def_rows: str | None = None,
+    otu_def_header: str = "read_id\tsample\tOTU_id\tOTU_role\n",
+    frozen_member_rows: str | None = None,
+    rep_hash_member_id: str | None = None,
     extra_args: list[str] | None = None,
     otu_size: int = 7,
+    otu_sizes_rows: str | None = None,
+    lock_summary_rows: str | None = None,
 ) -> dict:
     blast_otu = tmp_path / "blast_otu.tsv"
     blast_otu.write_text(
@@ -51,11 +56,14 @@ def _run_frozen_assignment_case(
         encoding="utf-8",
     )
     otu_sizes_round = tmp_path / "otu_sizes_round.tsv"
-    otu_sizes_round.write_text(f"otu_id\tsize\nOTUB_F-COI\t{otu_size}\n", encoding="utf-8")
+    otu_sizes_round.write_text(
+        "otu_id\tsize\n" + (otu_sizes_rows if otu_sizes_rows is not None else f"OTUB_F-COI\t{otu_size}\n"),
+        encoding="utf-8",
+    )
+    default_lock_row = "OTUB_F-COI\t0\t1\n" if frozen_member_rows is not None else "OTUB_F-COI\t0\t0\n"
     lock_summary = tmp_path / "lock.tsv"
     lock_summary.write_text(
-        "otu_key\teffective_consolidated\tis_frozen\n"
-        "OTUB_F-COI\t0\t1\n",
+        "otu_key\teffective_consolidated\tis_frozen\n" + (lock_summary_rows if lock_summary_rows is not None else default_lock_row),
         encoding="utf-8",
     )
     out = tmp_path / "round_report.json"
@@ -71,11 +79,26 @@ def _run_frozen_assignment_case(
     if otu_def_rows is not None:
         otu_def = tmp_path / "otu_def.tsv"
         otu_def.write_text(
-            "read_id\tsample\tOTU_id\n"
-            f"{otu_def_rows}",
+            f"{otu_def_header}{otu_def_rows}",
             encoding="utf-8",
         )
         args.extend(["--otu-def", str(otu_def)])
+    if frozen_member_rows is not None:
+        state_dir = tmp_path / "_state"
+        state_dir.mkdir(exist_ok=True)
+        rep_hash_member_id = rep_hash_member_id or "rep1|COI|sup|barcode=|adapter=sample_A"
+        (tmp_path / "RTBioScan_otu_hash_map.tsv").write_text(
+            f"{rep_hash_member_id}\th1\n",
+            encoding="utf-8",
+        )
+        (state_dir / "otu_frozen_meta.tsv").write_text(
+            f"FROZEN_h1\t{rep_hash_member_id}\th1\n",
+            encoding="utf-8",
+        )
+        (state_dir / "otu_frozen_members.tsv").write_text(
+            frozen_member_rows,
+            encoding="utf-8",
+        )
     if extra_args:
         args.extend(extra_args)
     result = _run(args)
@@ -244,7 +267,7 @@ def test_report_round_json_basic(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["run_id"] == "runA"
-    assert data["schema_version"] == "1.7"
+    assert data["schema_version"] == "2.0"
     assert data["barcode"] == "RTBioScan"
     assert data["round_barcode"] == "output_round_1"
     assert data["reads"]["total"] == 2
@@ -258,7 +281,7 @@ def test_report_round_json_basic(tmp_path: Path) -> None:
     assert "species" in assignments
     assert assignments["species"][0]["taxon"] == "S1"
     assert assignments["species"][0]["otu_count"] == 1
-    assert assignments["species"][0]["reads_total"] == 5
+    assert assignments["species"][0]["reads_total"] == 2
     assert data["otu"]["canonical"]["frozen_not_consolidated"] == 0
     assert data["otu"]["canonical"]["active_not_frozen"] == 1
     assert data["otu"]["canonical"]["informative_dynamic"] == 0
@@ -725,10 +748,10 @@ def test_report_round_json_emits_frozen_and_consolidated_read_totals(tmp_path: P
 
     otu_row = data["otu"]["assignments_by_level"]["species"][0]
     assert otu_row["taxon"] == "S1"
-    assert otu_row["otu_count"] == 2
-    assert otu_row["frozen_otu_count"] == 1
-    assert otu_row["reads_total"] == 8
-    assert otu_row["frozen_otu_reads_total"] == 5
+    assert otu_row["otu_count"] == 1
+    assert otu_row["frozen_otu_count"] == 0
+    assert otu_row["reads_total"] == 1
+    assert otu_row["frozen_otu_reads_total"] is None
     assert "frozen_otu_reads_sample_total" not in otu_row
 
     cons_row = data["consensus"]["assignments_by_level"]["species"][0]
@@ -739,6 +762,355 @@ def test_report_round_json_emits_frozen_and_consolidated_read_totals(tmp_path: P
     assert cons_row["consolidated_consensus_reads_total"] == 10
 
 
+def test_otu_reads_sample_total_per_sample(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_B\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "a1\tsample_A\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a2\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "a3\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "a4\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "b1\tsample_B\tOTUB_F-COI\tMEMBER\n"
+            "b2\tsample_B\tOTUB_F-COI\tMEMBER\n"
+        ),
+        otu_size=6,
+    )
+
+    assert data["schema_version"] == "2.0"
+    sample_a_row = _otu_species_row_by_sample(data, "sample_A")
+    sample_b_row = _otu_species_row_by_sample(data, "sample_B")
+    assert sample_a_row["otu_reads_sample_total"] == 4
+    assert sample_b_row["otu_reads_sample_total"] == 2
+    assert sample_a_row["reads_total"] == 4
+    assert sample_b_row["reads_total"] == 2
+
+
+def test_otu_reads_sample_total_sums_across_otus_in_same_taxon_row(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "f1\tsample_A\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "f2\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "f3\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "a1\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\n"
+            "a2\tsample_A\tOTUB_A-COI\tMEMBER\n"
+            "a3\tsample_A\tOTUB_A-COI\tMEMBER\n"
+            "a4\tsample_A\tOTUB_A-COI\tMEMBER\n"
+            "a5\tsample_A\tOTUB_A-COI\tMEMBER\n"
+        ),
+        otu_sizes_rows=(
+            "OTUB_F-COI\t3\n"
+            "OTUB_A-COI\t5\n"
+        ),
+        lock_summary_rows=(
+            "OTUB_F-COI\t0\t1\n"
+            "OTUB_A-COI\t0\t0\n"
+        ),
+        frozen_member_rows=(
+            "FROZEN_h1\tf1|COI|sup|barcode=|adapter=sample_A\t0\n"
+            "FROZEN_h1\tf2|COI|sup|barcode=|adapter=sample_A\t0\n"
+            "FROZEN_h1\tf3|COI|sup|barcode=|adapter=sample_A\t0\n"
+        ),
+        rep_hash_member_id="f1|COI|sup|barcode=|adapter=sample_A",
+    )
+
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["otu_count"] == 2
+    assert row["otu_reads_sample_total"] == 8
+    assert row["reads_total"] == 8
+    assert row["frozen_otu_reads_total"] == 3
+
+
+def test_otu_reads_sample_total_collapse_mode(tmp_path: Path) -> None:
+    roster = tmp_path / "samples.txt"
+    roster.write_text("sample_A\n", encoding="utf-8")
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A_1\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_A_2\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "a1\tsample_A_1\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a2\tsample_A_1\tOTUB_F-COI\tMEMBER\n"
+            "b1\tsample_A_2\tOTUB_F-COI\tMEMBER\n"
+            "b2\tsample_A_2\tOTUB_F-COI\tMEMBER\n"
+            "b3\tsample_A_2\tOTUB_F-COI\tMEMBER\n"
+        ),
+        otu_size=5,
+        extra_args=["--identity-mode", "collapse", "--sample-roster", str(roster)],
+    )
+
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["otu_reads_sample_total"] == 5
+    assert row["reads_total"] == 5
+
+
+def test_otu_reads_sample_total_track_mode(tmp_path: Path) -> None:
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text("track_id\nsample_A_1\nsample_A_2\n", encoding="utf-8")
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A_1\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_A_2\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "a1\tsample_A_1\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a2\tsample_A_1\tOTUB_F-COI\tMEMBER\n"
+            "b1\tsample_A_2\tOTUB_F-COI\tMEMBER\n"
+            "b2\tsample_A_2\tOTUB_F-COI\tMEMBER\n"
+            "b3\tsample_A_2\tOTUB_F-COI\tMEMBER\n"
+        ),
+        otu_size=5,
+        extra_args=["--identity-mode", "track", "--sample-roster", str(roster)],
+    )
+
+    sample_a_row = _otu_species_row_by_sample(data, "sample_A_1")
+    sample_b_row = _otu_species_row_by_sample(data, "sample_A_2")
+    assert sample_a_row["otu_reads_sample_total"] == 2
+    assert sample_b_row["otu_reads_sample_total"] == 3
+
+
+def test_otu_reads_sample_total_track_mode_normalizes_identity_value_marker_suffix(tmp_path: Path) -> None:
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text("track_id\nsample_A_1\nsample_A_2\n", encoding="utf-8")
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A_1_COI\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_A_2_COI\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_header=(
+            "read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\t"
+            "subsample\treplicate\tidentity_scope\tidentity_value\tOTU_id\tOTU_role\n"
+        ),
+        otu_def_rows=(
+            "a1\tCOI\thac\tsample_A_1_COI\tunknown\tunknown\tunknown\tunknown\tunit\tsample_A_1_COI\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a2\tCOI\thac\tsample_A_1_COI\tunknown\tunknown\tunknown\tunknown\tunit\tsample_A_1_COI\tOTUB_F-COI\tMEMBER\n"
+            "b1\tCOI\thac\tsample_A_2_COI\tunknown\tunknown\tunknown\tunknown\tunit\tsample_A_2_COI\tOTUB_F-COI\tMEMBER\n"
+            "b2\tCOI\thac\tsample_A_2_COI\tunknown\tunknown\tunknown\tunknown\tunit\tsample_A_2_COI\tOTUB_F-COI\tMEMBER\n"
+            "b3\tCOI\thac\tsample_A_2_COI\tunknown\tunknown\tunknown\tunknown\tunit\tsample_A_2_COI\tOTUB_F-COI\tMEMBER\n"
+        ),
+        otu_size=5,
+        extra_args=["--identity-mode", "track", "--sample-roster", str(roster)],
+    )
+
+    sample_a_row = _otu_species_row_by_sample(data, "sample_A_1")
+    sample_b_row = _otu_species_row_by_sample(data, "sample_A_2")
+    assert sample_a_row["otu_reads_sample_total"] == 2
+    assert sample_b_row["otu_reads_sample_total"] == 3
+    assert all(row["sample"] not in {"sample_A_1_COI", "sample_A_2_COI"} for row in data["otu"]["assignments_by_level"]["species"])
+
+
+def test_otu_reads_sample_total_track_mode_prefers_no_adapter_over_unknown_identity_value(tmp_path: Path) -> None:
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text("track_id\nsample_A_1\n", encoding="utf-8")
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="r1\tCOI\thac\tno_adapter\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_def_header=(
+            "read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\t"
+            "subsample\treplicate\tidentity_scope\tidentity_value\tOTU_id\tOTU_role\n"
+        ),
+        otu_def_rows=(
+            "a1\tCOI\thac\tno_adapter\tunknown\tunknown\tunknown\tunknown\tunit\tunknown\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a2\tCOI\thac\tno_adapter\tunknown\tunknown\tunknown\tunknown\tunit\tunknown\tOTUB_F-COI\tMEMBER\n"
+            "a3\tCOI\thac\tno_adapter\tunknown\tunknown\tunknown\tunknown\tunit\tunknown\tOTUB_F-COI\tMEMBER\n"
+        ),
+        otu_size=3,
+        extra_args=["--identity-mode", "track", "--sample-roster", str(roster)],
+    )
+
+    row = _otu_species_row_by_sample(data, "no_adapter")
+    assert row["otu_reads_sample_total"] == 3
+    assert all(r["sample"] != "unknown" for r in data["otu"]["assignments_by_level"]["species"])
+
+
+def test_otu_reads_sample_total_track_mode_prefers_no_adapter_over_mixed_case_unknown_identity_value(tmp_path: Path) -> None:
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text("track_id\nsample_A_1\n", encoding="utf-8")
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="r1\tCOI\thac\tno_adapter\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_def_header=(
+            "read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\t"
+            "subsample\treplicate\tidentity_scope\tidentity_value\tOTU_id\tOTU_role\n"
+        ),
+        otu_def_rows=(
+            "a1\tCOI\thac\tno_adapter\tunknown\tunknown\tunknown\tunknown\tunit\tUnknown\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a2\tCOI\thac\tno_adapter\tunknown\tunknown\tunknown\tunknown\tunit\tUNKNOWN\tOTUB_F-COI\tMEMBER\n"
+            "a3\tCOI\thac\tno_adapter\tunknown\tunknown\tunknown\tunknown\tunit\tUnKnOwN\tOTUB_F-COI\tMEMBER\n"
+        ),
+        otu_size=3,
+        extra_args=["--identity-mode", "track", "--sample-roster", str(roster)],
+    )
+
+    row = _otu_species_row_by_sample(data, "no_adapter")
+    assert row["otu_reads_sample_total"] == 3
+    assert all((r["sample"] or "").lower() != "unknown" for r in data["otu"]["assignments_by_level"]["species"])
+
+
+def test_otu_reads_sample_total_keeps_no_adapter_reads(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tno_adapter\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tno_adapter_1\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "a1\tno_adapter\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a2\tno_adapter\tOTUB_F-COI\tMEMBER\n"
+            "b1\tno_adapter_1\tOTUB_F-COI\tMEMBER\n"
+            "b2\tno_adapter_1\tOTUB_F-COI\tMEMBER\n"
+        ),
+        otu_size=4,
+    )
+
+    row = _otu_species_row_by_sample(data, "no_adapter")
+    assert row["otu_reads_sample_total"] == 4
+    assert row["reads_total"] == 4
+
+
+def test_otu_reads_sample_total_absent_without_otu_def(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_def_rows=None,
+    )
+
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["otu_reads_sample_total"] == 1
+    assert row["reads_total"] == 1
+    assert row["otu_reads_global_total"] == 7
+
+
+def test_otu_assignment_without_otu_def_keeps_sample_specific_blast_evidence(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thitA\t123\t90\t95\tOTUB_F-COI\tF1\tG1\t\n"
+            "r2\tCOI\thac\tsample_B\thitB\t123\t110\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=None,
+        otu_size=3,
+    )
+
+    species_rows = data["otu"]["assignments_by_level"]["species"]
+    genus_rows = data["otu"]["assignments_by_level"]["genus"]
+    assert len(species_rows) == 1
+    assert species_rows[0]["sample"] == "sample_B"
+    assert species_rows[0]["taxon"] == "S1"
+    sample_a_genus = next(row for row in genus_rows if row["sample"] == "sample_A")
+    assert sample_a_genus["taxon"] == "G1"
+    assert sample_a_genus["perc_id_min"] == 95
+    assert sample_a_genus["perc_id_max"] == 95
+
+
+def test_otu_assignment_propagates_assigned_otu_to_member_samples(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_def_rows=(
+            "a1\tsample_A\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a2\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "a3\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "a4\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "b1\tsample_B\tOTUB_F-COI\tMEMBER\n"
+            "b2\tsample_B\tOTUB_F-COI\tMEMBER\n"
+        ),
+        otu_size=6,
+    )
+
+    sample_a_row = _otu_species_row_by_sample(data, "sample_A")
+    sample_b_row = _otu_species_row_by_sample(data, "sample_B")
+    assert sample_a_row["taxon"] == "S1"
+    assert sample_b_row["taxon"] == "S1"
+    assert sample_a_row["otu_reads_sample_total"] == 4
+    assert sample_b_row["otu_reads_sample_total"] == 2
+    assert sample_a_row["reads_total"] == 4
+    assert sample_b_row["reads_total"] == 2
+    assert sample_a_row["perc_id_max"] == 99
+    assert sample_b_row["perc_id_max"] == 99
+
+
+def test_otu_assignment_canonicalization_promotes_existing_rows_to_species(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thitA\t123\t90\t95\tOTUB_F-COI\tF1\tG1\t\n"
+            "r2\tCOI\thac\tsample_B\thitB\t123\t110\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "a1\tsample_A\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a2\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "b1\tsample_B\tOTUB_F-COI\tMEMBER\n"
+        ),
+        otu_size=3,
+    )
+
+    sample_a_row = _otu_species_row_by_sample(data, "sample_A")
+    sample_b_row = _otu_species_row_by_sample(data, "sample_B")
+    assert sample_a_row["taxon"] == "S1"
+    assert sample_b_row["taxon"] == "S1"
+    assert sample_a_row["perc_id_min"] == 99
+    assert sample_a_row["perc_id_max"] == 99
+    assert sample_b_row["perc_id_min"] == 99
+    assert sample_b_row["perc_id_max"] == 99
+
+
+def test_otu_assignment_canonicalization_can_downgrade_species_rows(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thitA\t123\t100\t96\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_B\thitB\t123\t110\t99\tOTUB_F-COI\tF1\tG1\t\n"
+        ),
+        otu_def_rows=(
+            "a1\tsample_A\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a2\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "b1\tsample_B\tOTUB_F-COI\tMEMBER\n"
+        ),
+        otu_size=3,
+    )
+
+    assert data["otu"]["assignments_by_level"]["species"] == []
+    genus_rows = data["otu"]["assignments_by_level"]["genus"]
+    assert {row["sample"] for row in genus_rows} == {"sample_A", "sample_B"}
+    assert all(row["taxon"] == "G1" for row in genus_rows)
+    assert all(row["perc_id_min"] == 99 for row in genus_rows)
+    assert all(row["perc_id_max"] == 99 for row in genus_rows)
+
+
+def test_otu_assignment_reads_total_falls_back_to_total_members_when_size_missing(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_def_rows=(
+            "a1\tsample_A\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a2\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "b1\tsample_B\tOTUB_F-COI\tMEMBER\n"
+            "b2\tsample_B\tOTUB_F-COI\tMEMBER\n"
+        ),
+        otu_sizes_rows="otu_id\tsize\n",
+    )
+
+    sample_a_row = _otu_species_row_by_sample(data, "sample_A")
+    sample_b_row = _otu_species_row_by_sample(data, "sample_B")
+    assert sample_a_row["reads_total"] == 2
+    assert sample_b_row["reads_total"] == 2
+    assert sample_a_row["otu_reads_sample_total"] == 2
+    assert sample_b_row["otu_reads_sample_total"] == 2
+
+
 def test_frozen_otu_reads_sample_total_per_sample(tmp_path: Path) -> None:
     data = _run_frozen_assignment_case(
         tmp_path,
@@ -747,20 +1119,28 @@ def test_frozen_otu_reads_sample_total_per_sample(tmp_path: Path) -> None:
             "r2\tCOI\thac\tsample_B\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
         ),
         otu_def_rows=(
-            "a1\tsample_A\tOTUB_F-COI\n"
-            "a2\tsample_A\tOTUB_F-COI\n"
-            "b1\tsample_B\tOTUB_F-COI\n"
-            "b2\tsample_B\tOTUB_F-COI\n"
-            "b3\tsample_B\tOTUB_F-COI\n"
+            "rep1\tno_adapter\tOTUB_F-COI\tREPRESENTATIVE\n"
         ),
+        frozen_member_rows=(
+            "FROZEN_h1\ta1|COI|sup|barcode=|adapter=sample_A\t0\n"
+            "FROZEN_h1\ta2|COI|sup|barcode=|adapter=sample_A\t0\n"
+            "FROZEN_h1\tb1|COI|sup|barcode=|adapter=sample_B\t0\n"
+            "FROZEN_h1\tb2|COI|sup|barcode=|adapter=sample_B\t0\n"
+            "FROZEN_h1\tb3|COI|sup|barcode=|adapter=sample_B\t0\n"
+        ),
+        rep_hash_member_id="rep1|COI|sup|barcode=|adapter=no_adapter|COI",
     )
 
     sample_a_row = _otu_species_row_by_sample(data, "sample_A")
     sample_b_row = _otu_species_row_by_sample(data, "sample_B")
     assert sample_a_row["frozen_otu_reads_sample_total"] == 2
     assert sample_b_row["frozen_otu_reads_sample_total"] == 3
-    assert sample_a_row["frozen_otu_reads_total"] == 7
-    assert sample_b_row["frozen_otu_reads_total"] == 7
+    assert sample_a_row["otu_reads_sample_total"] == 2
+    assert sample_b_row["otu_reads_sample_total"] == 3
+    assert sample_a_row["frozen_otu_reads_total"] == 2
+    assert sample_b_row["frozen_otu_reads_total"] == 3
+    assert sample_a_row["frozen_otu_reads_global_total"] == 7
+    assert sample_b_row["frozen_otu_reads_global_total"] == 7
 
 
 def test_frozen_otu_reads_sample_total_collapse_mode(tmp_path: Path) -> None:
@@ -773,18 +1153,23 @@ def test_frozen_otu_reads_sample_total_collapse_mode(tmp_path: Path) -> None:
             "r2\tCOI\thac\tsample_A_2\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
         ),
         otu_def_rows=(
-            "a1\tsample_A_1\tOTUB_F-COI\n"
-            "a2\tsample_A_1\tOTUB_F-COI\n"
-            "b1\tsample_A_2\tOTUB_F-COI\n"
-            "b2\tsample_A_2\tOTUB_F-COI\n"
-            "b3\tsample_A_2\tOTUB_F-COI\n"
+            "rep1\tno_adapter\tOTUB_F-COI\tREPRESENTATIVE\n"
         ),
+        frozen_member_rows=(
+            "FROZEN_h1\ta1|COI|sup|barcode=|adapter=sample_A_1\t0\n"
+            "FROZEN_h1\ta2|COI|sup|barcode=|adapter=sample_A_1\t0\n"
+            "FROZEN_h1\tb1|COI|sup|barcode=|adapter=sample_A_2\t0\n"
+            "FROZEN_h1\tb2|COI|sup|barcode=|adapter=sample_A_2\t0\n"
+            "FROZEN_h1\tb3|COI|sup|barcode=|adapter=sample_A_2\t0\n"
+        ),
+        rep_hash_member_id="rep1|COI|sup|barcode=|adapter=no_adapter|COI",
         extra_args=["--identity-mode", "collapse", "--sample-roster", str(roster)],
     )
 
     collapsed_row = _otu_species_row_by_sample(data, "sample_A")
     assert collapsed_row["frozen_otu_reads_sample_total"] == 5
-    assert collapsed_row["frozen_otu_reads_total"] == 7
+    assert collapsed_row["frozen_otu_reads_total"] == 5
+    assert collapsed_row["frozen_otu_reads_global_total"] == 7
 
 
 def test_frozen_otu_reads_sample_total_track_mode(tmp_path: Path) -> None:
@@ -797,12 +1182,16 @@ def test_frozen_otu_reads_sample_total_track_mode(tmp_path: Path) -> None:
             "r2\tCOI\thac\tsample_A_2\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
         ),
         otu_def_rows=(
-            "a1\tsample_A_1\tOTUB_F-COI\n"
-            "a2\tsample_A_1\tOTUB_F-COI\n"
-            "b1\tsample_A_2\tOTUB_F-COI\n"
-            "b2\tsample_A_2\tOTUB_F-COI\n"
-            "b3\tsample_A_2\tOTUB_F-COI\n"
+            "rep1\tno_adapter\tOTUB_F-COI\tREPRESENTATIVE\n"
         ),
+        frozen_member_rows=(
+            "FROZEN_h1\ta1|COI|sup|barcode=|adapter=sample_A_1\t0\n"
+            "FROZEN_h1\ta2|COI|sup|barcode=|adapter=sample_A_1\t0\n"
+            "FROZEN_h1\tb1|COI|sup|barcode=|adapter=sample_A_2\t0\n"
+            "FROZEN_h1\tb2|COI|sup|barcode=|adapter=sample_A_2\t0\n"
+            "FROZEN_h1\tb3|COI|sup|barcode=|adapter=sample_A_2\t0\n"
+        ),
+        rep_hash_member_id="rep1|COI|sup|barcode=|adapter=no_adapter|COI",
         extra_args=["--identity-mode", "track", "--sample-roster", str(roster)],
     )
 
@@ -820,17 +1209,113 @@ def test_frozen_otu_reads_sample_total_keeps_no_adapter_reads(tmp_path: Path) ->
             "r2\tCOI\thac\tno_adapter_1\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
         ),
         otu_def_rows=(
-            "a1\tno_adapter\tOTUB_F-COI\n"
-            "a2\tno_adapter\tOTUB_F-COI\n"
-            "b1\tno_adapter_1\tOTUB_F-COI\n"
-            "b2\tno_adapter_1\tOTUB_F-COI\n"
-            "b3\tno_adapter_1\tOTUB_F-COI\n"
+            "rep1\tno_adapter\tOTUB_F-COI\tREPRESENTATIVE\n"
         ),
+        frozen_member_rows=(
+            "FROZEN_h1\ta1|COI|sup|barcode=|adapter=no_adapter|COI\t0\n"
+            "FROZEN_h1\ta2|COI|sup|barcode=|adapter=no_adapter|COI\t0\n"
+            "FROZEN_h1\tb1|COI|sup|barcode=|adapter=no_adapter_1\t0\n"
+            "FROZEN_h1\tb2|COI|sup|barcode=|adapter=no_adapter_1\t0\n"
+            "FROZEN_h1\tb3|COI|sup|barcode=|adapter=no_adapter_1\t0\n"
+        ),
+        rep_hash_member_id="rep1|COI|sup|barcode=|adapter=no_adapter|COI",
     )
 
     row = _otu_species_row_by_sample(data, "no_adapter")
     assert row["frozen_otu_reads_sample_total"] == 5
-    assert row["frozen_otu_reads_total"] == 7
+    assert row["frozen_otu_reads_total"] == 5
+    assert row["frozen_otu_reads_global_total"] == 7
+
+
+def test_frozen_otu_rows_omitted_when_frozen_state_missing(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_B\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "rep1\tsample_A\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a1\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "b1\tsample_B\tOTUB_F-COI\tMEMBER\n"
+            "b2\tsample_B\tOTUB_F-COI\tMEMBER\n"
+        ),
+        lock_summary_rows="OTUB_F-COI\t0\t1\n",
+    )
+    assert data["otu"]["assignments_by_level"]["species"] == []
+
+
+def test_frozen_otu_rows_omitted_when_frozen_state_mapping_incomplete(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_B\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "rep1\tsample_A\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a1\tsample_A\tOTUB_F-COI\tMEMBER\n"
+            "b1\tsample_B\tOTUB_F-COI\tMEMBER\n"
+            "b2\tsample_B\tOTUB_F-COI\tMEMBER\n"
+        ),
+        frozen_member_rows=(
+            "FROZEN_h1\tx1|COI|sup|barcode=|adapter=other_sample\t0\n"
+            "FROZEN_h1\tx2|COI|sup|barcode=|adapter=other_sample\t0\n"
+        ),
+        rep_hash_member_id="different_rep|COI|sup|barcode=|adapter=other_sample",
+    )
+
+    assert data["otu"]["assignments_by_level"]["species"] == []
+
+
+def test_frozen_otu_reads_sample_total_absent_when_state_lacks_sample(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="r1\tCOI\thac\tno_adapter\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_def_rows=(
+            "rep1\tno_adapter\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a1\tno_adapter\tOTUB_F-COI\tMEMBER\n"
+            "a2\tno_adapter\tOTUB_F-COI\tMEMBER\n"
+        ),
+        frozen_member_rows=(
+            "FROZEN_h1\tx1|COI|sup|barcode=|adapter=other_sample\t0\n"
+            "FROZEN_h1\tx2|COI|sup|barcode=|adapter=other_sample\t0\n"
+        ),
+        rep_hash_member_id="rep1|COI|sup|barcode=|adapter=no_adapter|COI",
+    )
+
+    assert not any(row.get("sample") == "no_adapter" for row in data["otu"]["assignments_by_level"]["species"])
+    row = _otu_species_row_by_sample(data, "other_sample")
+    assert row["frozen_otu_count"] == 1
+    assert row["frozen_otu_reads_total"] == 2
+    assert row["frozen_otu_reads_sample_total"] == 2
+    assert row["frozen_otu_reads_global_total"] == 7
+
+
+def test_frozen_otu_reads_sample_total_uses_frozen_members_when_otu_def_sample_is_wrong(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="r1\tCOI\thac\tCS.D.P_2_MPold1\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_size=303,
+        otu_def_rows=(
+            "rep1\tno_adapter\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "m1\tGAG1.spiked_1_MPold1\tOTUB_F-COI\tMEMBER\n"
+            "m2\tGAG1.spiked_1_MPold1\tOTUB_F-COI\tMEMBER\n"
+        ),
+        frozen_member_rows=(
+            "FROZEN_h1\tm1|COI|sup|barcode=|adapter=GAG1.spiked_1_MPold1_COI\t0\n"
+            "FROZEN_h1\tm2|COI|sup|barcode=|adapter=GAG1.spiked_1_MPold1_COI\t0\n"
+            "FROZEN_h1\tm3|COI|sup|barcode=|adapter=CS.D.P_2_MPold1_COI\t0\n"
+        ),
+        rep_hash_member_id="rep1|COI|sup|barcode=|adapter=GAG1.spiked_1_MPold1_COI",
+    )
+
+    row = _otu_species_row_by_sample(data, "CS.D.P_MPold1")
+    assert row["frozen_otu_count"] == 1
+    assert row["frozen_otu_reads_total"] == 1
+    assert row["frozen_otu_reads_global_total"] == 303
+    assert row["frozen_otu_reads_sample_total"] == 1
+    assert row["otu_reads_sample_total"] == 1
 
 
 def test_frozen_otu_reads_sample_total_absent_with_empty_otu_def(tmp_path: Path) -> None:
@@ -838,11 +1323,119 @@ def test_frozen_otu_reads_sample_total_absent_with_empty_otu_def(tmp_path: Path)
         tmp_path,
         blast_rows="r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
         otu_def_rows="",
+        lock_summary_rows="OTUB_F-COI\t0\t1\n",
+    )
+    assert data["otu"]["assignments_by_level"]["species"] == []
+
+
+def test_frozen_otu_four_track_units_scope_isolation(tmp_path: Path) -> None:
+    """Regression: per-track frozen reads must be track-scoped, not the global OTU total."""
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text(
+        "track_id\nsample_T1\nsample_T2\nsample_T3\nsample_T4\n",
+        encoding="utf-8",
+    )
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "f_r1\tCOI\thac\tsample_T1\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "f_r2\tCOI\thac\tsample_T2\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "f_r3\tCOI\thac\tsample_T3\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "f_r4\tCOI\thac\tsample_T4\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "nf_r1\tCOI\thac\tsample_T1\thit\t123\t100\t99\tOTUB_NF-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "rep1\tno_adapter\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "rep2\tno_adapter\tOTUB_NF-COI\tREPRESENTATIVE\n"
+            "nf_m1\tsample_T1\tOTUB_NF-COI\tMEMBER\n"
+            "nf_m2\tsample_T1\tOTUB_NF-COI\tMEMBER\n"
+            "nf_m3\tsample_T1\tOTUB_NF-COI\tMEMBER\n"
+            "nf_m4\tsample_T1\tOTUB_NF-COI\tMEMBER\n"
+            "nf_m5\tsample_T1\tOTUB_NF-COI\tMEMBER\n"
+            "nf_m6\tsample_T1\tOTUB_NF-COI\tMEMBER\n"
+        ),
+        frozen_member_rows=(
+            "FROZEN_h1\tm1a|COI|sup|barcode=|adapter=sample_T1\t0\n"
+            "FROZEN_h1\tm1b|COI|sup|barcode=|adapter=sample_T1\t0\n"
+            "FROZEN_h1\tm1c|COI|sup|barcode=|adapter=sample_T1\t0\n"
+            "FROZEN_h1\tm1d|COI|sup|barcode=|adapter=sample_T1\t0\n"
+            "FROZEN_h1\tm1e|COI|sup|barcode=|adapter=sample_T1\t0\n"
+            "FROZEN_h1\tm1f|COI|sup|barcode=|adapter=sample_T1\t0\n"
+            "FROZEN_h1\tm1g|COI|sup|barcode=|adapter=sample_T1\t0\n"
+            "FROZEN_h1\tm2a|COI|sup|barcode=|adapter=sample_T2\t0\n"
+            "FROZEN_h1\tm2b|COI|sup|barcode=|adapter=sample_T2\t0\n"
+            "FROZEN_h1\tm2c|COI|sup|barcode=|adapter=sample_T2\t0\n"
+            "FROZEN_h1\tm3a|COI|sup|barcode=|adapter=sample_T3\t0\n"
+            "FROZEN_h1\tm3b|COI|sup|barcode=|adapter=sample_T3\t0\n"
+            "FROZEN_h1\tm3c|COI|sup|barcode=|adapter=sample_T3\t0\n"
+            "FROZEN_h1\tm3d|COI|sup|barcode=|adapter=sample_T3\t0\n"
+            "FROZEN_h1\tm4a|COI|sup|barcode=|adapter=sample_T4\t0\n"
+        ),
+        rep_hash_member_id="rep1|COI|sup|barcode=|adapter=no_adapter|COI",
+        otu_sizes_rows="OTUB_F-COI\t15\n",
+        lock_summary_rows=(
+            "OTUB_F-COI\t0\t1\n"
+            "OTUB_NF-COI\t0\t0\n"
+        ),
+        extra_args=["--identity-mode", "track", "--sample-roster", str(roster)],
     )
 
-    row = _otu_species_row_by_sample(data, "sample_A")
-    assert "frozen_otu_reads_sample_total" not in row
-    assert row["frozen_otu_reads_total"] == 7
+    r1 = _otu_species_row_by_sample(data, "sample_T1")
+    r2 = _otu_species_row_by_sample(data, "sample_T2")
+    r3 = _otu_species_row_by_sample(data, "sample_T3")
+    r4 = _otu_species_row_by_sample(data, "sample_T4")
+
+    assert r1["reads_total"] == 13
+    assert r1["frozen_otu_reads_total"] == 7
+    assert r2["frozen_otu_reads_total"] == 3
+    assert r3["frozen_otu_reads_total"] == 4
+    assert r4["frozen_otu_reads_total"] == 1
+
+    for row in (r1, r2, r3, r4):
+        assert row["frozen_otu_reads_total"] != 15, (
+            f"track unit {row['sample']} shows global total 15; scope bleed detected"
+        )
+        assert row["frozen_otu_reads_sample_total"] == row["frozen_otu_reads_total"]
+        assert row["frozen_otu_reads_global_total"] == 15
+
+
+def test_frozen_otu_reads_invariants_hold_for_all_rows(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "r2\tCOI\thac\tsample_B\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows="rep1\tno_adapter\tOTUB_F-COI\tREPRESENTATIVE\n",
+        frozen_member_rows=(
+            "FROZEN_h1\ta1|COI|sup|barcode=|adapter=sample_A\t0\n"
+            "FROZEN_h1\ta2|COI|sup|barcode=|adapter=sample_A\t0\n"
+            "FROZEN_h1\tb1|COI|sup|barcode=|adapter=sample_B\t0\n"
+            "FROZEN_h1\tb2|COI|sup|barcode=|adapter=sample_B\t0\n"
+            "FROZEN_h1\tb3|COI|sup|barcode=|adapter=sample_B\t0\n"
+        ),
+        rep_hash_member_id="rep1|COI|sup|barcode=|adapter=no_adapter|COI",
+    )
+
+    for level in ("species", "genus", "family"):
+        for row in data["otu"]["assignments_by_level"][level]:
+            ctx = f"[{level}] sample={row.get('sample')} taxon={row.get('taxon')}"
+            if row.get("frozen_otu_reads_total") is not None and row.get("reads_total") is not None:
+                assert row["frozen_otu_reads_total"] <= row["reads_total"], (
+                    f"{ctx}: frozen_otu_reads_total > reads_total"
+                )
+            if row.get("frozen_otu_reads_sample_total") is not None and row.get("otu_reads_sample_total") is not None:
+                assert row["frozen_otu_reads_sample_total"] <= row["otu_reads_sample_total"], (
+                    f"{ctx}: frozen_otu_reads_sample_total > otu_reads_sample_total"
+                )
+            if row.get("frozen_otu_count", 0) > 0:
+                assert row.get("frozen_otu_reads_sample_total", 0) > 0, (
+                    f"{ctx}: frozen_otu_count without positive frozen sample reads"
+                )
+            assert row.get("frozen_otu_count", 0) <= row.get("otu_count", 0), (
+                f"{ctx}: frozen_otu_count > otu_count"
+            )
+    assert not any("invariant:" in warning for warning in data.get("warnings", []))
 
 
 def test_fate_size_streak_enforce_missing_file(tmp_path: Path) -> None:

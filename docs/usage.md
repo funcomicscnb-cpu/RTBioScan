@@ -2057,7 +2057,7 @@ Enable or disable incremental HTML report rendering (`${params.outdir}/report_ht
      - run report: `${params.outdir}/report_html/runs/<run_id>/report.html`
 - History dedupe key is `run_id + barcode + round_barcode` (resume-safe).
 - Missing source TSVs are recorded in `warnings[]`; report generation does not fail the round.
-- Report schema version is `1.7`.
+- Report schema version is `2.0`.
 - `otu.canonical.active` is a unique OTU count (`OTU_id`/`otu_id`), not read rows.
 - `blast.mode` reflects pipeline mode (`off|observe|enforce`); `blast.missing_policy` reports `keep|drop`.
 - HTML rendering sorts rounds by `timestamp_utc` (missing timestamps last), then `round_barcode`, then `barcode`.

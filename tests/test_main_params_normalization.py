@@ -2806,7 +2806,7 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'cp "${barcode}_summary_demult_rpt.txt" "${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt"' in summary_block
     assert '--demult "${demult_rpt}" \\' in summary_block
     assert '--read-fate-demult "${barcode}_read_fate_demult_first_seen.tsv" \\' in summary_block
-    assert '--schema-version "1.7" \\' in summary_block
+    assert '--schema-version "2.0" \\' in summary_block
     assert '--otu-sizes-round "${otu_sizes_round}" \\' in summary_block
     assert '--otu-size-streak "\\$ROUND_DIR/${barcode}_otu_size_streak.tsv" \\' in summary_block
     assert '--active-prune-counts "\\$ACTIVE_PRUNE_COUNTS_OUT" \\' in summary_block
