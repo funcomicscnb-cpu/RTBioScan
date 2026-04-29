@@ -933,7 +933,6 @@ _best_consensus_addition() {
 			[ -s "$_bca_ts" ] && awk 'BEGIN{RS=">"; ORS=""} NR>1 {h=$1; sub(/\n.*/, "", h); if(!seen[h]++){print ">"$0}}' "$_bca_ts" > "$_bca_sup"
 			rm -f "$_bca_tr" "$_bca_ts"
 		else
-			: > "$_bca_orig"
 			[ -f "$_bca_out_dir/${_bca_sel_otu}_all_reads.list"  ] && cat "$_bca_out_dir/${_bca_sel_otu}_all_reads.list"  >> "$_bca_orig"
 			[ -f "$_bca_out_dir/${_bca_sel_otu}_reads_sup.fasta" ] && cat "$_bca_out_dir/${_bca_sel_otu}_reads_sup.fasta" >  "$_bca_sup"
 		fi
@@ -1618,34 +1617,21 @@ while IFS= read -r sample; do
 		# O1b: batch pool extraction
 		if [ -s "$_union_pool_ids" ]; then
 			LC_ALL=C sort -u "$_union_pool_ids" -o "$_union_pool_ids"
-			_pool_fetch_ids="$_union_pool_ids.present"
-			_pool_id_count=$(wc -l < "$_union_pool_ids" 2>/dev/null | tr -d ' ' || echo 0)
-			_pool_id_count=${_pool_id_count:-0}
 			if [ -f "${sup_reads}.fai" ] && command -v samtools >/dev/null 2>&1; then
-				awk 'NR==FNR { have[$1]=1; next } ($1 in have) { print $1 }' "${sup_reads}.fai" "$_union_pool_ids" > "$_pool_fetch_ids"
-				_pool_present_count=$(wc -l < "$_pool_fetch_ids" 2>/dev/null | tr -d ' ' || echo 0)
-				_pool_present_count=${_pool_present_count:-0}
-				_pool_missing_count=$(( _pool_id_count - _pool_present_count ))
-				if [ "$_pool_missing_count" -gt 0 ]; then
-					cons_log "WARN: O1b skipped $_pool_missing_count pool IDs absent from accumulated FASTA for sample=$sample"
-				fi
-				if [ "$_pool_present_count" -gt 0 ]; then
-					if ! samtools faidx -r "$_pool_fetch_ids" "$sup_reads" > "$_union_pool_reads" 2>/dev/null; then
-						cons_log "WARN: O1b samtools faidx failed for present pool IDs; falling back to seqtk"
-						if ! seqtk subseq "$sup_reads" "$_pool_fetch_ids" > "$_union_pool_reads"; then
-							echo "ERROR: O1b seqtk fallback failed for pool extraction: sup_reads=$sup_reads union_ids=$_pool_fetch_ids" 1>&2
-							exit 1
-						fi
+				if ! samtools faidx -r "$_union_pool_ids" "$sup_reads" > "$_union_pool_reads" 2>/dev/null; then
+					cons_log "WARN: O1b samtools faidx failed (likely missing IDs); falling back to seqtk"
+					if ! seqtk subseq "$sup_reads" "$_union_pool_ids" > "$_union_pool_reads"; then
+						echo "ERROR: O1b seqtk fallback failed for pool extraction: sup_reads=$sup_reads union_ids=$_union_pool_ids" 1>&2
+						exit 1
 					fi
-				else
-					: > "$_union_pool_reads"
 				fi
-				# Guard empty output even after present-ID prefilter.
+				# samtools exits 0 even when IDs are absent; fall back to seqtk if output is empty but IDs were non-empty
+				_pool_id_count=$(wc -l < "$_union_pool_ids" 2>/dev/null || echo 0)
 				_pool_extracted=$(grep -c '^>' "$_union_pool_reads" 2>/dev/null || true)
 				_pool_extracted=${_pool_extracted:-0}
-				if [ "$_pool_extracted" -eq 0 ] && [ "$_pool_present_count" -gt 0 ]; then
-					cons_log "WARN: O1b samtools returned empty output for $_pool_present_count present pool IDs; falling back to seqtk"
-					if ! seqtk subseq "$sup_reads" "$_pool_fetch_ids" > "$_union_pool_reads"; then
+				if [ "$_pool_extracted" -eq 0 ] && [ "$_pool_id_count" -gt 0 ]; then
+					cons_log "WARN: O1b samtools returned empty output for $_pool_id_count pool IDs; falling back to seqtk"
+					if ! seqtk subseq "$sup_reads" "$_union_pool_ids" > "$_union_pool_reads"; then
 						echo "ERROR: O1b seqtk fallback failed for pool extraction: sup_reads=$sup_reads union_ids=$_union_pool_ids" 1>&2
 						exit 1
 					fi
@@ -2190,24 +2176,10 @@ while IFS= read -r sample; do
 				sort -u "$union_cand_ids" -o "$union_cand_ids"
 				if [ -f "${sup_reads}.fai" ] && command -v samtools >/dev/null 2>&1; then
 					# O1: indexed random-access extraction — O(n_candidates) instead of O(n_total_reads).
-					# Some samtools builds exit nonzero when any requested ID is absent, so prefilter via .fai.
-					union_cand_fetch_ids="${union_cand_ids}.present"
-					union_cand_total=$(wc -l < "$union_cand_ids" 2>/dev/null | tr -d ' ' || echo 0)
-					union_cand_total=${union_cand_total:-0}
-					awk 'NR==FNR { have[$1]=1; next } ($1 in have) { print $1 }' "${sup_reads}.fai" "$union_cand_ids" > "$union_cand_fetch_ids"
-					union_cand_present=$(wc -l < "$union_cand_fetch_ids" 2>/dev/null | tr -d ' ' || echo 0)
-					union_cand_present=${union_cand_present:-0}
-					union_cand_missing=$(( union_cand_total - union_cand_present ))
-					if [ "$union_cand_missing" -gt 0 ]; then
-						cons_log "WARN: candidate batch skipped $union_cand_missing IDs absent from accumulated FASTA for sample=$sample"
-					fi
-					if [ "$union_cand_present" -gt 0 ]; then
-						if ! samtools faidx -r "$union_cand_fetch_ids" "$sup_reads" > "$union_cand_reads"; then
-							echo "ERROR: Consensus batch samtools extraction failed: sample=$sample sup_reads=$sup_reads union_ids=$union_cand_fetch_ids" 1>&2
-							exit 1
-						fi
-					else
-						: > "$union_cand_reads"
+					# samtools faidx exits 0 even when some IDs are absent (prints warnings to stderr).
+					if ! samtools faidx -r "$union_cand_ids" "$sup_reads" > "$union_cand_reads"; then
+						echo "ERROR: Consensus batch samtools extraction failed: sample=$sample sup_reads=$sup_reads union_ids=$union_cand_ids" 1>&2
+						exit 1
 					fi
 				else
 					if ! seqtk subseq "$sup_reads" "$union_cand_ids" > "$union_cand_reads"; then

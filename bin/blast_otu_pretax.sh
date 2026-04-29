@@ -142,7 +142,7 @@ run_target_worker() {
 	fi
 
 	if [ -s "$preblast_report" ]; then
-		sed 's/,/;/g' "$preblast_report" | sed -E 's/\;\S+\|\S+\|/\;/' > "$blast_report"
+		sed 's/,/;/g' "$preblast_report" | sed -E 's/;[^;|]+\|[^;|]+\|/;/' > "$blast_report"
 		target_tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/rtbioscan_blast_taxdepth_${idx}.XXXXXX")"
 		if (
 			cd "$target_tmp_dir"

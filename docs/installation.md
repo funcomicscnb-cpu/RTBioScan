@@ -63,7 +63,7 @@ RTBioScan is a Nextflow DSL1 pipeline for real-time ONT metabarcoding. It requir
 | samtools | ≥ 1.16 | `samtools` must be in `PATH` |
 | LAST | ≥ 1400 | `lastal` must be in `PATH` |
 | pod5 | ≥ 0.2 | Required for `RTBioScan.sh --feeder` / `--do_metadata`; optional for direct pre-sliced POD5 runs |
-| taxonkit | any | Optional; used for full lineage retrieval |
+| taxonkit | any | **Required** for taxonomy resolution; if absent all taxa silently return `Unassigned` |
 | Dorado | 0.7.x (arm64 / x86-64) | Bundled in `bin/dorado/bin/dorado` |
 | BLAST databases | — | Provided separately (see §7) |
 
@@ -116,8 +116,13 @@ brew install blast cd-hit vsearch seqtk seqkit samtools
 brew tap brewsci/bio
 brew install last
 
-# Optional helper
-brew install taxonkit     # Full lineage retrieval
+# Required for taxonomy resolution (taxonkit is called by get_blast_taxdepth.pl;
+# if absent all taxa silently return Unassigned)
+brew install taxonkit
+
+# Download NCBI taxdump — taxonkit reads these files at runtime from ~/.taxonkit/
+mkdir -p ~/.taxonkit
+curl -L ftp://ftp.ncbi.nih.gov/pub/taxonomy/taxdump.tar.gz | tar -xz -C ~/.taxonkit
 ```
 
 Install the Python-packaged CLIs (`cutadapt` and `pod5`) in [§4 Python](#4-python) after Python itself is available.
@@ -145,6 +150,10 @@ conda create -n rtbioscan -c bioconda -c conda-forge \
   pod5
 
 conda activate rtbioscan
+
+# Download NCBI taxdump — taxonkit reads these files at runtime from ~/.taxonkit/
+mkdir -p ~/.taxonkit
+curl -L ftp://ftp.ncbi.nih.gov/pub/taxonomy/taxdump.tar.gz | tar -xz -C ~/.taxonkit
 ```
 
 Or with `apt` on Debian/Ubuntu (versions in the repositories may be older):
@@ -201,6 +210,9 @@ BiocManager::install(c(
   "DECIPHER",     # AlignSeqs / ConsensusSequence
   "muscle"        # Alignment back-end used by DECIPHER
 ))
+# IMPORTANT: DECIPHER 3.x (Bioconductor ≥ 3.19 / R ≥ 4.4) removed the
+# ignoreNonBases parameter used by Consensus_simple.R. Use R 4.3 +
+# Bioconductor 3.18 (DECIPHER 2.30.x) until the pipeline is updated.
 
 # Phylogenetics (optional — needed for tree visualisation outputs)
 install.packages("treemapify")
@@ -411,7 +423,7 @@ python3 -m pytest tests/ -q
 A quick tool availability check:
 
 ```bash
-for tool in blastn cd-hit-est vsearch cutadapt seqtk seqkit samtools lastal perl python3; do
+for tool in blastn cd-hit-est vsearch cutadapt seqtk seqkit samtools lastal taxonkit perl python3; do
   command -v "$tool" >/dev/null 2>&1 \
     && echo "OK  $tool ($(command -v $tool))" \
     || echo "MISSING  $tool"
