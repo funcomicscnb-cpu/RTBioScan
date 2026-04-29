@@ -11,6 +11,8 @@
 * [2. System tools](#2-system-tools)
   * [macOS (Apple Silicon — Homebrew recommended)](#macos-apple-silicon--homebrew-recommended)
   * [Linux](#linux)
+    * [Using the bundled environment.yml (recommended)](#using-the-bundled-environmentyml-recommended)
+    * [Post-install steps (Linux)](#post-install-steps-linux)
 * [3. R and Bioconductor packages](#3-r-and-bioconductor-packages)
 * [4. Python](#4-python)
 * [5. Perl modules](#5-perl-modules)
@@ -18,6 +20,7 @@
   * [macOS Apple Silicon](#macos-apple-silicon)
   * [Linux x86-64 (CUDA GPU)](#linux-x86-64-cuda-gpu)
   * [Linux x86-64 (CPU only)](#linux-x86-64-cpu-only)
+  * [GPU architecture compatibility (NVIDIA)](#gpu-architecture-compatibility-nvidia)
   * [Dorado basecalling models](#dorado-basecalling-models)
   * [Configuring the device](#configuring-the-device)
 * [7. BLAST databases](#7-blast-databases)
@@ -64,7 +67,7 @@ RTBioScan is a Nextflow DSL1 pipeline for real-time ONT metabarcoding. It requir
 | LAST | ≥ 1400 | `lastal` must be in `PATH` |
 | pod5 | ≥ 0.2 | Required for `RTBioScan.sh --feeder` / `--do_metadata`; optional for direct pre-sliced POD5 runs |
 | taxonkit | any | **Required** for taxonomy resolution; if absent all taxa silently return `Unassigned` |
-| Dorado | 0.7.x (arm64 / x86-64) | Bundled in `bin/dorado/bin/dorado` |
+| Dorado | 0.7.x (arm64 / x86-64); **1.0+ for NVIDIA RTX 50xx (Blackwell)** | Bundled in `bin/dorado/bin/dorado`; see [§6 GPU compatibility](#gpu-architecture-compatibility-nvidia) |
 | BLAST databases | — | Provided separately (see §7) |
 
 ---
@@ -134,7 +137,21 @@ Install the Python-packaged CLIs (`cutadapt` and `pod5`) in [§4 Python](#4-pyth
 ### Linux
 [back to Top](#rtbioscan-installation)
 
-Conda is the most reproducible approach on Linux:
+Conda is the most reproducible approach on Linux.
+
+#### Using the bundled `environment.yml` (recommended)
+[back to Top](#rtbioscan-installation)
+
+The repository ships an `environment.yml` that pins every dependency, including
+`r-base =4.3` (R 4.4+ breaks the Bioconductor packages used for consensus
+generation — see [§3](#3-r-and-bioconductor-packages)):
+
+```bash
+conda env create -f environment.yml
+conda activate rtbioscan
+```
+
+Alternatively, create the environment manually with explicit versions:
 
 ```bash
 conda create -n rtbioscan -c bioconda -c conda-forge \
@@ -155,6 +172,36 @@ conda activate rtbioscan
 mkdir -p ~/.taxonkit
 curl -L ftp://ftp.ncbi.nih.gov/pub/taxonomy/taxdump.tar.gz | tar -xz -C ~/.taxonkit
 ```
+
+#### Post-install steps (Linux)
+[back to Top](#rtbioscan-installation)
+
+**Nextflow symlink** — tests and some wrapper scripts resolve Nextflow as
+`nextflow` at the repository root. On Linux, Nextflow is installed as a
+standalone binary (not bundled in the repo). After cloning, create a symlink:
+
+```bash
+# Install Nextflow 22.10.8 if you haven't already
+curl -fsSL https://github.com/nextflow-io/nextflow/releases/download/v22.10.8/nextflow \
+  -o ~/bin/nextflow && chmod +x ~/bin/nextflow
+
+# Create the repo-root symlink (in .gitignore — recreate after fresh clones)
+cd /path/to/RTBioScan
+ln -sf ~/bin/nextflow nextflow
+```
+
+**Locale** — the default system locale on many Linux distributions uses commas
+as decimal separators (e.g. `es_ES.UTF-8`). This breaks `awk` float arithmetic
+and `$EPOCHREALTIME` parsing in several pipeline scripts. Set the following
+before activating the conda environment, or add them to `~/.bashrc`:
+
+```bash
+export LC_NUMERIC=C
+export LANG=en_US.UTF-8
+```
+
+The pipeline runner scripts (`run_*.sh`) set these automatically. When running
+`pytest`, `conftest.py` at the repo root injects them for all test subprocesses.
 
 Or with `apt` on Debian/Ubuntu (versions in the repositories may be older):
 
@@ -177,7 +224,12 @@ conda install -c bioconda seqkit last
 ## 3. R and Bioconductor packages
 [back to Top](#rtbioscan-installation)
 
-R ≥ 4.0 is required. Install R itself before the packages:
+R ≥ 4.0 is required, but **R must be pinned to 4.3.x on Linux**. R 4.4 introduced
+breaking changes in the Bioconductor ecosystem (DECIPHER, Biostrings, muscle) that
+cause consensus generation to fail. The bundled `environment.yml` enforces `r-base =4.3`
+automatically. When installing manually, target R 4.3.
+
+Install R itself before the packages:
 
 ```bash
 # macOS
@@ -318,6 +370,48 @@ bin/dorado/bin/dorado --version
 [back to Top](#rtbioscan-installation)
 
 The same binary supports CPU basecalling. Set `dorado_device = "cpu"` in `nextflow.config` (see below).
+
+### GPU architecture compatibility (NVIDIA)
+[back to Top](#rtbioscan-installation)
+
+The Dorado version you need depends on your NVIDIA GPU generation:
+
+| GPU series | Architecture | Compute capability | Minimum Dorado |
+|---|---|---|---|
+| RTX 20xx / Quadro RTX | Turing | sm_75 | 0.7.x |
+| RTX 30xx / A-series | Ampere | sm_86 | 0.7.x |
+| RTX 40xx / L-series | Ada Lovelace | sm_89 | 0.7.x |
+| **RTX 50xx** | **Blackwell** | **sm_120** | **1.0 or newer** |
+
+**RTX 50xx (Blackwell) users must use Dorado 1.0+.** The bundled 0.7.x binary
+was compiled against an older CUDA toolkit that does not include PTX or SASS for
+sm_120, so it will fail at model load time on Blackwell GPUs. Replace the bundled
+binary:
+
+```bash
+# Download Dorado 1.x (adjust version as needed)
+curl -L https://cdn.oxfordnanoportal.com/software/analysis/dorado-1.4.0-linux-x64.tar.gz \
+  | tar -xz
+
+mkdir -p bin/dorado
+mv dorado-1.4.0-linux-x64/* bin/dorado/
+
+# Verify it detects your GPU
+bin/dorado/bin/dorado --version
+bin/dorado/bin/dorado basecaller --help   # should not error on GPU init
+```
+
+With Dorado 1.x you may also want to update the models in `nextflow.config` to
+the v5.2.0 series, which is bundled by default in Dorado 1.x tarballs:
+
+```groovy
+fast_model = "bin/dorado/bin/dna_r10.4.1_e8.2_400bps_fast@v5.2.0"
+hac_model  = "bin/dorado/bin/dna_r10.4.1_e8.2_400bps_hac@v5.2.0"
+sup_model  = "bin/dorado/bin/dna_r10.4.1_e8.2_400bps_sup@v5.2.0"
+```
+
+> **macOS users:** This section does not apply. Dorado on Apple Silicon uses
+> the Metal GPU API, not CUDA, and all Dorado versions support Apple Silicon.
 
 ### Dorado basecalling models
 [back to Top](#rtbioscan-installation)

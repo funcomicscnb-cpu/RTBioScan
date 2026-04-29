@@ -23,7 +23,7 @@ __lock_utils_run_exit_hooks() {
 	__lock_utils_ensure_arrays
 	trap - EXIT
 	set +e
-	if [ "${#__lock_utils_exit_hooks[@]-0}" -gt 0 ]; then
+	if [ "${#__lock_utils_exit_hooks[@]}" -gt 0 ]; then
 		for hook in "${__lock_utils_exit_hooks[@]}"; do
 			hook_index=$((hook_index + 1))
 			(
@@ -73,7 +73,7 @@ append_trap() {
 	fi
 
 	__lock_utils_install_exit_dispatch
-	if [ "${#__lock_utils_exit_hooks[@]-0}" -gt 0 ]; then
+	if [ "${#__lock_utils_exit_hooks[@]}" -gt 0 ]; then
 		for hook in "${__lock_utils_exit_hooks[@]}"; do
 			if [ "$hook" = "$cmd" ]; then
 				return 0
@@ -102,7 +102,7 @@ release_lock() {
 cleanup_locks() {
 	local l
 	__lock_utils_ensure_arrays
-	[ "${#acquired_locks[@]-0}" -eq 0 ] && return
+	[ "${#acquired_locks[@]}" -eq 0 ] && return
 	for l in "${acquired_locks[@]}"; do
 		release_lock "$l"
 	done

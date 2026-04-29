@@ -1,6 +1,9 @@
 # Local installation overrides — not for version control
 conf/local.config
 
+# Linux: local nextflow symlink (points to system-installed binary)
+nextflow
+
 # Dorado binary and models (large binaries)
 bin/dorado/bin/dorado
 bin/dorado/bin/*.metallib

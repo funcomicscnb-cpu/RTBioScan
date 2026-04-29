@@ -1187,6 +1187,30 @@ while IFS= read -r sample; do
 		sb_lines=$(wc -l < "$sample_blast" | tr -d ' ')
 		cons_log "Sample=$sample blast_rows=$sb_lines parsed_rows=$sample_parsed_rows"
 	fi
+	# Fallback for no-BLAST-hit samples (e.g. novel/undescribed species not in the
+	# reference database): synthesise parsed rows directly from the frozen OTU member
+	# table so that stable clusters still receive a consensus sequence.  The FROZEN_
+	# key is used in place of the OTUB_ key; taxonomy will be reported as unassigned.
+	if [ "$sample_parsed_rows" -eq 0 ] \
+			&& [ -n "$frozen_members" ] && [ -f "$frozen_members" ] && [ -s "$frozen_members" ]; then
+		awk -F'\t' -v sample="$sample" '
+			{
+				frozen_key=$1; rid=$2
+				n=split(rid,t,"|")
+				model=(n>=3)?t[3]:""
+				bc=""; ad=""
+				for(i=1;i<=n;i++){
+					if(t[i]~/^barcode=/) bc=substr(t[i],9)
+					else if(t[i]~/^adapter=/) ad=substr(t[i],9)
+				}
+				if(ad==sample) print rid,frozen_key,bc,ad,model
+			}
+		' "$frozen_members" > "$sample_parsed"
+		sample_parsed_rows=$(awk 'NF{c++} END{print c+0}' "$sample_parsed")
+		if [ "$sample_parsed_rows" -gt 0 ]; then
+			echo "INFO: Sample=$sample zero blast hits; using $sample_parsed_rows frozen-pool reads for consensus (unassigned)" 1>&2
+		fi
+	fi
 	#echo "grep -E \"adapter=${sample}_[0-9]\" tmp_clean_blast_report_full.txt > $sample_blast"
 		if [ "$sample_parsed_rows" -ne 0 ];then
 			_t_otu_prepare_start=$(timing_now)
