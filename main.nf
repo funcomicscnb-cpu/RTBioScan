@@ -507,6 +507,16 @@ def validateOptionalFile = { String paramName, String rawPath ->
         exit 1, "Configured file for --${paramName} was not found: ${resolved}"
     }
 }
+def validateRequiredFile = { String paramName, String rawPath ->
+    if (!rawPath || rawPath == 'null') {
+        exit 1, "Missing required parameter --${paramName}"
+    }
+    def resolved = resolveConfigPath(rawPath)
+    def f = new File(resolved)
+    if (!f.exists() || !f.isFile()) {
+        exit 1, "Required file for --${paramName} was not found: ${resolved}"
+    }
+}
 def validateOptionalFileOrDisable = { String paramName, String rawPath ->
     if (!rawPath || rawPath == 'null') return
     def resolved = resolveConfigPath(rawPath)
@@ -519,6 +529,35 @@ def validateOptionalFileOrDisable = { String paramName, String rawPath ->
 validateDbPrefix('blast_filter_db', params.blast_filter_db?.toString())
 validateRequiredDir('blast_taxdb', params.blast_taxdb?.toString())
 validateOptionalFile('nonncbi_id2lineage_target', params.nonncbi_id2lineage_target?.toString())
+validateRequiredFile('state_reference_manifest', params.state_reference_manifest?.toString())
+if (params.state_taxonomy_data_dir?.toString()?.trim()) {
+    validateRequiredDir('state_taxonomy_data_dir', params.state_taxonomy_data_dir.toString())
+}
+def stateCompatibilityPolicy = params.state_compatibility_policy?.toString()?.trim()?.toLowerCase()
+if (!(stateCompatibilityPolicy in ['strict', 'adopt_legacy'])) {
+    exit 1, "Invalid --state_compatibility_policy '${params.state_compatibility_policy}'. Allowed values: strict, adopt_legacy"
+}
+def stateReferenceVerification = params.state_reference_verification?.toString()?.trim()?.toLowerCase()
+if (!(stateReferenceVerification in ['cached', 'full'])) {
+    exit 1, "Invalid --state_reference_verification '${params.state_reference_verification}'. Allowed values: cached, full"
+}
+def stateVerificationCacheRaw = params.state_verification_cache_dir?.toString()?.trim()
+def stateVerificationCacheDir
+if (stateVerificationCacheRaw) {
+    stateVerificationCacheDir = stateVerificationCacheRaw.startsWith('/')
+        ? stateVerificationCacheRaw
+        : "${workflow.launchDir}/${stateVerificationCacheRaw}"
+} else {
+    stateVerificationCacheDir = "${params.outdir}/temp/_compatibility_cache"
+}
+for (def versionParam : ['state_classifier_policy_version', 'state_scoring_policy_version']) {
+    if (!params."${versionParam}"?.toString()?.trim()) {
+        exit 1, "Missing required parameter --${versionParam}"
+    }
+}
+if (!params.nonncbi_id2lineage_target?.toString()?.trim()) {
+    log.warn "No --nonncbi_id2lineage_target is configured; OTU lineage annotation is disabled by the current classifier implementation"
+}
 
 // --- PREAMBLE §4: Startup operations (restart/restore handler) ---
 // Apply rolling-state restart semantics at script evaluation time (i.e. always runs, even with `-resume`).
@@ -575,9 +614,69 @@ if (!effectiveRestartMode || effectiveRestartMode == 'null') {
     }
 }
 
+// Bind rolling state to the exact reference, taxonomy, and classification contract.
+// This runs after restore/reset so a restored snapshot is checked before any process can consume it.
+def stateCompatibilityArgs = [
+    '/usr/bin/env',
+    'perl',
+    "${baseDir}/bin/state_compatibility_contract.pl",
+    '--state-dir', "${ongoingStateDir}/_state",
+    '--reference-manifest', resolveConfigPath(params.state_reference_manifest.toString()),
+    '--reference-root', baseDir.toString(),
+    '--taxonomy-data-dir', params.state_taxonomy_data_dir?.toString()?.trim()
+        ? resolveConfigPath(params.state_taxonomy_data_dir.toString())
+        : '',
+    '--classifier-policy-version', params.state_classifier_policy_version.toString(),
+    '--scoring-policy-version', params.state_scoring_policy_version.toString(),
+    '--targets', params.targets.toString(),
+    '--target-taxa', params.target_taxa.toString(),
+    '--blast-filter-db', params.blast_filter_db.toString(),
+    '--blast-db-specs', params.blast_db_specs.toString(),
+    '--blast-taxdb', params.blast_taxdb.toString(),
+    '--nonncbi-memtax', params.nonncbi_memtax?.toString() ?: '',
+    '--nonncbi-id2lineage', params.nonncbi_id2lineage_target?.toString() ?: '',
+    '--profile', workflow.profile?.toString() ?: '',
+    '--policy', stateCompatibilityPolicy,
+    '--lock-wait', (params.lock_wait_seconds ?: 300).toString(),
+    '--verification-cache-dir', stateVerificationCacheDir,
+    '--verification-mode', stateReferenceVerification
+]
+def stateCompatibilityProc = new ProcessBuilder(stateCompatibilityArgs.collect { it.toString() }).start()
+def stateCompatibilityOut = new StringBuffer()
+def stateCompatibilityErr = new StringBuffer()
+def stateCompatibilityStdout = Thread.start {
+    stateCompatibilityProc.inputStream.withReader('UTF-8') { r ->
+        r.eachLine { line -> stateCompatibilityOut.append(line).append('\n') }
+    }
+}
+def stateCompatibilityStderr = Thread.start {
+    stateCompatibilityProc.errorStream.withReader('UTF-8') { r ->
+        r.eachLine { line -> stateCompatibilityErr.append(line).append('\n') }
+    }
+}
+def stateCompatibilityExit = stateCompatibilityProc.waitFor()
+stateCompatibilityStdout.join()
+stateCompatibilityStderr.join()
+if (stateCompatibilityExit != 0) {
+    log.error "State compatibility validation failed.\nSTDOUT:\n${stateCompatibilityOut}\nSTDERR:\n${stateCompatibilityErr}"
+    throw new RuntimeException("State compatibility validation failed")
+}
+if (stateCompatibilityErr.toString().trim()) {
+    log.warn stateCompatibilityErr.toString().trim()
+}
+def stateCompatibilityContractId = stateCompatibilityOut.toString().trim()
+if (!(stateCompatibilityContractId ==~ /[0-9a-f]{64}/)) {
+    throw new RuntimeException("State compatibility validator returned an invalid contract ID: '${stateCompatibilityContractId}'")
+}
+summary['State Contract'] = stateCompatibilityContractId
+
 // --- PREAMBLE §5: Final computed values and channel bootstrap ---
-// Used to invalidate Nextflow caching on explicit restore/reset runs. Interpolated into process scripts below.
-def restartTokenForCache = (effectiveRestartMode in ['restore','reset']) ? "${effectiveRestartMode}:${custom_runName ?: workflow.runName}" : ''
+// Invalidate cached process scripts on restore/reset or compatibility-contract changes.
+def restartTokenParts = ["compat:${stateCompatibilityContractId}"]
+if (effectiveRestartMode in ['restore', 'reset']) {
+    restartTokenParts << "${effectiveRestartMode}:${custom_runName ?: workflow.runName}"
+}
+def restartTokenForCache = restartTokenParts.join('|')
 
 // formatOtuIdentity() → bottom of this file (hoisted method)
 
@@ -6360,7 +6459,8 @@ process backup_update_and_clean {
 			state_tables=( "\$STATE_TMP"/read_qscore_rolling.tsv "\$STATE_TMP"/otu_frozen_*.tsv \
 				"\$STATE_TMP"/otu_frozen_reps.fasta "\$STATE_TMP"/otu_frozen_reps.fasta.gz "\$STATE_TMP"/otu_active_pool.fasta \
 				"\$STATE_TMP"/otu_seen_hashes.tsv "\$STATE_TMP"/*consensus_consolidated_ids.txt "\$STATE_TMP"/otu_consolidated_keys.tsv \
-				"\$STATE_TMP"/*_seen_read_ids.tsv "\$STATE_TMP"/*_on_target_state.tsv )
+				"\$STATE_TMP"/*_seen_read_ids.tsv "\$STATE_TMP"/*_on_target_state.tsv \
+				"\$STATE_TMP"/state_compatibility_manifest.tsv )
 			if (( \${#state_tables[@]} )); then
 				sync_changed_files "\$CURRENT_TEMP_ROOT/tables" "\${state_tables[@]}" 2>/dev/null || true
 				sync_changed_files "\$CURRENT_ROOT/tables" "\${state_tables[@]}" 2>/dev/null || true
