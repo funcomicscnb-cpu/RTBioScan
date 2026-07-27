@@ -214,6 +214,10 @@ results/
     {run_id}_metadata.txt   ← run-filtered metadata TSV rows
     replicate_roster.tsv    ← replicate-level roster, when present
     replicate_identity.tsv  ← collapse/track identity bridge, when present
+    track_demult.fasta      ← track-mode demultiplexing FASTA, when present
+    track_roster.tsv        ← track-mode roster, when present
+    track_active_units.txt  ← track-mode active sample-marker units, when present
+    track_identity.tsv      ← track-mode sample-marker identity map, when present
 ```
 
 ### Disk management: pruning POD5 files during a run
@@ -330,6 +334,8 @@ Key options:
 4. Writes `results/sample_info/{run_id}/{run_id}_metadata.txt` as the run-filtered metadata TSV rows.
 5. Writes `results/sample_info/{run_id}/replicate_roster.tsv`, when present, and `results/sample_info/{run_id}/replicate_identity.tsv`, when present.
 6. Validates that the output FASTA line count matches the number of emitted demultiplexing records.
+
+When track mode artifacts are generated, each track unit corresponds to one observed sample-marker pair. Samples or replicates that cover only a subset of `--targets` are supported; unobserved markers produce no placeholder rows.
 
 **Input file formats:**
 
@@ -1081,6 +1087,7 @@ Pipe-separated list of marker names processed in this run. All per-marker parame
 
 - Default: `COI|ITS2`.
 - These strings are embedded in FASTQ/FASTA headers and must match the marker names expected by your databases and demultiplex setup.
+- The list is the run-wide allowed marker superset; individual samples or replicates may include any subset of these markers. Track-mode artifacts are generated from observed sample-marker combinations only.
 - To add a third marker: `--targets "COI|ITS2|16S"` (and set all matching per-marker params with a third `|`-separated value).
 
 #### `--target_taxa`

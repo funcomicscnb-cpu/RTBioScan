@@ -3566,6 +3566,68 @@ def test_track_mode_emits_track_unit_metrics_and_canonical_assignment_fields(tmp
     assert cons_by_unit["sample_A_1_ITS2"]["track_primer_label"] == "ITS2"
 
 
+def test_track_mode_accepts_sparse_track_identity_metrics(tmp_path: Path) -> None:
+    blast_otu = tmp_path / "blast_otu.tsv"
+    blast_otu.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        "r1\tCOI\thac\tsample_A_1\thit\t101\t400\t98.0\tOTU_A-COI\tF\tG\tSpecies_alpha\n",
+        encoding="utf-8",
+    )
+    blast_cons = tmp_path / "blast_cons.tsv"
+    blast_cons.write_text(
+        "consensus_id\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample\ttaxid\tblast_hit\taln_length\tperc_id\tconsensus_kingdom\tconsensus_phylum\tconsensus_class\tconsensus_order\tconsensus_family\tconsensus_genus\tconsensus_species\n"
+        "Cons1\tCOI\tconsensus\t10\tsample_A_1\t101\thit\t400\t98.0\tK\tP\tC\tO\tF\tG\tSpecies_alpha\n",
+        encoding="utf-8",
+    )
+    lock_summary = tmp_path / "lock.tsv"
+    lock_summary.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n"
+        "OTU_A-COI\t0\t0\n",
+        encoding="utf-8",
+    )
+    otu_sizes = tmp_path / "otu_sizes.tsv"
+    otu_sizes.write_text("otu_id\tsize\nOTU_A-COI\t5\n", encoding="utf-8")
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text(
+        "sample_id\ttrack_id\treplicate_number\n"
+        "sample_A\tsample_A_1\t1\n",
+        encoding="utf-8",
+    )
+    track_identity = tmp_path / "track_identity.tsv"
+    track_identity.write_text(
+        "sample_id\ttrack_id\treplicate_number\tmarker_id\tunit_id_track\n"
+        "sample_A\tsample_A_1\t1\tCOI\tsample_A_1_COI\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "round_report.json"
+    result = _run(
+        [
+            "--barcode", "RTBioScan",
+            "--round-barcode", "round_1",
+            "--run-id", "testrun",
+            "--out", str(out),
+            "--blast-otu", str(blast_otu),
+            "--otu-sizes-round", str(otu_sizes),
+            "--blast-consensus", str(blast_cons),
+            "--otu-lock-summary", str(lock_summary),
+            "--blast-filter-mode", "off",
+            "--identity-mode", "track",
+            "--sample-roster", str(roster),
+            "--track-identity", str(track_identity),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+
+    tum = data["track_unit_metrics"]
+    assert sorted(tum) == ["sample_A_1_COI"]
+    assert "sample_A_1_ITS2" not in tum
+    assert tum["sample_A_1_COI"]["track_primer_label"] == "COI"
+    assert tum["sample_A_1_COI"]["reads_blast_assigned"] == 1
+    assert tum["sample_A_1_COI"]["otu_active"] == 1
+    assert tum["sample_A_1_COI"]["consensus_emitted"] == 1
+
+
 def test_track_mode_duplicate_track_marker_mapping_fails(tmp_path: Path) -> None:
     roster = tmp_path / "track_roster.tsv"
     roster.write_text(
