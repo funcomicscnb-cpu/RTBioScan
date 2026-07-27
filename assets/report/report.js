@@ -3497,7 +3497,22 @@
         recordTrackGroupSortMeta(sampleLabel, row, sampleLabel);
         if (!matrixMap.has(sampleLabel)) matrixMap.set(sampleLabel, new Map());
         const sampleMap = matrixMap.get(sampleLabel);
-        const cell = sampleMap.get(taxon) || { supported: 0, unsupported: 0, total: 0, frozen: 0, frozenReads: 0, consolidated: 0, consolidatedReads: 0, special: 0 };
+        const cell = sampleMap.get(taxon) || {
+          supported: 0,
+          unsupported: 0,
+          total: 0,
+          frozen: 0,
+          frozenSupported: 0,
+          frozenUnsupported: 0,
+          frozenReads: 0,
+          consolidated: 0,
+          consolidatedSupported: 0,
+          consolidatedUnsupported: 0,
+          consolidatedReads: 0,
+          special: 0,
+          specialSupported: 0,
+          specialUnsupported: 0,
+        };
         const supported = sourceKey !== "otu" || isSupportedOtuAssignment(row);
         if (!taxonMarkers.has(taxon)) taxonMarkers.set(taxon, new Set());
         if (marker && (supported || markerKingdomFiltered(marker))) taxonMarkers.get(taxon).add(marker);
@@ -3516,9 +3531,15 @@
           cell.unsupported += value;
         }
         cell.total += value;
-        cell.frozen += num(row.frozen_otu_count);
+        const frozenVal = num(row.frozen_otu_count);
+        const consolidatedVal = num(row.consolidated_consensus_count);
+        cell.frozen += frozenVal;
+        if (supported) cell.frozenSupported += frozenVal;
+        else cell.frozenUnsupported += frozenVal;
         cell.frozenReads += num(row.frozen_otu_reads_sample_total);
-        cell.consolidated += num(row.consolidated_consensus_count);
+        cell.consolidated += consolidatedVal;
+        if (supported) cell.consolidatedSupported += consolidatedVal;
+        else cell.consolidatedUnsupported += consolidatedVal;
         cell.consolidatedReads += num(row.consolidated_consensus_reads_total);
         if (specialField) {
           const hasSpecialField = Object.prototype.hasOwnProperty.call(row, specialField);
@@ -3526,6 +3547,8 @@
             ? num(row[specialFallbackField])
             : num(row[specialField]);
           cell.special += specialVal;
+          if (supported) cell.specialSupported += specialVal;
+          else cell.specialUnsupported += specialVal;
         }
         if (Array.isArray(row.replicate_reads) && row.replicate_reads.length > 1) {
           cell.repReads = cell.repReads || {};
@@ -3614,12 +3637,20 @@
       taxonMarkerMap.set(taxon, markers.length ? markers[0] : "OTHER");
     });
 
+    const displayScopedValue = (cell, totalKey, supportedKey, unsupportedKey) => {
+      if (displayTotal) return num(cell[totalKey]);
+      return cell.supported > 0 ? num(cell[supportedKey]) : num(cell[unsupportedKey]);
+    };
     const hasSpecialCounts = Array.from(matrixMap.values()).some((sampleMap) =>
-      Array.from(sampleMap.values()).some((cell) => num(cell.special) > 0),
+      Array.from(sampleMap.values()).some((cell) =>
+        displayScopedValue(cell, "special", "specialSupported", "specialUnsupported") > 0
+      ),
     );
     const hasSpecialPresence = Array.from(matrixMap.values()).some((sampleMap) =>
       Array.from(sampleMap.values()).some((cell) =>
-        sourceKey === "otu" ? num(cell.frozen) > 0 : num(cell.consolidated) > 0
+        sourceKey === "otu"
+          ? displayScopedValue(cell, "frozen", "frozenSupported", "frozenUnsupported") > 0
+          : displayScopedValue(cell, "consolidated", "consolidatedSupported", "consolidatedUnsupported") > 0
       ),
     );
 
@@ -3781,13 +3812,18 @@
         activeView.displayTotal,
       );
       const highlightSpec = assignmentSunburstHighlightSpec(activeView.sourceKey);
+      const cellValueDescription = activeView.displayTotal
+        ? "Cells show total values"
+        : activeView.sourceKey === "otu"
+          ? `Cells show supported values; low-read-only OTU cells show assignments with fewer than ${OTU_ASSIGNMENT_MIN_READS} supporting reads`
+          : "Cells show values";
       status.textContent = `${activeView.label} at ${activeLevel} level.`;
       if (matrix.hasSpecialCounts) {
-        status.textContent += ` Cells show total values; bold values in parentheses show ${activeView.specialUnit}.`;
+        status.textContent += ` ${cellValueDescription}; bold values in parentheses show ${activeView.specialUnit}.`;
       } else if (matrix.hasSpecialPresence && activeView.sourceKey === "consensus" && activeView.id === "consensus_reads_total") {
-        status.textContent += ` Cells show total values. Consolidated consensus sequences are present, but consolidated read counts are unavailable in this view.`;
+        status.textContent += ` ${cellValueDescription}. Consolidated consensus sequences are present, but consolidated read counts are unavailable in this view.`;
       } else {
-        status.textContent += ` Cells show total values. No ${highlightSpec.label} are present in this view.`;
+        status.textContent += ` ${cellValueDescription}. No ${highlightSpec.label} are present in this view.`;
       }
       if (activeView.sourceKey === "otu") {
         status.textContent += `. Purple cells contain frozen OTUs. In the read view, parenthesized frozen-read values appear only when sample-specific frozen-read counts are known. Light orange cells mark OTU assignments with fewer than ${OTU_ASSIGNMENT_MIN_READS} supporting reads (not counted as supported).`;
@@ -3809,6 +3845,16 @@
       const cellDisplayValue = (cell) => (
         activeView.displayTotal ? num(cell.total) : (cell.supported > 0 ? cell.supported : cell.unsupported)
       );
+      const cellDisplayScopedValue = (cell, totalKey, supportedKey, unsupportedKey) => {
+        if (activeView.displayTotal) return num(cell[totalKey]);
+        return cell.supported > 0 ? num(cell[supportedKey]) : num(cell[unsupportedKey]);
+      };
+      const cellDisplaySpecialValue = (cell) =>
+        cellDisplayScopedValue(cell, "special", "specialSupported", "specialUnsupported");
+      const cellDisplayFrozenValue = (cell) =>
+        cellDisplayScopedValue(cell, "frozen", "frozenSupported", "frozenUnsupported");
+      const cellDisplayConsolidatedValue = (cell) =>
+        cellDisplayScopedValue(cell, "consolidated", "consolidatedSupported", "consolidatedUnsupported");
       const tsvRows = matrix.sampleList.map((sampleLabel) => [
         sampleLabel,
         ...matrix.taxonList.map((taxon) => {
@@ -3924,7 +3970,9 @@
         matrix.taxonList.forEach((taxon) => {
           const cell = (matrix.matrixMap.get(sampleLabel) || new Map()).get(taxon) || { supported: 0, unsupported: 0, total: 0 };
           const v = cellDisplayValue(cell);
-          const specialValue = num(cell.special);
+          const specialValue = cellDisplaySpecialValue(cell);
+          const frozenPresence = cellDisplayFrozenValue(cell);
+          const consolidatedPresence = cellDisplayConsolidatedValue(cell);
           const td = document.createElement("td");
           td.title = `${sampleLabel} / ${taxon}: ${v || 0}`;
           if (isNoReads) {
@@ -3933,7 +3981,7 @@
           } else if (v > 0) {
             setCellValue(td, v, specialValue);
             const intensity = matrix.maxVal > 0 ? v / matrix.maxVal : 0;
-            if (activeView.sourceKey === "otu" && cell.frozen > 0) {
+            if (activeView.sourceKey === "otu" && frozenPresence > 0) {
               // Purple gradient: frozen OTUs present
               const r = Math.round(237 + (106 - 237) * intensity);
               const g = Math.round(224 + (40 - 224) * intensity);
@@ -3942,8 +3990,8 @@
               td.style.color = intensity > 0.6 ? "#ffffff" : "#3d1060";
               td.title = specialValue > 0
                 ? `${sampleLabel} / ${taxon}: ${v} (${specialValue} ${activeView.specialUnit})`
-                : `${sampleLabel} / ${taxon}: ${v} (${cell.frozen} frozen OTU${cell.frozen !== 1 ? "s" : ""})`;
-            } else if (activeView.sourceKey === "consensus" && cell.consolidated > 0) {
+                : `${sampleLabel} / ${taxon}: ${v} (${frozenPresence} frozen OTU${frozenPresence !== 1 ? "s" : ""})`;
+            } else if (activeView.sourceKey === "consensus" && consolidatedPresence > 0) {
               // Amber gradient: consolidated consensus present
               const r = Math.round(254 + (181 - 254) * intensity);
               const g = Math.round(247 + (129 - 247) * intensity);
@@ -3952,7 +4000,7 @@
               td.style.color = intensity > 0.6 ? "#ffffff" : "#5a3e00";
               td.title = specialValue > 0
                 ? `${sampleLabel} / ${taxon}: ${v} (${specialValue} ${activeView.specialUnit})`
-                : `${sampleLabel} / ${taxon}: ${v} (${cell.consolidated} consolidated)`;
+                : `${sampleLabel} / ${taxon}: ${v} (${consolidatedPresence} consolidated)`;
             } else if (activeView.sourceKey === "otu" && cell.supported <= 0 && cell.unsupported > 0) {
               // Light orange: unsupported (low reads)
               td.style.background = "#fde8d8";

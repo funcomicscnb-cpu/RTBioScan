@@ -1361,7 +1361,11 @@ def test_report_js_contains_marker_split_read_fate_mapping() -> None:
     assert "consolidated_consensus_reads_total" in js_text
     assert "assignment-special-count" in js_text
     assert "samplesWithReadEvidence" in js_text
-    assert "Cells show total values; bold values in parentheses show" in js_text
+    assert "cellValueDescription" in js_text
+    assert 'activeView.sourceKey === "otu"' in js_text
+    assert "Cells show supported values; low-read-only OTU cells show assignments" in js_text
+    assert ': "Cells show values";' in js_text
+    assert "bold values in parentheses show" in js_text
     assert ".assignment-special-count" in css_text
 
 
@@ -1446,6 +1450,18 @@ def test_report_js_track_detail_matrix_uses_canonical_track_sort_fields() -> Non
     assert "track_sample_replicate_label" in js_text
     assert "track_replicate_label" in js_text
     assert "text.match(/^(.*?_\\d+)_[^_]+$/)" in js_text
+
+
+def test_report_js_assignment_matrix_scopes_special_counts_to_displayed_subset() -> None:
+    js_text = JS.read_text(encoding="utf-8")
+    assert "specialSupported" in js_text
+    assert "specialUnsupported" in js_text
+    assert "frozenSupported" in js_text
+    assert "frozenUnsupported" in js_text
+    assert 'displayScopedValue(cell, "special", "specialSupported", "specialUnsupported")' in js_text
+    assert 'displayScopedValue(cell, "frozen", "frozenSupported", "frozenUnsupported")' in js_text
+    assert 'cellDisplayScopedValue(cell, "special", "specialSupported", "specialUnsupported")' in js_text
+    assert "cell.supported > 0 ? num(cell[supportedKey]) : num(cell[unsupportedKey])" in js_text
 
 
 # ---------------------------------------------------------------------------
