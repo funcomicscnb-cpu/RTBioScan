@@ -188,9 +188,13 @@ side-by-side and never changes the configured binary or model paths.
 
 - static verification of bytes, version, platform, models, `basecaller`, and
   `summary` command compatibility;
-- live qualification on an explicitly requested hardware device and POD5,
-  using the exact FAST/HAC/SUP chunk, batch, overlap, quality, read-list, SAM,
-  and summary interfaces used by RTBioScan.
+- live qualification on an explicitly requested hardware device and the
+  checksummed official POD5 declared by
+  `conf/runtime_compatibility/dorado_qualification_fixture_v0.7.0.tsv`, using
+  the exact FAST/HAC/SUP chunk, batch, overlap, quality, read-list, SAM, and
+  summary interfaces used by RTBioScan. The tiny fixture qualifies hardware
+  and formats only; a representative full-round shadow run remains required
+  for biological classification qualification.
 
 Candidate runs use a new `state_id` and output directory. Promotion is an
 explicit reviewed configuration change; rollback selects the retained stable

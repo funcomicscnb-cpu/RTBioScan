@@ -7,15 +7,17 @@ Usage:
   bin/validate_dorado_release.sh \
     --manifest FILE \
     --release-dir DIR \
-    [--qualification-pod5 FILE --device DEVICE --report FILE]
+    [--qualification-pod5 FILE --qualification-manifest FILE \
+     --device DEVICE --report FILE]
 
 Without --qualification-pod5, verifies installed bytes, platform, Dorado
 version, model files, and the command-line surface used by RTBioScan.
 
-With --qualification-pod5, also runs FAST, HAC, and SUP basecalling using the
-production arguments, validates SAM/summary compatibility, and records a
-qualification report. --device and --report are then required. Qualification
-never changes RTBioScan defaults or state.
+With --qualification-pod5, also verifies the fixture manifest, runs FAST, HAC,
+and SUP basecalling using the production arguments, validates SAM/summary
+compatibility, and records a qualification report. --qualification-manifest,
+--device, and --report are then required. Qualification never changes
+RTBioScan defaults or state.
 EOF
 }
 
@@ -27,6 +29,7 @@ die() {
 manifest=""
 release_dir=""
 pod5=""
+qualification_manifest=""
 device=""
 report=""
 
@@ -45,6 +48,11 @@ while [ "$#" -gt 0 ]; do
 		--qualification-pod5)
 			[ "$#" -ge 2 ] || die "--qualification-pod5 requires a value"
 			pod5="$2"
+			shift 2
+			;;
+		--qualification-manifest)
+			[ "$#" -ge 2 ] || die "--qualification-manifest requires a value"
+			qualification_manifest="$2"
 			shift 2
 			;;
 		--device)
@@ -129,6 +137,8 @@ done
 	|| die "Dorado summary help failed"
 
 if [ -z "$pod5" ]; then
+	[ -z "$qualification_manifest" ] \
+		|| die "--qualification-manifest requires --qualification-pod5"
 	[ -z "$device" ] || die "--device requires --qualification-pod5"
 	[ -z "$report" ] || die "--report requires --qualification-pod5"
 	printf 'OK: Dorado release static compatibility passed (%s, %s)\n' \
@@ -138,12 +148,42 @@ fi
 
 [ -f "$pod5" ] || die "qualification POD5 not found: $pod5"
 [ -r "$pod5" ] || die "qualification POD5 is not readable: $pod5"
+[ -n "$qualification_manifest" ] \
+	|| die "--qualification-manifest is required with --qualification-pod5"
+[ -f "$qualification_manifest" ] \
+	|| die "qualification fixture manifest not found: $qualification_manifest"
 [ -n "$device" ] || die "--device is required with --qualification-pod5"
 [ -n "$report" ] || die "--report is required with --qualification-pod5"
 for tool in samtools awk grep sed shasum; do
 	command -v "$tool" >/dev/null 2>&1 \
 		|| die "qualification tool not found in PATH: $tool"
 done
+
+fixture_header="$(sed -n '1p' "$qualification_manifest")"
+[ "$fixture_header" = 'artifact	sha256	bytes	source_url	source_revision	chemistry	role' ] \
+	|| die "malformed Dorado qualification fixture manifest header"
+fixture_row_count="$(awk 'NR > 1 && $0 !~ /^[[:space:]]*$/ { count++ } END { print count + 0 }' "$qualification_manifest")"
+[ "$fixture_row_count" -eq 1 ] \
+	|| die "Dorado qualification fixture manifest must contain exactly one data row"
+fixture_row="$(awk 'NR > 1 && $0 !~ /^[[:space:]]*$/ { print; exit }' "$qualification_manifest")"
+IFS=$'\t' read -r fixture_artifact fixture_sha fixture_bytes fixture_url fixture_revision fixture_chemistry fixture_role <<< "$fixture_row"
+[ -n "$fixture_artifact" ] && [ -n "$fixture_sha" ] && [ -n "$fixture_bytes" ] \
+	&& [ -n "$fixture_url" ] && [ -n "$fixture_revision" ] \
+	&& [ -n "$fixture_chemistry" ] && [ -n "$fixture_role" ] \
+	|| die "malformed Dorado qualification fixture manifest row"
+case "$fixture_sha" in
+	*[!0-9a-f]*|'') die "invalid qualification fixture SHA-256" ;;
+esac
+[ "${#fixture_sha}" -eq 64 ] || die "invalid qualification fixture SHA-256 length"
+case "$fixture_bytes" in
+	*[!0-9]*|'') die "invalid qualification fixture byte count" ;;
+esac
+actual_fixture_bytes="$(wc -c < "$pod5" | tr -d '[:space:]')"
+[ "$actual_fixture_bytes" = "$fixture_bytes" ] \
+	|| die "qualification POD5 size mismatch: expected=$fixture_bytes actual=$actual_fixture_bytes"
+actual_fixture_sha="$(shasum -a 256 "$pod5" | awk '{print $1}')"
+[ "$actual_fixture_sha" = "$fixture_sha" ] \
+	|| die "qualification POD5 checksum mismatch: expected=$fixture_sha actual=$actual_fixture_sha"
 
 qualification_tmp="$(mktemp -d "${TMPDIR:-/tmp}/rtbioscan-dorado-qualification.XXXXXX")" \
 	|| die "cannot create Dorado qualification directory"
@@ -154,23 +194,36 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-expected_summary_header='input_filename	batch_id	parent_read_id	read_id	run_id	channel	mux	minknow_events	start_time	duration	passes_filtering	template_start	num_events_template	template_duration	sequence_length_template	mean_qscore_template	pore_type	experiment_id	sample_id	end_reason'
-
 validate_sam_and_summary() {
 	local stage="$1"
 	local sam="$2"
+	local require_reads="$3"
 	local summary="${qualification_tmp}/${stage}.summary.tsv"
 	local count
 	samtools view -h "$sam" >/dev/null \
 		|| die "Dorado ${stage} output is not valid SAM"
 	count="$(samtools view -c "$sam")"
-	[ "$count" -gt 0 ] || die "Dorado ${stage} output contains no reads"
+	if [ "$require_reads" -eq 1 ] && [ "$count" -eq 0 ]; then
+		die "Dorado ${stage} output contains no reads"
+	fi
 	"$dorado" summary "$sam" > "$summary" \
 		|| die "Dorado summary rejected ${stage} SAM output"
-	[ "$(sed -n '1p' "$summary")" = "$expected_summary_header" ] \
-		|| die "Dorado ${stage} summary header is incompatible with RTBioScan"
-	[ "$(awk 'END { print NR + 0 }' "$summary")" -gt 1 ] \
-		|| die "Dorado ${stage} summary contains no read rows"
+	awk -F '\t' '
+		NR == 1 {
+			seen_header = 1
+			for (i = 1; i <= NF; i++) h[$i] = 1
+			if (!(h["filename"] || h["input_filename"])) exit 1
+			if (!h["read_id"] || !h["run_id"] || !h["sequence_length_template"] || !h["mean_qscore_template"]) exit 1
+		}
+		END {
+			if (!seen_header) exit 1
+		}
+	' "$summary" \
+		|| die "Dorado ${stage} summary lacks columns required by RTBioScan"
+	if [ "$require_reads" -eq 1 ]; then
+		[ "$(awk 'END { print NR + 0 }' "$summary")" -gt 1 ] \
+			|| die "Dorado ${stage} summary contains no read rows"
+	fi
 }
 
 run_basecaller() {
@@ -181,6 +234,7 @@ run_basecaller() {
 	local batchsize="$5"
 	local min_qscore="$6"
 	local read_list="$7"
+	local require_reads="$8"
 	local sam="${qualification_tmp}/${stage}.sam"
 	local log="${qualification_tmp}/${stage}.log"
 
@@ -200,10 +254,10 @@ run_basecaller() {
 	if grep -Eiq 'fall(ing)? back.*(cpu|device)' "$log"; then
 		die "Dorado ${stage} reported a device fallback; requested '$device'"
 	fi
-	validate_sam_and_summary "$stage" "$sam"
+	validate_sam_and_summary "$stage" "$sam" "$require_reads"
 }
 
-run_basecaller fast "$fast_model" 100 1000 5040 0 ""
+run_basecaller fast "$fast_model" 100 1000 5040 0 "" 1
 samtools view "${qualification_tmp}/fast.sam" \
 	| awk 'NR == 1 { print $1; exit }' \
 	> "${qualification_tmp}/selected_read_ids.list"
@@ -211,9 +265,22 @@ samtools view "${qualification_tmp}/fast.sam" \
 	|| die "cannot select a read ID from FAST Dorado output"
 
 run_basecaller hac "$hac_model" 500 2000 3024 10 \
-	"${qualification_tmp}/selected_read_ids.list"
+	"${qualification_tmp}/selected_read_ids.list" 0
+if [ "$(samtools view -c "${qualification_tmp}/hac.sam")" -eq 0 ]; then
+	run_basecaller hac_format_probe "$hac_model" 500 2000 3024 0 \
+		"${qualification_tmp}/selected_read_ids.list" 1
+else
+	cp "${qualification_tmp}/hac.sam" "${qualification_tmp}/hac_format_probe.sam"
+fi
+
 run_basecaller sup "$sup_model" 1000 5000 720 15 \
-	"${qualification_tmp}/selected_read_ids.list"
+	"${qualification_tmp}/selected_read_ids.list" 0
+if [ "$(samtools view -c "${qualification_tmp}/sup.sam")" -eq 0 ]; then
+	run_basecaller sup_format_probe "$sup_model" 1000 5000 720 0 \
+		"${qualification_tmp}/selected_read_ids.list" 1
+else
+	cp "${qualification_tmp}/sup.sam" "${qualification_tmp}/sup_format_probe.sam"
+fi
 
 report_parent="$(dirname "$report")"
 [ -d "$report_parent" ] || mkdir -p "$report_parent"
@@ -225,10 +292,15 @@ report_tmp="${report}.tmp.$$"
 	printf 'platform\t%s\n' "$expected_platform"
 	printf 'dorado_version\t%s\n' "$actual_version"
 	printf 'device\t%s\n' "$device"
-	printf 'pod5_sha256\t%s\n' "$(shasum -a 256 "$pod5" | awk '{print $1}')"
+	printf 'pod5_artifact\t%s\n' "$fixture_artifact"
+	printf 'pod5_sha256\t%s\n' "$actual_fixture_sha"
+	printf 'pod5_source_revision\t%s\n' "$fixture_revision"
+	printf 'pod5_chemistry\t%s\n' "$fixture_chemistry"
 	printf 'fast_reads\t%s\n' "$(samtools view -c "${qualification_tmp}/fast.sam")"
-	printf 'hac_reads\t%s\n' "$(samtools view -c "${qualification_tmp}/hac.sam")"
-	printf 'sup_reads\t%s\n' "$(samtools view -c "${qualification_tmp}/sup.sam")"
+	printf 'hac_reads_at_threshold\t%s\n' "$(samtools view -c "${qualification_tmp}/hac.sam")"
+	printf 'hac_format_probe_reads\t%s\n' "$(samtools view -c "${qualification_tmp}/hac_format_probe.sam")"
+	printf 'sup_reads_at_threshold\t%s\n' "$(samtools view -c "${qualification_tmp}/sup.sam")"
+	printf 'sup_format_probe_reads\t%s\n' "$(samtools view -c "${qualification_tmp}/sup_format_probe.sam")"
 	printf 'status\tqualified\n'
 } > "$report_tmp"
 mv "$report_tmp" "$report"

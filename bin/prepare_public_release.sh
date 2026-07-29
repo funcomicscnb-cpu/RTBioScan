@@ -276,6 +276,7 @@ CORE_CONF=(
 	conf/state_compatibility/reference_manifest_legacy_v1.tsv
 	conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv
 	conf/runtime_compatibility/dorado_release_0.7.0_osx-arm64.tsv
+	conf/runtime_compatibility/dorado_qualification_fixture_v0.7.0.tsv
 	conf/runtime_validation/fast_routing_endosymbionts.fa
 	conf/runtime_validation/fast_routing_endosymbionts.expected.tsv
 )

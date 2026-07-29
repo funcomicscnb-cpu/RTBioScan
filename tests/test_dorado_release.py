@@ -182,6 +182,83 @@ def test_static_validator_checks_version_platform_and_command_surface(
     assert "static compatibility passed" in result.stdout
 
 
+def test_live_validator_rejects_unattested_pod5_before_basecalling(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    installed = _install(fixture)
+    assert installed.returncode == 0, installed.stderr
+
+    pod5 = tmp_path / "qualification.pod5"
+    pod5.write_bytes(b"not the attested fixture")
+    qualification_manifest = tmp_path / "qualification.tsv"
+    qualification_manifest.write_text(
+        "\t".join(
+            [
+                "artifact",
+                "sha256",
+                "bytes",
+                "source_url",
+                "source_revision",
+                "chemistry",
+                "role",
+            ]
+        )
+        + "\n"
+        + "\t".join(
+            [
+                pod5.name,
+                "0" * 64,
+                str(pod5.stat().st_size),
+                "https://example.invalid/qualification.pod5",
+                "fixture-revision",
+                "R10.4.1_E8.2_400bps_5kHz",
+                "test fixture",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            str(VALIDATOR),
+            "--manifest",
+            str(fixture["manifest"]),
+            "--release-dir",
+            str(fixture["destination"]),
+            "--qualification-pod5",
+            str(pod5),
+            "--qualification-manifest",
+            str(qualification_manifest),
+            "--device",
+            "cpu",
+            "--report",
+            str(tmp_path / "report.tsv"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "qualification POD5 checksum mismatch" in result.stderr
+
+
+def test_live_validator_preserves_production_calls_and_separate_format_probes() -> None:
+    validator = VALIDATOR.read_text(encoding="utf-8")
+    assert 'run_basecaller fast "$fast_model" 100 1000 5040 0 "" 1' in validator
+    assert (
+        'run_basecaller hac "$hac_model" 500 2000 3024 10 \\\n'
+        '\t"${qualification_tmp}/selected_read_ids.list" 0'
+    ) in validator
+    assert (
+        'run_basecaller sup "$sup_model" 1000 5000 720 15 \\\n'
+        '\t"${qualification_tmp}/selected_read_ids.list" 0'
+    ) in validator
+    assert "hac_format_probe" in validator
+    assert "sup_format_probe" in validator
+    assert "--qualification-manifest is required with --qualification-pod5" in validator
+
+
 def test_dorado_candidate_installation_does_not_change_pipeline_defaults() -> None:
     config = (REPO_ROOT / "nextflow.config").read_text(encoding="utf-8")
     assert 'dorado_bin = "bin/dorado/bin/dorado"' in config

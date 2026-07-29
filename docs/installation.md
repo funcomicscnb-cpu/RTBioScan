@@ -329,20 +329,37 @@ bin/validate_dorado_release.sh \
   --release-dir runtime/dorado/releases/dorado-0.7.0-osx-arm64
 ```
 
-Live qualification requires a representative R10.4.1 E8.2 400 bps POD5 and
-the actual hardware backend. It runs FAST, HAC, and SUP with the production
-chunk, batch, overlap, quality, and read-list arguments; validates SAM and
-`dorado summary` output; rejects reported device fallback; and writes an
-immutable evidence report outside the release directory.
+Live qualification uses a checksummed official Dorado v0.7.0 R10.4.1 E8.2
+400 bps POD5 fixture and the actual hardware backend:
+
+```bash
+curl -L \
+  -o /path/to/dorado-v0.7.0-qualification.pod5 \
+  https://raw.githubusercontent.com/nanoporetech/dorado/v0.7.0/tests/data/pod5/dna_r10.4.1_e8.2_400bps_5khz/dna_r10.4.1_e8.2_400bps_5khz-FLO_PRO114M-SQK_LSK114_XL-5000.pod5
+```
+
+The validator checks this file against the committed fixture manifest. It runs
+FAST, HAC, and SUP with the production chunk, batch, overlap, quality, and
+read-list arguments; validates SAM and `dorado summary` output; rejects
+reported device fallback; and writes an immutable evidence report outside the
+release directory. Because this fixture contains one short read, a
+production-threshold HAC or SUP result may contain no reads. In that case the
+validator performs a separate quality-zero format probe; it does not change
+the production threshold or qualify biological classification behavior.
 
 ```bash
 bin/validate_dorado_release.sh \
   --manifest conf/runtime_compatibility/dorado_release_0.7.0_osx-arm64.tsv \
   --release-dir runtime/dorado/releases/dorado-0.7.0-osx-arm64 \
-  --qualification-pod5 /path/to/qualification.pod5 \
+  --qualification-pod5 /path/to/dorado-v0.7.0-qualification.pod5 \
+  --qualification-manifest conf/runtime_compatibility/dorado_qualification_fixture_v0.7.0.tsv \
   --device metal \
   --report runtime/dorado/qualification/dorado-0.7.0-osx-arm64-metal.tsv
 ```
+
+This is a hardware and interface qualification, not an end-to-end RTBioScan
+classification fixture. Promotion still requires a representative full-round
+shadow run with the candidate binary and models.
 
 Run candidates in a new output directory and with a new `state_id`. Never
 resume or migrate the stable state into a candidate run.

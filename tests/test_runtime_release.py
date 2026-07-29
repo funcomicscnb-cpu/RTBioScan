@@ -76,6 +76,7 @@ def test_release_bundles_environment_locks_and_runtime_validator() -> None:
         "environment.yml",
         "conda-lock-linux-64.yml",
         "conda-lock-osx-64.yml",
+        "conf/runtime_compatibility/dorado_qualification_fixture_v0.7.0.tsv",
         "conf/runtime_validation/fast_routing_endosymbionts.fa",
         "conf/runtime_validation/fast_routing_endosymbionts.expected.tsv",
     ]:
