@@ -24,6 +24,7 @@ Nextflow config and Groovy support:
 - `conf/xprize.config`
 - `conf/state_compatibility/reference_manifest_legacy_v1.tsv`
 - `conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv`
+- `conf/runtime_compatibility/dorado_release_0.7.0_osx-arm64.tsv`
 - `conf/runtime_validation/fast_routing_endosymbionts.fa`
 - `conf/runtime_validation/fast_routing_endosymbionts.expected.tsv`
 - `lib/ChannelUtils.groovy`
@@ -60,12 +61,15 @@ Runtime scripts:
 - Keep `bin/lib/`
 - Keep `bin/report_placeholders/failed_round/`
 
-For the current default configuration, the release must include at least these Dorado model paths if Dorado is bundled:
+Do not bundle locally installed Dorado binaries or models. Dorado is
+platform-specific and is provisioned as a separate, checksummed release. Keep:
 
-- `bin/dorado/bin/dorado`
-- `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_fast@v5.0.0/`
-- `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_hac@v5.0.0/`
-- `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_sup@v4.3.0/`
+- `bin/install_dorado_release.pl`
+- `bin/validate_dorado_release.sh`
+- `conf/runtime_compatibility/dorado_release_*.tsv`
+
+The corresponding platform archive and model bytes are installed separately
+and are not copied by `prepare_public_release.sh`.
 
 ## Keep: runtime data that must exist somewhere
 
@@ -159,11 +163,9 @@ These are useful, but not required for the runtime release itself:
 - `bin/consensus_prune_apply.sh.pre_O1`
 - `conf/.xprize.config.swp`
 
-If you bundle Dorado, the following model directories are not used by the current defaults and can be excluded unless you intentionally support alternate configs:
-
-- `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_fast@v4.3.0/`
-- `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_hac@v4.3.0/`
-- `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_sup@v5.0.0/`
+Exclude every locally installed `bin/dorado/` or
+`runtime/dorado/releases/` tree. A public release must never inherit Dorado
+bytes from the machine that assembled it.
 
 ## Exclude: generated state and run info
 

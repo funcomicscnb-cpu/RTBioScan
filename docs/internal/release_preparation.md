@@ -74,13 +74,12 @@ bash bin/prepare_public_release.sh \
   --force
 ```
 
-Smaller release without bundled Dorado or local Nextflow:
+Smaller release without the local Nextflow binary:
 
 ```bash
 bash bin/prepare_public_release.sh \
   --outdir release/RTBioScan_public_nobundles \
   --profiles voucher \
-  --no-dorado \
   --no-nextflow \
   --force
 ```
@@ -106,11 +105,6 @@ bash bin/prepare_public_release.sh \
 `--no-nextflow`
 
 - Skips bundling the local `./nextflow` binary, even if it exists in the repository.
-
-`--no-dorado`
-
-- Skips bundling `bin/dorado/`.
-- Useful when Dorado binaries and models are distributed separately or are too large for the intended release artifact.
 
 `--strict`
 
@@ -141,7 +135,6 @@ It conditionally copies:
 
 - `conf/test.config` when `--profiles test` is requested
 - `tests/`, `pytest.ini`, and `Makefile` when `--with-tests` is used
-- `bin/dorado/` unless `--no-dorado` is used
 - the local `nextflow` binary unless `--no-nextflow` is used
 - profile-specific database files described in [public_release_manifest.md](public_release_manifest.md)
 
@@ -156,11 +149,9 @@ The script excludes:
 - `.DS_Store`
 - generated state such as `results/`, `work/`, `.nextflow/`, `.nextflow.log*`, and `Consensus/`
 
-For bundled Dorado, it keeps only the model paths currently required by `nextflow.config`:
-
-- `dna_r10.4.1_e8.2_400bps_fast@v5.0.0`
-- `dna_r10.4.1_e8.2_400bps_hac@v5.0.0`
-- `dna_r10.4.1_e8.2_400bps_sup@v4.3.0`
+It never copies locally installed Dorado binaries or model trees. The release
+contains only the Dorado installer, compatibility validator, and checksummed
+release manifests; platform bytes are provisioned separately.
 
 ## Profile handling
 

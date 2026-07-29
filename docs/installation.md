@@ -15,11 +15,9 @@
 * [4. Python](#4-python)
 * [5. Perl modules](#5-perl-modules)
 * [6. Dorado basecaller](#6-dorado-basecaller)
-  * [macOS Apple Silicon](#macos-apple-silicon)
-  * [Linux x86-64 (CUDA GPU)](#linux-x86-64-cuda-gpu)
-  * [Linux x86-64 (CPU only)](#linux-x86-64-cpu-only)
-  * [Dorado basecalling models](#dorado-basecalling-models)
-  * [Configuring the device](#configuring-the-device)
+  * [Install the audited macOS ARM64 baseline](#install-the-audited-macos-arm64-baseline)
+  * [Static and live compatibility checks](#static-and-live-compatibility-checks)
+  * [Explicit candidate selection](#explicit-candidate-selection)
 * [7. BLAST databases](#7-blast-databases)
 * [8. Verify the installation](#8-verify-the-installation)
 
@@ -35,7 +33,7 @@ RTBioScan is a Nextflow DSL1 pipeline for real-time ONT metabarcoding. It requir
 - The **`pod5` CLI** for the wrapper/feeder workflow (`RTBioScan.sh --feeder` / `--do_metadata`)
 - **R** with Bioconductor packages for consensus generation and report visualisation
 - **Python 3** for report rendering, the local report server, and Python-packaged CLIs
-- **Dorado** (Oxford Nanopore basecaller) bundled inside `bin/dorado/bin/`
+- **Dorado** (Oxford Nanopore basecaller), provisioned separately per platform
 - **BLAST databases** distributed separately from the code
 
 The first reproducible runtime candidate is the committed Conda lock for
@@ -72,7 +70,7 @@ not be used for RTBioScan.
 | LAST | `1542` | Must equal `version=1542` in the shipped `.prj` index |
 | pod5 | ≥ 0.2 | Required for `RTBioScan.sh --feeder` / `--do_metadata`; optional for direct pre-sliced POD5 runs |
 | taxonkit | `0.14.2` | Required; preserves the audited `{k}`/`{K}` semantics |
-| Dorado | 0.7.x (arm64 / x86-64) | Bundled in `bin/dorado/bin/dorado` |
+| Dorado | `0.7.0+71cc7442` baseline | Optional, platform-specific release; upgrades require qualification |
 | BLAST databases | — | Provided separately (see §7) |
 
 ---
@@ -273,100 +271,101 @@ perl -e 'use JSON::PP; print "OK\n"'
 ## 6. Dorado basecaller
 [back to Top](#rtbioscan-installation)
 
-Dorado is the Oxford Nanopore basecaller. The pipeline expects the binary at:
+Dorado is provisioned independently from the Conda runtime because its binary,
+models, and hardware backend are platform-specific. RTBioScan never updates
+Dorado automatically and public release assembly does not copy arbitrary local
+Dorado bytes.
 
+The audited compatibility baseline is `0.7.0+71cc7442`. Installations are
+immutable and side-by-side under:
+
+```text
+runtime/dorado/releases/<release-id>/
 ```
-bin/dorado/bin/dorado
-```
 
-relative to the RTBioScan root directory. The basecalling models go in the same directory.
+Installing a candidate does not change `dorado_bin`, model parameters, pipeline
+state, or the supported default. A candidate must pass static, live hardware,
+format, and full-round qualification before it can be promoted.
 
-### macOS Apple Silicon
-[back to Top](#rtbioscan-installation)
+### Install the audited macOS ARM64 baseline
+
+Download the official archive without extracting it:
 
 ```bash
-cd /path/to/RTBioScan
-
-# Download the macOS arm64 build (adjust version tag as needed)
-curl -L https://cdn.oxfordnanoportal.com/software/analysis/dorado-0.7.3-osx-arm64.tar.gz \
-  | tar -xz
-
-# Move to the expected location
-mkdir -p bin/dorado
-mv dorado-0.7.3-osx-arm64/* bin/dorado/
-
-# Verify
-bin/dorado/bin/dorado --version
+curl -L \
+  -o /path/to/dorado-0.7.0-osx-arm64.zip \
+  https://cdn.oxfordnanoportal.com/software/analysis/dorado-0.7.0-osx-arm64.zip
 ```
 
-### Linux x86-64 (CUDA GPU)
-[back to Top](#rtbioscan-installation)
+Prepare a model-source directory containing exactly the configured FAST, HAC,
+and SUP model directories. An existing audited installation may be used as the
+source; otherwise use the downloaded Dorado binary's `download` subcommand.
+The installer verifies every model tensor and configuration byte against the
+committed release manifest.
 
 ```bash
-cd /path/to/RTBioScan
-
-curl -L https://cdn.oxfordnanoportal.com/software/analysis/dorado-0.7.3-linux-x64.tar.gz \
-  | tar -xz
-
-mkdir -p bin/dorado
-mv dorado-0.7.3-linux-x64/* bin/dorado/
-
-bin/dorado/bin/dorado --version
+perl bin/install_dorado_release.pl \
+  --archive /path/to/dorado-0.7.0-osx-arm64.zip \
+  --model-source-dir /path/to/dorado-models \
+  --manifest conf/runtime_compatibility/dorado_release_0.7.0_osx-arm64.tsv \
+  --destination runtime/dorado/releases/dorado-0.7.0-osx-arm64
 ```
 
-### Linux x86-64 (CPU only)
-[back to Top](#rtbioscan-installation)
+Re-running the installer verifies an exact existing release and never replaces
+it. A different version or platform must use a different destination.
 
-The same binary supports CPU basecalling. Set `dorado_device = "cpu"` in `nextflow.config` (see below).
+The Linux x86-64 baseline must be installed from its own checksummed platform
+manifest once that manifest and live CUDA/CPU qualification are available. A
+macOS binary must never be copied into a Linux release.
 
-### Dorado basecalling models
-[back to Top](#rtbioscan-installation)
+### Static and live compatibility checks
 
-The three models used by the pipeline are already bundled in `bin/dorado/bin/` when you follow the steps above:
-
-| Model | Path in `bin/dorado/bin/` | Used for |
-|---|---|---|
-| FAST v5.0.0 | `dna_r10.4.1_e8.2_400bps_fast@v5.0.0` | First-pass basecalling |
-| HAC v5.0.0 | `dna_r10.4.1_e8.2_400bps_hac@v5.0.0` | High-accuracy pass |
-| SUP v4.3.0 | `dna_r10.4.1_e8.2_400bps_sup@v4.3.0` | Super-accuracy consensus |
-
-If the models are not bundled in the Dorado tarball you downloaded, download them explicitly:
+Static verification checks installed bytes, platform, version, model
+completeness, and every Dorado command-line option used by RTBioScan:
 
 ```bash
-# Download models into the Dorado binary directory
-bin/dorado/bin/dorado download --model dna_r10.4.1_e8.2_400bps_fast@v5.0.0 \
-  --directory bin/dorado/bin/
-
-bin/dorado/bin/dorado download --model dna_r10.4.1_e8.2_400bps_hac@v5.0.0 \
-  --directory bin/dorado/bin/
-
-bin/dorado/bin/dorado download --model dna_r10.4.1_e8.2_400bps_sup@v4.3.0 \
-  --directory bin/dorado/bin/
+bin/validate_dorado_release.sh \
+  --manifest conf/runtime_compatibility/dorado_release_0.7.0_osx-arm64.tsv \
+  --release-dir runtime/dorado/releases/dorado-0.7.0-osx-arm64
 ```
 
-The model paths in `nextflow.config` are already set to match this layout:
+Live qualification requires a representative R10.4.1 E8.2 400 bps POD5 and
+the actual hardware backend. It runs FAST, HAC, and SUP with the production
+chunk, batch, overlap, quality, and read-list arguments; validates SAM and
+`dorado summary` output; rejects reported device fallback; and writes an
+immutable evidence report outside the release directory.
 
-```groovy
-fast_model = "bin/dorado/bin/dna_r10.4.1_e8.2_400bps_fast@v5.0.0"
-hac_model  = "bin/dorado/bin/dna_r10.4.1_e8.2_400bps_hac@v5.0.0"
-sup_model  = "bin/dorado/bin/dna_r10.4.1_e8.2_400bps_sup@v4.3.0"
+```bash
+bin/validate_dorado_release.sh \
+  --manifest conf/runtime_compatibility/dorado_release_0.7.0_osx-arm64.tsv \
+  --release-dir runtime/dorado/releases/dorado-0.7.0-osx-arm64 \
+  --qualification-pod5 /path/to/qualification.pod5 \
+  --device metal \
+  --report runtime/dorado/qualification/dorado-0.7.0-osx-arm64-metal.tsv
 ```
 
-### Configuring the device
-[back to Top](#rtbioscan-installation)
+Run candidates in a new output directory and with a new `state_id`. Never
+resume or migrate the stable state into a candidate run.
 
-Edit `nextflow.config` to set the hardware accelerator:
+### Explicit candidate selection
 
-```groovy
-// Apple Silicon GPU (default)
-dorado_device = "metal"
+Installation and qualification still do not activate a release. Select it
+explicitly only for a shadow run:
 
-// NVIDIA GPU (CUDA)
-dorado_device = "cuda:0"
-
-// CPU only (any platform, slower)
-dorado_device = "cpu"
+```bash
+./RTBioScan.sh \
+  --state_id DORADO_CANDIDATE_STATE \
+  --outdir results_dorado_candidate \
+  --dorado_bin runtime/dorado/releases/dorado-0.7.0-osx-arm64/bin/dorado \
+  --fast_model runtime/dorado/releases/dorado-0.7.0-osx-arm64/models/dna_r10.4.1_e8.2_400bps_fast@v5.0.0 \
+  --hac_model runtime/dorado/releases/dorado-0.7.0-osx-arm64/models/dna_r10.4.1_e8.2_400bps_hac@v5.0.0 \
+  --sup_model runtime/dorado/releases/dorado-0.7.0-osx-arm64/models/dna_r10.4.1_e8.2_400bps_sup@v4.3.0 \
+  [normal run arguments]
 ```
+
+Rollback means selecting the retained stable release and its matching,
+untouched state. Installed releases are never overwritten or deleted by the
+installer.
 
 ---
 
@@ -449,10 +448,10 @@ command -v pod5 >/dev/null 2>&1 \
   && echo "OK  pod5 ($(command -v pod5))" \
   || echo "MISSING  pod5"
 
-# Dorado binary
-[ -x bin/dorado/bin/dorado ] \
-  && echo "OK  dorado $(bin/dorado/bin/dorado --version 2>&1 | head -1)" \
-  || echo "MISSING  bin/dorado/bin/dorado"
+# Dorado release (adjust platform manifest/release path when qualified)
+bin/validate_dorado_release.sh \
+  --manifest conf/runtime_compatibility/dorado_release_0.7.0_osx-arm64.tsv \
+  --release-dir runtime/dorado/releases/dorado-0.7.0-osx-arm64
 
 # R packages
 Rscript -e 'library(Biostrings); library(DECIPHER); library(ggplot2); cat("R packages OK\n")'

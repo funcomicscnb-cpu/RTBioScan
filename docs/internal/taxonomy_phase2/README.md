@@ -176,6 +176,29 @@ Nextflow profile remains disabled because `process.conda = environment.yml`
 would re-solve dependencies instead of using the committed lock. Install and
 activate the platform lock, validate it, and run without `-profile conda`.
 
+## Optional Dorado releases
+
+Dorado is not part of the Conda lock and is never updated automatically.
+`0.7.0+71cc7442` is the audited baseline. The committed macOS ARM64 manifest
+pins the official platform archive plus every active FAST, HAC, and SUP model
+artifact. `bin/install_dorado_release.pl` installs immutable releases
+side-by-side and never changes the configured binary or model paths.
+
+`bin/validate_dorado_release.sh` has two gates:
+
+- static verification of bytes, version, platform, models, `basecaller`, and
+  `summary` command compatibility;
+- live qualification on an explicitly requested hardware device and POD5,
+  using the exact FAST/HAC/SUP chunk, batch, overlap, quality, read-list, SAM,
+  and summary interfaces used by RTBioScan.
+
+Candidate runs use a new `state_id` and output directory. Promotion is an
+explicit reviewed configuration change; rollback selects the retained stable
+release and its untouched matching state. A Linux x86-64 release remains
+unqualified until its platform manifest and live CUDA/CPU evidence exist.
+Phase 2.1c will bind the selected Dorado binary, model manifests, device, and
+effective arguments into the state identity.
+
 ## Existing rolling state
 
 The default `strict` policy deliberately refuses pre-Phase-2 state because its

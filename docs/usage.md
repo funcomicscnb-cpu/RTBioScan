@@ -1123,6 +1123,8 @@ Device string passed to Dorado.
 - Default: `metal`.
 - Examples: `metal`, `cpu`, `cuda:0`.
 - On macOS, use a provisioned local execution mode so Dorado can access Metal directly.
+- The selected hardware backend is part of Dorado qualification and must not
+  be changed inside an existing rolling state.
 
 #### `--dorado_bin`
 [back to Top](#rtbioscan-usage)
@@ -1131,6 +1133,9 @@ Path to the Dorado executable.
 
 - Default: `bin/dorado/bin/dorado`.
 - Relative paths are resolved from the pipeline root.
+- The default preserves the legacy installation layout. New or candidate
+  releases are installed side-by-side and selected explicitly only after
+  `bin/validate_dorado_release.sh` passes.
 
 #### `--fast_model`
 [back to Top](#rtbioscan-usage)
@@ -1138,6 +1143,7 @@ Path to the Dorado executable.
 Dorado model used for the initial FAST on-target screening pass.
 
 - Default: `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_fast@v5.0.0`.
+- Binary and model paths must come from the same qualified release.
 
 #### `--hac_model`
 [back to Top](#rtbioscan-usage)
@@ -1145,6 +1151,7 @@ Dorado model used for the initial FAST on-target screening pass.
 Dorado model used for the main HAC basecalling pass.
 
 - Default: `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_hac@v5.0.0`.
+- Binary and model paths must come from the same qualified release.
 
 #### `--sup_model`
 [back to Top](#rtbioscan-usage)
@@ -1152,6 +1159,7 @@ Dorado model used for the main HAC basecalling pass.
 Dorado model used for SUP consensus-support basecalling.
 
 - Default: `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_sup@v4.3.0`.
+- Binary and model paths must come from the same qualified release.
 
 #### `--dorado_retry_attempts`
 [back to Top](#rtbioscan-usage)
