@@ -279,6 +279,9 @@ CORE_TOP=(
 	RTBioScan.sh
 	main.nf
 	nextflow.config
+	environment.yml
+	conda-lock-linux-64.yml
+	conda-lock-osx-64.yml
 )
 
 CORE_CONF=(
@@ -286,6 +289,10 @@ CORE_CONF=(
 	conf/barcoding.config
 	conf/voucher.config
 	conf/xprize.config
+	conf/state_compatibility/reference_manifest_legacy_v1.tsv
+	conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv
+	conf/runtime_validation/fast_routing_endosymbionts.fa
+	conf/runtime_validation/fast_routing_endosymbionts.expected.tsv
 )
 
 CORE_LIB=(
@@ -369,6 +376,7 @@ DB_FILES=(
 
 DB_DIRS=(
 	"db/taxdb"
+	"db/taxonomy/releases/ncbi-taxdump-2024-06-24"
 )
 
 if profile_enabled barcoding; then
@@ -418,10 +426,6 @@ for rel in "${DB_DIRS[@]}"; do
 		copy_path "$rel"
 	fi
 done
-
-if [ ! -f "${REPO_ROOT}/environment.yml" ]; then
-	warn "environment.yml is absent in the source repo; the bundled conda profile remains incomplete"
-fi
 
 printf 'Release directory prepared at: %s\n' "$OUTDIR"
 if [ -n "$PROFILES" ]; then

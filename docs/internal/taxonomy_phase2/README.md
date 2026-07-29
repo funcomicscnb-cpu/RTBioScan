@@ -11,8 +11,8 @@ created, `bin/state_compatibility_contract.pl` binds the rolling state to:
 
 - the SHA-256 of a versioned reference manifest;
 - verified SHA-256 checksums of every artifact named by that manifest;
-- the effective TaxonKit `nodes.dmp`, `names.dmp`, `merged.dmp`, and
-  `delnodes.dmp` files;
+- the pinned TaxonKit release manifest and verified `nodes.dmp`, `names.dmp`,
+  `merged.dmp`, and `delnodes.dmp` files;
 - marker targets and target taxa;
 - BLAST/LAST database and taxonomy-map selections;
 - explicit classifier-policy and scoring-policy versions.
@@ -48,11 +48,20 @@ The manifest intentionally describes the installed operational indexes. It does
 not activate the 1,493 FASTA-only COI tail records identified in Phase 1. Tail
 admission remains a separate, audited reference release.
 
-On the first verification, all manifest entries and the four effective TaxonKit
-files are checked byte-for-byte. The resulting attestation is stored in a
-private per-user cache. Later `cached` starts reuse verified hashes only when
-device, inode, ownership, mode, size, mtime, and ctime are unchanged. A changed
-entry alone is rehashed. `full` mode always rehashes every entry.
+`conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv` pins the exact
+June-2024 TaxonKit baseline used before remediation. The source archive and all
+four extracted files match the hashes captured in Phase 1. The default runtime
+directory is:
+
+```text
+db/taxonomy/releases/ncbi-taxdump-2024-06-24
+```
+
+On the first verification, all reference-manifest entries and the four pinned
+TaxonKit files are checked byte-for-byte. The resulting attestation is stored
+in a private per-user cache. Later `cached` starts reuse verified hashes only
+when device, inode, ownership, mode, size, mtime, and ctime are unchanged. A
+changed entry alone is rehashed. `full` mode always rehashes every entry.
 
 The configured FAST/LAST prefix, every marker BLAST prefix, BLAST taxonomy
 directory, taxonomy-memory seed, and lineage map must also be represented in the
@@ -67,7 +76,8 @@ expected component groups.
 |---|---|---|
 | `state_compatibility_policy` | `strict` | `strict` rejects legacy state without a manifest; `adopt_legacy` permits one explicit adoption |
 | `state_reference_manifest` | `conf/state_compatibility/reference_manifest_legacy_v1.tsv` | Checksummed operational reference set |
-| `state_taxonomy_data_dir` | empty | Explicit TaxonKit data directory; empty preserves TaxonKit's `$HOME/.taxonkit` default |
+| `state_taxonomy_data_dir` | `db/taxonomy/releases/ncbi-taxdump-2024-06-24` | Required pinned TaxonKit runtime directory |
+| `state_taxonomy_release_manifest` | `conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv` | Expected archive and runtime-file hashes |
 | `state_reference_verification` | `cached` | `cached` uses private stat attestations; `full` rehashes every declared reference and taxonomy file |
 | `state_verification_cache_dir` | empty | Cache root; empty derives `<outdir>/temp/_compatibility_cache`, with a private `uid-N` child |
 | `state_classifier_policy_version` | `legacy-rank-string-v1` | Manual compatibility version for classifier semantics |
@@ -81,6 +91,18 @@ Empty per-marker `nonncbi_memtax` entries and an empty
 classifier emits no OTU lineage annotations when the lineage override file is
 absent; startup warns about this degraded behavior. Adding a TaxonKit-only
 fallback is deferred because it would change classification behavior.
+
+Install the release from the audited archive with:
+
+```bash
+perl bin/install_taxonomy_release.pl \
+  --archive /path/to/taxdump.tar.gz \
+  --manifest conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv \
+  --destination db/taxonomy/releases/ncbi-taxdump-2024-06-24
+```
+
+The installer is idempotent for an exact existing release and refuses to
+replace mismatched data.
 
 ## Attestation trust boundary
 
@@ -110,20 +132,49 @@ verification remain outside this cache's guarantee. Use full verification when
 those risks apply. Production reference releases should use immutable,
 content-addressed directories and read-only mounts or permissions.
 
-## Phase 2.1a interim limitation
+## Phase 2.1b taxonomy packaging and propagation
 
-Phase 2.1a is a performance and robustness release, not the production
-completion gate. Until the exact legacy taxonomy is packaged and the execution
-toolchain is pinned:
+Phase 2.1b removes the host-local `~/.taxonkit` dependency. The same resolved
+directory is:
 
-- do not change the TaxonKit directory or toolchain within an existing state;
-- use a new state if either changes;
-- do not assume the host-side tool versions describe a Docker, Singularity, or
-  Conda execution backend.
+- verified by the host-side compatibility contract;
+- exported as `TAXONKIT_DB` in both OTU and consensus taxonomy processes; and
+- checked for visibility again inside the execution environment before
+  classification starts.
 
-The planned Phase 2.1b release will package and propagate the exact June 2024
-taxonomy baseline. Phase 2.1c will add backend-aware toolchain identity and an
-explicit contract-schema migration.
+Moving an existing Phase-2.1a state from `~/.taxonkit` to the canonical
+directory is compatible only when all four content hashes remain identical.
+The contract ID then stays unchanged and the state manifest records the former
+taxonomy path. Any byte change remains an incompatible taxonomy change.
+
+Phase 2 is still not the production completion gate until Phase 2.1c adds
+backend-aware toolchain identity and the explicit contract-schema migration.
+Until then, do not change the TaxonKit, BLAST, or LAST toolchain within an
+existing state.
+
+## Runtime qualification after container removal
+
+The inherited `hecrp/nanortax` container belonged to another pipeline and is
+not an RTBioScan runtime. Docker and Singularity are now explanatory erroring
+profiles. The candidate managed runtime is represented by:
+
+- `environment.yml`;
+- `conda-lock-linux-64.yml`; and
+- `conda-lock-osx-64.yml` (Rosetta on Apple Silicon).
+
+The load-bearing pins are BLAST 2.15.0, LAST 1542, SeqKit 2.6.1, TaxonKit
+0.14.2, and Cutadapt 4.6. LAST 1542 is required by the
+`version=1542` field in `db/targets_All_tagged_nr95.prj`; rebuilding the index
+and changing this pin must always be one coordinated reference release.
+
+`bin/validate_runtime.sh` checks the versions, LAST index readability and exact
+first-hit routing fixture, BLAST/SeqKit/Cutadapt behavior, and the five-taxon
+TaxonKit rank matrix. Both locks pass against the shipped 1542 index and pinned
+taxonomy: macOS `osx-64` under Rosetta and `linux-64` with Linux/amd64 binaries.
+The macOS lock also loads the declared R/Bioconductor packages. The `conda`
+Nextflow profile remains disabled because `process.conda = environment.yml`
+would re-solve dependencies instead of using the committed lock. Install and
+activate the platform lock, validate it, and run without `-profile conda`.
 
 ## Existing rolling state
 
@@ -146,6 +197,13 @@ The installed manifest records `legacy_adopted	1`. Subsequent runs use
 If provenance cannot be confirmed, use a new `--state_id` or explicitly reset
 the state. Never adopt merely to bypass an incompatibility error.
 
+Contract-bearing state whose recorded `execution_profile` contains `docker` or
+`singularity` is rejected because the former image belonged to NanoRTax, not
+RTBioScan. This automated check covers Phase-2.1a-and-later state manifests.
+Pre-contract state has no trustworthy execution-backend provenance: never use
+`adopt_legacy` for state known or suspected to have been produced with that
+image. Start a new state and reanalyse instead.
+
 ## Mismatch behavior
 
 A mismatch is fatal and reports the changed contract fields. The supported
@@ -166,6 +224,11 @@ There is no force flag that combines incompatible rolling state.
 - Legacy material fails under `strict`.
 - Explicit legacy adoption succeeds once and is recorded.
 - Reference artifacts are rejected if their bytes no longer match the manifest.
+- Taxonomy artifacts are rejected unless size and SHA-256 match the pinned
+  taxonomy release manifest.
+- OTU and consensus processes receive the same canonical `TAXONKIT_DB`.
+- A content-identical Phase-2.1a taxonomy-path migration preserves the contract
+  ID and records its former path.
 - An unchanged cached restart does not rehash or rewrite the attestation.
 - Changing one file rehashes only that file.
 - Unsafe cache ownership or permissions cannot authorize cached reuse.

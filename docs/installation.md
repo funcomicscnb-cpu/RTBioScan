@@ -9,8 +9,8 @@
 * [Requirements at a glance](#requirements-at-a-glance)
 * [1. Nextflow](#1-nextflow)
 * [2. System tools](#2-system-tools)
-  * [macOS (Apple Silicon — Homebrew recommended)](#macos-apple-silicon--homebrew-recommended)
-  * [Linux](#linux)
+  * [macOS (Apple Silicon — manual host runtime)](#macos-apple-silicon--manual-host-runtime)
+  * [Locked Conda runtime (Linux x86-64 and macOS under Rosetta)](#locked-conda-runtime-linux-x86-64-and-macos-under-rosetta)
 * [3. R and Bioconductor packages](#3-r-and-bioconductor-packages)
 * [4. Python](#4-python)
 * [5. Perl modules](#5-perl-modules)
@@ -22,7 +22,6 @@
   * [Configuring the device](#configuring-the-device)
 * [7. BLAST databases](#7-blast-databases)
 * [8. Verify the installation](#8-verify-the-installation)
-* [Alternative: Docker (no local dependencies)](#alternative-docker-no-local-dependencies)
 
 ---
 
@@ -39,7 +38,16 @@ RTBioScan is a Nextflow DSL1 pipeline for real-time ONT metabarcoding. It requir
 - **Dorado** (Oxford Nanopore basecaller) bundled inside `bin/dorado/bin/`
 - **BLAST databases** distributed separately from the code
 
-**On macOS (Apple Silicon), Homebrew is the recommended package manager.** It installs native arm64 binaries, requires no environment activation, and covers all the CLI tools this pipeline needs. Conda is the better choice when deploying on Linux or sharing a reproducible environment across platforms. A Docker image (`hecrp/nanortax:latest`) is also available and requires only Docker and Nextflow.
+The first reproducible runtime candidate is the committed Conda lock for
+`linux-64` and macOS `osx-64` under Rosetta. Install and activate the lock, then
+run RTBioScan without `-profile conda`; that profile remains disabled because
+Nextflow would re-solve `environment.yml` instead of consuming the committed
+lock. Native Homebrew remains usable only when every required tool is
+provisioned at the validated versions.
+
+RTBioScan does not currently publish a validated Docker or Singularity image.
+The former `hecrp/nanortax` setting belonged to a different pipeline and must
+not be used for RTBioScan.
 
 ---
 
@@ -54,16 +62,16 @@ RTBioScan is a Nextflow DSL1 pipeline for real-time ONT metabarcoding. It requir
 | Perl | ≥ 5.20 | Standard modules only (see §5) |
 | Python | ≥ 3.8 | Pipeline scripts use stdlib only; `cutadapt` / `pod5` install via `pip` or `conda` |
 | R | ≥ 4.0 | + Bioconductor packages (see §3) |
-| BLAST+ | ≥ 2.12 | `blastn` must be in `PATH` |
+| BLAST+ | `2.15.0` | Audited classification baseline |
 | cd-hit | ≥ 4.8 | `cd-hit-est` must be in `PATH` |
 | vsearch | ≥ 2.21 | `vsearch` must be in `PATH` |
-| cutadapt | ≥ 4.0 | Required for barcode / primer demultiplexing |
+| cutadapt | `4.6` | Required for barcode / primer demultiplexing |
 | seqtk | ≥ 1.3 | `seqtk` must be in `PATH` |
-| seqkit | ≥ 2.4 | `seqkit` must be in `PATH` |
+| seqkit | `2.6.1` | `seqkit` must be in `PATH` |
 | samtools | ≥ 1.16 | `samtools` must be in `PATH` |
-| LAST | ≥ 1400 | `lastal` must be in `PATH` |
+| LAST | `1542` | Must equal `version=1542` in the shipped `.prj` index |
 | pod5 | ≥ 0.2 | Required for `RTBioScan.sh --feeder` / `--do_metadata`; optional for direct pre-sliced POD5 runs |
-| taxonkit | any | Optional; used for full lineage retrieval |
+| taxonkit | `0.14.2` | Required; preserves the audited `{k}`/`{K}` semantics |
 | Dorado | 0.7.x (arm64 / x86-64) | Bundled in `bin/dorado/bin/dorado` |
 | BLAST databases | — | Provided separately (see §7) |
 
@@ -103,65 +111,69 @@ java -version
 ## 2. System tools
 [back to Top](#rtbioscan-installation)
 
-### macOS (Apple Silicon — Homebrew recommended)
+### macOS (Apple Silicon — manual host runtime)
 [back to Top](#rtbioscan-installation)
 
-Homebrew installs native arm64 binaries with no environment activation step, which is simpler and faster than Conda on macOS. Install [Homebrew](https://brew.sh) first, then:
+Homebrew can supply most native arm64 tools, but the shipped LAST index requires
+LAST 1542 exactly. A newer `brew install last` is not automatically compatible.
+Use this path only if you can provision the audited versions and pass
+`bin/validate_runtime.sh`.
 
-```bash
-# All core tools in one command
-brew install blast cd-hit vsearch seqtk seqkit samtools
+Generic `brew install` commands are deliberately not presented as a
+reproducible recipe: Homebrew tracks current releases and may install a LAST,
+BLAST, or TaxonKit version that differs from this reference release. For a new
+installation, prefer the locked Conda runtime below. Existing manually
+provisioned hosts must supply all tools in the requirements table; install the
+wrapper-side `pod5` CLI as described in [§4 Python](#4-python).
 
-# LAST aligner (brewsci/bio tap)
-brew tap brewsci/bio
-brew install last
+> **Note:** A dependency installation is not acceptance. The runtime validator
+> fails if `lastal` does not equal the `.prj` builder version or if another
+> load-bearing tool differs from the audited baseline.
 
-# Optional helper
-brew install taxonkit     # Full lineage retrieval
-```
+> **Conda on Apple Silicon:** the committed macOS lock is `osx-64`, not native
+> `osx-arm64`, because the validated historical LAST/R/Bioconductor combination
+> is unavailable natively. Rosetta 2 is required.
 
-Install the Python-packaged CLIs (`cutadapt` and `pod5`) in [§4 Python](#4-python) after Python itself is available.
-
-> **Note:** Homebrew installs to `/opt/homebrew/bin/` on Apple Silicon. This is added to your `PATH` automatically after `brew shellenv` runs from your shell profile (usually already done by the Homebrew installer).
-
-> **Conda on macOS:** If you prefer Conda or need the same environment on both macOS and Linux, the Linux Conda instructions below work on macOS too. Use [Miniforge](https://github.com/conda-forge/miniforge) (arm64 native) rather than the standard Anaconda installer to avoid Rosetta issues.
-
-### Linux
+### Locked Conda runtime (Linux x86-64 and macOS under Rosetta)
 [back to Top](#rtbioscan-installation)
 
-Conda is the most reproducible approach on Linux:
+Install the committed lock that matches the runtime platform:
 
 ```bash
-conda create -n rtbioscan -c bioconda -c conda-forge \
-  blast=2.14 \
-  cd-hit=4.8.1 \
-  vsearch=2.22.1 \
-  cutadapt=4.6 \
-  seqtk=1.3 \
-  seqkit=2.6.1 \
-  samtools=1.18 \
-  last=1454 \
-  taxonkit=0.15 \
-  pod5
+# Linux x86-64
+conda-lock install --name rtbioscan conda-lock-linux-64.yml
+conda activate rtbioscan
 
+# macOS Apple Silicon, using the osx-64 lock under Rosetta
+CONDA_SUBDIR=osx-64 conda-lock install \
+  --force-platform osx-64 \
+  --name rtbioscan \
+  conda-lock-osx-64.yml
 conda activate rtbioscan
 ```
 
-Or with `apt` on Debian/Ubuntu (versions in the repositories may be older):
+Validate the installed runtime against the shipped LAST index and pinned
+taxonomy before starting the pipeline:
 
 ```bash
-sudo apt-get install -y \
-  ncbi-blast+ \
-  cd-hit \
-  vsearch \
-  cutadapt \
-  seqtk \
-  samtools
-
-# seqkit, LAST, and pod5 are not typically available in usable repo versions; install via conda
-# or use §4 to install pod5 with pip:
-conda install -c bioconda seqkit last
+bin/validate_runtime.sh \
+  --taxonomy-data-dir db/taxonomy/releases/ncbi-taxdump-2024-06-24 \
+  --last-index db/targets_All_tagged_nr95
 ```
+
+The validator checks the exact tool versions, confirms that LAST 1542 reads the
+1542 index, replays the committed FAST first-hit fixture, exercises BLAST,
+SeqKit, and Cutadapt, and verifies the TaxonKit kingdom matrix. Launch the
+pipeline from the activated environment without `-profile conda`.
+
+Both committed locks pass this validator against the shipped index and pinned
+taxonomy: `osx-64` under Rosetta and `linux-64` with Linux/amd64 binaries. This
+qualifies the toolchain behavior; a minimal full Nextflow round remains a
+separate release gate before enabling the `conda` profile.
+
+`pod5` is a wrapper-side host dependency and is intentionally not part of the
+cross-platform process lock. Install it separately when using
+`RTBioScan.sh --feeder` or `--do_metadata`.
 
 ---
 
@@ -371,13 +383,28 @@ The pipeline expects, relative to the RTBioScan root:
 |---|---|---|
 | `blast_db_specs` | `db/COInr98_2024Jun_RioNegro_Brazil\|db/ITS2nr98_2024Jun_RioNegro_Brazil` | Per-marker taxonomy assignment (pipe-separated, same order as `--targets`) |
 | `blast_filter_db` | `db/toDefault/targets_All_tagged_nr95` | Kingdom pre-filter (LAST) |
-| `blast_taxdb` | `db/taxdb` | NCBI taxonomy (taxonkit) |
+| `blast_taxdb` | `db/taxdb` | BLAST taxid lookup database |
+| `state_taxonomy_data_dir` | `db/taxonomy/releases/ncbi-taxdump-2024-06-24` | Pinned TaxonKit lineage database |
 
 Auxiliary files also expected in `db/`:
 
 - `COInr_2024Jun_metazoa_memtax1.txt` — in-memory taxonomy for fast COI lookup
 - `ITS2nr_2024Jun_viridiplantae_memtax2.txt` — in-memory taxonomy for fast ITS2 lookup
 - `DBnr_2024Jun_id2lineage.txt` — sequence ID to lineage mapping
+
+The prepared runtime release includes the pinned TaxonKit directory. For a
+source checkout, install it from the matching June-2024 `taxdump.tar.gz`:
+
+```bash
+perl bin/install_taxonomy_release.pl \
+  --archive /path/to/taxdump.tar.gz \
+  --manifest conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv \
+  --destination db/taxonomy/releases/ncbi-taxdump-2024-06-24
+```
+
+The installer verifies the archive and all four extracted files, installs the
+release atomically, and refuses to overwrite a mismatched existing directory.
+The pipeline does not fall back to `~/.taxonkit`.
 
 **To use your own databases**, update the corresponding parameters in `nextflow.config` or pass them as command-line arguments:
 
@@ -436,31 +463,8 @@ nextflow -version
 
 ---
 
-## Alternative: Docker (no local dependencies)
-[back to Top](#rtbioscan-installation)
-
-If you prefer not to install tools natively for the Nextflow tasks themselves, Docker requires only **Docker Desktop** and **Nextflow**.
-
-```bash
-# Pull the container image
-docker pull hecrp/nanortax:latest
-
-# Run the pipeline with the docker profile
-nextflow run main.nf \
-  --reads "pod5/reads_rt_round_pod5/*pod5" \
-  -profile docker
-
-# Or with the voucher profile
-nextflow run main.nf \
-  --reads "pod5/reads_rt_round_pod5/*pod5" \
-  -profile voucher,docker
-```
-
-The Docker image (`hecrp/nanortax:latest`) bundles the pipeline-side bioinformatics tools except Dorado and the BLAST databases. You still need to:
-
-1. Place the Dorado binary and models in `bin/dorado/bin/` (see §6).
-2. Place or symlink the BLAST databases in `db/` (see §7).
-
-If you launch via `RTBioScan.sh --feeder` or `--do_metadata` while using `-profile docker`, install `pod5` on the host as well. Those wrapper-side scripts run outside the container. Likewise, `--serve` requires a host `python3`.
-
-> **macOS note:** Docker on macOS runs inside a Linux VM. The `dorado_device = "metal"` option does not work inside Docker — set `dorado_device = "cpu"` when using Docker on a Mac.
+> **Unsupported container profiles:** `-profile docker` and
+> `-profile singularity` are retained only as explanatory erroring stubs. They
+> fail before any pipeline work starts. Do not resume rolling state previously
+> produced with the inherited NanoRTax image; start a new state and reanalyse
+> with a provisioned RTBioScan runtime.

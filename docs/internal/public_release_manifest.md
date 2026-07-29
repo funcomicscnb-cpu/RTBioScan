@@ -11,6 +11,9 @@ Top level:
 - `RTBioScan.sh`
 - `main.nf`
 - `nextflow.config`
+- `environment.yml`
+- `conda-lock-linux-64.yml`
+- `conda-lock-osx-64.yml`
 - `nextflow` only if you intentionally want to ship a pinned local Nextflow binary
 
 Nextflow config and Groovy support:
@@ -19,6 +22,10 @@ Nextflow config and Groovy support:
 - `conf/barcoding.config`
 - `conf/voucher.config`
 - `conf/xprize.config`
+- `conf/state_compatibility/reference_manifest_legacy_v1.tsv`
+- `conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv`
+- `conf/runtime_validation/fast_routing_endosymbionts.fa`
+- `conf/runtime_validation/fast_routing_endosymbionts.expected.tsv`
 - `lib/ChannelUtils.groovy`
 - `lib/DemuxConfig.groovy`
 
@@ -65,6 +72,8 @@ For the current default configuration, the release must include at least these D
 The pipeline is not fully runnable without its databases. These can either be shipped with the release or documented as external downloads, but they must exist for the selected profile:
 
 - `db/` content referenced by `nextflow.config`
+- `db/taxonomy/releases/ncbi-taxdump-2024-06-24/`, containing the four
+  checksummed TaxonKit runtime files declared by the taxonomy release manifest
 - Any extra `db/` content referenced by the profile(s) you want to support publicly
 
 Important:
@@ -176,12 +185,9 @@ If you bundle Dorado, the following model directories are not used by the curren
 - `CLAUDE.md`
 - `docs/internal/`
 
-## Missing before a complete public release
+## Runtime qualification before a complete public release
 
-`nextflow.config` still references `environment.yml` for the `conda` profile, but that file is not present in this worktree.
-
-Before calling the release fully functional, do one of these:
-
-- add `environment.yml`, or
-- remove/replace the `conda` profile from the public release, or
-- document that only non-conda profiles are supported in that release artifact
+The candidate Conda specification and platform-separated lockfiles are bundled.
+Do not enable or advertise the `conda` profile until the locked runtime passes
+the committed LAST-index, routing, BLAST replay, TaxonKit rank-semantics,
+SeqKit, Cutadapt, and minimal-round acceptance checks.

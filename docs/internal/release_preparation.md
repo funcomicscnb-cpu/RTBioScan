@@ -191,12 +191,10 @@ This is useful for CI or release-candidate validation.
 
 The script reflects the current repository state, including current gaps.
 
-At the time this documentation was written:
-
-- `nextflow.config` references `environment.yml` for the `conda` profile
-- `environment.yml` is not present in this worktree
-
-As a result, the script warns that the bundled `conda` profile remains incomplete unless that file is added separately.
+The release includes `environment.yml` plus separate `linux-64` and `osx-64`
+locks. A clean dependency solve is necessary but does not qualify the runtime:
+the locked environment must also pass the committed behavioral acceptance
+checks before the `conda` profile is enabled or advertised.
 
 Another common case is missing database prefixes referenced by config files. In non-strict mode this becomes a warning; in strict mode it is a hard error.
 
