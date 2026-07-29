@@ -7,6 +7,25 @@
 // parseBool(), parseBoolStrict() → bottom of this file (hoisted methods)
 // ChannelUtils (strictRoundJoin family) → lib/ChannelUtils.groovy (auto-loaded by Nextflow)
 
+// Reject execution backends that are deliberately retained only as explanatory
+// profile stubs before any input, demultiplexing, or rolling-state work begins.
+def activeProfiles = (workflow.profile ?: '').tokenize(',')*.trim().findAll { it }
+def usingDockerProfile = activeProfiles.contains('docker')
+def usingCondaProfile = activeProfiles.contains('conda')
+def unsupportedContainerProfiles = activeProfiles.findAll { it in ['docker', 'singularity'] }
+if (unsupportedContainerProfiles) {
+    exit 1, """Unsupported RTBioScan execution profile: ${unsupportedContainerProfiles.join(', ')}.
+The inherited hecrp/nanortax container belonged to a different pipeline and has been removed.
+Use a provisioned host runtime for now. Do not resume state created with docker/singularity;
+start with a new --state_id (or reset the rolling state)."""
+}
+if (usingCondaProfile) {
+    exit 1, """The RTBioScan conda profile is not enabled yet.
+Install the platform lock with conda-lock, activate that environment, run
+bin/validate_runtime.sh, and launch RTBioScan without -profile conda.
+Direct Nextflow Conda resolution would bypass the committed lockfile."""
+}
+
 // Compute demultiplexing enablement once and reuse it everywhere.
 // This avoids mismatches where params.demultiplex_mode aliases normalize to the same effective mode.
 def replicateModeCanonical = getReplicateModeCanonical()
@@ -54,10 +73,6 @@ if (!(runModeRaw in ['batch', 'realtime'])) {
 }
 def runMode = runModeRaw
 params.run_mode = runMode
-def activeProfiles = (workflow.profile ?: '').tokenize(',')*.trim().findAll { it }
-def usingDockerProfile = activeProfiles.contains('docker')
-def usingCondaProfile = activeProfiles.contains('conda')
-
 def readsProvided = params.reads?.toString()?.trim()
 def deriveGlobRoot = { pattern ->
     try {
@@ -530,9 +545,10 @@ validateDbPrefix('blast_filter_db', params.blast_filter_db?.toString())
 validateRequiredDir('blast_taxdb', params.blast_taxdb?.toString())
 validateOptionalFile('nonncbi_id2lineage_target', params.nonncbi_id2lineage_target?.toString())
 validateRequiredFile('state_reference_manifest', params.state_reference_manifest?.toString())
-if (params.state_taxonomy_data_dir?.toString()?.trim()) {
-    validateRequiredDir('state_taxonomy_data_dir', params.state_taxonomy_data_dir.toString())
-}
+validateRequiredFile('state_taxonomy_release_manifest', params.state_taxonomy_release_manifest?.toString())
+validateRequiredDir('state_taxonomy_data_dir', params.state_taxonomy_data_dir?.toString())
+def stateTaxonomyDataDirResolved = resolveConfigPath(params.state_taxonomy_data_dir.toString())
+def stateTaxonomyReleaseManifestResolved = resolveConfigPath(params.state_taxonomy_release_manifest.toString())
 def stateCompatibilityPolicy = params.state_compatibility_policy?.toString()?.trim()?.toLowerCase()
 if (!(stateCompatibilityPolicy in ['strict', 'adopt_legacy'])) {
     exit 1, "Invalid --state_compatibility_policy '${params.state_compatibility_policy}'. Allowed values: strict, adopt_legacy"
@@ -623,9 +639,8 @@ def stateCompatibilityArgs = [
     '--state-dir', "${ongoingStateDir}/_state",
     '--reference-manifest', resolveConfigPath(params.state_reference_manifest.toString()),
     '--reference-root', baseDir.toString(),
-    '--taxonomy-data-dir', params.state_taxonomy_data_dir?.toString()?.trim()
-        ? resolveConfigPath(params.state_taxonomy_data_dir.toString())
-        : '',
+    '--taxonomy-data-dir', stateTaxonomyDataDirResolved,
+    '--taxonomy-release-manifest', stateTaxonomyReleaseManifestResolved,
     '--classifier-policy-version', params.state_classifier_policy_version.toString(),
     '--scoring-policy-version', params.state_scoring_policy_version.toString(),
     '--targets', params.targets.toString(),
@@ -2593,6 +2608,13 @@ process blast_OTU_pretax {
 	set -euo pipefail
 	shopt -s nullglob
 	export LC_ALL=C
+	export TAXONKIT_DB="${stateTaxonomyDataDirResolved}"
+	for _taxonomy_file in nodes.dmp names.dmp merged.dmp delnodes.dmp; do
+		if [ ! -r "\$TAXONKIT_DB/\$_taxonomy_file" ]; then
+			echo "ERROR: pinned TaxonKit taxonomy artifact is unavailable inside the execution environment: \$TAXONKIT_DB/\$_taxonomy_file" 1>&2
+			exit 1
+		fi
+	done
 	RESTART_TOKEN="${restartTokenForCache}"
 	THREADS=${task.cpus}
 	OTU_BLAST_MIN_MEMBERS="${otuBlastMinMembersStr}"
@@ -4020,12 +4042,19 @@ process consensus {
 		// Per-target DB paths are now computed in the bash loop from params.blast_db_specs
 		
 		taxdb_dir = taxdb_dir + params.blast_taxdb
-		// taxonkit DB path removed; TaxonKit will use its default DB (or external env config) if invoked.
+		// TAXONKIT_DB is exported inside the process script from the pinned compatibility release.
 
     """
 	set -euo pipefail
 	shopt -s nullglob
 	export LC_ALL=C
+	export TAXONKIT_DB="${stateTaxonomyDataDirResolved}"
+	for _taxonomy_file in nodes.dmp names.dmp merged.dmp delnodes.dmp; do
+		if [ ! -r "\$TAXONKIT_DB/\$_taxonomy_file" ]; then
+			echo "ERROR: pinned TaxonKit taxonomy artifact is unavailable inside the execution environment: \$TAXONKIT_DB/\$_taxonomy_file" 1>&2
+			exit 1
+		fi
+	done
 	RESTART_TOKEN="${restartTokenForCache}"
 	THREADS=${task.cpus}
 		export RTBIOSCAN_RSCRIPT="${consensusRscriptBin ?: 'Rscript'}"

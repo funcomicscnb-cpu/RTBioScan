@@ -34,6 +34,7 @@ def _build_fixture(
     root = tmp_path / "reference"
     taxonomy = tmp_path / "taxonomy"
     manifest = tmp_path / "reference_manifest.tsv"
+    taxonomy_manifest = tmp_path / "taxonomy_release.tsv"
     state = tmp_path / "state"
     cache = tmp_path / "cache"
 
@@ -68,6 +69,20 @@ def _build_fixture(
     for name in ["nodes.dmp", "names.dmp", "merged.dmp", "delnodes.dmp"]:
         _write_file(taxonomy / name, f"{name}\n")
 
+    taxonomy_rows = [
+        "kind\tartifact\tsha256\tbytes\trole",
+        f"archive\ttaxdump.tar.gz\t{'0' * 64}\t0\tfixture archive",
+    ]
+    for name in ["nodes.dmp", "names.dmp", "merged.dmp", "delnodes.dmp"]:
+        path = taxonomy / name
+        taxonomy_rows.append(
+            f"data\t{name}\t{_sha256(path)}\t{path.stat().st_size}\tfixture {name}"
+        )
+    taxonomy_manifest.write_text(
+        "\n".join(taxonomy_rows) + "\n",
+        encoding="utf-8",
+    )
+
     rows = ["artifact\tsha256\trole"]
     for path, role in artifacts:
         rows.append(f"{path.relative_to(root)}\t{_sha256(path)}\t{role}")
@@ -75,6 +90,7 @@ def _build_fixture(
     return {
         "root": root,
         "taxonomy": taxonomy,
+        "taxonomy_manifest": taxonomy_manifest,
         "manifest": manifest,
         "state": state,
         "cache": cache,
@@ -90,6 +106,7 @@ def _run_contract(
     memtax: str = "db/memtax.tsv",
     lineage: str = "db/id2lineage.tsv",
     scoring_version: str = "legacy-first-single-hit-v1",
+    profile: str = "test",
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -103,6 +120,8 @@ def _run_contract(
             str(fixture["root"]),
             "--taxonomy-data-dir",
             str(fixture["taxonomy"]),
+            "--taxonomy-release-manifest",
+            str(fixture["taxonomy_manifest"]),
             "--classifier-policy-version",
             "legacy-rank-string-v1",
             "--scoring-policy-version",
@@ -129,6 +148,8 @@ def _run_contract(
             str(fixture["cache"]),
             "--verification-mode",
             verification_mode,
+            "--profile",
+            profile,
         ],
         capture_output=True,
         text=True,
@@ -201,7 +222,7 @@ def test_new_state_and_unchanged_restart_reuse_private_cache(tmp_path: Path) -> 
     assert cache_file.stat().st_mtime_ns == cache_mtime
 
 
-def test_only_changed_taxonomy_artifact_is_rehashed(tmp_path: Path) -> None:
+def test_taxonomy_artifact_drift_is_rejected_before_cache_update(tmp_path: Path) -> None:
     fixture = _build_fixture(tmp_path)
     first = _run_contract(fixture)
     assert first.returncode == 0, first.stderr
@@ -211,6 +232,21 @@ def test_only_changed_taxonomy_artifact_is_rehashed(tmp_path: Path) -> None:
     changed = fixture["taxonomy"] / "names.dmp"
     changed.write_text("changed names\n", encoding="utf-8")
     second = _run_contract(fixture, state=tmp_path / "state-v2")
+    assert second.returncode != 0
+    assert "taxonomy artifact size mismatch" in second.stderr
+    assert _cache_verified_times(cache_file) == before
+
+
+def test_only_changed_taxonomy_stat_signature_is_rehashed(tmp_path: Path) -> None:
+    fixture = _build_fixture(tmp_path)
+    first = _run_contract(fixture)
+    assert first.returncode == 0, first.stderr
+    cache_file = _cache_file(fixture)
+    before = _cache_verified_times(cache_file)
+
+    changed = fixture["taxonomy"] / "names.dmp"
+    changed.chmod(0o440)
+    second = _run_contract(fixture)
     assert second.returncode == 0, second.stderr
     after = _cache_verified_times(cache_file)
 
@@ -221,6 +257,30 @@ def test_only_changed_taxonomy_artifact_is_rehashed(tmp_path: Path) -> None:
     } == {
         path: stamp for path, stamp in before.items() if path != changed_key
     }
+
+
+def test_changed_taxonomy_release_requires_a_matching_manifest(tmp_path: Path) -> None:
+    fixture = _build_fixture(tmp_path)
+    first = _run_contract(fixture)
+    assert first.returncode == 0, first.stderr
+
+    changed = fixture["taxonomy"] / "names.dmp"
+    changed.write_text("changed names\n", encoding="utf-8")
+    rows = fixture["taxonomy_manifest"].read_text(encoding="utf-8").splitlines()
+    fixture["taxonomy_manifest"].write_text(
+        "\n".join(
+            f"data\tnames.dmp\t{_sha256(changed)}\t{changed.stat().st_size}\tfixture names.dmp"
+            if row.startswith("data\tnames.dmp\t")
+            else row
+            for row in rows
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    second = _run_contract(fixture, state=tmp_path / "state-v2")
+    assert second.returncode == 0, second.stderr
+    assert second.stdout != first.stdout
 
 
 def test_same_size_reference_edit_with_preserved_mtime_is_rejected(
@@ -346,6 +406,78 @@ def test_contract_mismatch_remains_fail_closed(tmp_path: Path) -> None:
     assert "scoring_policy_version" in mismatch.stderr
 
 
+def test_contract_bearing_container_state_cannot_be_resumed_on_host(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    first = _run_contract(fixture, profile="docker")
+    assert first.returncode == 0, first.stderr
+
+    resumed = _run_contract(fixture, profile="test")
+    assert resumed.returncode != 0
+    assert "produced with unsupported docker/singularity execution profile" in resumed.stderr
+    assert "cannot be resumed or migrated" in resumed.stderr
+
+
+def test_legacy_state_warning_forbids_adopting_suspected_container_state(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    fixture["state"].mkdir(parents=True)
+    (fixture["state"] / "legacy.tsv").write_text("legacy\n", encoding="utf-8")
+
+    result = _run_contract(fixture)
+    assert result.returncode != 0
+    assert "Never adopt state known or suspected" in result.stderr
+    assert "NanoRTax image" in result.stderr
+
+
+def test_container_profiles_are_explanatory_stubs_and_fail_early() -> None:
+    config_text = (REPO_ROOT / "nextflow.config").read_text(encoding="utf-8")
+    main_text = (REPO_ROOT / "main.nf").read_text(encoding="utf-8")
+
+    assert "hecrp/nanortax" not in config_text
+    assert "docker.enabled = true" not in config_text
+    assert "singularity.enabled = true" not in config_text
+    assert "params.unsupported_execution_profile = 'docker'" in config_text
+    assert "params.unsupported_execution_profile = 'singularity'" in config_text
+    assert "params.unsupported_execution_profile = 'conda'" in config_text
+    assert "conda.enabled = true" not in config_text
+    assert "Unsupported RTBioScan execution profile" in main_text
+    assert "inherited hecrp/nanortax container" in main_text
+    assert "Direct Nextflow Conda resolution would bypass" in main_text
+
+
+def test_matching_taxonomy_bytes_migrate_legacy_provenance_without_new_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    first = _run_contract(fixture)
+    assert first.returncode == 0, first.stderr
+    contract_path = fixture["state"] / "state_compatibility_manifest.tsv"
+    lines = contract_path.read_text(encoding="utf-8").splitlines()
+    legacy_lines = []
+    for line in lines:
+        if line.startswith("taxonomy_release_manifest_"):
+            continue
+        if line.startswith("taxonomy_data_dir\t"):
+            legacy_lines.append("taxonomy_data_dir\t/legacy/home/.taxonkit")
+        elif line.startswith("taxonomy_mode\t"):
+            legacy_lines.append("taxonomy_mode\timplicit_default")
+        else:
+            legacy_lines.append(line)
+    contract_path.write_text("\n".join(legacy_lines) + "\n", encoding="utf-8")
+
+    migrated = _run_contract(fixture)
+    assert migrated.returncode == 0, migrated.stderr
+    assert migrated.stdout == first.stdout
+    contract = contract_path.read_text(encoding="utf-8")
+    assert f"taxonomy_data_dir\t{fixture['taxonomy']}\n" in contract
+    assert "taxonomy_mode\tpinned_explicit\n" in contract
+    assert "taxonomy_migrated_from_data_dir\t/legacy/home/.taxonkit\n" in contract
+    assert "taxonomy_release_manifest_sha256\t" in contract
+
+
 def test_untrusted_cache_file_is_reverified_and_replaced_privately(tmp_path: Path) -> None:
     fixture = _build_fixture(tmp_path)
     first = _run_contract(fixture)
@@ -453,3 +585,27 @@ def test_duplicate_manifest_artifact_is_rejected(tmp_path: Path) -> None:
     result = _run_contract(fixture)
     assert result.returncode != 0
     assert "duplicate artifact in reference manifest" in result.stderr
+
+
+def test_main_wires_one_pinned_taxonomy_release_into_both_taxonomy_processes() -> None:
+    main_text = (REPO_ROOT / "main.nf").read_text(encoding="utf-8")
+    config_text = (REPO_ROOT / "nextflow.config").read_text(encoding="utf-8")
+    release_text = (REPO_ROOT / "bin" / "prepare_public_release.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'state_taxonomy_data_dir = "db/taxonomy/releases/ncbi-taxdump-2024-06-24"' in config_text
+    assert "state_taxonomy_release_manifest" in config_text
+    assert "'--taxonomy-data-dir', stateTaxonomyDataDirResolved" in main_text
+    assert "'--taxonomy-release-manifest', stateTaxonomyReleaseManifestResolved" in main_text
+    assert main_text.count('export TAXONKIT_DB="${stateTaxonomyDataDirResolved}"') == 2
+
+    blast_start = main_text.index("process blast_OTU_pretax {")
+    consensus_start = main_text.index("process consensus {")
+    report_start = main_text.index("process _reporting_blast_pretax {")
+    blast_block = main_text[blast_start:report_start]
+    consensus_block = main_text[consensus_start:]
+    assert 'export TAXONKIT_DB="${stateTaxonomyDataDirResolved}"' in blast_block
+    assert 'export TAXONKIT_DB="${stateTaxonomyDataDirResolved}"' in consensus_block
+    assert "conf/state_compatibility/reference_manifest_legacy_v1.tsv" in release_text
+    assert "conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv" in release_text
+    assert "db/taxonomy/releases/ncbi-taxdump-2024-06-24" in release_text

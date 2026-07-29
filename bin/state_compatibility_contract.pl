@@ -27,6 +27,7 @@ GetOptions(
     'reference-manifest=s'        => \$opt{reference_manifest},
     'reference-root=s'            => \$opt{reference_root},
     'taxonomy-data-dir=s'         => \$opt{taxonomy_dir},
+    'taxonomy-release-manifest=s' => \$opt{taxonomy_release_manifest},
     'classifier-policy-version=s' => \$opt{classifier_policy_version},
     'scoring-policy-version=s'    => \$opt{scoring_policy_version},
     'targets=s'                   => \$opt{targets},
@@ -43,11 +44,17 @@ GetOptions(
     'verification-mode=s'         => \$opt{verification_mode},
 ) or die "ERROR: invalid state compatibility options\n";
 
+my %required_option_name = (
+    taxonomy_dir              => 'taxonomy-data-dir',
+    taxonomy_release_manifest => 'taxonomy-release-manifest',
+);
 for my $required (
     qw(
         state_dir
         reference_manifest
         reference_root
+        taxonomy_dir
+        taxonomy_release_manifest
         classifier_policy_version
         scoring_policy_version
         targets
@@ -57,7 +64,8 @@ for my $required (
         blast_taxdb
     )
 ) {
-    die "ERROR: --" . ($required =~ s/_/-/gr) . " is required\n"
+    my $option_name = $required_option_name{$required} // ($required =~ s/_/-/gr);
+    die "ERROR: --$option_name is required\n"
         if !defined $opt{$required} || $opt{$required} eq '';
 }
 
@@ -88,7 +96,7 @@ sub file_sha256 {
     open(my $fh, '<:raw', $path) or die "ERROR: cannot read '$path': $!\n";
     my $sha = Digest::SHA->new(256);
     $sha->addfile($fh);
-    close($fh);
+    close($fh) or die "ERROR: cannot close '$path': $!\n";
     return $sha->hexdigest;
 }
 
@@ -135,6 +143,15 @@ sub trim {
     return $value;
 }
 
+sub profile_uses_unsupported_container {
+    my ($profile) = @_;
+    for my $token (split /,/, lc(trim($profile // ''))) {
+        $token = trim($token);
+        return 1 if $token eq 'docker' || $token eq 'singularity';
+    }
+    return 0;
+}
+
 sub read_reference_manifest {
     my ($manifest_path, $reference_root) = @_;
     open(my $fh, '<', $manifest_path)
@@ -173,6 +190,55 @@ sub read_reference_manifest {
     close($fh);
     die "ERROR: reference manifest '$manifest_path' contains no artifacts\n" if $row_count == 0;
     return \%artifacts;
+}
+
+sub read_taxonomy_release_manifest {
+    my ($manifest_path) = @_;
+    open(my $fh, '<', $manifest_path)
+        or die "ERROR: cannot read taxonomy release manifest '$manifest_path': $!\n";
+    my $header = <$fh>;
+    die "ERROR: taxonomy release manifest '$manifest_path' is empty\n" if !defined $header;
+    chomp $header;
+    die "ERROR: taxonomy release manifest must start with kind<TAB>artifact<TAB>sha256<TAB>bytes<TAB>role\n"
+        if $header ne "kind\tartifact\tsha256\tbytes\trole";
+
+    my %entries;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line eq '';
+        my ($kind, $artifact, $sha256, $bytes, $role, @extra) = split /\t/, $line, -1;
+        die "ERROR: malformed taxonomy release manifest row: $line\n"
+            if !defined $kind || ($kind ne 'archive' && $kind ne 'data')
+            || !defined $artifact || $artifact !~ /\A[A-Za-z0-9_.-]+\z/
+            || !defined $sha256 || $sha256 !~ /\A[0-9a-f]{64}\z/
+            || !defined $bytes || $bytes !~ /\A[0-9]+\z/
+            || !defined $role || $role eq '' || @extra;
+        die "ERROR: duplicate taxonomy release artifact: $artifact\n"
+            if exists $entries{$artifact};
+        $entries{$artifact} = {
+            kind   => $kind,
+            sha256 => $sha256,
+            bytes  => $bytes,
+            role   => $role,
+        };
+    }
+    close($fh) or die "ERROR: cannot close taxonomy release manifest '$manifest_path': $!\n";
+
+    my @archive = grep { $entries{$_}{kind} eq 'archive' } keys %entries;
+    die "ERROR: taxonomy release manifest must contain exactly one archive row\n"
+        if @archive != 1;
+    my %required = map { $_ => 1 } qw(nodes.dmp names.dmp merged.dmp delnodes.dmp);
+    for my $artifact (sort keys %required) {
+        die "ERROR: taxonomy release manifest is missing data artifact '$artifact'\n"
+            if !exists $entries{$artifact} || $entries{$artifact}{kind} ne 'data';
+    }
+    my @unexpected_data = grep {
+        $entries{$_}{kind} eq 'data' && !$required{$_}
+    } keys %entries;
+    die "ERROR: taxonomy release manifest contains unexpected data artifacts: "
+        . join(', ', sort @unexpected_data) . "\n"
+        if @unexpected_data;
+    return \%entries;
 }
 
 sub manifest_relative_path {
@@ -461,10 +527,15 @@ sub verify_with_attestation {
     for my $subject (@{$subjects_ref}) {
         my $path = $subject->{path};
         my $expected_sha = $subject->{expected_sha} // '';
+        my $expected_size = $subject->{expected_size} // '';
         my $cached_entry = $cached_ref ? $cached_ref->{entries}{$path} : undef;
         my $current_signature = stat_signature($path);
         my ($verified_sha, $verified_signature, $verified_at);
 
+        if ($expected_size ne '' && "$current_signature->{size}" ne "$expected_size") {
+            die "ERROR: $subject->{kind} artifact size mismatch for '$path': "
+                . "manifest=$expected_size actual=$current_signature->{size}\n";
+        }
         if (
             $mode eq 'cached'
             && $cached_entry
@@ -482,7 +553,7 @@ sub verify_with_attestation {
         }
 
         if ($expected_sha ne '' && $verified_sha ne $expected_sha) {
-            die "ERROR: reference artifact checksum mismatch for '$path': "
+            die "ERROR: $subject->{kind} artifact checksum mismatch for '$path': "
                 . "manifest=$expected_sha actual=$verified_sha\n";
         }
         $verified{$path} = {
@@ -515,13 +586,18 @@ sub write_contract_atomic {
 
 my $state_dir = absolute_path($opt{state_dir});
 my $reference_manifest = absolute_path($opt{reference_manifest});
+my $taxonomy_release_manifest = absolute_path($opt{taxonomy_release_manifest});
 my $reference_root = abs_path($opt{reference_root});
 die "ERROR: reference manifest not found: $reference_manifest\n"
     if !-f $reference_manifest;
+die "ERROR: taxonomy release manifest not found: $taxonomy_release_manifest\n"
+    if !-f $taxonomy_release_manifest;
 die "ERROR: reference root not found: $opt{reference_root}\n"
     if !defined $reference_root || !-d $reference_root;
 my $manifest_sha256 = file_sha256($reference_manifest);
+my $taxonomy_release_manifest_sha256 = file_sha256($taxonomy_release_manifest);
 my $manifest_artifacts_ref = read_reference_manifest($reference_manifest, $reference_root);
+my $taxonomy_release_entries_ref = read_taxonomy_release_manifest($taxonomy_release_manifest);
 
 my @last_extensions = qw(.prj .bck .des .sds .ssp .suf .tis);
 my @blast_v5_extensions = qw(.ndb .nhr .nin .njs .not .nsq .ntf .nto);
@@ -556,14 +632,7 @@ if (trim($opt{nonncbi_id2lineage}) ne '') {
 }
 
 my $taxonomy_dir = trim($opt{taxonomy_dir});
-my $taxonomy_mode = 'explicit';
-if ($taxonomy_dir eq '') {
-    my $home = $ENV{HOME} // '';
-    die "ERROR: cannot resolve implicit TaxonKit data directory because HOME is empty\n"
-        if $home eq '';
-    $taxonomy_dir = File::Spec->catdir($home, '.taxonkit');
-    $taxonomy_mode = 'implicit_default';
-}
+my $taxonomy_mode = 'pinned_explicit';
 my $taxonomy_candidate = absolute_path($taxonomy_dir);
 $taxonomy_dir = abs_path($taxonomy_candidate);
 die "ERROR: TaxonKit taxonomy directory not found: $taxonomy_candidate ($taxonomy_mode)\n"
@@ -586,10 +655,11 @@ for my $name (@taxonomy_files) {
     die "ERROR: required TaxonKit taxonomy file not found: $path\n" if !-f $path;
     $taxonomy_path{$name} = $path;
     push @subjects, {
-        kind         => 'taxonomy',
-        path         => $path,
-        expected_sha => '',
-        role         => "TaxonKit $name",
+        kind          => 'taxonomy',
+        path          => $path,
+        expected_sha  => $taxonomy_release_entries_ref->{$name}{sha256},
+        expected_size => $taxonomy_release_entries_ref->{$name}{bytes},
+        role          => $taxonomy_release_entries_ref->{$name}{role},
     };
 }
 
@@ -600,10 +670,11 @@ if (!$cache_allowed && $opt{verification_mode} eq 'cached') {
     warn "WARNING: reference or taxonomy files are group/world writable; using full verification without attestation reuse\n";
 }
 my %attestation_meta = (
-    schema_version            => '1',
-    reference_manifest_sha256 => $manifest_sha256,
-    reference_root            => $reference_root,
-    taxonomy_data_dir         => $taxonomy_dir,
+    schema_version                      => '1',
+    reference_manifest_sha256           => $manifest_sha256,
+    taxonomy_release_manifest_sha256 => $taxonomy_release_manifest_sha256,
+    reference_root                      => $reference_root,
+    taxonomy_data_dir                   => $taxonomy_dir,
 );
 my $verified_ref = verify_with_attestation(
     subjects      => \@subjects,
@@ -643,9 +714,11 @@ my $canonical = join('', map { "$_\t$identity{$_}\n" } sort keys %identity);
 my %contract = (
     %identity,
     reference_manifest_path => $reference_manifest,
-    taxonomy_data_dir       => $taxonomy_dir,
-    taxonomy_mode           => $taxonomy_mode,
-    execution_profile       => trim($opt{profile}),
+    taxonomy_release_manifest_path   => $taxonomy_release_manifest,
+    taxonomy_release_manifest_sha256 => $taxonomy_release_manifest_sha256,
+    taxonomy_data_dir                => $taxonomy_dir,
+    taxonomy_mode                    => $taxonomy_mode,
+    execution_profile                => trim($opt{profile}),
 );
 $contract{contract_id} = sha256_hex($canonical);
 
@@ -659,6 +732,14 @@ my $error = '';
 eval {
     if (-f $contract_path) {
         my $existing_ref = read_contract($contract_path);
+        my $existing_profile = $existing_ref->{execution_profile} // '';
+        if (profile_uses_unsupported_container($existing_profile)) {
+            die "ERROR: rolling state at '$state_dir' was produced with unsupported "
+                . "docker/singularity execution profile '$existing_profile'.\n"
+                . "The inherited hecrp/nanortax image belonged to a different pipeline, "
+                . "so this state cannot be resumed or migrated. Use a new --state_id or "
+                . "--restart_mode reset and reanalyse with a supported runtime.\n";
+        }
         my @changed;
         for my $key (sort(keys(%identity)), 'contract_id') {
             my $old = $existing_ref->{$key} // '';
@@ -670,11 +751,24 @@ eval {
                 . join("\n", map { "  $_" } @changed)
                 . "\nUse a new --state_id, --restart_mode reset, or the matching reference/taxonomy/classifier versions.\n";
         }
+        my $old_taxonomy_dir = $existing_ref->{taxonomy_data_dir} // '';
+        my $old_taxonomy_manifest_sha = $existing_ref->{taxonomy_release_manifest_sha256} // '';
+        if (
+            $old_taxonomy_dir ne $contract{taxonomy_data_dir}
+            || $old_taxonomy_manifest_sha ne $contract{taxonomy_release_manifest_sha256}
+        ) {
+            my $migrated_from = $existing_ref->{taxonomy_migrated_from_data_dir} // '';
+            $migrated_from = $old_taxonomy_dir
+                if $migrated_from eq '' && $old_taxonomy_dir ne '' && $old_taxonomy_dir ne $contract{taxonomy_data_dir};
+            $contract{taxonomy_migrated_from_data_dir} = $migrated_from if $migrated_from ne '';
+            my $legacy_adopted = ($existing_ref->{legacy_adopted} // '') eq '1' ? 1 : 0;
+            write_contract_atomic($contract_path, \%contract, $legacy_adopted);
+        }
     } else {
         my $has_material = state_has_material($state_dir);
         if ($has_material && $opt{policy} ne 'adopt_legacy') {
             die "ERROR: legacy rolling state exists without a compatibility manifest at '$state_dir'.\n"
-                . "Re-run once with --state_compatibility_policy adopt_legacy only after confirming that the state was produced by the current reference, taxonomy, and classifier baseline; otherwise use a new --state_id or --restart_mode reset.\n";
+                . "Re-run once with --state_compatibility_policy adopt_legacy only after confirming that the state was produced by the current reference, taxonomy, classifier, and supported host runtime baseline. Never adopt state known or suspected to have been produced with the inherited docker/singularity NanoRTax image; use a new --state_id or --restart_mode reset instead.\n";
         }
         print STDERR "WARNING: adopting legacy rolling state at '$state_dir' under the current compatibility contract\n"
             if $has_material;

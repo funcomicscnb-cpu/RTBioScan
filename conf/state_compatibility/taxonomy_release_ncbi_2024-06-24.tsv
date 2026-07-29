@@ -1,0 +1,6 @@
+kind	artifact	sha256	bytes	role
+archive	taxdump.tar.gz	8a01a683fb2ca0290de7a7f95ee4e5adef7657a11a6d660fbaed2520ba8fa5b7	65575128	NCBI taxdump archive downloaded 2024-06-24
+data	nodes.dmp	5314b15ebd7b29245c1e608f4cf8e57e0205abfce4e23c9dd1daee0d069962e7	195896358	TaxonKit taxonomy nodes
+data	names.dmp	65f0730ab036f0a559cbcc420db146ea303cad2eb8310f5876963b536c371498	246724816	TaxonKit taxonomy names
+data	merged.dmp	78a292a17c337d1bf47f16917e2cdd75e5a61a5ee439f21c1c18c2dc51f10663	1468588	TaxonKit merged taxids
+data	delnodes.dmp	64d01cb5a2ed8ebe3ee55ff95f596e84507ce2f39c0eab44bc4fbba5d45291b4	5399138	TaxonKit deleted taxids

@@ -68,12 +68,12 @@ NXF_OPTS='-Xms1g -Xmx4g'
 
 **Pipeline only** — POD5 chunks already present in `reads_rt_round_pod5/`:
 ```bash
-./RTBioScan.sh --run_id MY_RUN -profile docker -resume
+./RTBioScan.sh --run_id MY_RUN -resume
 ```
 
 **Pipeline + live report in browser** — resume with auto-refreshing report:
 ```bash
-./RTBioScan.sh --run_id MY_RUN --serve --serve-open -profile docker -resume
+./RTBioScan.sh --run_id MY_RUN --serve --serve-open -resume
 ```
 
 **First-time real-time run** — metadata setup + feeder + pipeline + report:
@@ -85,8 +85,7 @@ NXF_OPTS='-Xms1g -Xmx4g'
   --metadata   /path/to/Pipeline_Information.tsv \
   --general_fasta /path/to/demult_general.fasta \
   --primers_fasta /path/to/demult_primers.fasta \
-  --serve --serve-open \
-  -profile docker
+  --serve --serve-open
 ```
 
 **Subsequent real-time rounds** — feeder + pipeline (metadata already set up):
@@ -96,13 +95,13 @@ NXF_OPTS='-Xms1g -Xmx4g'
   --run_id MY_RUN_ID \
   --input_folder /path/to/minknow/output \
   --serve --serve-open \
-  -profile docker -resume
+  -resume
 ```
 
 **Independent parameter reruns on the same prepared input data**:
 ```bash
-./RTBioScan.sh --run_id MY_RUN -name MY_RUN_params_A -profile docker --outdir results_params_A
-./RTBioScan.sh --run_id MY_RUN -name MY_RUN_params_B -profile docker --outdir results_params_B
+./RTBioScan.sh --run_id MY_RUN -name MY_RUN_params_A --outdir results_params_A
+./RTBioScan.sh --run_id MY_RUN -name MY_RUN_params_B --outdir results_params_B
 ```
 
 Use this pattern only when you intentionally want to reuse the same `results/pod5/<run_id>/` and `results/sample_info/<run_id>/` inputs. For fully independent wrapper-driven runs, use a different `--run_id` for each run and make sure the metadata TSV contains matching rows for each `run_id`.
@@ -111,7 +110,7 @@ Use this pattern only when you intentionally want to reuse the same `results/pod
 ```bash
 ./RTBioScan.sh \
   --serve --serve-open \
-  -profile docker --run_mode batch \
+  --run_mode batch \
   --reads "/path/to/pod5/chunks/*.pod5"
 ```
 
@@ -355,7 +354,6 @@ To run on a pre-existing set of POD5 chunks without the feeder, use `RTBioScan.s
 
 ```bash
 ./RTBioScan.sh \
-  -profile docker \
   --run_mode batch \
   --reads "/path/to/pod5/chunks/*.pod5"
 ```
@@ -370,7 +368,7 @@ In batch mode (`--watch false` is implied), the pipeline processes all matching 
   --general_fasta /path/to/demult_general.fasta \
   --primers_fasta /path/to/demult_primers.fasta \
   --skip_pod5 \
-  -profile docker --run_mode batch \
+  --run_mode batch \
   --reads "/path/to/pod5/chunks/*.pod5"
 ```
 
@@ -487,13 +485,13 @@ The recommended way to launch the pipeline is via `RTBioScan.sh` (see [Quick sta
 ```bash
 ./RTBioScan.sh --feeder --serve --serve-open \
   --run_id MY_RUN_ID --input_folder /path/to/minknow/output \
-  -profile docker -resume
+  -resume
 ```
 
 Direct Nextflow invocation (when the feeder and server are managed separately):
 
 ```bash
-NXF_VER=22.10.8 nextflow run main.nf -name 'my_run' -profile docker -resume
+NXF_VER=22.10.8 nextflow run main.nf -name 'my_run' -resume
 ```
 
 When you launch through `RTBioScan.sh` and provide `--run_id`, the wrapper auto-injects `--run_id`, `--reads`, `--ori_dir`, `--indexes`, and `--primer_indexes` if you did not pass them explicitly. Raw `nextflow run` does not do this.
@@ -751,15 +749,18 @@ Nextflow execution name.
 ### `-profile`
 [back to Top](#rtbioscan-usage)
 
-Selects a configuration profile. Profiles set default parameters and control how software is executed. Multiple profiles can be combined: `-profile docker,xprize` (later profiles override earlier ones).
+Selects a configuration profile. Profiles set default parameters and, where
+supported, control how software is executed. Multiple domain profiles can be
+combined, for example `-profile xprize,debug` (later profiles override earlier
+ones).
 
 Available profiles:
 
 | Profile | Notes | Description |
 |---|---|---|
-| `docker` | Linux/CUDA only | Runs all analysis tools inside `hecrp/nanortax:latest`. **Not suitable for macOS basecalling**: the default `dorado_device = "metal"` is incompatible with Docker containers (Metal GPU not accessible). For Linux, add `--dorado_device cuda:0`; for CPU-only testing use `--dorado_device cpu`. |
-| `conda` | macOS + Linux | Uses the Conda environment in `environment.yml`. Dorado runs as a local binary so Metal GPU works on macOS. Requires the environment to be installed first. |
-| `singularity` | Linux only | Singularity with auto-mounts. Same Metal incompatibility as Docker — only suitable for Linux/CUDA. |
+| `docker` | Unsupported | Explanatory erroring stub. RTBioScan does not publish a validated Docker image; the former NanoRTax image belonged to another pipeline. |
+| `conda` | Disabled stub | Install and activate the committed platform lock, validate it, then run without an execution profile. Direct Nextflow Conda resolution would bypass the lock. |
+| `singularity` | Unsupported | Explanatory erroring stub until RTBioScan publishes and validates its own image. |
 | `debug` | — | Identical to the default profile, adds `$HOSTNAME` logging at the start of each process. |
 | `xprize` | Requires XPrize databases | COI+ITS2 parameter presets for the XPrize/Tumbira deployment (`conf/xprize.config`). Requires XPrize-specific databases in `db/` and species-of-interest lists. |
 | `test` | Requires `db/toDefault/` | Test configuration pointing to `db/toDefault/` databases (`conf/test.config`). Requires those databases to be present; no bundled test data. |
@@ -1121,7 +1122,7 @@ Device string passed to Dorado.
 
 - Default: `metal`.
 - Examples: `metal`, `cpu`, `cuda:0`.
-- On macOS, use a local/Conda execution mode so Dorado can access Metal directly.
+- On macOS, use a provisioned local execution mode so Dorado can access Metal directly.
 
 #### `--dorado_bin`
 [back to Top](#rtbioscan-usage)
