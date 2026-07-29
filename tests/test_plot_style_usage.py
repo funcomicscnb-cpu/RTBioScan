@@ -79,6 +79,21 @@ def test_plot_scripts_runtime_smoke(tmp_path: Path) -> None:
         assert result.returncode == 0, result.stderr or result.stdout
 
 
+def test_read_info_quality_emits_placeholders_for_header_only_round(
+    tmp_path: Path,
+) -> None:
+    script = (REPO_ROOT / "bin/Read_info_quality.R").read_text(encoding="utf-8")
+    assert "if (nrow(data_long) == 0)" in script
+    for suffix in [
+        "_violin_quality_read_info.png",
+        "_violin_length_read_info.png",
+        "_violin_length_read_info_log.png",
+        "_density_read_info.png",
+        "_density_read_info_with_unmatched.png",
+    ]:
+        assert suffix in script
+
+
 def test_read_counts_runtime_smoke_wrapper_style_invocation(tmp_path: Path) -> None:
     rscript = shutil.which("Rscript")
     if rscript is None:

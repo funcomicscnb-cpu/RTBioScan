@@ -22,6 +22,23 @@ data_long <- pivot_longer(read_info,
                           values_to = "qscore",
                           values_drop_na = TRUE)
 
+if (nrow(data_long) == 0) {
+  placeholder_outputs <- c(
+    "_violin_quality_read_info.png" = "Quality Distribution by Barcode",
+    "_violin_length_read_info.png" = "Read Length by Barcode",
+    "_violin_length_read_info_log.png" = "Read Length by Barcode (log scale)",
+    "_density_read_info.png" = "Read quality and length density",
+    "_density_read_info_with_unmatched.png" = "Read quality and length density"
+  )
+  for (suffix in names(placeholder_outputs)) {
+    save_plot_placeholder(
+      paste0(sample_name, suffix),
+      unname(placeholder_outputs[[suffix]])
+    )
+  }
+  quit(status = 0)
+}
+
 output_file <- paste0(sample_name,"_violin_quality_read_info.png")
 p <- ggplot(data_long, aes(x = qscore_type, y = qscore)) +
   geom_violin(aes(fill=barcode), alpha = 0.8) +

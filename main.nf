@@ -5532,10 +5532,18 @@ process getting_run_summary {
 		ROUND_DEMULT_SIDECAR_LOCAL="${barcode}_demult_rpt.contract.tsv"
 		ROUND_OTU_RPT_LOCAL="${barcode}_otu_def_rpt.txt"
 		ROUND_OTU_SIDECAR_LOCAL="${barcode}_otu_def_rpt.contract.tsv"
+		ROUND_READ_INFO_LOCAL="${barcode}_read_info_rpt.txt"
+		ROUND_ON_TARGET_LOCAL="${barcode}_on_target_rpt.txt"
+		ROUND_BLAST_OTU_LOCAL="${barcode}_blast_otu_pretax_rpt.txt"
+		ROUND_BLAST_CONSENSUS_LOCAL="${barcode}_blast_consensus_tax_rpt.txt"
 		ensure_local_round_alias "${demult_rpt}" "\$ROUND_DEMULT_RPT_LOCAL"
 		ensure_local_round_alias "${demult_rpt_sidecar}" "\$ROUND_DEMULT_SIDECAR_LOCAL"
 		ensure_local_round_alias "${otu_def_rpt}" "\$ROUND_OTU_RPT_LOCAL"
 		ensure_local_round_alias "${otu_def_rpt_sidecar}" "\$ROUND_OTU_SIDECAR_LOCAL"
+		ensure_local_round_alias "${read_info_rpt}" "\$ROUND_READ_INFO_LOCAL"
+		ensure_local_round_alias "${on_target_rpt}" "\$ROUND_ON_TARGET_LOCAL"
+		ensure_local_round_alias "${blast_otu_pretax_rpt}" "\$ROUND_BLAST_OTU_LOCAL"
+		ensure_local_round_alias "${blast_consensus_tax}" "\$ROUND_BLAST_CONSENSUS_LOCAL"
 			export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
 			perl ${baseDir}/bin/reporting_parser_state_preflight.pl \
 				${ongoingStateDir}/_state \
