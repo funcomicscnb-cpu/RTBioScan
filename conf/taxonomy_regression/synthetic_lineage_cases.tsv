@@ -1,0 +1,5 @@
+marker	synthetic_taxid	legacy_global_kingdom	expected_marker_kingdom	fixture_status
+COI	-557	Viridiplantae	Metazoa	observed_reference
+ITS2	-557	Viridiplantae	Viridiplantae	resolver_only
+COI	-561	Viridiplantae	Metazoa	resolver_only
+ITS2	-561	Viridiplantae	Viridiplantae	observed_reference
