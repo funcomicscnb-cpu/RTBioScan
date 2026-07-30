@@ -30,6 +30,7 @@
       "demultiplex_mode",
       "targets",
       "target_taxa",
+      "fast_filter_shadow",
       "on_target_quality_score",
       "min_quality_score",
       "hq_quality_score",
@@ -188,6 +189,7 @@
     "demultiplex_mode": {"category": "Input", "default_owner": "nextflow.config", "description": "Demultiplexing gate. Canonical values are auto, full, primers_only, and off; legacy aliases are normalized temporarily.", "list_policy": "scalar", "allow_empty_entries": false, "allowed_values": ["auto", "full", "primers_only", "off"]},
     "targets": {"category": "Input", "default_owner": "nextflow.config", "description": "Pipe-separated marker names processed in this run.", "list_policy": "pipe-aligned", "allow_empty_entries": false},
     "target_taxa": {"category": "Input", "default_owner": "nextflow.config", "description": "Pipe-separated taxon filters aligned to targets; empty entries mean any taxon for that marker.", "list_policy": "pipe-aligned", "allow_empty_entries": true},
+    "fast_filter_shadow": {"category": "Quality filters", "default_owner": "nextflow.config", "description": "Write decision-neutral FAST first-hit competition diagnostics without changing read routing.", "list_policy": "scalar", "allow_empty_entries": false, "allowed_values": [true, false]},
 
     "on_target_quality_score": {"category": "Quality filters", "default_owner": "nextflow.config", "description": "Minimum FAST qscore for on-target detection.", "list_policy": "scalar", "allow_empty_entries": false},
     "min_quality_score": {"category": "Quality filters", "default_owner": "nextflow.config", "description": "Minimum HAC qscore for entry into the HQ pool.", "list_policy": "scalar", "allow_empty_entries": false},

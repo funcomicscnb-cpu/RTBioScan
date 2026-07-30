@@ -1093,6 +1093,16 @@ Pipe-separated list of taxon filters for the fast on-target detection pass, in t
 - Empty entries still count toward the required 1:1 alignment with `--targets`.
 - Example with a third marker that accepts any taxon: `--target_taxa "Metazoa|Viridiplantae|"`
 
+#### `--fast_filter_shadow`
+[back to Top](#rtbioscan-usage)
+
+Write per-read and per-round TSV diagnostics that compare the current FAST first-hit routing decision with the best target and off-target LAST scores.
+
+- Default: `false`.
+- Diagnostic only: enabling it preserves the legacy first-emitted hit and does not change which reads are retained.
+- Diagnostics are written into the corresponding round state directory only after both TSV files are complete.
+- Use representative run data to evaluate competition margins; small fixtures validate wiring, not biological thresholds.
+
 #### `--on_target_quality_score`
 [back to Top](#rtbioscan-usage)
 

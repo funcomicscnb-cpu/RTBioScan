@@ -807,6 +807,7 @@ if (effectiveRestartMode in ['restore', 'reset']) {
     restartTokenParts << "${effectiveRestartMode}:${custom_runName ?: workflow.runName}"
 }
 def restartTokenForCache = restartTokenParts.join('|')
+def fastFilterShadowEnabled = parseBoolStrict(params.fast_filter_shadow, false, 'fast_filter_shadow')
 
 // formatOtuIdentity() → bottom of this file (hoisted method)
 
@@ -1001,6 +1002,12 @@ process fast_on_target_detection {
 	: > \$barcode\\_fast.fasta
 	: > \$barcode\\_qced_reads_kingdom.txt
 	: > \$barcode\\_reads_target.list
+	# FAST shadow state cleanup start
+	SHADOW_STATE_DETAIL="${ongoingStateDir}/\$round_barcode/\$barcode\\_fast_filter_shadow.tsv"
+	SHADOW_STATE_SUMMARY="${ongoingStateDir}/\$round_barcode/\$barcode\\_fast_filter_shadow_summary.tsv"
+	rm -f "\$SHADOW_STATE_DETAIL" "\$SHADOW_STATE_SUMMARY"
+	rm -f \$barcode\\_fast_filter_shadow.tsv \$barcode\\_fast_filter_shadow_summary.tsv
+	# FAST shadow state cleanup end
 		
  	wait_seconds=${params.file_wait_minutes * 60}
     elapsed=0
@@ -1073,8 +1080,53 @@ process fast_on_target_detection {
 	then
 		echo "Warning: No reads passed QC filtering, please check the quality of your run or modify the min/max read length and quality score thresholds" 1>&2
 		: > \$barcode\\_qced_reads_kingdom.txt
+		if [ "${fastFilterShadowEnabled ? 1 : 0}" -eq 1 ]; then
+			if ! python3 ${baseDir}/bin/fast_filter_shadow.py \
+				--empty \
+				--fasta \$barcode\\_fast.fasta \
+				--legacy-out \$barcode\\_qced_reads_kingdom.txt \
+				--shadow-out \$barcode\\_fast_filter_shadow.tsv \
+				--summary-out \$barcode\\_fast_filter_shadow_summary.tsv \
+				--targets "${params.targets}" \
+				--target-taxa "${params.target_taxa}" \
+				--round-barcode "\$round_barcode";
+			then
+				echo "WARN: FAST shadow instrumentation failed for an empty FASTA; legacy empty result is unchanged" 1>&2
+				rm -f \$barcode\\_fast_filter_shadow.tsv \$barcode\\_fast_filter_shadow_summary.tsv
+			fi
+		fi
 	else
-				if lastal ${baseDir}/${params.blast_filter_db} \$barcode\\_fast.fasta -f BlastTab -P "\$THREADS" | grep -v "^#" | awk '!seen[\$1]++' > \$barcode\\_qced_reads_kingdom.txt;
+			if [ "${fastFilterShadowEnabled ? 1 : 0}" -eq 1 ]; then
+				set +e
+				lastal ${baseDir}/${params.blast_filter_db} \$barcode\\_fast.fasta -f BlastTab -P "\$THREADS" | \
+					python3 ${baseDir}/bin/fast_filter_shadow.py \
+						--fasta \$barcode\\_fast.fasta \
+						--legacy-out \$barcode\\_qced_reads_kingdom.txt \
+						--shadow-out \$barcode\\_fast_filter_shadow.tsv \
+						--summary-out \$barcode\\_fast_filter_shadow_summary.tsv \
+						--targets "${params.targets}" \
+						--target-taxa "${params.target_taxa}" \
+						--round-barcode "\$round_barcode"
+				_shadow_pipe_status=( "\${PIPESTATUS[@]}" )
+				set -e
+				_shadow_last_status="\${_shadow_pipe_status[0]:-1}"
+				_shadow_helper_status="\${_shadow_pipe_status[1]:-1}"
+				if [ "\$_shadow_last_status" -eq 0 ] && [ "\$_shadow_helper_status" -eq 0 ]; then
+					echo "\$barcode\\_qced_reads_kingdom.txt and FAST shadow diagnostics created" 1>&2
+				elif [ "\$_shadow_last_status" -eq 0 ] && [ "\$_shadow_helper_status" -eq 2 ] && [ -f \$barcode\\_qced_reads_kingdom.txt ]; then
+					echo "WARN: FAST shadow diagnostics rejected malformed evidence; preserving first hits from the original LAST stream" 1>&2
+					rm -f \$barcode\\_fast_filter_shadow.tsv \$barcode\\_fast_filter_shadow_summary.tsv
+				else
+					echo "WARN: FAST shadow instrumentation failed; rerunning the unchanged legacy router" 1>&2
+					rm -f \$barcode\\_fast_filter_shadow.tsv \$barcode\\_fast_filter_shadow_summary.tsv
+					if lastal ${baseDir}/${params.blast_filter_db} \$barcode\\_fast.fasta -f BlastTab -P "\$THREADS" | grep -v "^#" | awk '!seen[\$1]++' > \$barcode\\_qced_reads_kingdom.txt; then
+						echo "\$barcode\\_qced_reads_kingdom.txt recovered with the legacy router" 1>&2
+					else
+						echo "WARN: legacy FAST router also failed; continuing with empty placeholders" 1>&2
+						: > \$barcode\\_qced_reads_kingdom.txt
+					fi
+				fi
+			elif lastal ${baseDir}/${params.blast_filter_db} \$barcode\\_fast.fasta -f BlastTab -P "\$THREADS" | grep -v "^#" | awk '!seen[\$1]++' > \$barcode\\_qced_reads_kingdom.txt;
 				then
 					echo "\$barcode\\_qced_reads_kingdom.txt created" 1>&2
 				else
@@ -1110,6 +1162,25 @@ process fast_on_target_detection {
 			printf "No target reads for %s\n" "\$round_barcode" > ${ongoingStateDir}/\$round_barcode/ROUND_FAILED.txt
 			: > \$barcode\\_reads_target.list
 		fi
+		# FAST shadow state publish start
+		if [ "${fastFilterShadowEnabled ? 1 : 0}" -eq 1 ] && \
+			[ -f \$barcode\\_fast_filter_shadow.tsv ] && \
+			[ -f \$barcode\\_fast_filter_shadow_summary.tsv ]; then
+			_shadow_detail_tmp="\${SHADOW_STATE_DETAIL}.tmp.\$\$"
+			_shadow_summary_tmp="\${SHADOW_STATE_SUMMARY}.tmp.\$\$"
+			rm -f "\$_shadow_detail_tmp" "\$_shadow_summary_tmp"
+			if cp -f \$barcode\\_fast_filter_shadow.tsv "\$_shadow_detail_tmp" && \
+				cp -f \$barcode\\_fast_filter_shadow_summary.tsv "\$_shadow_summary_tmp" && \
+				mv -f "\$_shadow_detail_tmp" "\$SHADOW_STATE_DETAIL" && \
+				mv -f "\$_shadow_summary_tmp" "\$SHADOW_STATE_SUMMARY"; then
+				:
+			else
+				echo "WARN: FAST shadow diagnostics could not be published; removing partial state" 1>&2
+				rm -f "\$SHADOW_STATE_DETAIL" "\$SHADOW_STATE_SUMMARY" \
+					"\$_shadow_detail_tmp" "\$_shadow_summary_tmp"
+			fi
+		fi
+		# FAST shadow state publish end
 
 			# In full_round mode keep lock ownership until backup_update_and_clean.
 			# In dorado_only mode this handoff/release already happened after FAST basecalling.
