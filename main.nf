@@ -4678,6 +4678,7 @@ process consensus {
 							printf '%s\n' "\$_TAXDB_SIG" > "\$TAXONKIT_CACHE_META" 2>/dev/null || true
 						fi
 							fi
+						# consensus provenance failfast start
 										if ! perl ${baseDir}/bin/emit_consensus_round_provenance.pl \
 							--consensus-dir Consensus \
 							--round-barcode "${round_barcode}" \
@@ -4685,6 +4686,7 @@ process consensus {
 							echo "ERROR: failed to emit consensus round provenance" 1>&2
 							exit 1
 						fi
+						# consensus provenance failfast end
 									# Generate recovery list now: OriginalReads are removed by the collect step when keep=1.
 					# -- §6: Consensus state update (assigned OTU keys, protected reads) --
 					RECOVERY_IDS="${round_barcode}_consensus_assigned_reads.list"
