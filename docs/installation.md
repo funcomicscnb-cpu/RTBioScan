@@ -285,7 +285,64 @@ runtime/dorado/releases/<release-id>/
 
 Installing a candidate does not change `dorado_bin`, model parameters, pipeline
 state, or the supported default. A candidate must pass static, live hardware,
-format, and full-round qualification before it can be promoted.
+format, and full-round qualification before it can be promoted. Production
+qualification requires the intended accelerator: Metal on supported Apple
+hardware or CUDA on supported Linux hardware. A CPU run is diagnostic-only and
+can never qualify a Dorado release for RTBioScan's real-time production path.
+
+### Optional Dorado 0.2.3 recovery candidate
+
+Dorado `0.2.3+4ed609d` remains an opt-in legacy candidate; it is not the
+default. On the audited Apple M1 Pro, all three native 5 kHz v4.2-alpha FAST,
+HAC, and SUP models initialized Metal and basecalled the one-read hardware
+fixture through RTBioScan's compatibility launcher from a normal Terminal
+session. The release accepts a directory rather than a single POD5 path, does
+not accept the newer `--emit-sam` option, and does not provide `summary`.
+RTBioScan detects the supported basecaller options and handles the input and
+summary differences explicitly while keeping the current default path
+unchanged.
+
+Download the three native models into a persistent candidate directory using
+the installed 0.2.3 binary:
+
+```bash
+mkdir -p runtime/dorado/candidates/dorado-0.2.3-models
+
+/opt/bin/dorado download \
+  --model dna_r10.4.1_e8.2_5khz_400bps_fast@v4.2.alpha \
+  --directory runtime/dorado/candidates/dorado-0.2.3-models
+/opt/bin/dorado download \
+  --model dna_r10.4.1_e8.2_5khz_400bps_hac@v4.2.alpha \
+  --directory runtime/dorado/candidates/dorado-0.2.3-models
+/opt/bin/dorado download \
+  --model dna_r10.4.1_e8.2_5khz_400bps_sup@v4.2.alpha \
+  --directory runtime/dorado/candidates/dorado-0.2.3-models
+```
+
+Select the candidate only in a fresh shadow state:
+
+```bash
+./RTBioScan.sh \
+  --state_id DORADO_023_SHADOW \
+  --outdir results_dorado_023_shadow \
+  --state_toolchain_policy_manifest conf/runtime_compatibility/toolchain_dorado_0.2.3_v1.tsv \
+  --dorado_bin /opt/bin/dorado \
+  --dorado_input_mode directory \
+  --dorado_summary_bin bin/dorado/bin/dorado \
+  --fast_model runtime/dorado/candidates/dorado-0.2.3-models/dna_r10.4.1_e8.2_5khz_400bps_fast@v4.2.alpha \
+  --hac_model runtime/dorado/candidates/dorado-0.2.3-models/dna_r10.4.1_e8.2_5khz_400bps_hac@v4.2.alpha \
+  --sup_model runtime/dorado/candidates/dorado-0.2.3-models/dna_r10.4.1_e8.2_5khz_400bps_sup@v4.2.alpha \
+  [normal run arguments]
+```
+
+The legacy policy requires the audited `0.2.3+4ed609d` basecaller and
+`0.7.0+71cc7442` summary reader. Because this candidate does not yet have a
+committed immutable release manifest, the runtime contract hashes the selected
+binary, complete model directories, summary binary, compatibility helper,
+device, and effective arguments and records the selection as unqualified.
+Do not resume a 0.7.0 state with this configuration. Promotion still requires
+representative marker-length FAST/HAC/SUP output, classification equivalence,
+and sustained Metal throughput/latency evidence on the intended hardware.
 
 ### Install the audited macOS ARM64 baseline
 

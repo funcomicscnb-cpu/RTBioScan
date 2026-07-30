@@ -15,6 +15,9 @@ my %opt = (
     runtime_backend        => '',
     runtime_lock_manifest  => '',
     dorado_release_manifest => '',
+    dorado_summary_bin      => '',
+    dorado_input_mode       => 'file',
+    dorado_input_compat_helper => '',
 );
 my @dorado_model;
 my @dorado_args;
@@ -24,6 +27,9 @@ GetOptions(
     'runtime-backend=s'        => \$opt{runtime_backend},
     'runtime-lock-manifest=s'  => \$opt{runtime_lock_manifest},
     'dorado-bin=s'             => \$opt{dorado_bin},
+    'dorado-summary-bin=s'     => \$opt{dorado_summary_bin},
+    'dorado-input-mode=s'      => \$opt{dorado_input_mode},
+    'dorado-input-compat-helper=s' => \$opt{dorado_input_compat_helper},
     'dorado-release-manifest=s' => \$opt{dorado_release_manifest},
     'dorado-model=s@'          => \@dorado_model,
     'dorado-device=s'          => \$opt{dorado_device},
@@ -41,6 +47,12 @@ die "ERROR: --runtime-lock-manifest is required for the conda backend\n"
     if $opt{runtime_backend} eq 'conda' && $opt{runtime_lock_manifest} eq '';
 die "ERROR: --runtime-lock-manifest is only valid for the conda backend\n"
     if $opt{runtime_backend} ne 'conda' && $opt{runtime_lock_manifest} ne '';
+die "ERROR: --dorado-input-mode must be file or directory\n"
+    if $opt{dorado_input_mode} ne 'file' && $opt{dorado_input_mode} ne 'directory';
+die "ERROR: --dorado-input-compat-helper is required for directory input mode\n"
+    if $opt{dorado_input_mode} eq 'directory' && $opt{dorado_input_compat_helper} eq '';
+die "ERROR: --dorado-input-compat-helper is only valid for directory input mode\n"
+    if $opt{dorado_input_mode} ne 'directory' && $opt{dorado_input_compat_helper} ne '';
 
 sub trim {
     my ($value) = @_;
@@ -246,6 +258,9 @@ if ($opt{runtime_lock_manifest} ne '') {
 }
 
 my $dorado_bin = resolve_executable($opt{dorado_bin});
+my $dorado_summary_bin = $opt{dorado_summary_bin} eq ''
+    ? $dorado_bin
+    : resolve_executable($opt{dorado_summary_bin});
 my %resolved_tool = map { $_ => resolve_executable($_) } @tool_names;
 my $rscript = resolve_executable('Rscript');
 my $probe_script = require_regular_file(
@@ -294,6 +309,32 @@ $fingerprint{dorado_version} = $dorado_version;
 $fingerprint{dorado_device} = trim($opt{dorado_device});
 if ($opt{dorado_release_manifest} eq '') {
     $fingerprint{dorado_binary_sha256} = file_sha256($dorado_bin);
+}
+if ($dorado_summary_bin ne $dorado_bin) {
+    my ($summary_status, $summary_output) =
+        run_capture($dorado_summary_bin, '--version');
+    die "ERROR: Dorado summary version probe failed: " . trim($summary_output) . "\n"
+        if $summary_status != 0;
+    my ($summary_version) =
+        trim($summary_output) =~ /(\d+\.\d+\.\d+(?:[+][A-Za-z0-9._-]+)?)/;
+    die "ERROR: Dorado summary version could not be parsed\n"
+        if !defined $summary_version;
+    my $expected_summary = $policy_ref->{'dorado:summary'};
+    die "ERROR: toolchain policy must declare dorado:summary when a separate summary binary is selected\n"
+        if !defined $expected_summary;
+    die "ERROR: Dorado summary version mismatch: expected $expected_summary, found $summary_version\n"
+        if $summary_version ne $expected_summary;
+    $fingerprint{dorado_summary_version} = $summary_version;
+    $fingerprint{dorado_summary_binary_sha256} = file_sha256($dorado_summary_bin);
+}
+if ($opt{dorado_input_mode} eq 'directory') {
+    my $compat_helper = require_regular_file(
+        $opt{dorado_input_compat_helper}, 'Dorado input compatibility helper'
+    );
+    die "ERROR: Dorado input compatibility helper is not executable: $compat_helper\n"
+        if !-x $compat_helper;
+    $fingerprint{dorado_input_mode} = 'directory';
+    $fingerprint{dorado_input_compat_helper_sha256} = file_sha256($compat_helper);
 }
 
 my $model_ref = parse_named_values(\@dorado_model, 'dorado-model', [qw(fast hac sup)]);

@@ -65,8 +65,12 @@ def _run(
     runtime: dict[str, Path],
     *,
     backend: str = "host",
+    policy_manifest: Path = POLICY,
     lock_manifest: Path | None = None,
     release_manifest: Path | None = None,
+    summary_bin: Path | None = None,
+    input_mode: str = "file",
+    input_compat_helper: Path | None = None,
     fast_args: str = "--emit-sam --chunksize 1000",
 ) -> subprocess.CompletedProcess[str]:
     output = tmp_path / "fingerprint.tsv"
@@ -74,11 +78,13 @@ def _run(
         "perl",
         str(SCRIPT),
         "--policy-manifest",
-        str(POLICY),
+        str(policy_manifest),
         "--runtime-backend",
         backend,
         "--dorado-bin",
         str(runtime["dorado"]),
+        "--dorado-input-mode",
+        input_mode,
         "--dorado-model",
         f"fast={runtime['fast']}",
         "--dorado-model",
@@ -100,6 +106,12 @@ def _run(
         command.extend(["--runtime-lock-manifest", str(lock_manifest)])
     if release_manifest is not None:
         command.extend(["--dorado-release-manifest", str(release_manifest)])
+    if summary_bin is not None:
+        command.extend(["--dorado-summary-bin", str(summary_bin)])
+    if input_compat_helper is not None:
+        command.extend(
+            ["--dorado-input-compat-helper", str(input_compat_helper)]
+        )
     env = dict(os.environ)
     env["PATH"] = f"{runtime['bindir']}:{env.get('PATH', '')}"
     return subprocess.run(
@@ -201,6 +213,46 @@ def test_non_executable_dorado_is_rejected_before_version_probe(tmp_path: Path) 
     result = _run(tmp_path, runtime)
     assert result.returncode != 0
     assert "runtime executable is not executable" in result.stderr
+
+
+def test_legacy_dorado_binds_separate_summary_and_input_adapter(
+    tmp_path: Path,
+) -> None:
+    runtime = _fake_runtime(tmp_path)
+    _write_executable(runtime["dorado"], "0.2.3+4ed609d")
+    summary_bin = runtime["bindir"] / "dorado-summary"
+    _write_executable(summary_bin, "0.7.0+71cc7442")
+    policy = tmp_path / "toolchain-legacy-dorado.tsv"
+    policy.write_text(
+        POLICY.read_text(encoding="utf-8").replace(
+            "dorado\tdorado\t0.7.0+71cc7442\n",
+            "dorado\tdorado\t0.2.3+4ed609d\n"
+            "dorado\tsummary\t0.7.0+71cc7442\n",
+        ),
+        encoding="utf-8",
+    )
+    helper = tmp_path / "dorado-input-compat"
+    _write_executable(helper, "compat helper")
+
+    result = _run(
+        tmp_path,
+        runtime,
+        policy_manifest=policy,
+        summary_bin=summary_bin,
+        input_mode="directory",
+        input_compat_helper=helper,
+    )
+    assert result.returncode == 0, result.stderr
+    values = _values(tmp_path / "fingerprint.tsv")
+    assert values["dorado_version"] == "0.2.3+4ed609d"
+    assert values["dorado_summary_version"] == "0.7.0+71cc7442"
+    assert values["dorado_input_mode"] == "directory"
+    assert values["dorado_summary_binary_sha256"] == hashlib.sha256(
+        summary_bin.read_bytes()
+    ).hexdigest()
+    assert values["dorado_input_compat_helper_sha256"] == hashlib.sha256(
+        helper.read_bytes()
+    ).hexdigest()
 
 
 def test_qualified_dorado_manifest_binds_selected_release_layout(

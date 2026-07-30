@@ -379,6 +379,18 @@ def shellQuote = { Object value ->
     def s = value == null ? '' : value.toString()
     return "'${s.replace("'", "'\"'\"'")}'"
 }
+def doradoInputMode = params.dorado_input_mode?.toString()?.trim()?.toLowerCase() ?: 'file'
+if (!(doradoInputMode in ['file', 'directory'])) {
+    exit 1, "Invalid --dorado_input_mode '${params.dorado_input_mode}'. Allowed values: file, directory"
+}
+def _doradoSummaryBinRaw = params.dorado_summary_bin?.toString()?.trim()
+def doradoSummaryBin = _doradoSummaryBinRaw
+    ? (_doradoSummaryBinRaw.startsWith('/') ? _doradoSummaryBinRaw : "${baseDir}/${_doradoSummaryBinRaw}")
+    : doradoBin
+def doradoInputCompatHelper = "${baseDir}/bin/dorado_basecaller_input_compat.sh"
+def doradoBasecallerLauncher = doradoInputMode == 'directory'
+    ? "${shellQuote(doradoInputCompatHelper)} directory ${shellQuote(doradoBin)}"
+    : doradoBin
 def resolveModelPath = { String p ->
     if (!p) return null
     p.startsWith('/') ? p : "${baseDir}/${p}"
@@ -406,6 +418,12 @@ def validateDoradoModel = { String paramName, String resolvedPath ->
 }
 if (!file(doradoBin).exists()) {
     exit 1, "Missing Dorado binary: ${doradoBin}"
+}
+if (!file(doradoSummaryBin).exists()) {
+    exit 1, "Missing Dorado summary binary: ${doradoSummaryBin}"
+}
+if (doradoInputMode == 'directory' && !file(doradoInputCompatHelper).exists()) {
+    exit 1, "Missing Dorado input compatibility helper: ${doradoInputCompatHelper}"
 }
 validateDoradoModel('fast_model', doradoFastModel)
 validateDoradoModel('hac_model', doradoHacModel)
@@ -676,6 +694,8 @@ def stateToolchainArgs = [
     '--policy-manifest', stateToolchainPolicyManifestResolved,
     '--runtime-backend', stateRuntimeBackend,
     '--dorado-bin', doradoBin,
+    '--dorado-summary-bin', doradoSummaryBin,
+    '--dorado-input-mode', doradoInputMode,
     '--dorado-model', "fast=${doradoFastModel}",
     '--dorado-model', "hac=${doradoHacModel}",
     '--dorado-model', "sup=${doradoSupModel}",
@@ -690,6 +710,9 @@ if (stateRuntimeLockManifestResolved) {
 }
 if (stateDoradoReleaseManifestResolved) {
     stateToolchainArgs.addAll(['--dorado-release-manifest', stateDoradoReleaseManifestResolved])
+}
+if (doradoInputMode == 'directory') {
+    stateToolchainArgs.addAll(['--dorado-input-compat-helper', doradoInputCompatHelper])
 }
 def stateToolchainProc = new ProcessBuilder(stateToolchainArgs.collect { it.toString() }).start()
 def stateToolchainOut = new StringBuffer()
@@ -998,7 +1021,7 @@ process fast_on_target_detection {
 						fi
 		                    if dorado_basecall_retry "FAST basecalling" "\${barcode}_fast.sam" \
 						${baseDir}/bin/with_dorado_lock.sh "\$DORADO_LOCK" "\$DORADO_LOCK_WAIT" "fast_on_target_detection:\$round_barcode" -- \
-						${doradoBin} basecaller -x ${params.dorado_device} \
+						${doradoBasecallerLauncher} basecaller -x ${params.dorado_device} \
 						${doradoFastBasecallerArgs} \
 						--min-qscore ${params.on_target_quality_score} \
 						${doradoFastModel} ${read_file};
@@ -1178,7 +1201,7 @@ process _reporting_fast_on_target {
 	# dorado summary can abort if the SAM is empty/invalid (e.g. no reads in this POD5).
 	# In that case we still create a header-only TSV so downstream reporting doesn't fail.
 	if [ -s ${round_fast_sam} ] && grep -q '^@' ${round_fast_sam}; then
-		${doradoBin} summary ${round_fast_sam} > ${barcode}_round_fast.tsv || true
+		${doradoSummaryBin} summary ${round_fast_sam} > ${barcode}_round_fast.tsv || true
 	fi
 	if [ ! -s ${barcode}_round_fast.tsv ]; then
 		printf "%b" "\$DORADO_SUMMARY_HEADER" > ${barcode}_round_fast.tsv
@@ -1275,7 +1298,7 @@ process hac_basecalling {
 					fi
 						if dorado_basecall_retry "HAC basecalling" "${barcode}_hac.sam" \
 							${baseDir}/bin/with_dorado_lock.sh "\$DORADO_LOCK" "\$DORADO_LOCK_WAIT" "hac_basecalling:\$round_barcode" -- \
-							${doradoBin} basecaller -x ${params.dorado_device} \
+							${doradoBasecallerLauncher} basecaller -x ${params.dorado_device} \
 							${doradoHacBasecallerArgs} \
 							--min-qscore ${params.min_quality_score} -l ${barcode}_read_names_hq.list \
 							${doradoHacModel} ${read_file};
@@ -1362,7 +1385,7 @@ process _reporting_hac_basecalling {
 
 	# dorado summary may abort if SAM is empty/invalid; create a header-only TSV in that case.
 	if [ -s ${round_hac_sam} ] && grep -q '^@' ${round_hac_sam}; then
-		${doradoBin} summary ${round_hac_sam} > ${barcode}_round_hac.tsv || true
+		${doradoSummaryBin} summary ${round_hac_sam} > ${barcode}_round_hac.tsv || true
 	fi
 	if [ ! -s ${barcode}_round_hac.tsv ]; then
 		printf "%b" "\$DORADO_SUMMARY_HEADER" > ${barcode}_round_hac.tsv
@@ -3402,7 +3425,7 @@ process blast_OTU_pretax {
 		    SUP_TASK_CPUS="${task.cpus}"
 		    SUP_FASTA_HQ_QCED="${fasta_hq_qced}"
 		    SUP_BASEDIR="${baseDir}"
-		    SUP_DORADO_BIN="${doradoBin}"
+		    SUP_DORADO_BIN="${doradoSummaryBin}"
 		    SUP_CACHE_LOCK="\${STATE_DIR}/.sup_basecall_cache.lock"
 		    SUP_CACHE_SCHEMA_VERSION="2"
 		    SUP_CACHE_RESTART_TOKEN="${restartTokenForCache ?: workflow.runName}"
@@ -3446,7 +3469,7 @@ process blast_OTU_pretax {
 							_t_dorado_sup_basecaller_start=\$(now_ms)
 							if dorado_basecall_retry "SUP basecalling" "${barcode}_blastreport_sup.sam" \
 							"\$BIN_DIR/with_dorado_lock.sh" "\$DORADO_LOCK" "\$DORADO_LOCK_WAIT" "blast_OTU_pretax:\$round_barcode:sup" -- \
-							${doradoBin} basecaller -x ${params.dorado_device} \
+							${doradoBasecallerLauncher} basecaller -x ${params.dorado_device} \
 							${doradoSupBasecallerArgs} \
 							--min-qscore ${params.hq_quality_score} -l ${barcode}_blastreport_hac_missing.list \
 							${doradoSupModel} ${read_file};

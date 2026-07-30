@@ -1137,6 +1137,32 @@ Path to the Dorado executable.
   releases are installed side-by-side and selected explicitly only after
   `bin/validate_dorado_release.sh` passes.
 
+#### `--dorado_input_mode`
+[back to Top](#rtbioscan-usage)
+
+Controls how the final POD5 argument is presented to Dorado.
+
+- Default: `file`.
+- Allowed values: `file`, `directory`.
+- Use `directory` only for legacy Dorado releases such as `0.2.3` that require
+  an input directory. RTBioScan stages a symlink to the single round POD5 in a
+  private temporary directory and removes that directory after the basecaller
+  exits.
+- The selected mode and compatibility-helper checksum are included in the
+  rolling-state toolchain fingerprint.
+
+#### `--dorado_summary_bin`
+[back to Top](#rtbioscan-usage)
+
+Optional path to a Dorado executable that provides the `summary` subcommand.
+
+- Default: empty, which uses `--dorado_bin`.
+- A separate summary binary is required for Dorado `0.2.3`, whose SAM output
+  is accepted by Dorado `0.7.0 summary`.
+- When different from `--dorado_bin`, its version and checksum are included in
+  the rolling-state toolchain fingerprint and must be declared by the selected
+  toolchain policy.
+
 #### `--fast_model`
 [back to Top](#rtbioscan-usage)
 
