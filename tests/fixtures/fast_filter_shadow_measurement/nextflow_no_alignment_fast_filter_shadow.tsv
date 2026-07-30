@@ -1,0 +1,2 @@
+round_barcode	read_id	read_length	current_subject	current_label	current_score	current_retained	best_target_subject	best_target_label	best_target_score	best_target_pident	best_target_aln_length	best_offtarget_subject	best_offtarget_label	best_offtarget_score	best_offtarget_pident	best_offtarget_aln_length	target_minus_offtarget_margin	competition_status
+rtbioscan-shadow-success-cpu	c9d52049-ce91-491c-8b19-3ae940f9f020	44				0												no_alignment
