@@ -546,9 +546,17 @@ validateRequiredDir('blast_taxdb', params.blast_taxdb?.toString())
 validateOptionalFile('nonncbi_id2lineage_target', params.nonncbi_id2lineage_target?.toString())
 validateRequiredFile('state_reference_manifest', params.state_reference_manifest?.toString())
 validateRequiredFile('state_taxonomy_release_manifest', params.state_taxonomy_release_manifest?.toString())
+validateRequiredFile('state_toolchain_policy_manifest', params.state_toolchain_policy_manifest?.toString())
 validateRequiredDir('state_taxonomy_data_dir', params.state_taxonomy_data_dir?.toString())
 def stateTaxonomyDataDirResolved = resolveConfigPath(params.state_taxonomy_data_dir.toString())
 def stateTaxonomyReleaseManifestResolved = resolveConfigPath(params.state_taxonomy_release_manifest.toString())
+def stateToolchainPolicyManifestResolved = resolveConfigPath(params.state_toolchain_policy_manifest.toString())
+def stateDoradoReleaseManifestRaw = params.state_dorado_release_manifest?.toString()?.trim()
+def stateDoradoReleaseManifestResolved = ''
+if (stateDoradoReleaseManifestRaw) {
+    validateRequiredFile('state_dorado_release_manifest', stateDoradoReleaseManifestRaw)
+    stateDoradoReleaseManifestResolved = resolveConfigPath(stateDoradoReleaseManifestRaw)
+}
 def stateCompatibilityPolicy = params.state_compatibility_policy?.toString()?.trim()?.toLowerCase()
 if (!(stateCompatibilityPolicy in ['strict', 'adopt_legacy'])) {
     exit 1, "Invalid --state_compatibility_policy '${params.state_compatibility_policy}'. Allowed values: strict, adopt_legacy"
@@ -556,6 +564,10 @@ if (!(stateCompatibilityPolicy in ['strict', 'adopt_legacy'])) {
 def stateReferenceVerification = params.state_reference_verification?.toString()?.trim()?.toLowerCase()
 if (!(stateReferenceVerification in ['cached', 'full'])) {
     exit 1, "Invalid --state_reference_verification '${params.state_reference_verification}'. Allowed values: cached, full"
+}
+def stateContractMigration = params.state_contract_migration?.toString()?.trim()?.toLowerCase()
+if (!(stateContractMigration in ['strict', 'attest_v1'])) {
+    exit 1, "Invalid --state_contract_migration '${params.state_contract_migration}'. Allowed values: strict, attest_v1"
 }
 def stateVerificationCacheRaw = params.state_verification_cache_dir?.toString()?.trim()
 def stateVerificationCacheDir
@@ -632,6 +644,83 @@ if (!effectiveRestartMode || effectiveRestartMode == 'null') {
 
 // Bind rolling state to the exact reference, taxonomy, and classification contract.
 // This runs after restore/reset so a restored snapshot is checked before any process can consume it.
+def stateRuntimeBackend = System.getenv('CONDA_PREFIX')?.toString()?.trim() ? 'conda' : 'host'
+def stateRuntimeLockManifestResolved = ''
+def stateRuntimeLockManifestRaw = params.state_runtime_lock_manifest?.toString()?.trim()
+if (stateRuntimeBackend == 'conda') {
+    if (!stateRuntimeLockManifestRaw || stateRuntimeLockManifestRaw == 'auto') {
+        def osName = System.getProperty('os.name')?.toLowerCase() ?: ''
+        def lockName
+        if (osName.contains('mac') || osName.contains('darwin')) {
+            lockName = 'conda-lock-osx-64.yml'
+        } else if (osName.contains('linux')) {
+            lockName = 'conda-lock-linux-64.yml'
+        } else {
+            exit 1, "No committed RTBioScan runtime lock is available for operating system '${System.getProperty('os.name')}'"
+        }
+        stateRuntimeLockManifestResolved = "${baseDir}/${lockName}"
+    } else {
+        validateRequiredFile('state_runtime_lock_manifest', stateRuntimeLockManifestRaw)
+        stateRuntimeLockManifestResolved = resolveConfigPath(stateRuntimeLockManifestRaw)
+    }
+} else if (stateRuntimeLockManifestRaw && stateRuntimeLockManifestRaw != 'auto') {
+    exit 1, "--state_runtime_lock_manifest is only valid while an activated Conda environment supplies the runtime"
+}
+
+def stateToolchainFingerprintFile = File.createTempFile('rtbioscan-toolchain-', '.tsv')
+stateToolchainFingerprintFile.deleteOnExit()
+def stateToolchainArgs = [
+    '/usr/bin/env',
+    'perl',
+    "${baseDir}/bin/runtime_toolchain_fingerprint.pl",
+    '--policy-manifest', stateToolchainPolicyManifestResolved,
+    '--runtime-backend', stateRuntimeBackend,
+    '--dorado-bin', doradoBin,
+    '--dorado-model', "fast=${doradoFastModel}",
+    '--dorado-model', "hac=${doradoHacModel}",
+    '--dorado-model', "sup=${doradoSupModel}",
+    '--dorado-device', params.dorado_device.toString(),
+    '--dorado-args', "fast=${doradoFastBasecallerArgs}",
+    '--dorado-args', "hac=${doradoHacBasecallerArgs}",
+    '--dorado-args', "sup=${doradoSupBasecallerArgs}",
+    '--output', stateToolchainFingerprintFile.toString()
+]
+if (stateRuntimeLockManifestResolved) {
+    stateToolchainArgs.addAll(['--runtime-lock-manifest', stateRuntimeLockManifestResolved])
+}
+if (stateDoradoReleaseManifestResolved) {
+    stateToolchainArgs.addAll(['--dorado-release-manifest', stateDoradoReleaseManifestResolved])
+}
+def stateToolchainProc = new ProcessBuilder(stateToolchainArgs.collect { it.toString() }).start()
+def stateToolchainOut = new StringBuffer()
+def stateToolchainErr = new StringBuffer()
+def stateToolchainStdout = Thread.start {
+    stateToolchainProc.inputStream.withReader('UTF-8') { r ->
+        r.eachLine { line -> stateToolchainOut.append(line).append('\n') }
+    }
+}
+def stateToolchainStderr = Thread.start {
+    stateToolchainProc.errorStream.withReader('UTF-8') { r ->
+        r.eachLine { line -> stateToolchainErr.append(line).append('\n') }
+    }
+}
+def stateToolchainExit = stateToolchainProc.waitFor()
+stateToolchainStdout.join()
+stateToolchainStderr.join()
+if (stateToolchainExit != 0) {
+    stateToolchainFingerprintFile.delete()
+    log.error "Runtime toolchain validation failed.\nSTDOUT:\n${stateToolchainOut}\nSTDERR:\n${stateToolchainErr}"
+    throw new RuntimeException("Runtime toolchain validation failed")
+}
+if (stateToolchainErr.toString().trim()) {
+    log.warn stateToolchainErr.toString().trim()
+}
+def stateToolchainFingerprintId = stateToolchainOut.toString().trim()
+if (!(stateToolchainFingerprintId ==~ /[0-9a-f]{64}/)) {
+    stateToolchainFingerprintFile.delete()
+    throw new RuntimeException("Runtime toolchain validator returned an invalid fingerprint ID: '${stateToolchainFingerprintId}'")
+}
+
 def stateCompatibilityArgs = [
     '/usr/bin/env',
     'perl',
@@ -654,7 +743,9 @@ def stateCompatibilityArgs = [
     '--policy', stateCompatibilityPolicy,
     '--lock-wait', (params.lock_wait_seconds ?: 300).toString(),
     '--verification-cache-dir', stateVerificationCacheDir,
-    '--verification-mode', stateReferenceVerification
+    '--verification-mode', stateReferenceVerification,
+    '--toolchain-fingerprint', stateToolchainFingerprintFile.toString(),
+    '--contract-migration', stateContractMigration
 ]
 def stateCompatibilityProc = new ProcessBuilder(stateCompatibilityArgs.collect { it.toString() }).start()
 def stateCompatibilityOut = new StringBuffer()
@@ -672,6 +763,7 @@ def stateCompatibilityStderr = Thread.start {
 def stateCompatibilityExit = stateCompatibilityProc.waitFor()
 stateCompatibilityStdout.join()
 stateCompatibilityStderr.join()
+stateToolchainFingerprintFile.delete()
 if (stateCompatibilityExit != 0) {
     log.error "State compatibility validation failed.\nSTDOUT:\n${stateCompatibilityOut}\nSTDERR:\n${stateCompatibilityErr}"
     throw new RuntimeException("State compatibility validation failed")

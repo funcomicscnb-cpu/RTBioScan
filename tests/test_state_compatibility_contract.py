@@ -22,6 +22,25 @@ def _write_file(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _write_toolchain_fingerprint(
+    path: Path,
+    *,
+    backend: str = "test",
+    blast_version: str = "2.15.0",
+) -> None:
+    values = {
+        "fingerprint_schema_version": "1",
+        "runtime_backend": backend,
+        "tool_blastn_version": blast_version,
+    }
+    canonical = "".join(f"{key}\t{values[key]}\n" for key in sorted(values))
+    fingerprint_id = hashlib.sha256(canonical.encode()).hexdigest()
+    path.write_text(
+        canonical + f"fingerprint_id\t{fingerprint_id}\n",
+        encoding="utf-8",
+    )
+
+
 def _build_fixture(
     tmp_path: Path,
     *,
@@ -37,6 +56,7 @@ def _build_fixture(
     taxonomy_manifest = tmp_path / "taxonomy_release.tsv"
     state = tmp_path / "state"
     cache = tmp_path / "cache"
+    toolchain_fingerprint = tmp_path / "toolchain_fingerprint.tsv"
 
     artifacts: list[tuple[Path, str]] = []
     for extension in LAST_EXTENSIONS:
@@ -87,6 +107,7 @@ def _build_fixture(
     for path, role in artifacts:
         rows.append(f"{path.relative_to(root)}\t{_sha256(path)}\t{role}")
     manifest.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    _write_toolchain_fingerprint(toolchain_fingerprint)
     return {
         "root": root,
         "taxonomy": taxonomy,
@@ -94,6 +115,7 @@ def _build_fixture(
         "manifest": manifest,
         "state": state,
         "cache": cache,
+        "toolchain_fingerprint": toolchain_fingerprint,
     }
 
 
@@ -107,6 +129,7 @@ def _run_contract(
     lineage: str = "db/id2lineage.tsv",
     scoring_version: str = "legacy-first-single-hit-v1",
     profile: str = "test",
+    contract_migration: str = "strict",
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -150,6 +173,10 @@ def _run_contract(
             verification_mode,
             "--profile",
             profile,
+            "--toolchain-fingerprint",
+            str(fixture["toolchain_fingerprint"]),
+            "--contract-migration",
+            contract_migration,
         ],
         capture_output=True,
         text=True,
@@ -204,6 +231,55 @@ def _poison_current_cache_entry(cache_file: Path, target: Path) -> None:
     cache_file.chmod(0o600)
 
 
+def _contract_values(path: Path) -> dict[str, str]:
+    return dict(
+        line.split("\t", 1)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    )
+
+
+def _downgrade_contract_to_schema_v1(path: Path) -> str:
+    values = _contract_values(path)
+    identity_keys = [
+        "schema_version",
+        "reference_manifest_sha256",
+        "taxonomy_nodes_sha256",
+        "taxonomy_names_sha256",
+        "taxonomy_merged_sha256",
+        "taxonomy_delnodes_sha256",
+        "classifier_policy_version",
+        "scoring_policy_version",
+        "targets",
+        "target_taxa",
+        "blast_filter_db",
+        "blast_db_specs",
+        "blast_taxdb",
+        "nonncbi_memtax",
+        "nonncbi_id2lineage",
+    ]
+    legacy = {key: values[key] for key in identity_keys}
+    legacy["schema_version"] = "1"
+    canonical = "".join(f"{key}\t{legacy[key]}\n" for key in sorted(legacy))
+    legacy_id = hashlib.sha256(canonical.encode()).hexdigest()
+    metadata_keys = [
+        "reference_manifest_path",
+        "taxonomy_release_manifest_path",
+        "taxonomy_release_manifest_sha256",
+        "taxonomy_data_dir",
+        "taxonomy_mode",
+        "execution_profile",
+        "legacy_adopted",
+    ]
+    output = {**legacy, "contract_id": legacy_id}
+    output.update({key: values[key] for key in metadata_keys if key in values})
+    path.write_text(
+        "".join(f"{key}\t{output[key]}\n" for key in sorted(output)),
+        encoding="utf-8",
+    )
+    return legacy_id
+
+
 def test_new_state_and_unchanged_restart_reuse_private_cache(tmp_path: Path) -> None:
     fixture = _build_fixture(tmp_path)
     first = _run_contract(fixture)
@@ -220,6 +296,83 @@ def test_new_state_and_unchanged_restart_reuse_private_cache(tmp_path: Path) -> 
     assert second.returncode == 0, second.stderr
     assert second.stdout == first.stdout
     assert cache_file.stat().st_mtime_ns == cache_mtime
+
+
+def test_runtime_toolchain_change_is_incompatible_with_existing_state(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    first = _run_contract(fixture)
+    assert first.returncode == 0, first.stderr
+
+    _write_toolchain_fingerprint(
+        fixture["toolchain_fingerprint"],
+        blast_version="2.16.0",
+    )
+    changed = _run_contract(fixture)
+    assert changed.returncode != 0
+    assert "toolchain_fingerprint_id" in changed.stderr
+
+
+def test_corrupt_runtime_toolchain_fingerprint_is_rejected(tmp_path: Path) -> None:
+    fixture = _build_fixture(tmp_path)
+    fixture["toolchain_fingerprint"].write_text(
+        "fingerprint_schema_version\t1\n"
+        f"fingerprint_id\t{'0' * 64}\n",
+        encoding="utf-8",
+    )
+    result = _run_contract(fixture)
+    assert result.returncode != 0
+    assert "runtime toolchain fingerprint checksum mismatch" in result.stderr
+
+
+def test_schema_v1_state_requires_explicit_attested_migration(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    first = _run_contract(fixture)
+    assert first.returncode == 0, first.stderr
+    contract_path = fixture["state"] / "state_compatibility_manifest.tsv"
+    legacy_id = _downgrade_contract_to_schema_v1(contract_path)
+
+    strict = _run_contract(fixture)
+    assert strict.returncode != 0
+    assert "requires explicit toolchain migration" in strict.stderr
+    assert "--state_contract_migration attest_v1" in strict.stderr
+
+    migrated = _run_contract(
+        fixture,
+        contract_migration="attest_v1",
+    )
+    assert migrated.returncode == 0, migrated.stderr
+    assert "cannot be cryptographically proven" in migrated.stderr
+    values = _contract_values(contract_path)
+    assert values["schema_version"] == "2"
+    assert values["migrated_from_contract_id"] == legacy_id
+    assert values["toolchain_migration_attested"] == "1"
+    assert (
+        values["toolchain_migration_limitation"]
+        == "historical_schema_v1_runtime_not_cryptographically_provable"
+    )
+
+
+def test_schema_v1_migration_rejects_changed_legacy_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    first = _run_contract(fixture)
+    assert first.returncode == 0, first.stderr
+    contract_path = fixture["state"] / "state_compatibility_manifest.tsv"
+    _downgrade_contract_to_schema_v1(contract_path)
+
+    changed = _run_contract(
+        fixture,
+        scoring_version="changed-scoring-v2",
+        contract_migration="attest_v1",
+    )
+    assert changed.returncode != 0
+    assert "schema-v1 rolling state is incompatible" in changed.stderr
+    assert "scoring_policy_version" in changed.stderr
 
 
 def test_taxonomy_artifact_drift_is_rejected_before_cache_update(tmp_path: Path) -> None:
@@ -608,4 +761,26 @@ def test_main_wires_one_pinned_taxonomy_release_into_both_taxonomy_processes() -
     assert 'export TAXONKIT_DB="${stateTaxonomyDataDirResolved}"' in consensus_block
     assert "conf/state_compatibility/reference_manifest_legacy_v1.tsv" in release_text
     assert "conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv" in release_text
+    assert "conf/runtime_compatibility/toolchain_legacy_v1.tsv" in release_text
     assert "db/taxonomy/releases/ncbi-taxdump-2024-06-24" in release_text
+
+
+def test_main_wires_schema_v2_runtime_fingerprint_before_state_contract() -> None:
+    main_text = (REPO_ROOT / "main.nf").read_text(encoding="utf-8")
+    config_text = (REPO_ROOT / "nextflow.config").read_text(encoding="utf-8")
+    fingerprint_call = main_text.index("bin/runtime_toolchain_fingerprint.pl")
+    contract_call = main_text.index("bin/state_compatibility_contract.pl")
+    assert fingerprint_call < contract_call
+    assert "'--toolchain-fingerprint', stateToolchainFingerprintFile.toString()" in main_text
+    assert "'--contract-migration', stateContractMigration" in main_text
+    assert "'--dorado-bin', doradoBin" in main_text
+    assert "'--dorado-device', params.dorado_device.toString()" in main_text
+    assert '"fast=${doradoFastBasecallerArgs}"' in main_text
+    assert "stateRuntimeBackend = System.getenv('CONDA_PREFIX')" in main_text
+    assert "conda-lock-osx-64.yml" in main_text
+    assert "conda-lock-linux-64.yml" in main_text
+    assert (
+        'state_toolchain_policy_manifest = '
+        '"conf/runtime_compatibility/toolchain_legacy_v1.tsv"'
+    ) in config_text
+    assert 'state_contract_migration = "strict"' in config_text

@@ -15,7 +15,9 @@ created, `bin/state_compatibility_contract.pl` binds the rolling state to:
   `merged.dmp`, and `delnodes.dmp` files;
 - marker targets and target taxa;
 - BLAST/LAST database and taxonomy-map selections;
-- explicit classifier-policy and scoring-policy versions.
+- explicit classifier-policy and scoring-policy versions; and
+- a schema-v2 fingerprint of the resolved command-line runtime, R consensus
+  packages, and selected Dorado binary/models/device/effective arguments.
 
 The resulting contract ID is written atomically to:
 
@@ -31,8 +33,9 @@ contract change therefore changes the relevant Nextflow task signatures as well
 as being rejected at the rolling-state boundary.
 
 Execution profile and resolved filesystem paths are recorded for provenance but
-do not change the contract ID. Content hashes and classification settings are the
-compatibility identity.
+do not change the contract ID. The live runtime backend, exact probed versions,
+applicable Conda lock checksum, Dorado checksum, model configuration checksums,
+and effective Dorado settings do change the schema-v2 contract ID.
 
 ## Default baseline
 
@@ -82,6 +85,10 @@ expected component groups.
 | `state_verification_cache_dir` | empty | Cache root; empty derives `<outdir>/temp/_compatibility_cache`, with a private `uid-N` child |
 | `state_classifier_policy_version` | `legacy-rank-string-v1` | Manual compatibility version for classifier semantics |
 | `state_scoring_policy_version` | `legacy-first-single-hit-v1` | Manual compatibility version for scoring/selection semantics |
+| `state_toolchain_policy_manifest` | `conf/runtime_compatibility/toolchain_legacy_v1.tsv` | Exact supported tool and R-package versions |
+| `state_runtime_lock_manifest` | `auto` | In an activated Conda environment, select and bind the committed OS-specific lock; explicit paths are also accepted |
+| `state_dorado_release_manifest` | empty | Optional qualified Dorado release manifest; an explicit installation without one is fingerprinted but recorded as unqualified |
+| `state_contract_migration` | `strict` | `strict` rejects schema-v1 state; `attest_v1` performs the one-time explicit v1-to-v2 migration |
 
 Any future behavior change to classifier or scoring semantics must increment the
 corresponding version. Any reference change must use a new, reviewed manifest.
@@ -147,10 +154,44 @@ directory is compatible only when all four content hashes remain identical.
 The contract ID then stays unchanged and the state manifest records the former
 taxonomy path. Any byte change remains an incompatible taxonomy change.
 
-Phase 2 is still not the production completion gate until Phase 2.1c adds
-backend-aware toolchain identity and the explicit contract-schema migration.
-Until then, do not change the TaxonKit, BLAST, or LAST toolchain within an
-existing state.
+## Phase 2.1c resolved toolchain identity
+
+`bin/runtime_toolchain_fingerprint.pl` probes the executables that will actually
+run, rather than trusting a Nextflow profile name. The committed legacy policy
+pins BLAST, LAST, TaxonKit, SeqKit, Cutadapt, VSEARCH, CD-HIT, Samtools, Seqtk,
+R, DECIPHER, Biostrings, and Dorado. Missing tools, failed probes, non-executable
+Dorado binaries, and version mismatches fail before any process launches.
+
+An activated Conda runtime is distinguished from a host runtime and binds the
+matching committed platform lock. The fingerprint also includes:
+
+- the selected Dorado binary SHA-256 and exact version;
+- FAST/HAC/SUP model names, `config.toml` checksums, and model-content
+  identities;
+- the selected device and effective per-stage basecaller arguments; and
+- the qualified Dorado release-manifest checksum when one is supplied.
+
+The device is deliberately compatibility-significant: changing, for example,
+from `metal` to `cuda` or `cpu` makes an existing state incompatible because
+backend-dependent floating-point behavior can change basecalls. Select the
+recorded device again, use a new state, or explicitly reset; the pipeline never
+silently combines results produced by different basecalling backends.
+
+Supplying a qualified Dorado manifest additionally requires the selected binary
+and model configurations to match that manifest and its installed release
+layout; declared model artifacts must remain present at their pinned sizes, and
+the complete manifest supplies their content identity. Without one, the
+explicit binary and models remain usable for compatibility with existing
+installations, but their directories are fully hashed, startup warns, and the
+state records `unqualified_explicit`. Promotion evidence still requires
+`validate_dorado_release.sh`; a state fingerprint is not a hardware
+qualification.
+
+Schema v1 did not record a runtime fingerprint. Its history therefore cannot be
+reconstructed cryptographically. Migration is fail-closed and requires all
+legacy reference/taxonomy/classifier fields to match plus a one-time operator
+attestation. The schema-v2 manifest records the former contract ID, UTC
+attestation time, and this limitation.
 
 ## Runtime qualification after container removal
 
@@ -200,8 +241,8 @@ Candidate runs use a new `state_id` and output directory. Promotion is an
 explicit reviewed configuration change; rollback selects the retained stable
 release and its untouched matching state. A Linux x86-64 release remains
 unqualified until its platform manifest and live CUDA/CPU evidence exist.
-Phase 2.1c will bind the selected Dorado binary, model manifests, device, and
-effective arguments into the state identity.
+Schema v2 binds the selected Dorado binary, model configurations, optional
+release manifest, device, and effective arguments into the state identity.
 
 ## Existing rolling state
 
@@ -231,6 +272,25 @@ Pre-contract state has no trustworthy execution-backend provenance: never use
 `adopt_legacy` for state known or suspected to have been produced with that
 image. Start a new state and reanalyse instead.
 
+### Schema-v1 to schema-v2 migration
+
+For a contract-bearing schema-v1 state, first activate and validate the pinned
+legacy runtime and confirm that the state was not produced by the inherited
+NanoRTax container. Then migrate exactly once:
+
+```bash
+nextflow run main.nf \
+  --state_id EXISTING_PHASE2_STATE \
+  --state_contract_migration attest_v1 \
+  [the run's normal arguments]
+```
+
+The migration cannot prove which historical binaries created the v1 state; the
+operator attestation acknowledges that unavoidable limitation. A changed
+legacy identity is rejected even with `attest_v1`. Subsequent starts use the
+default `strict` setting and must reproduce the recorded schema-v2 toolchain
+fingerprint.
+
 ## Mismatch behavior
 
 A mismatch is fatal and reports the changed contract fields. The supported
@@ -256,6 +316,11 @@ There is no force flag that combines incompatible rolling state.
 - OTU and consensus processes receive the same canonical `TAXONKIT_DB`.
 - A content-identical Phase-2.1a taxonomy-path migration preserves the contract
   ID and records its former path.
+- The resolved runtime matches the exact toolchain policy before state is used.
+- Changing a tool version, Conda lock, Dorado binary/model configuration,
+  device, or effective Dorado arguments changes the schema-v2 identity.
+- Schema-v1 state is rejected unless explicitly migrated; migration records the
+  former contract ID and the historical-runtime trust limitation.
 - An unchanged cached restart does not rehash or rewrite the attestation.
 - Changing one file rehashes only that file.
 - Unsafe cache ownership or permissions cannot authorize cached reuse.

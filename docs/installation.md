@@ -373,6 +373,7 @@ explicitly only for a shadow run:
 ./RTBioScan.sh \
   --state_id DORADO_CANDIDATE_STATE \
   --outdir results_dorado_candidate \
+  --state_dorado_release_manifest conf/runtime_compatibility/dorado_release_0.7.0_osx-arm64.tsv \
   --dorado_bin runtime/dorado/releases/dorado-0.7.0-osx-arm64/bin/dorado \
   --fast_model runtime/dorado/releases/dorado-0.7.0-osx-arm64/models/dna_r10.4.1_e8.2_400bps_fast@v5.0.0 \
   --hac_model runtime/dorado/releases/dorado-0.7.0-osx-arm64/models/dna_r10.4.1_e8.2_400bps_hac@v5.0.0 \
@@ -383,6 +384,13 @@ explicitly only for a shadow run:
 Rollback means selecting the retained stable release and its matching,
 untouched state. Installed releases are never overwritten or deleted by the
 installer.
+
+The optional `state_dorado_release_manifest` binds the complete qualified
+release declaration into the schema-v2 state identity and verifies that the
+selected binary and model configurations belong to it. Omitting the parameter
+keeps an existing explicit Dorado installation usable and fingerprints all
+selected model bytes directly, but records it as unqualified and does not
+substitute for static/live release qualification.
 
 ---
 

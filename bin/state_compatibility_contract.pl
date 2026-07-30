@@ -9,6 +9,7 @@ use Fcntl qw(O_CREAT O_EXCL O_WRONLY);
 use File::Path qw(make_path);
 use File::Spec;
 use Getopt::Long qw(GetOptions);
+use POSIX qw(strftime);
 use Time::HiRes qw(time usleep);
 
 my %opt = (
@@ -20,6 +21,7 @@ my %opt = (
     nonncbi_id2lineage     => '',
     verification_cache_dir => '',
     verification_mode      => 'cached',
+    contract_migration     => 'strict',
 );
 
 GetOptions(
@@ -42,6 +44,8 @@ GetOptions(
     'lock-wait=i'                 => \$opt{lock_wait},
     'verification-cache-dir=s'    => \$opt{verification_cache_dir},
     'verification-mode=s'         => \$opt{verification_mode},
+    'toolchain-fingerprint=s'     => \$opt{toolchain_fingerprint},
+    'contract-migration=s'        => \$opt{contract_migration},
 ) or die "ERROR: invalid state compatibility options\n";
 
 my %required_option_name = (
@@ -62,6 +66,7 @@ for my $required (
         blast_filter_db
         blast_db_specs
         blast_taxdb
+        toolchain_fingerprint
     )
 ) {
     my $option_name = $required_option_name{$required} // ($required =~ s/_/-/gr);
@@ -75,6 +80,8 @@ die "ERROR: --lock-wait must be >= 1\n"
     if !defined $opt{lock_wait} || $opt{lock_wait} < 1;
 die "ERROR: --verification-mode must be cached or full\n"
     if $opt{verification_mode} ne 'cached' && $opt{verification_mode} ne 'full';
+die "ERROR: --contract-migration must be strict or attest_v1\n"
+    if $opt{contract_migration} ne 'strict' && $opt{contract_migration} ne 'attest_v1';
 
 my @owned_lock_dirs;
 my @owned_temp_files;
@@ -284,6 +291,38 @@ sub read_contract {
         $values{$key} = $value;
     }
     close($fh);
+    return \%values;
+}
+
+sub read_toolchain_fingerprint {
+    my ($path) = @_;
+    open(my $fh, '<', $path)
+        or die "ERROR: cannot read runtime toolchain fingerprint '$path': $!\n";
+    my %values;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line eq '';
+        my ($key, $value, @extra) = split /\t/, $line, -1;
+        die "ERROR: malformed runtime toolchain fingerprint row: $line\n"
+            if !defined $key || $key !~ /\A[A-Za-z0-9_+-]+\z/
+            || !defined $value || @extra;
+        die "ERROR: duplicate runtime toolchain fingerprint field: $key\n"
+            if exists $values{$key};
+        $values{$key} = $value;
+    }
+    close($fh)
+        or die "ERROR: cannot close runtime toolchain fingerprint '$path': $!\n";
+    die "ERROR: runtime toolchain fingerprint schema is not supported\n"
+        if ($values{fingerprint_schema_version} // '') ne '1';
+    my $declared_id = delete $values{fingerprint_id};
+    die "ERROR: runtime toolchain fingerprint has no valid fingerprint_id\n"
+        if !defined $declared_id || $declared_id !~ /\A[0-9a-f]{64}\z/;
+    my $canonical = join('', map { "$_\t$values{$_}\n" } sort keys %values);
+    my $actual_id = sha256_hex($canonical);
+    die "ERROR: runtime toolchain fingerprint checksum mismatch: "
+        . "declared=$declared_id actual=$actual_id\n"
+        if $declared_id ne $actual_id;
+    $values{fingerprint_id} = $declared_id;
     return \%values;
 }
 
@@ -587,6 +626,7 @@ sub write_contract_atomic {
 my $state_dir = absolute_path($opt{state_dir});
 my $reference_manifest = absolute_path($opt{reference_manifest});
 my $taxonomy_release_manifest = absolute_path($opt{taxonomy_release_manifest});
+my $toolchain_fingerprint_path = absolute_path($opt{toolchain_fingerprint});
 my $reference_root = abs_path($opt{reference_root});
 die "ERROR: reference manifest not found: $reference_manifest\n"
     if !-f $reference_manifest;
@@ -594,10 +634,13 @@ die "ERROR: taxonomy release manifest not found: $taxonomy_release_manifest\n"
     if !-f $taxonomy_release_manifest;
 die "ERROR: reference root not found: $opt{reference_root}\n"
     if !defined $reference_root || !-d $reference_root;
+die "ERROR: runtime toolchain fingerprint not found: $toolchain_fingerprint_path\n"
+    if !-f $toolchain_fingerprint_path;
 my $manifest_sha256 = file_sha256($reference_manifest);
 my $taxonomy_release_manifest_sha256 = file_sha256($taxonomy_release_manifest);
 my $manifest_artifacts_ref = read_reference_manifest($reference_manifest, $reference_root);
 my $taxonomy_release_entries_ref = read_taxonomy_release_manifest($taxonomy_release_manifest);
+my $toolchain_fingerprint_ref = read_toolchain_fingerprint($toolchain_fingerprint_path);
 
 my @last_extensions = qw(.prj .bck .des .sds .ssp .suf .tis);
 my @blast_v5_extensions = qw(.ndb .nhr .nin .njs .not .nsq .ntf .nto);
@@ -688,7 +731,7 @@ my %taxonomy_hash = map {
     $_ => $verified_ref->{$taxonomy_path{$_}}{verified_sha}
 } @taxonomy_files;
 
-my %identity = (
+my %legacy_identity = (
     schema_version             => '1',
     reference_manifest_sha256 => $manifest_sha256,
     taxonomy_nodes_sha256      => $taxonomy_hash{'nodes.dmp'},
@@ -707,10 +750,18 @@ my %identity = (
 );
 
 for my $key (qw(classifier_policy_version scoring_policy_version)) {
-    die "ERROR: $key must not be empty\n" if $identity{$key} eq '';
+    die "ERROR: $key must not be empty\n" if $legacy_identity{$key} eq '';
 }
 
+my %identity = (
+    %legacy_identity,
+    schema_version           => '2',
+    toolchain_fingerprint_id => $toolchain_fingerprint_ref->{fingerprint_id},
+);
 my $canonical = join('', map { "$_\t$identity{$_}\n" } sort keys %identity);
+my $legacy_canonical =
+    join('', map { "$_\t$legacy_identity{$_}\n" } sort keys %legacy_identity);
+my $legacy_contract_id = sha256_hex($legacy_canonical);
 my %contract = (
     %identity,
     reference_manifest_path => $reference_manifest,
@@ -720,6 +771,9 @@ my %contract = (
     taxonomy_mode                    => $taxonomy_mode,
     execution_profile                => trim($opt{profile}),
 );
+for my $key (sort keys %{$toolchain_fingerprint_ref}) {
+    $contract{"toolchain_$key"} = $toolchain_fingerprint_ref->{$key};
+}
 $contract{contract_id} = sha256_hex($canonical);
 
 make_path($state_dir) if !-d $state_dir;
@@ -740,29 +794,93 @@ eval {
                 . "so this state cannot be resumed or migrated. Use a new --state_id or "
                 . "--restart_mode reset and reanalyse with a supported runtime.\n";
         }
-        my @changed;
-        for my $key (sort(keys(%identity)), 'contract_id') {
-            my $old = $existing_ref->{$key} // '';
-            my $new = $contract{$key};
-            push @changed, "$key: '$old' -> '$new'" if $old ne $new;
-        }
-        if (@changed) {
-            die "ERROR: incompatible rolling state at '$state_dir'.\n"
-                . join("\n", map { "  $_" } @changed)
-                . "\nUse a new --state_id, --restart_mode reset, or the matching reference/taxonomy/classifier versions.\n";
-        }
-        my $old_taxonomy_dir = $existing_ref->{taxonomy_data_dir} // '';
-        my $old_taxonomy_manifest_sha = $existing_ref->{taxonomy_release_manifest_sha256} // '';
-        if (
-            $old_taxonomy_dir ne $contract{taxonomy_data_dir}
-            || $old_taxonomy_manifest_sha ne $contract{taxonomy_release_manifest_sha256}
-        ) {
+        my $existing_schema = $existing_ref->{schema_version} // '';
+        die "ERROR: unsupported rolling-state contract schema '$existing_schema' at '$state_dir'\n"
+            if $existing_schema ne '1' && $existing_schema ne '2';
+
+        if ($existing_schema eq '1') {
+            my @legacy_changed;
+            for my $key (sort(keys(%legacy_identity))) {
+                my $old = $existing_ref->{$key} // '';
+                my $new = $legacy_identity{$key};
+                push @legacy_changed, "$key: '$old' -> '$new'" if $old ne $new;
+            }
+            my $old_contract_id = $existing_ref->{contract_id} // '';
+            push @legacy_changed,
+                "contract_id: '$old_contract_id' -> '$legacy_contract_id'"
+                if $old_contract_id ne $legacy_contract_id;
+            if (@legacy_changed) {
+                die "ERROR: schema-v1 rolling state is incompatible with the legacy "
+                    . "reference/taxonomy/classifier baseline at '$state_dir'.\n"
+                    . join("\n", map { "  $_" } @legacy_changed)
+                    . "\nUse a new --state_id, --restart_mode reset, or the matching legacy inputs.\n";
+            }
+            if ($opt{contract_migration} ne 'attest_v1') {
+                die "ERROR: schema-v1 rolling state requires explicit toolchain migration at '$state_dir'.\n"
+                    . "The historical runtime was not recorded and cannot be cryptographically proven. "
+                    . "After verifying that this state was produced by the supported legacy host/locked "
+                    . "runtime and not the inherited NanoRTax container, re-run once with "
+                    . "--state_contract_migration attest_v1. Otherwise use a new --state_id or "
+                    . "--restart_mode reset.\n";
+            }
+            my $old_taxonomy_dir = $existing_ref->{taxonomy_data_dir} // '';
             my $migrated_from = $existing_ref->{taxonomy_migrated_from_data_dir} // '';
             $migrated_from = $old_taxonomy_dir
-                if $migrated_from eq '' && $old_taxonomy_dir ne '' && $old_taxonomy_dir ne $contract{taxonomy_data_dir};
-            $contract{taxonomy_migrated_from_data_dir} = $migrated_from if $migrated_from ne '';
+                if $migrated_from eq '' && $old_taxonomy_dir ne ''
+                && $old_taxonomy_dir ne $contract{taxonomy_data_dir};
+            $contract{taxonomy_migrated_from_data_dir} = $migrated_from
+                if $migrated_from ne '';
+            $contract{migrated_from_contract_id} = $old_contract_id;
+            $contract{toolchain_migration_attested} = '1';
+            $contract{toolchain_migration_attested_utc} =
+                strftime('%Y-%m-%dT%H:%M:%SZ', gmtime());
+            $contract{toolchain_migration_limitation} =
+                'historical_schema_v1_runtime_not_cryptographically_provable';
             my $legacy_adopted = ($existing_ref->{legacy_adopted} // '') eq '1' ? 1 : 0;
             write_contract_atomic($contract_path, \%contract, $legacy_adopted);
+            warn "WARNING: migrated schema-v1 rolling state to schema v2 under an "
+                . "operator-attested legacy runtime assumption; historical toolchain identity "
+                . "was not recorded and cannot be cryptographically proven\n";
+        } else {
+            my @changed;
+            for my $key (sort(keys(%identity)), 'contract_id') {
+                my $old = $existing_ref->{$key} // '';
+                my $new = $contract{$key};
+                push @changed, "$key: '$old' -> '$new'" if $old ne $new;
+            }
+            if (@changed) {
+                die "ERROR: incompatible rolling state at '$state_dir'.\n"
+                    . join("\n", map { "  $_" } @changed)
+                    . "\nUse a new --state_id, --restart_mode reset, or the matching reference/taxonomy/classifier/toolchain versions.\n";
+            }
+            my $old_taxonomy_dir = $existing_ref->{taxonomy_data_dir} // '';
+            my $old_taxonomy_manifest_sha =
+                $existing_ref->{taxonomy_release_manifest_sha256} // '';
+            if (
+                $old_taxonomy_dir ne $contract{taxonomy_data_dir}
+                || $old_taxonomy_manifest_sha ne $contract{taxonomy_release_manifest_sha256}
+            ) {
+                my $migrated_from = $existing_ref->{taxonomy_migrated_from_data_dir} // '';
+                $migrated_from = $old_taxonomy_dir
+                    if $migrated_from eq '' && $old_taxonomy_dir ne ''
+                    && $old_taxonomy_dir ne $contract{taxonomy_data_dir};
+                $contract{taxonomy_migrated_from_data_dir} = $migrated_from
+                    if $migrated_from ne '';
+                for my $key (
+                    qw(
+                        migrated_from_contract_id
+                        toolchain_migration_attested
+                        toolchain_migration_attested_utc
+                        toolchain_migration_limitation
+                    )
+                ) {
+                    $contract{$key} = $existing_ref->{$key}
+                        if defined $existing_ref->{$key};
+                }
+                my $legacy_adopted =
+                    ($existing_ref->{legacy_adopted} // '') eq '1' ? 1 : 0;
+                write_contract_atomic($contract_path, \%contract, $legacy_adopted);
+            }
         }
     } else {
         my $has_material = state_has_material($state_dir);
