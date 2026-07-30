@@ -22,7 +22,7 @@ data_long <- pivot_longer(read_info,
                           values_to = "qscore",
                           values_drop_na = TRUE)
 
-if (nrow(data_long) == 0) {
+if (nrow(read_info) < 2 || nrow(data_long) == 0) {
   placeholder_outputs <- c(
     "_violin_quality_read_info.png" = "Quality Distribution by Barcode",
     "_violin_length_read_info.png" = "Read Length by Barcode",

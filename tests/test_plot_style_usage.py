@@ -79,19 +79,48 @@ def test_plot_scripts_runtime_smoke(tmp_path: Path) -> None:
         assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_read_info_quality_emits_placeholders_for_header_only_round(
+def test_read_info_quality_emits_placeholders_for_empty_and_single_read_round(
     tmp_path: Path,
 ) -> None:
-    script = (REPO_ROOT / "bin/Read_info_quality.R").read_text(encoding="utf-8")
-    assert "if (nrow(data_long) == 0)" in script
-    for suffix in [
+    rscript = shutil.which("Rscript")
+    if rscript is None:
+        return
+
+    header = (
+        "read_id\tfilename\trun_id\tbarcode\tfast_length\tfast_mean_qscore"
+        "\thac_length\thac_mean_qscore\tsup_length\tsup_mean_qscore\n"
+    )
+    cases = {
+        "empty": header,
+        "single": (
+            header
+            + "fixture\tfixture.pod5\ttest\tCOI\t180\t9\t183\t12\t182\t12\n"
+        ),
+    }
+    suffixes = [
         "_violin_quality_read_info.png",
         "_violin_length_read_info.png",
         "_violin_length_read_info_log.png",
         "_density_read_info.png",
         "_density_read_info_with_unmatched.png",
-    ]:
-        assert suffix in script
+    ]
+
+    for sample_name, contents in cases.items():
+        case_dir = tmp_path / sample_name
+        case_dir.mkdir()
+        read_info = case_dir / f"{sample_name}_read_info_rpt.txt"
+        read_info.write_text(contents, encoding="utf-8")
+
+        result = subprocess.run(
+            [rscript, str(REPO_ROOT / "bin/Read_info_quality.R"), str(read_info)],
+            cwd=case_dir,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr or result.stdout
+        for suffix in suffixes:
+            assert (case_dir / f"{sample_name}{suffix}").is_file()
 
 
 def test_read_counts_runtime_smoke_wrapper_style_invocation(tmp_path: Path) -> None:
