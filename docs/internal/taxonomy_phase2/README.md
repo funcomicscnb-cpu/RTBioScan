@@ -217,6 +217,62 @@ Nextflow profile remains disabled because `process.conda = environment.yml`
 would re-solve dependencies instead of using the committed lock. Install and
 activate the platform lock, validate it, and run without `-profile conda`.
 
+### Deterministic classification benchmark
+
+`conf/taxonomy_regression/` is the post-FAST-basecall target-filter and taxonomy
+benchmark that bridges Phase 2 and Phase 3. FAST labels such as Bacteria/Fungi
+are operational exclusion buckets used to avoid unnecessary HAC/SUP
+basecalling, not strict origin assignments. The benchmark freezes the legacy
+A/B1 behavior, the unsupported B2 hypothesis, the -557/-561 synthetic-ID
+collisions, marker controls, and fixed HAC/FAST-like variants. Its controls
+include a genuine human COI query that correctly first-routes to the explicit
+`COI|Human` exclusion bucket but has a human-like sequence in the
+`COI|Bacteria` bucket. This captures bidirectional decoy contamination without
+misstating Human as a configured `COI|Metazoa` target. Run the benchmark with:
+
+```bash
+python3 bin/validate_taxonomy_classification_fixture.py \
+  --taxonomy-data-dir db/taxonomy/releases/ncbi-taxdump-2024-06-24
+```
+
+The expected results intentionally preserve the current defects. Phase 3 will
+use a new corrected expectation while retaining this legacy baseline. The
+fixture proves the downstream Chain-A trap but not its current FAST reachability:
+all committed endosymbiont variants first-route to `COI|Bacteria`. Live
+incidence must be measured in shadow mode on representative pre-filter reads;
+a generic marker-length POD5 is workflow evidence, not incidence evidence.
+Shadow margins measure routing and compute impact, not biological truth by
+themselves; accuracy requires independently adjudicated controls or reviewed
+reads against broader curated references. Any Phase 3 ambiguity policy must
+retain near ties for HAC/SUP by default and may exclude them only with
+independently strong off-target evidence.
+
+Enable the decision-neutral collector with `--fast_filter_shadow true`. It
+adds per-read and per-round read/base diagnostics to the round directory while
+preserving the legacy first-hit target list. The default is `false`; no
+threshold or alternative assignment is enforced in Phase 2.
+
+Integration evidence from 2026-07-30:
+
+- a Nextflow 22.10.8 CPU round exercised the non-empty FAST/shadow branch and
+  completed all 15 processes;
+- the resulting detail and summary files contained one 44-base no-alignment
+  read, including `current_excluded__no_alignment = 1`;
+- a second round forced only the shadow helper to fail, logged the legacy
+  router fallback, omitted partial shadow files, and completed all 15
+  processes.
+
+This is workflow/fallback evidence, not classification-incidence evidence.
+Direct Metal attempts launched through the Codex command executor failed while
+loading Dorado tensors, but that executor is not a valid GPU qualification
+context. A native standalone Metal probe launched from Terminal enumerated the
+Apple M1 Pro, compiled and dispatched a compute kernel, and verified 256 GPU
+results. Terminal-side one-read tests then succeeded for both Dorado
+`0.2.3+4ed609d` with its native v4.2-alpha FAST model and Dorado
+`0.7.0+71cc7442` with the configured v5 FAST model. Accelerator qualification
+must therefore be launched through the same normal Terminal/Nextflow runtime
+used in production, never inferred from the Codex executor.
+
 ## Optional Dorado releases
 
 Dorado is not part of the Conda lock and is never updated automatically.
@@ -229,18 +285,54 @@ side-by-side and never changes the configured binary or model paths.
 
 - static verification of bytes, version, platform, models, `basecaller`, and
   `summary` command compatibility;
-- live qualification on an explicitly requested hardware device and the
+- live compatibility on an explicitly requested hardware device and the
   checksummed official POD5 declared by
   `conf/runtime_compatibility/dorado_qualification_fixture_v0.7.0.tsv`, using
   the exact FAST/HAC/SUP chunk, batch, overlap, quality, read-list, SAM, and
-  summary interfaces used by RTBioScan. The tiny fixture qualifies hardware
-  and formats only; a representative full-round shadow run remains required
-  for biological classification qualification.
+  summary interfaces used by RTBioScan. Only Metal or CUDA evidence qualifies
+  a release as an accelerator candidate; CPU and other devices are recorded as
+  diagnostic-only. The tiny fixture qualifies hardware and formats only. A
+  representative accelerator-backed full-round shadow run remains required
+  for biological classification and real-time performance qualification. A
+  failed live attempt writes a read-only failed-status report and preserves
+  stage logs, effective arguments, a checksum manifest, and environment
+  metadata in the sibling `<report>.evidence` directory rather than deleting
+  the diagnostic reason during temporary-directory cleanup. A per-report lock
+  serializes concurrent attempts; handled HUP/INT/TERM signals preserve
+  evidence and release it. Untrappable termination can leave a stale lock that
+  requires ownership/process inspection before manual removal.
 
 Candidate runs use a new `state_id` and output directory. Promotion is an
-explicit reviewed configuration change; rollback selects the retained stable
-release and its untouched matching state. A Linux x86-64 release remains
-unqualified until its platform manifest and live CUDA/CPU evidence exist.
+explicit reviewed configuration change. The candidate must run FAST, HAC, and
+SUP without CPU fallback on the intended Metal or CUDA device and meet
+predeclared throughput, p95 round-latency, total-basecalling-time, and
+sequencer-input-headroom budgets against the stable release on identical
+hardware and inputs. Failure of either accelerator compatibility or the
+real-time budget rejects promotion; CPU success cannot override it. Rollback
+selects the retained stable release and its untouched matching state. A Linux
+x86-64 release remains unqualified until its platform manifest and live CUDA
+evidence exist.
+
+Dorado `0.2.3+4ed609d` is also supported as an explicit recovery candidate,
+not a default. It uses `dorado_input_mode=directory`, a separately selected
+`0.7.0+71cc7442` summary binary, native 5 kHz v4.2-alpha FAST/HAC/SUP models,
+and `toolchain_dorado_0.2.3_v1.tsv`. RTBioScan's capability probe omits the
+unsupported modern `--emit-sam` flag while retaining the advertised legacy
+overlap/chunk/batch options. On 2026-07-30, all three model stages completed
+the official one-read fixture on Metal through the compatibility launcher,
+including HAC/SUP read-list input and modern summary parsing. The schema-v2
+fingerprint binds both executables, the directory-staging helper, all model
+content, device, and effective arguments. This proves hardware/interface
+operation only; marker-length classification and sustained real-time
+performance remain promotion gates.
+
+The normalized capture in
+`tests/fixtures/dorado_mixed_0_2_3_0_7_0/` and
+`tests/test_dorado_mixed_summary_reporting.py` lock the mixed-version reporting
+contract: the captured 0.2.3 FAST/HAC/SUP SAM records must agree with their
+0.7.0 summary rows, populate the complete RTBioScan read-information table,
+and remain readable by the SUP cache ID parser.
+
 Schema v2 binds the selected Dorado binary, model configurations, optional
 release manifest, device, and effective arguments into the state identity.
 
@@ -334,3 +426,22 @@ testable.
 The first deployment of the compatibility token changes task signatures for
 processes that consume it, causing one intentional cache invalidation. Stable
 contract IDs remain reusable thereafter.
+
+## Phase 2 closeout
+
+The Phase 2 implementation backlog is committed on
+`agent/taxonomy-state-compatibility-phase-2-1a`. It includes runtime/state
+reproducibility, pinned taxonomy, Dorado qualification and recovery support,
+mixed-version reporting coverage, decision-neutral FAST shadow diagnostics,
+the deterministic taxonomy benchmark, and zero/one-read plot hardening.
+
+Closeout validation on 2026-07-30 produced 1,050 passing tests, 56 skips, and
+one expected-pass marker. `bin/check_param_registry.py` passes with all runtime
+parameters registered. The full LAST 1542 / BLAST 2.15.0 / TaxonKit 0.14.2
+classification replay matches the committed legacy snapshot.
+
+No taxonomy behavior change is enforced by this phase. Phase 3 starts by
+running `--fast_filter_shadow true` on representative production reads and
+independently adjudicating a reviewed disagreement subset. Reference curation,
+ancestry eligibility, competitive downstream classification, or FAST routing
+changes must remain separate, versioned stages after that measurement gate.
