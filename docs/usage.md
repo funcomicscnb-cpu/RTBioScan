@@ -942,6 +942,103 @@ Stable rolling-state namespace under `${outdir}/temp/{ongoing,current}/state/`.
 - Use this when you want multiple Nextflow invocations to reuse the same rolling state even if the run name changes.
 - For independent reruns, do not reuse `--state_id` unless shared rolling state is intentional.
 
+#### `--state_compatibility_policy`
+[back to Top](#rtbioscan-usage)
+
+Controls handling of rolling state that predates the compatibility manifest.
+
+- Default: `strict`.
+- `strict`: reject legacy state without a manifest.
+- `adopt_legacy`: explicitly attest and adopt eligible legacy state once.
+
+#### `--state_reference_manifest`
+[back to Top](#rtbioscan-usage)
+
+Checksummed manifest for the complete operational reference set bound to rolling state.
+
+- Default: `conf/state_compatibility/reference_manifest_legacy_v1.tsv`.
+- Custom reference selections require a corresponding reviewed manifest.
+
+#### `--state_taxonomy_data_dir`
+[back to Top](#rtbioscan-usage)
+
+Pinned TaxonKit runtime directory used for classification and compatibility verification.
+
+- Default: `db/taxonomy/releases/ncbi-taxdump-2024-06-24`.
+- The directory must contain the release artifacts declared by `--state_taxonomy_release_manifest`.
+
+#### `--state_taxonomy_release_manifest`
+[back to Top](#rtbioscan-usage)
+
+Manifest containing the expected taxonomy archive and runtime-file hashes.
+
+- Default: `conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv`.
+
+#### `--state_reference_verification`
+[back to Top](#rtbioscan-usage)
+
+Controls verification of declared reference and taxonomy files at startup.
+
+- Default: `cached`.
+- `cached`: reuse private attestations only while identity, ownership, permissions, size, and timestamps remain unchanged; changed entries are rehashed.
+- `full`: rehash every declared reference and taxonomy file.
+
+#### `--state_verification_cache_dir`
+[back to Top](#rtbioscan-usage)
+
+Optional root for private per-user reference-verification attestations.
+
+- Default: empty, deriving `${outdir}/temp/_compatibility_cache` with a private `uid-N` child.
+
+#### `--state_classifier_policy_version`
+[back to Top](#rtbioscan-usage)
+
+Manual compatibility version for classifier semantics.
+
+- Default: `legacy-rank-string-v1`.
+- Increment this value only as part of a reviewed classifier behavior change and state-migration plan.
+
+#### `--state_scoring_policy_version`
+[back to Top](#rtbioscan-usage)
+
+Manual compatibility version for scoring and selection semantics.
+
+- Default: `legacy-first-single-hit-v1`.
+- Increment this value only as part of a reviewed scoring behavior change and state-migration plan.
+
+#### `--state_toolchain_policy_manifest`
+[back to Top](#rtbioscan-usage)
+
+Manifest of supported runtime tools and R-package versions included in the state identity.
+
+- Default: `conf/runtime_compatibility/toolchain_legacy_v1.tsv`.
+
+#### `--state_runtime_lock_manifest`
+[back to Top](#rtbioscan-usage)
+
+Conda runtime lock manifest included in the toolchain fingerprint.
+
+- Default: `auto`.
+- In an activated Conda environment, `auto` selects the committed lock for the current platform; an explicit manifest path is also accepted.
+- An explicit runtime lock is rejected when the run is using the host runtime instead of Conda.
+
+#### `--state_dorado_release_manifest`
+[back to Top](#rtbioscan-usage)
+
+Optional qualified Dorado release manifest included in the toolchain fingerprint.
+
+- Default: empty.
+- Without a manifest, an explicit Dorado installation is still fingerprinted but recorded as unqualified.
+
+#### `--state_contract_migration`
+[back to Top](#rtbioscan-usage)
+
+Controls migration of schema-v1 compatibility state to schema v2.
+
+- Default: `strict`.
+- `strict`: reject schema-v1 state.
+- `attest_v1`: perform the explicit one-time v1-to-v2 attestation migration.
+
 #### `--restart_mode`
 [back to Top](#rtbioscan-usage)
 
@@ -1728,6 +1825,13 @@ CPU budget passed to the consensus helper for internal parallelism decisions.
 
 - Default: `0`.
 - `0` means auto-detect: P-cores on Apple Silicon, `nproc - 2` on other platforms.
+
+#### `--rscript_bin`
+[back to Top](#rtbioscan-usage)
+
+Rscript executable name or path used by consensus reporting helpers.
+
+- Default: `Rscript`.
 
 #### `--consensus_zero_emit_policy`
 [back to Top](#rtbioscan-usage)
