@@ -120,6 +120,42 @@ def test_synthetic_tie_golden_regenerates_byte_for_byte(tmp_path):
     ).read_bytes()
 
 
+def test_nextflow_no_alignment_golden_regenerates_from_captured_fasta(tmp_path):
+    shadow = tmp_path / "nextflow_no_alignment_fast_filter_shadow.tsv"
+    summary = tmp_path / "nextflow_no_alignment_fast_filter_shadow_summary.tsv"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PRODUCER),
+            "--fasta",
+            str(FIXTURES / "nextflow_no_alignment.fa"),
+            "--legacy-out",
+            str(tmp_path / "legacy.tsv"),
+            "--shadow-out",
+            str(shadow),
+            "--summary-out",
+            str(summary),
+            "--targets",
+            "COI|ITS2",
+            "--target-taxa",
+            "Metazoa|Viridiplantae",
+            "--round-barcode",
+            "rtbioscan-shadow-success-cpu",
+        ],
+        input="",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert shadow.read_bytes() == (
+        FIXTURES / "nextflow_no_alignment_fast_filter_shadow.tsv"
+    ).read_bytes()
+    assert summary.read_bytes() == (
+        FIXTURES / "nextflow_no_alignment_fast_filter_shadow_summary.tsv"
+    ).read_bytes()
+
+
 def test_rejects_summary_mismatch_without_writing_outputs(tmp_path):
     detail = tmp_path / "bad_fast_filter_shadow.tsv"
     summary = tmp_path / "bad_fast_filter_shadow_summary.tsv"
