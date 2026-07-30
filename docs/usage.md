@@ -1173,7 +1173,16 @@ Retry count for Dorado basecalling wrapper failures.
 
 Sleep interval between Dorado retry attempts.
 
-- Default: `300`.
+- Default: `10`.
+- The global Dorado lock remains held during this short backoff so another
+  round cannot start basecalling against a potentially unstable accelerator.
+- Unmistakable Dorado CLI/usage errors are non-retryable and fail immediately;
+  backend initialization failures and other non-zero exits retain the normal
+  retry allowance.
+- Process statuses `126` (not executable), `127` (not found), and `132`
+  (`SIGILL`, normally an incompatible executable/runtime) also fail
+  immediately. Ambiguous loader failures and memory-pressure failures remain
+  retryable.
 
 #### `--align_threads`, `--blast_threads`, `--cluster_threads`
 [back to Top](#rtbioscan-usage)

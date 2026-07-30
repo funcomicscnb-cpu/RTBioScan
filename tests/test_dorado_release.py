@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import platform
+import signal
+import stat
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 
 
@@ -44,6 +48,26 @@ if [ "${1:-}" = "basecaller" ] && [ "${2:-}" = "--help" ]; then
 fi
 if [ "${1:-}" = "summary" ] && [ "${2:-}" = "--help" ]; then
   exit 0
+fi
+if [ "${1:-}" = "summary" ]; then
+  printf 'filename\tread_id\trun_id\tsequence_length_template\tmean_qscore_template\n'
+  printf 'fixture.pod5\tfixture-read\tfixture-run\t4\t40\n'
+  exit 0
+fi
+if [ "${1:-}" = "basecaller" ]; then
+  if [ -n "${DORADO_FIXTURE_STARTED_FILE:-}" ]; then
+    printf 'started\n' > "${DORADO_FIXTURE_STARTED_FILE}"
+  fi
+  if [ -n "${DORADO_FIXTURE_SLEEP:-}" ]; then
+    sleep "${DORADO_FIXTURE_SLEEP}"
+  fi
+  if [ "${DORADO_FIXTURE_SUCCESS:-0}" = "1" ]; then
+    printf '@HD\tVN:1.6\n'
+    printf 'fixture-read\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\n'
+    exit 0
+  fi
+  echo "fixture Metal model-load failure" >&2
+  exit 42
 fi
 exit 2
 """,
@@ -243,6 +267,230 @@ def test_live_validator_rejects_unattested_pod5_before_basecalling(
     assert "qualification POD5 checksum mismatch" in result.stderr
 
 
+def test_live_validator_preserves_read_only_failure_evidence(tmp_path: Path) -> None:
+    fixture = _build_fixture(tmp_path)
+    installed = _install(fixture)
+    assert installed.returncode == 0, installed.stderr
+
+    pod5 = tmp_path / "qualification.pod5"
+    pod5.write_bytes(b"attested qualification fixture")
+    qualification_manifest = tmp_path / "qualification.tsv"
+    qualification_manifest.write_text(
+        "\t".join(
+            [
+                "artifact",
+                "sha256",
+                "bytes",
+                "source_url",
+                "source_revision",
+                "chemistry",
+                "role",
+            ]
+        )
+        + "\n"
+        + "\t".join(
+            [
+                pod5.name,
+                _sha256(pod5),
+                str(pod5.stat().st_size),
+                "https://example.invalid/qualification.pod5",
+                "fixture-revision",
+                "R10.4.1_E8.2_400bps_5kHz",
+                "test fixture",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    report = tmp_path / "qualification-report.tsv"
+
+    result = subprocess.run(
+        [
+            str(VALIDATOR),
+            "--manifest",
+            str(fixture["manifest"]),
+            "--release-dir",
+            str(fixture["destination"]),
+            "--qualification-pod5",
+            str(pod5),
+            "--qualification-manifest",
+            str(qualification_manifest),
+            "--device",
+            "metal",
+            "--report",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "Dorado fast basecalling failed on requested device 'metal'" in result.stderr
+    evidence = Path(f"{report}.evidence")
+    assert report.is_file(), result.stderr
+    assert evidence.is_dir(), result.stderr
+
+    report_values = dict(
+        line.split("\t", 1)
+        for line in report.read_text(encoding="utf-8").splitlines()[1:]
+    )
+    assert report_values["status"] == "failed"
+    assert report_values["failed_stage"] == "fast"
+    assert report_values["stage_exit_status"] == "42"
+    assert report_values["validator_exit_status"] == "1"
+    assert report_values["evidence_directory"] == str(evidence)
+
+    assert "fixture Metal model-load failure" in (
+        evidence / "fast.log"
+    ).read_text(encoding="utf-8")
+    commands = (evidence / "commands.tsv").read_text(encoding="utf-8")
+    assert "\tbasecaller\tmetal\t1\t100\t1000\t5040\t0\t" in commands
+    assert (evidence / "environment.tsv").is_file()
+    assert (evidence / "dorado-version.txt").is_file()
+    assert (evidence / "resource-limits.txt").is_file()
+    assert (evidence / "runtime-environment.tsv").is_file()
+    checksum_result = subprocess.run(
+        ["shasum", "-a", "256", "-c", "checksums.sha256"],
+        cwd=evidence,
+        capture_output=True,
+        text=True,
+    )
+    assert checksum_result.returncode == 0, checksum_result.stderr
+    assert report.stat().st_ino == (evidence / "failure-report.tsv").stat().st_ino
+    assert not Path(f"{report}.lockdir").exists()
+    assert stat.S_IMODE(report.stat().st_mode) == 0o444
+    assert stat.S_IMODE(evidence.stat().st_mode) == 0o555
+    for artifact in evidence.iterdir():
+        assert stat.S_IMODE(artifact.stat().st_mode) == 0o444
+
+
+def test_live_validator_serializes_attempts_for_the_same_report(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    installed = _install(fixture)
+    assert installed.returncode == 0, installed.stderr
+
+    pod5 = tmp_path / "qualification.pod5"
+    pod5.write_bytes(b"attested qualification fixture")
+    qualification_manifest = tmp_path / "qualification.tsv"
+    qualification_manifest.write_text(
+        "artifact\tsha256\tbytes\tsource_url\tsource_revision\tchemistry\trole\n"
+        f"{pod5.name}\t{_sha256(pod5)}\t{pod5.stat().st_size}"
+        "\thttps://example.invalid/qualification.pod5\tfixture-revision"
+        "\tR10.4.1_E8.2_400bps_5kHz\ttest fixture\n",
+        encoding="utf-8",
+    )
+    report = tmp_path / "qualification-report.tsv"
+    started = tmp_path / "basecaller-started"
+    command = [
+        str(VALIDATOR),
+        "--manifest",
+        str(fixture["manifest"]),
+        "--release-dir",
+        str(fixture["destination"]),
+        "--qualification-pod5",
+        str(pod5),
+        "--qualification-manifest",
+        str(qualification_manifest),
+        "--device",
+        "metal",
+        "--report",
+        str(report),
+    ]
+    first = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={
+            **os.environ,
+            "DORADO_FIXTURE_STARTED_FILE": str(started),
+            "DORADO_FIXTURE_SLEEP": "2",
+        },
+    )
+    for _ in range(100):
+        if started.exists():
+            break
+        time.sleep(0.05)
+    assert started.exists()
+
+    second = subprocess.run(command, capture_output=True, text=True)
+    assert second.returncode != 0
+    assert "locked by another attempt" in second.stderr
+
+    first_stdout, first_stderr = first.communicate(timeout=10)
+    assert first.returncode != 0, first_stdout
+    assert "fixture Metal model-load failure" in (
+        Path(f"{report}.evidence") / "fast.log"
+    ).read_text(encoding="utf-8")
+    assert "Failure report:" in first_stderr
+    assert not Path(f"{report}.lockdir").exists()
+
+
+def test_term_preserves_failure_evidence_and_releases_lock(tmp_path: Path) -> None:
+    fixture = _build_fixture(tmp_path)
+    installed = _install(fixture)
+    assert installed.returncode == 0, installed.stderr
+
+    pod5 = tmp_path / "qualification.pod5"
+    pod5.write_bytes(b"attested qualification fixture")
+    qualification_manifest = tmp_path / "qualification.tsv"
+    qualification_manifest.write_text(
+        "artifact\tsha256\tbytes\tsource_url\tsource_revision\tchemistry\trole\n"
+        f"{pod5.name}\t{_sha256(pod5)}\t{pod5.stat().st_size}"
+        "\thttps://example.invalid/qualification.pod5\tfixture-revision"
+        "\tR10.4.1_E8.2_400bps_5kHz\ttest fixture\n",
+        encoding="utf-8",
+    )
+    report = tmp_path / "qualification-report.tsv"
+    started = tmp_path / "basecaller-started"
+    process = subprocess.Popen(
+        [
+            str(VALIDATOR),
+            "--manifest",
+            str(fixture["manifest"]),
+            "--release-dir",
+            str(fixture["destination"]),
+            "--qualification-pod5",
+            str(pod5),
+            "--qualification-manifest",
+            str(qualification_manifest),
+            "--device",
+            "metal",
+            "--report",
+            str(report),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        env={
+            **os.environ,
+            "DORADO_FIXTURE_STARTED_FILE": str(started),
+            "DORADO_FIXTURE_SLEEP": "30",
+        },
+    )
+    for _ in range(100):
+        if started.exists():
+            break
+        time.sleep(0.05)
+    assert started.exists()
+    os.killpg(process.pid, signal.SIGTERM)
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert process.returncode == 143, (stdout, stderr)
+    values = dict(
+        line.split("\t", 1)
+        for line in report.read_text(encoding="utf-8").splitlines()[1:]
+    )
+    assert values["status"] == "failed"
+    assert values["failure_reason"] == "qualification interrupted by TERM"
+    assert values["validator_exit_status"] == "143"
+    assert (Path(f"{report}.evidence") / "fast.log").is_file()
+    assert not Path(f"{report}.lockdir").exists()
+
+
 def test_live_validator_preserves_production_calls_and_separate_format_probes() -> None:
     validator = VALIDATOR.read_text(encoding="utf-8")
     assert 'run_basecaller fast "$fast_model" 100 1000 5040 0 "" 1' in validator
@@ -257,6 +505,87 @@ def test_live_validator_preserves_production_calls_and_separate_format_probes() 
     assert "hac_format_probe" in validator
     assert "sup_format_probe" in validator
     assert "--qualification-manifest is required with --qualification-pod5" in validator
+
+
+def test_live_validator_reports_accelerator_and_diagnostic_success(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    installed = _install(fixture)
+    assert installed.returncode == 0, installed.stderr
+
+    pod5 = tmp_path / "qualification.pod5"
+    pod5.write_bytes(b"attested qualification fixture")
+    qualification_manifest = tmp_path / "qualification.tsv"
+    qualification_manifest.write_text(
+        "artifact\tsha256\tbytes\tsource_url\tsource_revision\tchemistry\trole\n"
+        f"{pod5.name}\t{_sha256(pod5)}\t{pod5.stat().st_size}"
+        "\thttps://example.invalid/qualification.pod5\tfixture-revision"
+        "\tR10.4.1_E8.2_400bps_5kHz\ttest fixture\n",
+        encoding="utf-8",
+    )
+
+    cases = {
+        "metal": (
+            "accelerator",
+            "accelerator_candidate",
+            "accelerator_compatibility_passed",
+        ),
+        "cpu": ("non_accelerator", "diagnostic_only", "compatibility_only"),
+    }
+    for device, expected in cases.items():
+        report = tmp_path / f"{device}-qualification-report.tsv"
+        result = subprocess.run(
+            [
+                str(VALIDATOR),
+                "--manifest",
+                str(fixture["manifest"]),
+                "--release-dir",
+                str(fixture["destination"]),
+                "--qualification-pod5",
+                str(pod5),
+                "--qualification-manifest",
+                str(qualification_manifest),
+                "--device",
+                device,
+                "--report",
+                str(report),
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "DORADO_FIXTURE_SUCCESS": "1"},
+        )
+
+        assert result.returncode == 0, result.stderr
+        values = dict(
+            line.split("\t", 1)
+            for line in report.read_text(encoding="utf-8").splitlines()[1:]
+        )
+        assert (
+            values["device_class"],
+            values["qualification_scope"],
+            values["status"],
+        ) == expected
+        assert values["fast_reads"] == "1"
+        assert values["hac_format_probe_reads"] == "1"
+        assert values["sup_format_probe_reads"] == "1"
+        assert stat.S_IMODE(report.stat().st_mode) == 0o444
+        assert not Path(f"{report}.evidence").exists()
+        assert not Path(f"{report}.lockdir").exists()
+        if device == "cpu":
+            assert "diagnostic-only" in result.stdout
+        else:
+            assert "diagnostic-only" not in result.stdout
+
+
+def test_only_accelerator_devices_can_produce_production_qualification() -> None:
+    validator = VALIDATOR.read_text(encoding="utf-8")
+    assert "metal|cuda|cuda:*)" in validator
+    assert 'qualification_scope="accelerator_candidate"' in validator
+    assert 'report_status="accelerator_compatibility_passed"' in validator
+    assert 'qualification_scope="diagnostic_only"' in validator
+    assert 'report_status="compatibility_only"' in validator
+    assert "cannot qualify a production RTBioScan release" in validator
 
 
 def test_dorado_candidate_installation_does_not_change_pipeline_defaults() -> None:

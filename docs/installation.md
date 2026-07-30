@@ -315,8 +315,9 @@ Re-running the installer verifies an exact existing release and never replaces
 it. A different version or platform must use a different destination.
 
 The Linux x86-64 baseline must be installed from its own checksummed platform
-manifest once that manifest and live CUDA/CPU qualification are available. A
-macOS binary must never be copied into a Linux release.
+manifest once that manifest and live CUDA qualification are available. CPU
+evidence may diagnose command and format compatibility but cannot qualify the
+release. A macOS binary must never be copied into a Linux release.
 
 ### Static and live compatibility checks
 
@@ -341,11 +342,26 @@ curl -L \
 The validator checks this file against the committed fixture manifest. It runs
 FAST, HAC, and SUP with the production chunk, batch, overlap, quality, and
 read-list arguments; validates SAM and `dorado summary` output; rejects
-reported device fallback; and writes an immutable evidence report outside the
+reported device fallback; and writes a read-only evidence report outside the
 release directory. Because this fixture contains one short read, a
 production-threshold HAC or SUP result may contain no reads. In that case the
 validator performs a separate quality-zero format probe; it does not change
 the production threshold or qualify biological classification behavior.
+
+If live qualification fails after the fixture has been verified, the requested
+report is written with `status=failed` and a read-only sibling directory named
+`<report>.evidence` preserves the completed stage logs, effective command
+arguments, checksums, and OS/hardware metadata. The primary bundle includes its
+own `failure-report.tsv` and `checksums.sha256`; the requested report is a hard
+link to that bundled report. A per-report lock prevents concurrent attempts
+from publishing to the same path. Use a new report path for every attempt;
+previous success and failure evidence is never overwritten.
+
+Handled HUP, INT, and TERM interruptions preserve a failed attempt and release
+its lock. SIGKILL, host failure, or power loss cannot be trapped and may leave
+an incomplete `<report>.lockdir` or temporary bundle. Inspect those artifacts
+and confirm that no validator process still owns the recorded PID before
+removing a stale lock; never delete it merely to bypass an active attempt.
 
 ```bash
 bin/validate_dorado_release.sh \
@@ -359,7 +375,15 @@ bin/validate_dorado_release.sh \
 
 This is a hardware and interface qualification, not an end-to-end RTBioScan
 classification fixture. Promotion still requires a representative full-round
-shadow run with the candidate binary and models.
+shadow run with the candidate binary and models on the intended Metal or CUDA
+device. Before the comparison, define the deployment's minimum reads/second
+and bases/second, maximum p95 round latency, maximum total basecalling-time
+ratio relative to the stable release, and required headroom over the observed
+sequencer input rate. Measure FAST, HAC, and SUP on the same hardware, fixture,
+models, and effective arguments for the candidate and stable release. Reject
+the candidate if the accelerator fails, falls back to CPU, or misses any
+predeclared real-time performance budget. A passing CPU run does not override
+an accelerator failure.
 
 Run candidates in a new output directory and with a new `state_id`. Never
 resume or migrate the stable state into a candidate run.
@@ -383,7 +407,9 @@ explicitly only for a shadow run:
 
 Rollback means selecting the retained stable release and its matching,
 untouched state. Installed releases are never overwritten or deleted by the
-installer.
+installer. Do not replace or remove the stable release until the candidate has
+passed accelerator compatibility and representative performance qualification
+and has completed an operational shadow period.
 
 The optional `state_dorado_release_manifest` binds the complete qualified
 release declaration into the schema-v2 state identity and verifies that the
