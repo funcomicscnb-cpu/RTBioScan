@@ -65,15 +65,18 @@ off-target operational classes.
 Phase 3 must add a separately versioned corrected expectation; it must not
 overwrite the legacy baseline.
 
-`chain_a_reference_candidates.tsv` freezes the high-identity downstream hits
-currently established for the LR799917 query. Two were biologically confirmed
-in Phase 1. `BOLD_COI-5P_ISUP118-14` ties the selected legacy hit at 98.876%
-identity over 534 aligned bases and bit score 950, but remains explicitly
-`candidate_pending_adjudication`: sequence similarity discovers candidates; it
-does not by itself authorize reference removal. Its `-2704` identifier is a
-synthetic taxid, but it has one consistent Metazoa mapping in the shipped
-global lineage file and is not evidence of the separate cross-marker namespace
-collision represented by `-557` and `-561`.
+`chain_a_reference_candidates.tsv` is the manually reviewed high-identity
+subset. It contains the two Phase-1-confirmed LR799917 records and the tied
+`BOLD_COI-5P_ISUP118-14` candidate, plus two records discovered with the
+independent Wolbachia control. `BOLD_COI-5P_GBMHH30183-19` is confirmed because
+its complete 470-base reference sequence exactly matches the independently
+identified Wolbachia coxA query while carrying the host taxid for *Telmapsylla
+minuta*. `BOLD_COI-5P_GBMIN70259-17` remains pending. `ISUP118-14` also remains
+explicitly `candidate_pending_adjudication`: sequence similarity discovers
+candidates; it does not by itself authorize reference removal. Its `-2704`
+identifier has one consistent Metazoa mapping in the shipped global lineage
+file and is not evidence of the separate cross-marker namespace collision
+represented by `-557` and `-561`.
 
 The normal full validator re-derives the alignment columns with BLAST 2.15.0
 using the committed LR799917 query and shipped COI index. Candidate enumeration
@@ -81,6 +84,50 @@ retains all tied hits and uses the production search settings except for a
 raised target cap; `-max_target_seqs 1` hides the tied `ISUP118-14` record. A
 high-identity cutoff is a review-queue criterion only, not an automatic
 curation rule.
+
+### Protocol-defined Chain-A similarity audit
+
+`chain_a_audit_queries.tsv` declares three independently identified bacterial
+coxA controls by accession and sequence checksum. The offline, database-release
+tool `bin/audit_taxonomy_reference_candidates.py` extracts those sequences from
+the shipped FAST source and searches the shipped downstream COI BLAST snapshot.
+It is not called by `main.nf`, does not modify a reference or index, and contains
+no sample/read identifiers, organism-name filters, or database-specific
+dispositions. Database specificity resides in the manifest and resulting
+curation artifacts.
+
+The committed protocol uses BLAST 2.15.0 `blastn`, dust disabled, word size 11,
+E-value 1e-20, one HSP per pair, a target cap of 1,000,000, minimum identity 85%,
+and minimum coverage 80% of the shorter sequence. Priority review requires at
+least 97% identity and 90% shorter-sequence coverage. Shorter-sequence coverage
+retains a truncated reference that substantially covers the reference even
+when it cannot cover the longer control. These thresholds define a finite
+review protocol; they are not proof of biological exhaustiveness.
+
+Against the checksummed shipped snapshot, the protocol produces 44
+query/reference rows (five priority and 39 review); all are emitted as
+`pending_adjudication`. For this snapshot the rows also correspond to 44 unique
+reference IDs. The priority records are the three LR799917-associated records
+already described above and the two Wolbachia-associated records. Lower-tier
+similarity can include ordinary conserved animal COI, so neither tier is an
+automatic contamination label. Only the separately reviewed
+`chain_a_reference_candidates.tsv` records an adjudicated disposition.
+
+Regenerate the discovery table and its checksummed provenance with:
+
+```bash
+python3 bin/audit_taxonomy_reference_candidates.py \
+  --query-manifest conf/taxonomy_regression/chain_a_audit_queries.tsv \
+  --query-source-fasta db/targets_All_tagged_nr95.fa \
+  --database db/COInr98_2024Jun_RioNegro_Brazil \
+  --reference-source-fasta db/COInr98_2024Jun_RioNegro_Brazil.fasta \
+  --output conf/taxonomy_regression/chain_a_similarity_audit.tsv \
+  --provenance-output conf/taxonomy_regression/chain_a_similarity_audit_provenance.tsv
+```
+
+The qualified environment must supply BLAST 2.15.0. Byte-identical output is
+expected only when the script, manifest, source FASTAs, BLAST index components,
+tool version, and declared parameters match the provenance artifact.
 
 `homonym_taxid_audit.tsv` uses each complete reference sequence and the
 best-scoring bacterial LAST 1542 alignment against the shipped

@@ -95,10 +95,14 @@ the databases) produced a **three-mode defect model** at the *reference-database
 - **Chain A** — a **bacterial-endosymbiont COI** sequence (Wolbachia, Rickettsia, the LR799917
   "uncultured bacterium" class) sits in the **animal** COI DB (`db/COInr98_2024Jun_RioNegro_Brazil`)
   under a **Metazoa/host-insect taxid** (documented BOLD contamination: endosymbiont amplicons
-  deposited under host-arthropod taxonomy). A DB-wide scan found ≈17 near-certain (Wolbachia/Rickettsia)
-  and up to ≈74 candidate such records. If a bacterial read reaches the animal lane and hits one,
-  it inherits a clean Metazoa taxid → reported as an animal. The empty-kingdom guard cannot catch
-  this (the taxid resolves cleanly to Metazoa).
+  deposited under host-arthropod taxonomy). The committed protocol-defined audit uses three
+  checksummed, independently identified bacterial coxA controls and finds 44 query/reference rows
+  on the shipped snapshot: five priority-review and 39 review. These counts define a review queue,
+  not 44 contamination calls and not biological exhaustiveness. Three records are confirmed in the
+  reviewed subset, including an exact 470/470 Wolbachia match under its host taxid; two priority
+  records remain pending. If a bacterial read reaches the animal lane and hits a contaminated record,
+  it inherits a clean Metazoa taxid → reported as an animal. The empty-kingdom guard cannot catch this
+  (the taxid resolves cleanly to Metazoa).
 - **Chain B1** — a genuinely bacterial sequence (`D11038`, *Bacillus* sp. PS3) in the animal DB under
   a **bacterial** taxid (1386). TaxonKit `{K}` (kingdom) is **empty** for bacteria (they have a
   superkingdom, no kingdom rank), and the JSON reporter's `is_kingdom_consistent`
@@ -281,8 +285,8 @@ COI/BLAST curation separate from any FAST/LAST reference or routing release.
    - First curate the downstream animal COI DB only. The exact LR799917 accession is correctly labelled
      `COI|Bacteria` in the FAST reference; separate near-identical host-labelled downstream records are
      the demonstrated defect. Use `conf/taxonomy_regression/chain_a_reference_candidates.tsv` as the
-     reviewed seed. Retain tied hits, and do not remove a sequence-similarity candidate until its
-     biological status is adjudicated.
+     reviewed subset. The broader generated audit remains a pending review queue. Retain tied hits,
+     and do not remove a sequence-similarity candidate until its biological status is adjudicated.
    - Rebuild the downstream COI BLAST index from that curated canonical FASTA, use a new reference
      manifest/state identity, and compare legacy versus corrected benchmark expectations. Do not touch
      the FAST/LAST source or index in this sub-release.
@@ -340,27 +344,35 @@ expected outcomes.
 
 ## 7. The immediate next step, precisely
 
-**Goal:** finish the evidence-bounded Chain-A reference audit before changing the downstream COI
+**Goal:** adjudicate the generated Chain-A review queue before changing the downstream COI
 classification database.
 
-1. Preserve `legacy_expected.tsv` byte-for-byte. Use
-   `chain_a_reference_candidates.tsv` as a separate candidate/curation artifact.
-2. Reproduce all candidate alignments from the committed bacterial query against the shipped COI
-   BLAST index with a target cap high enough to retain equal-scoring hits. The full fixture validator
-   now hard-fails if the three frozen alignment signatures change or disappear.
-3. Expand the review queue by sequence similarity, not organism/accession text. Declare the discovery
-   thresholds, retain all boundary/tied hits, and record query/reference checksums and alignment metrics.
-   Discovery is not adjudication and must not automatically remove records.
-4. Independently adjudicate each new candidate. `GBCL13897-12` and `GBCL13905-12` remain confirmed;
-   `ISUP118-14` is pending despite tying the first record at 98.876% over 534 bases. Its unique synthetic
-   taxid `-2704` is not evidence of the separate cross-marker synthetic-ID collision defect.
-5. Freeze the complete reviewed set and its dispositions before producing a curated COI FASTA, BLAST
-   index, manifest, state identity, or corrected benchmark expectation.
+The discovery half of this gate is now reproducible. `chain_a_audit_queries.tsv` declares three
+independently supported bacterial controls by accession and sequence SHA-256.
+`bin/audit_taxonomy_reference_candidates.py` uses only those sequences and declared BLAST/coverage
+thresholds; it has no organism-name, sample, or problematic-read rule. The provenance artifact pins
+the tool, parameters, source FASTAs, every BLAST index component, and the generated table. On the
+shipped snapshot it emits 44 pending query/reference rows (five priority, 39 review), all explicitly
+`pending_adjudication`.
 
-Exit criteria for this stage are a complete, reproducible candidate table with explicit confirmed,
-rejected, and unresolved dispositions. The following stage is a downstream-COI-only reference release.
-FAST/LAST cleanup, routing thresholds, representative incidence, throughput, and accuracy calibration
-remain separate deferred work.
+1. Preserve `legacy_expected.tsv` and the production FASTA/index byte-for-byte.
+2. Independently review every unique record in `chain_a_similarity_audit.tsv`, recording evidence and
+   one explicit disposition: confirmed contamination, rejected candidate, or unresolved. Similarity
+   tier alone never authorizes removal. Review the five priority records first, then the remaining 39.
+3. Keep the reviewed outcome in `chain_a_reference_candidates.tsv` (or a successor with an expanded
+   disposition schema). Three records are currently confirmed: `GBCL13897-12`, `GBCL13905-12`, and
+   `GBMHH30183-19`; the last is an exact 470/470 match to the independently identified Wolbachia coxA
+   control while stored under its psyllid host taxid. `ISUP118-14` and `GBMIN70259-17` remain pending.
+4. Regenerate the audit and require byte-identical candidate/provenance output before freezing the
+   reviewed set. If the database, source FASTAs, tool, parameters, or script change, create a new
+   audit snapshot rather than silently updating this one.
+5. Only after all rows have dispositions, create a downstream-COI-only curated FASTA/index release,
+   manifest/state identity, and separate corrected benchmark expectation.
+
+Exit criteria are explicit reviewed dispositions for the full protocol-defined queue plus reproducible
+audit artifacts. The following stage is a downstream-COI-only reference release. FAST/LAST cleanup,
+routing thresholds, representative incidence, throughput, and accuracy calibration remain separate
+deferred work.
 
 ---
 

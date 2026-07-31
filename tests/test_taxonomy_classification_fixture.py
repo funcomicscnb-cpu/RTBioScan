@@ -108,6 +108,8 @@ def test_chain_a_reference_candidates_capture_tie_without_overclaiming():
         "BOLD_COI-5P_GBCL13897-12",
         "BOLD_COI-5P_ISUP118-14",
         "BOLD_COI-5P_GBCL13905-12",
+        "BOLD_COI-5P_GBMHH30183-19",
+        "BOLD_COI-5P_GBMIN70259-17",
     }
     assert by_id["BOLD_COI-5P_GBCL13897-12"]["evidence_status"] == "confirmed"
     isup = by_id["BOLD_COI-5P_ISUP118-14"]
@@ -118,6 +120,14 @@ def test_chain_a_reference_candidates_capture_tie_without_overclaiming():
     assert isup["bitscore"] == by_id["BOLD_COI-5P_GBCL13897-12"]["bitscore"]
     assert isup["pident"] == by_id["BOLD_COI-5P_GBCL13897-12"]["pident"]
     assert isup["aln_length"] == by_id["BOLD_COI-5P_GBCL13897-12"]["aln_length"]
+
+    exact_wolbachia = by_id["BOLD_COI-5P_GBMHH30183-19"]
+    assert exact_wolbachia["evidence_status"] == "confirmed"
+    assert exact_wolbachia["pident"] == "100.000"
+    assert exact_wolbachia["aln_length"] == "470"
+    wolbachia_candidate = by_id["BOLD_COI-5P_GBMIN70259-17"]
+    assert wolbachia_candidate["evidence_status"] == "candidate_pending_adjudication"
+    assert wolbachia_candidate["corrected_outcome"] == "adjudicate_before_release"
 
     lineage_map = REPO_ROOT / "db" / "DBnr_2024Jun_id2lineage.txt"
     neg2704 = [

@@ -233,10 +233,20 @@ misstating Human as a configured `COI|Metazoa` target.
 The Chain-A description is sequence-specific: the exact LR799917 accession is
 correctly labelled `COI|Bacteria` in the FAST reference, while separate
 host-labelled records in the downstream animal database are near-identical to
-that bacterial query. `chain_a_reference_candidates.tsv` now records the two
-Phase-1-confirmed records and the tied `ISUP118-14` candidate. The latter is
-pending biological adjudication; its uniquely mapped synthetic taxid `-2704`
-must not be conflated with the separate `-557`/`-561` namespace collisions.
+that bacterial query. A protocol-defined audit now searches three checksummed,
+independently identified bacterial coxA controls without using label or
+accession patterns to select downstream hits. On the shipped snapshot it emits
+44 pending query/reference rows: five priority-review and 39 review. These are
+review-queue results, not automatic contamination calls and not a claim of
+biological exhaustiveness.
+
+`chain_a_reference_candidates.tsv` records the reviewed subset. In addition to
+the two Phase-1-confirmed LR799917 records and pending tied `ISUP118-14`, the
+audit confirms `GBMHH30183-19`: its entire 470-base reference is identical to
+the independent Wolbachia control but carries its psyllid host taxid.
+`GBMIN70259-17` remains pending despite a 97.021% full-control alignment.
+`ISUP118-14`'s uniquely mapped synthetic taxid `-2704` must not be conflated
+with the separate `-557`/`-561` namespace collisions.
 
 Run the benchmark with:
 
