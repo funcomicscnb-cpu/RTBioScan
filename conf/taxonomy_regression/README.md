@@ -66,17 +66,16 @@ Phase 3 must add a separately versioned corrected expectation; it must not
 overwrite the legacy baseline.
 
 `chain_a_reference_candidates.tsv` is the manually reviewed high-identity
-subset. It contains the two Phase-1-confirmed LR799917 records and the tied
-`BOLD_COI-5P_ISUP118-14` candidate, plus two records discovered with the
-independent Wolbachia control. `BOLD_COI-5P_GBMHH30183-19` is confirmed because
-its complete 470-base reference sequence exactly matches the independently
-identified Wolbachia coxA query while carrying the host taxid for *Telmapsylla
-minuta*. `BOLD_COI-5P_GBMIN70259-17` remains pending. `ISUP118-14` also remains
-explicitly `candidate_pending_adjudication`: sequence similarity discovers
-candidates; it does not by itself authorize reference removal. Its `-2704`
-identifier has one consistent Metazoa mapping in the shipped global lineage
-file and is not evidence of the separate cross-marker namespace collision
-represented by `-557` and `-561`.
+subset. All five priority records are now confirmed reference-sequence
+contamination, without claiming that their host specimens were misidentified.
+`BOLD_COI-5P_GBMHH30183-19` is an exact 470-base match to independently
+identified Wolbachia coxA while carrying the host taxid for *Telmapsylla
+minuta*. `BOLD_COI-5P_ISUP118-14` is a full-query LR799917-class bacterial coxA
+match; `BOLD_COI-5P_GBMIN70259-17` is a full-length 97.021% Wolbachia coxA
+match. Independent same-species animal controls are strongly discordant with
+those two records. `ISUP118-14`'s `-2704` identifier has one consistent Metazoa
+mapping in the shipped global lineage file and is not evidence of the separate
+cross-marker namespace collision represented by `-557` and `-561`.
 
 The normal full validator re-derives the alignment columns with BLAST 2.15.0
 using the committed LR799917 query and shipped COI index. Candidate enumeration
@@ -112,6 +111,26 @@ already described above and the two Wolbachia-associated records. Lower-tier
 similarity can include ordinary conserved animal COI, so neither tier is an
 automatic contamination label. Only the separately reviewed
 `chain_a_reference_candidates.tsv` records an adjudicated disposition.
+
+`chain_a_priority_adjudication.tsv` freezes the evidence that resolved the two
+formerly pending priority records. On 2026-07-31, NCBI GenBank identified
+`LR799917.1` as bacterial coxA, `MG988837.1` as Wolbachia coxA, and `OM089800.1`
+as mitochondrial *Bactericera albiventris* COI. The official BOLD API returned
+`ISUP118-14` as a morphology-identified *Galerita bicolor* leg specimen and
+returned the independent morphology-identified `BETN8083-20` control; their
+sequence hashes match the shipped source FASTA. The API returned no current
+document for `GBMIN70259-17`, which is recorded as missing external metadata
+and is not itself used as evidence for the disposition.
+
+The adjudication test independently verifies the source-record SHA-256 values,
+cross-checks bacterial-control metrics against the generated audit, and
+replays candidate-versus-same-species BLAST. `ISUP118-14` shares only an
+8%-coverage local alignment with the independent *Galerita* COI control.
+`GBMIN70259-17` is only 65.756% identical over 99% of its length to the
+independently deposited mitochondrial *Bactericera* control. The combination
+of full bacterial-control support and strong same-species mitochondrial
+discordance establishes contaminated reference sequence while allowing the
+host specimen metadata itself to remain valid.
 
 Regenerate the discovery table and its checksummed provenance with:
 

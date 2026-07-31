@@ -1,7 +1,11 @@
 import csv
 import hashlib
 import importlib.util
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -196,3 +200,88 @@ def test_committed_provenance_pins_counts_and_candidate_bytes():
     assert values[("count", "review_candidates")] == "39"
     expected_digest = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
     assert values[("sha256", str(candidate_path.relative_to(REPO_ROOT)))] == expected_digest
+
+
+def test_priority_adjudications_are_sequence_reproducible(tmp_path):
+    blastn = shutil.which("blastn")
+    if blastn is None:
+        pytest.skip("blastn is required for priority-adjudication replay")
+    audit = load_module()
+    with (FIXTURE_DIR / "chain_a_priority_adjudication.tsv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        adjudications = list(csv.DictReader(handle, delimiter="\t"))
+    with (FIXTURE_DIR / "chain_a_similarity_audit.tsv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        discovery = {
+            row["reference_id"]: row for row in csv.DictReader(handle, delimiter="\t")
+        }
+
+    assert {row["reference_id"] for row in adjudications} == {
+        "BOLD_COI-5P_ISUP118-14",
+        "BOLD_COI-5P_GBMIN70259-17",
+    }
+    assert {row["disposition"] for row in adjudications} == {
+        "confirmed_reference_sequence_contamination"
+    }
+
+    wanted = {
+        row[field]
+        for row in adjudications
+        for field in ("reference_id", "same_species_control_id")
+    }
+    reference_records = {
+        header.split()[0].split("|", 1)[0]: sequence
+        for header, sequence in audit.iter_fasta(
+            REPO_ROOT / "db" / "COInr98_2024Jun_RioNegro_Brazil.fasta"
+        )
+        if header.split()[0].split("|", 1)[0] in wanted
+    }
+    assert set(reference_records) == wanted
+
+    for index, row in enumerate(adjudications):
+        candidate = reference_records[row["reference_id"]]
+        control = reference_records[row["same_species_control_id"]]
+        assert hashlib.sha256(candidate.encode()).hexdigest() == row[
+            "reference_sequence_sha256"
+        ]
+        assert hashlib.sha256(control.encode()).hexdigest() == row[
+            "same_species_control_sequence_sha256"
+        ]
+        assert discovery[row["reference_id"]]["pident"] == row["bacterial_pident"]
+        assert discovery[row["reference_id"]]["alignment_length"] == row[
+            "bacterial_alignment_length"
+        ]
+        assert discovery[row["reference_id"]]["shorter_sequence_coverage"] == row[
+            "bacterial_query_coverage"
+        ]
+
+        query = tmp_path / f"candidate-{index}.fa"
+        subject = tmp_path / f"same-species-{index}.fa"
+        query.write_text(f">candidate\n{candidate}\n", encoding="utf-8")
+        subject.write_text(f">control\n{control}\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                blastn,
+                "-task",
+                "blastn",
+                "-dust",
+                "no",
+                "-query",
+                str(query),
+                "-subject",
+                str(subject),
+                "-outfmt",
+                "6 pident length qcovs",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        observed = result.stdout.splitlines()[0].split("\t")
+        assert observed == [
+            row["same_species_pident"],
+            row["same_species_alignment_length"],
+            row["same_species_candidate_coverage"],
+        ]

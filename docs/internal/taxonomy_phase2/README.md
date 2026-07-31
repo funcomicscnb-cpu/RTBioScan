@@ -240,13 +240,17 @@ accession patterns to select downstream hits. On the shipped snapshot it emits
 review-queue results, not automatic contamination calls and not a claim of
 biological exhaustiveness.
 
-`chain_a_reference_candidates.tsv` records the reviewed subset. In addition to
-the two Phase-1-confirmed LR799917 records and pending tied `ISUP118-14`, the
-audit confirms `GBMHH30183-19`: its entire 470-base reference is identical to
-the independent Wolbachia control but carries its psyllid host taxid.
-`GBMIN70259-17` remains pending despite a 97.021% full-control alignment.
-`ISUP118-14`'s uniquely mapped synthetic taxid `-2704` must not be conflated
-with the separate `-557`/`-561` namespace collisions.
+`chain_a_reference_candidates.tsv` records the reviewed subset. All five
+priority records are confirmed reference-sequence contamination. The evidence
+does not require the host specimens to be misidentified: `ISUP118-14` is a
+morphology-identified *Galerita* leg specimen whose submitted sequence is
+LR799917-class bacterial coxA, and `GBMIN70259-17` is a full-length 97.021%
+Wolbachia coxA match. Independent same-species animal COI controls are strongly
+discordant with both. `chain_a_priority_adjudication.tsv` pins those controls,
+sequence hashes, pairwise metrics, external evidence status, and dispositions.
+The remaining 39 lower-tier discovery records remain pending. `ISUP118-14`'s
+uniquely mapped synthetic taxid `-2704` must not be conflated with the separate
+`-557`/`-561` namespace collisions.
 
 Run the benchmark with:
 

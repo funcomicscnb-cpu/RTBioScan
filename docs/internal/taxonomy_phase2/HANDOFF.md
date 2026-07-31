@@ -98,9 +98,10 @@ the databases) produced a **three-mode defect model** at the *reference-database
   deposited under host-arthropod taxonomy). The committed protocol-defined audit uses three
   checksummed, independently identified bacterial coxA controls and finds 44 query/reference rows
   on the shipped snapshot: five priority-review and 39 review. These counts define a review queue,
-  not 44 contamination calls and not biological exhaustiveness. Three records are confirmed in the
-  reviewed subset, including an exact 470/470 Wolbachia match under its host taxid; two priority
-  records remain pending. If a bacterial read reaches the animal lane and hits a contaminated record,
+  not 44 contamination calls and not biological exhaustiveness. All five priority records are now
+  confirmed reference-sequence contamination: the sequence evidence is bacterial/endosymbiont coxA
+  even where the host specimen metadata may be valid. The other 39 records remain pending. If a
+  bacterial read reaches the animal lane and hits a contaminated record,
   it inherits a clean Metazoa taxid → reported as an animal. The empty-kingdom guard cannot catch this
   (the taxid resolves cleanly to Metazoa).
 - **Chain B1** — a genuinely bacterial sequence (`D11038`, *Bacillus* sp. PS3) in the animal DB under
@@ -344,7 +345,7 @@ expected outcomes.
 
 ## 7. The immediate next step, precisely
 
-**Goal:** adjudicate the generated Chain-A review queue before changing the downstream COI
+**Goal:** adjudicate the remaining lower-tier Chain-A review queue before changing the downstream COI
 classification database.
 
 The discovery half of this gate is now reproducible. `chain_a_audit_queries.tsv` declares three
@@ -358,11 +359,12 @@ shipped snapshot it emits 44 pending query/reference rows (five priority, 39 rev
 1. Preserve `legacy_expected.tsv` and the production FASTA/index byte-for-byte.
 2. Independently review every unique record in `chain_a_similarity_audit.tsv`, recording evidence and
    one explicit disposition: confirmed contamination, rejected candidate, or unresolved. Similarity
-   tier alone never authorizes removal. Review the five priority records first, then the remaining 39.
+   tier alone never authorizes removal. The five priority records are complete; review the remaining 39.
 3. Keep the reviewed outcome in `chain_a_reference_candidates.tsv` (or a successor with an expanded
-   disposition schema). Three records are currently confirmed: `GBCL13897-12`, `GBCL13905-12`, and
-   `GBMHH30183-19`; the last is an exact 470/470 match to the independently identified Wolbachia coxA
-   control while stored under its psyllid host taxid. `ISUP118-14` and `GBMIN70259-17` remain pending.
+   disposition schema). All five priority records are confirmed. `GBMHH30183-19` is an exact 470/470
+   Wolbachia coxA match under its psyllid host taxid. `ISUP118-14` and `GBMIN70259-17` were resolved by
+   combining their full bacterial-control alignments with strongly discordant, independently sourced
+   same-species mitochondrial COI controls; `chain_a_priority_adjudication.tsv` freezes that evidence.
 4. Regenerate the audit and require byte-identical candidate/provenance output before freezing the
    reviewed set. If the database, source FASTAs, tool, parameters, or script change, create a new
    audit snapshot rather than silently updating this one.
