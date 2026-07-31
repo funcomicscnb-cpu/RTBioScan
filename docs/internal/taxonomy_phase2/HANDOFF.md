@@ -264,23 +264,32 @@ before acting; every behavior change carries a versioned expectation in the A/B1
 (legacy vs corrected); state must be reset/reclassified when references or the classifier change
 (the 2.1c contract already enforces this).** Ordered stages:
 
-1. **Measure real incidence with shadow instrumentation before curating.** Run `--fast_filter_shadow true`
-   on representative data (or the qualification/POD5 fixtures if real reads are unavailable) and analyze
-   the joint metrics: how many reads are `current_excluded__target_leads` (candidate false-exclusions)
-   vs `current_retained__offtarget_leads` (candidate false-inclusions), and the basecalling reads/bases
-   at stake. This sizes Chain-A-vs-false-exclusion and justifies (or de-scopes) the changes below.
-2. **Reference curation + synchronized rebuild** (attributable sub-releases; shadow first because a
-   LAST rebuild can shift first-hit ordering):
-   - Curate the ≈17–74 endosymbiont-under-host-taxid records in the animal COI DB (Wolbachia/Rickettsia/
-     LR799917 class); relocate/relabel to bacterial identity. Use `conf/taxonomy_regression/` +
-     the DB-wide scan approach as the starting list.
-   - **Clean BOTH buckets** (contamination is bidirectional): remove animal/human-contaminated sequences
-     (e.g. `SZWG01000034`) from the FAST `COI|Bacteria` decoy portion too.
+Current scope decision (2026-07-31): functional correctness and unintended behavior are in scope;
+performance calibration and biological-accuracy policy are deferred. Representative FAST shadow
+measurement remains required before changing FAST routing, but it is not a prerequisite for repairing
+a deterministic downstream reference defect reproduced by forced marker-lane BLAST. Keep downstream
+COI/BLAST curation separate from any FAST/LAST reference or routing release.
+
+1. **Deferred FAST measurement gate.** Before changing the FAST reference or routing behavior, run
+   `--fast_filter_shadow true` on representative data and analyze the joint metrics: how many reads are
+   `current_excluded__target_leads` (candidate false-exclusions) vs
+   `current_retained__offtarget_leads` (candidate false-inclusions), and the basecalling reads/bases at
+   stake. Qualification/POD5 wiring fixtures are not representative incidence evidence. This gate does
+   not block downstream-only curation of already reproduced reference defects.
+2. **Reference curation + synchronized rebuild** (attributable sub-releases; downstream BLAST and
+   FAST/LAST releases remain separate):
+   - First curate the downstream animal COI DB only. The exact LR799917 accession is correctly labelled
+     `COI|Bacteria` in the FAST reference; separate near-identical host-labelled downstream records are
+     the demonstrated defect. Use `conf/taxonomy_regression/chain_a_reference_candidates.tsv` as the
+     reviewed seed. Retain tied hits, and do not remove a sequence-similarity candidate until its
+     biological status is adjudicated.
+   - Rebuild the downstream COI BLAST index from that curated canonical FASTA, use a new reference
+     manifest/state identity, and compare legacy versus corrected benchmark expectations. Do not touch
+     the FAST/LAST source or index in this sub-release.
    - Remove/relabel `D11038` (B1) and correct the nine homonym taxids (B2).
-   - **Enforce forever:** `LAST .prj version == pinned LAST version` (rebuild `lastdb` with the pinned
-     version) and `FASTA identifiers == BLAST identifiers == LAST identifiers`. Rebuild BLAST + LAST from
-     one canonical source; regenerate `reference_manifest_legacy_v1.tsv` (new version) so the contract
-     forces a state reset.
+   - Treat FAST-reference cleanup (including `SZWG01000034`) and any LAST rebuild as a separate,
+     measurement-gated routing release. A LAST rebuild must retain the pinned LAST 1542 format, recheck
+     first-hit ordering, publish a new manifest/state identity, and requalify routing behavior.
    - Audit the known 1,493-record FASTA/BLAST-index desync separately (the shipped index is an exact
      stale prefix of the FASTA); introduce any appended tail as its own reference version.
 3. **Superkingdom/ancestry eligibility guard** (fixes B1/B2; **must** land after step 2's homonym fix,
@@ -331,27 +340,27 @@ expected outcomes.
 
 ## 7. The immediate next step, precisely
 
-**Goal:** establish the incidence, direction, and compute cost of FAST routing disagreements without
-changing which reads reach HAC/SUP.
+**Goal:** finish the evidence-bounded Chain-A reference audit before changing the downstream COI
+classification database.
 
-1. Predeclare a representative dataset containing configured Metazoa COI and Viridiplantae ITS2
-   targets plus independently supported off-target material. Record input checksums, hardware,
-   runtime/toolchain identity, and the legacy state/reference contract.
-2. Use a fresh candidate `state_id`/output namespace and run the normal production workflow with
-   `--fast_filter_shadow true`. Do not edit thresholds, references, target labels, or the legacy router.
-3. Aggregate detail/summary TSVs across rounds. Report reads and bases for at least
-   `current_excluded__target_leads`, `current_retained__offtarget_leads`, target/off-target-only,
-   ties, and no-alignment, split by marker and representative read-length/error strata.
-4. Independently adjudicate a reviewed subset of disagreements against broader curated references.
-   Shadow disagreement is a routing-policy signal, not biological truth; do not call it a false
-   positive/negative without independent evidence.
-5. Estimate HAC/SUP reads, bases, basecalling time, added classifier time, and p95 round latency under
-   candidate tri-state policies. Near ties remain retained by default.
-6. Write a versioned measurement report before proposing enforcement. If live disagreements are rare
-   or one-sided, de-scope the corresponding behavior change rather than forcing the fixture narrative.
+1. Preserve `legacy_expected.tsv` byte-for-byte. Use
+   `chain_a_reference_candidates.tsv` as a separate candidate/curation artifact.
+2. Reproduce all candidate alignments from the committed bacterial query against the shipped COI
+   BLAST index with a target cap high enough to retain equal-scoring hits. The full fixture validator
+   now hard-fails if the three frozen alignment signatures change or disappear.
+3. Expand the review queue by sequence similarity, not organism/accession text. Declare the discovery
+   thresholds, retain all boundary/tied hits, and record query/reference checksums and alignment metrics.
+   Discovery is not adjudication and must not automatically remove records.
+4. Independently adjudicate each new candidate. `GBCL13897-12` and `GBCL13905-12` remain confirmed;
+   `ISUP118-14` is pending despite tying the first record at 98.876% over 534 bases. Its unique synthetic
+   taxid `-2704` is not evidence of the separate cross-marker synthetic-ID collision defect.
+5. Freeze the complete reviewed set and its dispositions before producing a curated COI FASTA, BLAST
+   index, manifest, state identity, or corrected benchmark expectation.
 
-Exit criteria for this stage are evidence and a reviewed Phase 3 decision record, not a code-path
-change. Reference curation begins only after this gate.
+Exit criteria for this stage are a complete, reproducible candidate table with explicit confirmed,
+rejected, and unresolved dispositions. The following stage is a downstream-COI-only reference release.
+FAST/LAST cleanup, routing thresholds, representative incidence, throughput, and accuracy calibration
+remain separate deferred work.
 
 ---
 

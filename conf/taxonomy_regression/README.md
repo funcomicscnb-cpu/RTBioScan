@@ -24,8 +24,10 @@ are two links in Chain A.
 
 ## Cases
 
-- **A:** bacterial LR799917/Wolbachia sequences that hit animal references
-  carrying Metazoa host taxids.
+- **A:** bacterial LR799917/Wolbachia query sequences that hit separate,
+  near-identical animal-database records carrying Metazoa host identities. The
+  exact LR799917 accession is correctly labelled `COI|Bacteria` in the FAST
+  database; it is not itself stored under a Metazoa identity downstream.
 - **B1:** D11038, a bacterial sequence carrying bacterial taxid 1386. TaxonKit
   resolves its superkingdom as Bacteria and its kingdom as empty; the legacy
   JSON guard retains that empty kingdom.
@@ -62,6 +64,23 @@ off-target operational classes.
 `legacy_expected.tsv` records the shipped behavior, including known defects.
 Phase 3 must add a separately versioned corrected expectation; it must not
 overwrite the legacy baseline.
+
+`chain_a_reference_candidates.tsv` freezes the high-identity downstream hits
+currently established for the LR799917 query. Two were biologically confirmed
+in Phase 1. `BOLD_COI-5P_ISUP118-14` ties the selected legacy hit at 98.876%
+identity over 534 aligned bases and bit score 950, but remains explicitly
+`candidate_pending_adjudication`: sequence similarity discovers candidates; it
+does not by itself authorize reference removal. Its `-2704` identifier is a
+synthetic taxid, but it has one consistent Metazoa mapping in the shipped
+global lineage file and is not evidence of the separate cross-marker namespace
+collision represented by `-557` and `-561`.
+
+The normal full validator re-derives the alignment columns with BLAST 2.15.0
+using the committed LR799917 query and shipped COI index. Candidate enumeration
+retains all tied hits and uses the production search settings except for a
+raised target cap; `-max_target_seqs 1` hides the tied `ISUP118-14` record. A
+high-identity cutoff is a review-queue criterion only, not an automatic
+curation rule.
 
 `homonym_taxid_audit.tsv` uses each complete reference sequence and the
 best-scoring bacterial LAST 1542 alignment against the shipped

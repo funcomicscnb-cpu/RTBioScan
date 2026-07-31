@@ -93,6 +93,118 @@ def read_cases(path: Path) -> list[dict[str, str]]:
     return rows
 
 
+def validate_chain_a_candidates(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        required = [
+            "query_id",
+            "source_accession",
+            "reference_id",
+            "stored_taxid",
+            "header_kingdom",
+            "stored_taxon",
+            "pident",
+            "aln_length",
+            "bitscore",
+            "evidence_status",
+            "corrected_outcome",
+            "notes",
+        ]
+        if reader.fieldnames != required:
+            die(f"unexpected Chain-A candidate schema in {path}")
+        rows = list(reader)
+    if not rows:
+        die(f"Chain-A candidate table is empty: {path}")
+    reference_ids = [row["reference_id"] for row in rows]
+    if len(reference_ids) != len(set(reference_ids)):
+        die("duplicate reference_id in Chain-A candidate table")
+    allowed_statuses = {"confirmed", "candidate_pending_adjudication"}
+    for row in rows:
+        if row["evidence_status"] not in allowed_statuses:
+            die(
+                "unsupported Chain-A candidate evidence status for "
+                f"{row['reference_id']}: {row['evidence_status']}"
+            )
+        try:
+            if float(row["pident"]) <= 0 or int(row["aln_length"]) <= 0:
+                raise ValueError
+            float(row["bitscore"])
+        except ValueError:
+            die(f"invalid Chain-A alignment metrics for {row['reference_id']}")
+    return rows
+
+
+def verify_chain_a_candidate_alignments(
+    fixture: Path, database: Path, candidates: list[dict[str, str]]
+) -> None:
+    output = run_checked(
+        [
+            "blastn",
+            "-task",
+            "megablast",
+            "-dust",
+            "no",
+            "-query",
+            str(fixture),
+            "-db",
+            str(database),
+            "-num_threads",
+            "1",
+            "-outfmt",
+            "6 qseqid sseqid pident length bitscore",
+            "-perc_identity",
+            "92",
+            "-evalue",
+            "11",
+            "-max_hsps",
+            "50",
+            "-max_target_seqs",
+            "25",
+            "-word_size",
+            "50",
+            "-qcov_hsp_perc",
+            "50",
+            "-mt_mode",
+            "2",
+        ]
+    )
+    expected_keys = {
+        (row["query_id"], row["reference_id"]): row for row in candidates
+    }
+    observed: dict[tuple[str, str], tuple[str, str, str, str]] = {}
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 5:
+            continue
+        query_id = fields[0].split("|", 1)[0]
+        reference_id = fields[1].split("|", 1)[0]
+        key = (query_id, reference_id)
+        if key not in expected_keys or key in observed:
+            continue
+        taxid_match = re.search(r"\|kraken:taxid\|(-?\d+)", fields[1])
+        observed[key] = (
+            taxid_match.group(1) if taxid_match else "",
+            fields[2],
+            fields[3],
+            fields[4],
+        )
+    missing = sorted(set(expected_keys) - set(observed))
+    if missing:
+        die(f"Chain-A candidate alignments missing from BLAST replay: {missing}")
+    for key, row in expected_keys.items():
+        expected = (
+            row["stored_taxid"],
+            row["pident"],
+            row["aln_length"],
+            row["bitscore"],
+        )
+        if observed[key] != expected:
+            die(
+                f"Chain-A candidate alignment changed for {row['reference_id']}: "
+                f"expected {expected}, observed {observed[key]}"
+            )
+
+
 def validate_fixture(
     fixture: Path, cases_path: Path, synthetic_cases_path: Path
 ) -> tuple[list[dict[str, str]], dict[str, str]]:
@@ -366,6 +478,12 @@ def main() -> int:
         type=Path,
         default=repo_root / "conf/taxonomy_regression/synthetic_lineage_cases.tsv",
     )
+    parser.add_argument(
+        "--chain-a-candidates",
+        type=Path,
+        default=repo_root
+        / "conf/taxonomy_regression/chain_a_reference_candidates.tsv",
+    )
     parser.add_argument("--taxonomy-data-dir", type=Path)
     parser.add_argument(
         "--last-index", type=Path, default=repo_root / "db/targets_All_tagged_nr95"
@@ -407,6 +525,7 @@ def main() -> int:
     cases, sequences = validate_fixture(
         args.fixture, args.cases, args.synthetic_cases
     )
+    chain_a_candidates = validate_chain_a_candidates(args.chain_a_candidates)
     if args.validate_only:
         print("OK: deterministic taxonomy classification fixture is internally valid")
         return 0
@@ -440,6 +559,9 @@ def main() -> int:
             sequences,
             {"COI": args.coi_db, "ITS2": args.its2_db},
             workdir,
+        )
+        verify_chain_a_candidate_alignments(
+            args.fixture, args.coi_db, chain_a_candidates
         )
 
     subjects_by_marker: dict[str, set[str]] = {"COI": set(), "ITS2": set()}

@@ -228,7 +228,17 @@ collisions, marker controls, and fixed HAC/FAST-like variants. Its controls
 include a genuine human COI query that correctly first-routes to the explicit
 `COI|Human` exclusion bucket but has a human-like sequence in the
 `COI|Bacteria` bucket. This captures bidirectional decoy contamination without
-misstating Human as a configured `COI|Metazoa` target. Run the benchmark with:
+misstating Human as a configured `COI|Metazoa` target.
+
+The Chain-A description is sequence-specific: the exact LR799917 accession is
+correctly labelled `COI|Bacteria` in the FAST reference, while separate
+host-labelled records in the downstream animal database are near-identical to
+that bacterial query. `chain_a_reference_candidates.tsv` now records the two
+Phase-1-confirmed records and the tied `ISUP118-14` candidate. The latter is
+pending biological adjudication; its uniquely mapped synthetic taxid `-2704`
+must not be conflated with the separate `-557`/`-561` namespace collisions.
+
+Run the benchmark with:
 
 ```bash
 python3 bin/validate_taxonomy_classification_fixture.py \

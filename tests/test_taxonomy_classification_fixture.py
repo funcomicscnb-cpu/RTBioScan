@@ -100,6 +100,40 @@ def test_current_chain_a_fixtures_do_not_reproduce_fast_misrouting():
     }
 
 
+def test_chain_a_reference_candidates_capture_tie_without_overclaiming():
+    rows = read_tsv("chain_a_reference_candidates.tsv")
+    by_id = {row["reference_id"]: row for row in rows}
+
+    assert set(by_id) == {
+        "BOLD_COI-5P_GBCL13897-12",
+        "BOLD_COI-5P_ISUP118-14",
+        "BOLD_COI-5P_GBCL13905-12",
+    }
+    assert by_id["BOLD_COI-5P_GBCL13897-12"]["evidence_status"] == "confirmed"
+    isup = by_id["BOLD_COI-5P_ISUP118-14"]
+    assert isup["stored_taxid"] == "-2704"
+    assert isup["header_kingdom"] == "Metazoa"
+    assert isup["evidence_status"] == "candidate_pending_adjudication"
+    assert isup["corrected_outcome"] == "adjudicate_before_release"
+    assert isup["bitscore"] == by_id["BOLD_COI-5P_GBCL13897-12"]["bitscore"]
+    assert isup["pident"] == by_id["BOLD_COI-5P_GBCL13897-12"]["pident"]
+    assert isup["aln_length"] == by_id["BOLD_COI-5P_GBCL13897-12"]["aln_length"]
+
+    lineage_map = REPO_ROOT / "db" / "DBnr_2024Jun_id2lineage.txt"
+    neg2704 = [
+        line.rstrip("\n").split("\t", 1)
+        for line in lineage_map.read_text(encoding="utf-8").splitlines()
+        if line.startswith("-2704\t")
+    ]
+    assert neg2704 == [
+        [
+            "-2704",
+            "k__Metazoa;p__Arthropoda;c__Insecta;o__Coleoptera;"
+            "f__Carabidae;g__Galerita;s__Galerita bicolor",
+        ]
+    ]
+
+
 def test_b2_hypothesis_is_not_encoded_as_animal_truth():
     cases = {row["query_id"]: row for row in read_tsv("classification_cases.tsv")}
     legacy = {row["query_id"]: row for row in read_tsv("legacy_expected.tsv")}
