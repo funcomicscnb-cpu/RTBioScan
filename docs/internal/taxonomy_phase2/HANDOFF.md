@@ -100,9 +100,10 @@ the databases) produced a **three-mode defect model** at the *reference-database
   on the shipped snapshot: five priority-review and 39 review. These counts define a review queue,
   not 44 contamination calls and not biological exhaustiveness. All five priority records are now
   confirmed reference-sequence contamination: the sequence evidence is bacterial/endosymbiont coxA
-  even where the host specimen metadata may be valid. Local-only cross-host adjudication confirms 23
-  more bacterial-like reference/metadata inconsistencies and leaves 16 explicitly unresolved. If a
-  bacterial read reaches the animal lane and hits a contaminated record,
+  even where the host specimen metadata may be valid. Local-only cross-family adjudication identifies
+  24 lower-tier sequence/host-label-conflict candidates and leaves 15 explicitly unresolved. This
+  lower-tier evidence does not by itself establish bacterial origin or which conflicting endpoint is
+  wrong. If a bacterial read reaches the animal lane and hits a contaminated record,
   it inherits a clean Metazoa taxid → reported as an animal. The empty-kingdom guard cannot catch this
   (the taxid resolves cleanly to Metazoa).
 - **Chain B1** — a genuinely bacterial sequence (`D11038`, *Bacillus* sp. PS3) in the animal DB under
@@ -288,7 +289,8 @@ COI/BLAST curation separate from any FAST/LAST reference or routing release.
      `COI|Bacteria` in the FAST reference; separate near-identical host-labelled downstream records are
      the demonstrated defect. Use `conf/taxonomy_regression/chain_a_reference_candidates.tsv` as the
      reviewed priority subset and `chain_a_lower_tier_adjudication.tsv` for the broader local-only
-     dispositions. Quarantine only confirmed records; retain all unresolved records unchanged.
+     dispositions. Keep confirmed bacterial contaminants, cross-family conflict candidates, and
+     unresolved records as separate release evidence classes; retain all unresolved records unchanged.
    - Rebuild the downstream COI BLAST index from that curated canonical FASTA, use a new reference
      manifest/state identity, and compare legacy versus corrected benchmark expectations. Do not touch
      the FAST/LAST source or index in this sub-release.
@@ -356,23 +358,32 @@ the tool, parameters, source FASTAs, every BLAST index component, and the genera
 shipped snapshot it emits 44 pending query/reference rows (five priority, 39 review), all explicitly
 `pending_adjudication`.
 
-The disposition gate is now complete within the authorized evidence scope. The five priority records
-are confirmed. `chain_a_lower_tier_adjudication.tsv` gives every remaining record an explicit local-only
-disposition: 23 confirmed cross-host bacterial-like reference clusters and 16 unresolved. Confirmation
-requires both the existing bacterial-control support and a direct ≥95%-identity, ≥80%-shorter-coverage
-match carrying a different host-family assignment. The unresolved records failed that confirmation
-rule; they were not treated as clean or contaminated by default.
+The closed-set omission in the first local adjudication is corrected. The comparison graph now contains
+all 39 review records plus only the five priority records explicitly marked `confirmed` in
+`chain_a_reference_candidates.tsv`; anchors remain absent from the lower-tier output. The five priority
+records are confirmed bacterial/endosymbiont reference-sequence contamination. The lower-tier artifact
+records a different evidence class: 24 cross-family sequence/host-label-conflict candidates and 15
+unresolved records. Twenty-three candidates have direct review-peer support; `GMODL3842-22` has direct
+support from the confirmed `GBMIN70259-17` anchor at 96.018% identity over 452 nt and 95.763%
+shorter-sequence coverage. The lower-tier rule establishes neither bacterial origin nor which endpoint
+is wrong. The unresolved records were not treated as clean or contaminated by default.
 
 1. Preserve `legacy_expected.tsv` and the shipped production FASTA/index byte-for-byte as the legacy
    release.
 2. Regenerate both discovery and adjudication artifacts byte-for-byte. If the database, source FASTAs,
    tool, parameters, or scripts change, create a new audit snapshot rather than silently updating one.
-3. Build a new canonical downstream COI FASTA that quarantines only the 28 confirmed records (five
-   priority plus 23 lower-tier). Retain all 16 unresolved records unchanged and list them in release
-   diagnostics; do not silently relabel or remove them.
-4. Build a new downstream BLAST index from that canonical FASTA and publish checksummed manifests plus
+3. Produce an explicit downstream-COI disposition manifest with three non-interchangeable reasons:
+   five `confirmed_reference_sequence_contamination`, 24
+   `cross_family_sequence_label_conflict_candidate`, and 15
+   `unresolved_insufficient_local_discriminator`. For the correctness-first release, quarantining the
+   24 conflict candidates is a conservative release-policy choice, not a biological-origin claim.
+4. Build a new canonical downstream COI FASTA that quarantines the five confirmed contaminants and,
+   once that policy is recorded in the release manifest, the 24 conflict candidates. Retain all 15
+   unresolved records unchanged and list them in release diagnostics; do not silently relabel or remove
+   them.
+5. Build a new downstream BLAST index from that canonical FASTA and publish checksummed manifests plus
    a new reference/state identity. Do not touch the FAST/LAST source or index.
-5. Add a separately versioned corrected benchmark expectation and compare it with the immutable legacy
+6. Add a separately versioned corrected benchmark expectation and compare it with the immutable legacy
    expectation across every report surface before considering release promotion.
 
 Exit criteria for the next stage are a reproducible downstream-only reference release, explicit

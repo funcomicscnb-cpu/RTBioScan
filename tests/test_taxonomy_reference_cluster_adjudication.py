@@ -21,7 +21,13 @@ def load_module():
     return module
 
 
-def audit_row(reference_id, family, pident="88.000", coverage="95.000"):
+def audit_row(
+    reference_id,
+    family,
+    pident="88.000",
+    coverage="95.000",
+    discovery_tier="review",
+):
     return {
         "query_id": "control",
         "source_accession": "control.1",
@@ -32,7 +38,7 @@ def audit_row(reference_id, family, pident="88.000", coverage="95.000"):
         "pident": pident,
         "alignment_length": "100",
         "shorter_sequence_coverage": coverage,
-        "discovery_tier": "review",
+        "discovery_tier": discovery_tier,
         "review_status": "pending_adjudication",
     }
 
@@ -57,14 +63,64 @@ def test_cross_family_rule_is_name_independent_and_conservative():
     edges = adjudicator.parse_edges(blast, by_id, 95.0, 80.0)
     result = {
         row["reference_id"]: row
-        for row in adjudicator.build_adjudications(rows, edges)
+        for row in adjudicator.build_adjudications(rows, rows, set(), edges)
     }
 
-    assert result["opaque_a"]["disposition"].startswith("confirmed_")
-    assert result["opaque_b"]["disposition"].startswith("confirmed_")
+    assert result["opaque_a"]["disposition"] == (
+        "cross_family_sequence_label_conflict_candidate"
+    )
+    assert result["opaque_b"]["disposition"] == (
+        "cross_family_sequence_label_conflict_candidate"
+    )
     assert result["opaque_c"]["disposition"] == (
         "unresolved_insufficient_local_discriminator"
     )
+
+
+def test_confirmed_anchor_can_support_review_row_without_becoming_output():
+    adjudicator = load_module()
+    review = audit_row("opaque_review", "FamilyOne")
+    anchor = audit_row(
+        "opaque_anchor",
+        "FamilyTwo",
+        pident="99.000",
+        coverage="100.000",
+        discovery_tier="priority",
+    )
+    comparison_rows = [review, anchor]
+    by_id = {row["reference_id"]: row for row in comparison_rows}
+    blast = "\n".join(
+        [
+            "opaque_review\t100\topaque_anchor\t100\t96.000\t95\t1e-30\t150",
+            "opaque_anchor\t100\topaque_review\t100\t96.000\t95\t1e-30\t150",
+        ]
+    )
+
+    edges = adjudicator.parse_edges(blast, by_id, 95.0, 80.0)
+    result = adjudicator.build_adjudications(
+        [review], comparison_rows, {"opaque_anchor"}, edges
+    )
+
+    assert [row["reference_id"] for row in result] == ["opaque_review"]
+    assert result[0]["disposition"] == (
+        "cross_family_sequence_label_conflict_candidate"
+    )
+    assert result[0]["cross_family_reference_id"] == "opaque_anchor"
+    assert result[0]["cross_family_reference_role"] == "confirmed_anchor"
+
+
+def test_anchor_manifest_rejects_nonconfirmed_rows(tmp_path):
+    adjudicator = load_module()
+    manifest = tmp_path / "anchors.tsv"
+    manifest.write_text(
+        "reference_id\tevidence_status\n"
+        "confirmed_anchor\tconfirmed\n"
+        "pending_candidate\tcandidate_pending_adjudication\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="contains non-confirmed rows"):
+        adjudicator.read_confirmed_anchor_ids(manifest)
 
 
 def test_committed_local_adjudication_has_declared_outcomes():
@@ -74,25 +130,48 @@ def test_committed_local_adjudication_has_declared_outcomes():
 
     assert len(rows) == 39
     assert len({row["reference_id"] for row in rows}) == 39
-    confirmed = [row for row in rows if row["disposition"].startswith("confirmed_")]
+    conflicts = [
+        row
+        for row in rows
+        if row["disposition"] == "cross_family_sequence_label_conflict_candidate"
+    ]
     unresolved = [row for row in rows if row["disposition"].startswith("unresolved_")]
-    assert len(confirmed) == 23
-    assert len(unresolved) == 16
-    for row in confirmed:
+    assert len(conflicts) == 24
+    assert len(unresolved) == 15
+    for row in conflicts:
         assert row["header_family"] != row["cross_family_reference_family"]
+        assert row["cross_family_reference_role"] in {
+            "confirmed_anchor",
+            "review_candidate",
+        }
         assert float(row["cross_family_pident"]) >= 95
         assert float(row["cross_family_shorter_sequence_coverage"]) >= 80
         assert int(row["component_size"]) > 1
         assert int(row["component_family_count"]) > 1
     for row in unresolved:
         assert row["cross_family_reference_id"] == ""
-        assert row["component_id"] == "singleton"
 
     component_sizes = {
         row["component_id"]: int(row["component_size"])
-        for row in confirmed
+        for row in conflicts
     }
-    assert Counter(component_sizes.values()) == Counter({2: 2, 3: 1, 16: 1})
+    assert Counter(component_sizes.values()) == Counter({2: 2, 3: 2, 16: 1})
+    assert Counter(row["cross_family_reference_role"] for row in conflicts) == Counter(
+        {"review_candidate": 23, "confirmed_anchor": 1}
+    )
+
+    by_id = {row["reference_id"]: row for row in rows}
+    cross_tier = by_id["BOLD_COI-5P_GMODL3842-22"]
+    assert cross_tier["cross_family_reference_id"] == (
+        "BOLD_COI-5P_GBMIN70259-17"
+    )
+    assert cross_tier["cross_family_reference_family"] == "Triozidae"
+    assert cross_tier["cross_family_reference_role"] == "confirmed_anchor"
+    assert cross_tier["cross_family_pident"] == "96.018"
+    assert cross_tier["cross_family_alignment_length"] == "452"
+    assert cross_tier["cross_family_shorter_sequence_coverage"] == "95.763"
+    assert cross_tier["component_id"] == "cluster_8fef88fc9b07"
+    assert cross_tier["component_size"] == "3"
 
 
 def test_committed_local_adjudication_provenance_matches_bytes():
@@ -102,10 +181,23 @@ def test_committed_local_adjudication_provenance_matches_bytes():
         rows = list(csv.DictReader(handle, delimiter="\t"))
     values = {(row["field"], row["artifact"]): row["value"] for row in rows}
 
-    assert values[("parameter", "scope")] == "local_all_vs_all_only"
+    assert values[("schema", "")] == "chain_a_local_cluster_adjudication_v2"
+    assert values[("parameter", "output_scope")] == "review_only"
+    assert values[("parameter", "component_scope")] == (
+        "review_plus_confirmed_anchors"
+    )
     assert values[("count", "all_review_records")] == "39"
-    assert values[("count", "confirmed_records")] == "23"
-    assert values[("count", "unresolved_records")] == "16"
+    assert values[("count", "confirmed_anchor_records")] == "5"
+    assert values[("count", "all_comparison_records")] == "44"
+    assert values[("count", "cross_family_conflict_candidates")] == "24"
+    assert values[("count", "selected_review_candidate_neighbors")] == "23"
+    assert values[("count", "selected_confirmed_anchor_neighbors")] == "1"
+    assert values[("count", "unresolved_records")] == "15"
+    anchor_manifest = FIXTURE_DIR / "chain_a_reference_candidates.tsv"
+    anchor_digest = hashlib.sha256(anchor_manifest.read_bytes()).hexdigest()
+    assert values[("sha256", str(anchor_manifest.relative_to(REPO_ROOT)))] == (
+        anchor_digest
+    )
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     assert values[("sha256", str(output.relative_to(REPO_ROOT)))] == digest
 
@@ -123,6 +215,8 @@ def test_local_adjudication_regenerates_exact_rows(tmp_path):
             str(SCRIPT),
             "--audit",
             str(FIXTURE_DIR / "chain_a_similarity_audit.tsv"),
+            "--confirmed-anchor-manifest",
+            str(FIXTURE_DIR / "chain_a_reference_candidates.tsv"),
             "--reference-source-fasta",
             str(reference_fasta),
             "--output",

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Adjudicate bacterial-like reference candidates from local cross-host evidence.
+"""Adjudicate reference candidates from local cross-family sequence evidence.
 
-This is an offline database-curation tool. It compares only candidate reference
-sequences already present in a declared audit and never calls a remote service.
-It does not modify a reference FASTA, BLAST index, or pipeline behavior.
+This is an offline database-curation tool. It compares review-tier references
+with one another and with references declared confirmed by a separate manifest.
+It never calls a remote service and does not modify a reference FASTA, BLAST
+index, or pipeline behavior.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ OUTPUT_FIELDS = [
     "cross_family_reference_class",
     "cross_family_reference_order",
     "cross_family_reference_family",
+    "cross_family_reference_role",
     "cross_family_pident",
     "cross_family_alignment_length",
     "cross_family_shorter_sequence_coverage",
@@ -82,7 +84,9 @@ def iter_fasta(path: Path):
         yield header, "".join(sequence).upper()
 
 
-def read_review_rows(path: Path) -> list[dict[str, str]]:
+def read_audit_rows(
+    path: Path,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     with path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))
     required = {
@@ -100,20 +104,41 @@ def read_review_rows(path: Path) -> list[dict[str, str]]:
     }
     if not rows or not required.issubset(rows[0]):
         die(f"unexpected or empty candidate audit: {path}")
+    ids = [row["reference_id"] for row in rows]
+    if len(ids) != len(set(ids)):
+        die("candidate audit reference IDs are not unique")
+    for row in rows:
+        if not re.fullmatch(r"[0-9a-f]{64}", row["reference_sequence_sha256"]):
+            die(f"invalid reference checksum for {row['reference_id']}")
+
     review_rows = [row for row in rows if row["discovery_tier"] == "review"]
     if not review_rows:
         die(f"candidate audit has no review-tier rows: {path}")
-    ids = [row["reference_id"] for row in review_rows]
-    if len(ids) != len(set(ids)):
-        die("review-tier reference IDs are not unique")
     for row in review_rows:
         if row["review_status"] != "pending_adjudication":
             die(f"review row is not pending: {row['reference_id']}")
         if float(row["pident"]) < 85 or float(row["shorter_sequence_coverage"]) < 80:
             die(f"review row falls outside the declared discovery protocol: {row['reference_id']}")
-        if not re.fullmatch(r"[0-9a-f]{64}", row["reference_sequence_sha256"]):
-            die(f"invalid reference checksum for {row['reference_id']}")
-    return review_rows
+    return rows, review_rows
+
+
+def read_confirmed_anchor_ids(path: Path) -> list[str]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    required = {"reference_id", "evidence_status"}
+    if not rows or not required.issubset(rows[0]):
+        die(f"unexpected or empty confirmed-anchor manifest: {path}")
+    anchor_ids = [row["reference_id"] for row in rows]
+    if any(not reference_id for reference_id in anchor_ids):
+        die("confirmed-anchor manifest contains an empty reference ID")
+    if len(anchor_ids) != len(set(anchor_ids)):
+        die("confirmed-anchor reference IDs are not unique")
+    nonconfirmed = sorted(
+        row["reference_id"] for row in rows if row["evidence_status"] != "confirmed"
+    )
+    if nonconfirmed:
+        die(f"confirmed-anchor manifest contains non-confirmed rows: {nonconfirmed}")
+    return anchor_ids
 
 
 def extract_reference_sequences(
@@ -137,7 +162,7 @@ def extract_reference_sequences(
         sequences[reference_id] = sequence
     missing = sorted(set(wanted) - set(sequences))
     if missing:
-        die(f"review references missing from source FASTA: {missing}")
+        die(f"comparison references missing from source FASTA: {missing}")
     return sequences
 
 
@@ -263,13 +288,15 @@ def connected_components(
 
 
 def build_adjudications(
-    rows: list[dict[str, str]],
+    review_rows: list[dict[str, str]],
+    comparison_rows: list[dict[str, str]],
+    confirmed_anchor_ids: set[str],
     edges: dict[tuple[str, str], dict[str, str]],
 ) -> list[dict[str, str]]:
-    rows_by_id = {row["reference_id"]: row for row in rows}
+    rows_by_id = {row["reference_id"]: row for row in comparison_rows}
     components = connected_components(set(rows_by_id), edges)
     adjudications: list[dict[str, str]] = []
-    for row in rows:
+    for row in review_rows:
         reference_id = row["reference_id"]
         family = lineage_rank(row["header_lineage"], "f__")
         cross_family: list[tuple[dict[str, str], str]] = []
@@ -301,17 +328,20 @@ def build_adjudications(
         )
         if neighbor:
             neighbor_row = rows_by_id[neighbor]
-            disposition = "confirmed_cross_host_bacterial_like_reference_cluster"
+            disposition = "cross_family_sequence_label_conflict_candidate"
             notes = (
-                "Full/near-full independently supported bacterial-control match plus "
-                "a >=95% local match carrying a different host-family assignment"
+                "Meets the declared bacterial-control similarity screen and has a "
+                ">=95% local sequence match carrying a different host-family assignment; "
+                "this supports a sequence/label-conflict candidate, not proof of "
+                "bacterial origin"
             )
         else:
             neighbor_row = {}
             disposition = "unresolved_insufficient_local_discriminator"
             notes = (
-                "Meets bacterial-control discovery thresholds but lacks a >=95% "
-                "cross-family local candidate match; external sequence search was not authorized"
+                "Meets the declared bacterial-control similarity screen but lacks a >=95% "
+                "cross-family local match in the review-plus-confirmed-anchor scope; no "
+                "biological origin is assigned"
             )
         adjudications.append(
             {
@@ -337,6 +367,11 @@ def build_adjudications(
                 ),
                 "cross_family_reference_family": lineage_rank(
                     neighbor_row.get("header_lineage", ""), "f__"
+                ),
+                "cross_family_reference_role": (
+                    "confirmed_anchor"
+                    if neighbor in confirmed_anchor_ids
+                    else "review_candidate" if neighbor else ""
                 ),
                 "cross_family_pident": best_edge.get("pident", ""),
                 "cross_family_alignment_length": best_edge.get(
@@ -380,18 +415,32 @@ def provenance_text(
     adjudications: list[dict[str, str]],
     output_text: str,
     blast_version: str,
+    confirmed_anchor_count: int,
 ) -> str:
-    confirmed = sum(row["disposition"].startswith("confirmed_") for row in adjudications)
-    unresolved = len(adjudications) - confirmed
+    conflict_candidates = sum(
+        row["disposition"] == "cross_family_sequence_label_conflict_candidate"
+        for row in adjudications
+    )
+    review_neighbor_count = sum(
+        row["cross_family_reference_role"] == "review_candidate"
+        for row in adjudications
+    )
+    anchor_neighbor_count = sum(
+        row["cross_family_reference_role"] == "confirmed_anchor"
+        for row in adjudications
+    )
+    unresolved = len(adjudications) - conflict_candidates
     rows = [
-        ("schema", "", "chain_a_local_cluster_adjudication_v1"),
+        ("schema", "", "chain_a_local_cluster_adjudication_v2"),
         ("tool", "blastn", blast_version.splitlines()[0]),
-        ("parameter", "scope", "local_all_vs_all_only"),
+        ("parameter", "output_scope", "review_only"),
+        ("parameter", "component_scope", "review_plus_confirmed_anchors"),
         ("parameter", "task", "blastn"),
         ("parameter", "dust", "no"),
         ("parameter", "evalue", "1e-20"),
         ("parameter", "word_size", "11"),
         ("parameter", "max_hsps", "1"),
+        ("parameter", "max_target_seqs", "1000"),
         ("parameter", "min_cross_family_pident", f"{args.min_cross_family_pident:g}"),
         (
             "parameter",
@@ -399,9 +448,30 @@ def provenance_text(
             f"{args.min_cross_family_shorter_coverage:g}",
         ),
         ("count", "all_review_records", str(len(adjudications))),
-        ("count", "confirmed_records", str(confirmed)),
+        ("count", "confirmed_anchor_records", str(confirmed_anchor_count)),
+        (
+            "count",
+            "all_comparison_records",
+            str(len(adjudications) + confirmed_anchor_count),
+        ),
+        ("count", "cross_family_conflict_candidates", str(conflict_candidates)),
+        (
+            "count",
+            "selected_review_candidate_neighbors",
+            str(review_neighbor_count),
+        ),
+        (
+            "count",
+            "selected_confirmed_anchor_neighbors",
+            str(anchor_neighbor_count),
+        ),
         ("count", "unresolved_records", str(unresolved)),
         ("sha256", str(args.audit), sha256_file(args.audit)),
+        (
+            "sha256",
+            str(args.confirmed_anchor_manifest),
+            sha256_file(args.confirmed_anchor_manifest),
+        ),
         ("sha256", str(args.reference_source_fasta), sha256_file(args.reference_source_fasta)),
         ("sha256", str(args.output), sha256_bytes(output_text.encode("utf-8"))),
     ]
@@ -413,6 +483,7 @@ def provenance_text(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audit", type=Path, required=True)
+    parser.add_argument("--confirmed-anchor-manifest", type=Path, required=True)
     parser.add_argument("--reference-source-fasta", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--provenance-output", type=Path, required=True)
@@ -425,39 +496,73 @@ def main() -> int:
         die("cross-family identity threshold must be in (0, 100]")
     if not 0 < args.min_cross_family_shorter_coverage <= 100:
         die("cross-family coverage threshold must be in (0, 100]")
-    for path in (args.audit, args.reference_source_fasta):
+    for path in (
+        args.audit,
+        args.confirmed_anchor_manifest,
+        args.reference_source_fasta,
+    ):
         if not path.is_file():
             die(f"required input is missing: {path}")
     if shutil.which(args.blastn) is None:
         die(f"BLAST executable is not available: {args.blastn}")
 
-    rows = read_review_rows(args.audit)
-    sequences = extract_reference_sequences(args.reference_source_fasta, rows)
+    audit_rows, review_rows = read_audit_rows(args.audit)
+    audit_rows_by_id = {row["reference_id"]: row for row in audit_rows}
+    confirmed_anchor_ids = read_confirmed_anchor_ids(args.confirmed_anchor_manifest)
+    missing_anchors = sorted(set(confirmed_anchor_ids) - set(audit_rows_by_id))
+    if missing_anchors:
+        die(f"confirmed anchors missing from candidate audit: {missing_anchors}")
+    review_ids = {row["reference_id"] for row in review_rows}
+    overlapping_anchors = sorted(review_ids.intersection(confirmed_anchor_ids))
+    if overlapping_anchors:
+        die(f"confirmed anchors overlap review-tier rows: {overlapping_anchors}")
+    anchor_rows = [audit_rows_by_id[reference_id] for reference_id in confirmed_anchor_ids]
+    nonpriority_anchors = sorted(
+        row["reference_id"]
+        for row in anchor_rows
+        if row["discovery_tier"] != "priority"
+    )
+    if nonpriority_anchors:
+        die(f"confirmed anchors are not priority-tier audit rows: {nonpriority_anchors}")
+    comparison_rows = review_rows + sorted(
+        anchor_rows, key=lambda row: row["reference_id"]
+    )
+    sequences = extract_reference_sequences(args.reference_source_fasta, comparison_rows)
     with tempfile.TemporaryDirectory(prefix="rtbioscan-local-cluster-audit.") as temp:
-        query_fasta = Path(temp) / "review-records.fa"
-        write_query_fasta(query_fasta, rows, sequences)
+        query_fasta = Path(temp) / "comparison-records.fa"
+        write_query_fasta(query_fasta, comparison_rows, sequences)
         blast_output = run_all_vs_all(query_fasta, args.blastn)
-    rows_by_id = {row["reference_id"]: row for row in rows}
+    rows_by_id = {row["reference_id"]: row for row in comparison_rows}
     edges = parse_edges(
         blast_output,
         rows_by_id,
         args.min_cross_family_pident,
         args.min_cross_family_shorter_coverage,
     )
-    adjudications = build_adjudications(rows, edges)
+    adjudications = build_adjudications(
+        review_rows,
+        comparison_rows,
+        set(confirmed_anchor_ids),
+        edges,
+    )
     output_text = tsv_text(OUTPUT_FIELDS, adjudications)
     provenance = provenance_text(
         args,
         adjudications,
         output_text,
         run_checked([args.blastn, "-version"]),
+        len(anchor_rows),
     )
     write_atomic(args.output, output_text)
     write_atomic(args.provenance_output, provenance)
-    confirmed = sum(row["disposition"].startswith("confirmed_") for row in adjudications)
+    conflict_candidates = sum(
+        row["disposition"] == "cross_family_sequence_label_conflict_candidate"
+        for row in adjudications
+    )
     print(
         f"OK: wrote {len(adjudications)} local adjudications "
-        f"({confirmed} confirmed, {len(adjudications) - confirmed} unresolved)"
+        f"({conflict_candidates} cross-family conflict candidates, "
+        f"{len(adjudications) - conflict_candidates} unresolved)"
     )
     return 0
 

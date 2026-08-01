@@ -136,47 +136,64 @@ host specimen metadata itself to remain valid.
 
 `chain_a_lower_tier_adjudication.tsv` evaluates all 39 review-tier records
 without sending sequence data to an external service. The generic offline tool
-`bin/adjudicate_taxonomy_reference_clusters.py` extracts the checksummed
-candidate sequences and runs a local all-versus-all BLAST. It contains no
-record, organism, sample, or database-specific dispositions.
+`bin/adjudicate_taxonomy_reference_clusters.py` extracts the checksummed review
+sequences plus only the five records explicitly marked `confirmed` in
+`chain_a_reference_candidates.tsv`, then runs a local all-versus-all BLAST. The
+confirmed records act as comparison anchors and are not emitted as lower-tier
+output rows. The tool contains no record, organism, sample, or database-specific
+dispositions.
 
-The conservative confirmation rule requires both:
+The conservative conflict-candidate rule requires both:
 
 1. the existing discovery alignment to an independently identified bacterial
    coxA control at at least 85% identity and 80% shorter-sequence coverage; and
-2. a direct local candidate-to-candidate alignment at at least 95% identity and
-   80% shorter-sequence coverage where the two records carry different,
-   non-empty host-family assignments.
+2. a direct local alignment to another review record or confirmed anchor at at
+   least 95% identity and 80% shorter-sequence coverage where the two records
+   carry different, non-empty host-family assignments.
 
-The second condition detects sequence clusters that cannot credibly represent
-the different host-family COI assignments simultaneously. It establishes a
-bacterial-like reference/metadata inconsistency suitable for quarantine; it
-does not identify the exact bacterium or challenge the physical specimen IDs.
-Records lacking that direct cross-family discriminator remain unresolved even
-when their bacterial-control similarity is suggestive.
+The bacterial-control threshold is a similarity screen, not proof of bacterial
+origin. The second condition identifies a sequence/host-label conflict: the
+assignments cannot safely be treated as mutually independent, correctly labelled
+host COI references. It does not identify which endpoint is wrong, establish the
+biological origin of either complete sequence, or challenge the physical
+specimen IDs. Such rows are recorded as
+`cross_family_sequence_label_conflict_candidate`; records lacking the direct
+cross-family discriminator remain unresolved.
 
-On the shipped snapshot, 23 records satisfy both conditions and 16 remain
-`unresolved_insufficient_local_discriminator`. The confirmed set forms four
-components of sizes 16, 3, 2, and 2. Examples include an Isopoda/Collembola pair
-at 99.380%, a Coleoptera/Hymenoptera link at 97.833%, and identical sequences
-stored under Chalcididae and Halictidae host assignments. The unresolved 16
-must not be automatically removed or relabelled.
+On the shipped snapshot, 24 review records satisfy both conditions and 15 remain
+`unresolved_insufficient_local_discriminator`. Twenty-three are supported by a
+review-record peer in four review-only components of sizes 16, 3, 2, and 2.
+Examples include an Isopoda/Collembola pair at 99.380%, a
+Coleoptera/Hymenoptera link at 97.833%, and identical sequences stored under
+Chalcididae and Halictidae host assignments. The additional record,
+`GMODL3842-22`, is supported by the confirmed `GBMIN70259-17` anchor at 96.018%
+identity over 452 nt and 95.763% shorter-sequence coverage. That alignment covers
+only 69.219% of the complete 653-nt review record, so it is not described as
+proof that the whole record is bacterial. Components include anchors in their
+IDs and sizes even though anchors are absent from the 39-row output. The 15
+unresolved records must not be automatically removed or relabelled.
 
 Regenerate the local adjudication and provenance with:
 
 ```bash
 python3 bin/adjudicate_taxonomy_reference_clusters.py \
   --audit conf/taxonomy_regression/chain_a_similarity_audit.tsv \
+  --confirmed-anchor-manifest \
+    conf/taxonomy_regression/chain_a_reference_candidates.tsv \
   --reference-source-fasta db/COInr98_2024Jun_RioNegro_Brazil.fasta \
   --output conf/taxonomy_regression/chain_a_lower_tier_adjudication.tsv \
   --provenance-output \
     conf/taxonomy_regression/chain_a_lower_tier_adjudication_provenance.tsv
 ```
 
-The artifact records that its scope is `local_all_vs_all_only`. Resolving the
-remaining 16 requires independently sourced sequence evidence or explicit
-authorization for an external search; absence of that evidence is preserved as
-uncertainty, not converted into a biological conclusion.
+The artifact records `review_only` output and
+`review_plus_confirmed_anchors` comparison scope, pins the anchor manifest, and
+labels each supporting neighbor as `review_candidate` or `confirmed_anchor`.
+Resolving the remaining 15 requires independently sourced sequence evidence or
+explicit authorization for an external search; absence of that evidence is
+preserved as uncertainty, not converted into a biological conclusion. Treating
+all conflict candidates as quarantine inputs is a release-policy choice and must
+not be reported as confirmation of bacterial origin.
 
 Regenerate the discovery table and its checksummed provenance with:
 
