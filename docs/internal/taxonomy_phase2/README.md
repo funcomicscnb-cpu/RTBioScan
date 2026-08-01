@@ -257,13 +257,24 @@ cross-family sequence/label-conflict candidate only when its bacterial-control
 similarity-screen result is accompanied by a direct ≥95%-identity,
 ≥80%-shorter-coverage match carrying a different host family. This flags a
 label-conflict candidate under the declared protocol, not bacterial origin or
-which endpoint is wrong. Twenty-four records satisfy the rule: 23 through review peers
-in the existing four components and `GMODL3842-22` through a confirmed priority
+which endpoint is wrong. Twenty-four records satisfy the rule: 23 through review
+peers in the existing four components and `GMODL3842-22` through a confirmed priority
 anchor. Fifteen remain unresolved and must not be automatically curated.
 `chain_a_lower_tier_adjudication.tsv` and its provenance freeze the result and
 explicitly distinguish review-peer from confirmed-anchor evidence.
 `ISUP118-14`'s uniquely mapped synthetic taxid `-2704` must not be conflated with
 the separate `-557`/`-561` namespace collisions.
+
+The versioned policy `chain_a_downstream_coi_release_policy_v1.tsv` now keeps
+evidence separate from release action. Its generic builder emits a 44-row master
+disposition, a 29-row correctness-first quarantine projection, and a 15-row
+retained-unresolved projection. The 24 conflict candidates remain labelled as
+policy quarantines rather than confirmed bacterial contamination. Diagnostics
+also disclose that three stored taxids lose their only source record and that no
+exact copy of the 27 quarantined sequence hashes remains. No source FASTA, BLAST
+index, pipeline configuration, or state identity is changed by this manifest
+stage. These diagnostics observe the pinned full shipped FASTA; they do not
+choose the canonical release base.
 
 Run the benchmark with:
 

@@ -195,6 +195,72 @@ preserved as uncertainty, not converted into a biological conclusion. Treating
 all conflict candidates as quarantine inputs is a release-policy choice and must
 not be reported as confirmation of bacterial origin.
 
+### Downstream COI disposition manifest
+
+`chain_a_downstream_coi_release_policy_v1.tsv` makes the correctness-first
+release decision explicit rather than embedding it in pipeline or organism-
+specific code. It maps the five confirmed priority contaminants and 24
+cross-family conflict candidates to `quarantine`, while the 15 unresolved rows
+map to `retain`. The policy preserves the three evidence classes; quarantine of
+the conflict candidates is not reinterpreted as confirmation of bacterial
+origin.
+
+`bin/build_taxonomy_reference_disposition_manifest.py` validates that the five
+priority and 39 lower-tier records are disjoint and exactly partition the audit,
+then verifies every selected taxid and sequence SHA-256 against the pinned
+shipped source FASTA snapshot. It emits one authoritative, reference-ID-sorted 44-row manifest
+plus mechanically derived 29-row quarantine and 15-row retained-unresolved
+projections. The retained projection is an unresolved subset, not a clean-
+reference allowlist. Nonlisted FASTA records are outside this Chain-A queue and
+are not silently adjudicated as clean.
+
+All four outputs are fully staged before replacement. Each file is atomically
+replaced, and the checksummed provenance output is written last as the artifact-
+set commit marker; its absence or hash mismatch identifies an incomplete or
+mixed set.
+
+The manifest also records correctness-relevant release impact. The 29-record
+quarantine represents 27 distinct sequence hashes; none has an exact retained
+copy in the source snapshot. Three stored taxids (`1119366`, `1717526`, and
+`650448`) would lose their only source record. These are disclosed consequences
+of the conservative policy, not accuracy claims.
+
+Regenerate all four disposition outputs with:
+
+```bash
+python3 bin/build_taxonomy_reference_disposition_manifest.py \
+  --audit conf/taxonomy_regression/chain_a_similarity_audit.tsv \
+  --audit-provenance \
+    conf/taxonomy_regression/chain_a_similarity_audit_provenance.tsv \
+  --confirmed-reference-manifest \
+    conf/taxonomy_regression/chain_a_reference_candidates.tsv \
+  --lower-tier-adjudication \
+    conf/taxonomy_regression/chain_a_lower_tier_adjudication.tsv \
+  --lower-tier-provenance \
+    conf/taxonomy_regression/chain_a_lower_tier_adjudication_provenance.tsv \
+  --release-policy \
+    conf/taxonomy_regression/chain_a_downstream_coi_release_policy_v1.tsv \
+  --reference-source-fasta db/COInr98_2024Jun_RioNegro_Brazil.fasta \
+  --manifest-output \
+    conf/taxonomy_regression/chain_a_downstream_coi_disposition_v1.tsv \
+  --quarantine-output \
+    conf/taxonomy_regression/chain_a_downstream_coi_quarantine_v1.tsv \
+  --retained-output \
+    conf/taxonomy_regression/chain_a_downstream_coi_retained_unresolved_v1.tsv \
+  --provenance-output \
+    conf/taxonomy_regression/chain_a_downstream_coi_disposition_v1_provenance.tsv
+```
+
+The pinned shipped FASTA snapshot has 792,926 records but 792,925 unique IDs
+because its final duplicate `WPB428` record is empty. This pre-existing defect
+is outside the 44-record Chain-A queue and is not repaired by the disposition
+stage. The canonical base remains undecided, and the two source questions are
+nested: using the legacy 791,433-record indexed prefix excludes the 1,493-record
+tail, including the duplicated `WPB428` entries; expanding to the full FASTA
+requires an explicit duplicate-ID policy. All 44 disposition targets are in the
+legacy indexed prefix, so the quarantine projection applies under either base
+choice. Neither source change may be folded silently into Chain-A quarantine.
+
 Regenerate the discovery table and its checksummed provenance with:
 
 ```bash

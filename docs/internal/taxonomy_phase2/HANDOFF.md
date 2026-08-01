@@ -289,8 +289,9 @@ COI/BLAST curation separate from any FAST/LAST reference or routing release.
      `COI|Bacteria` in the FAST reference; separate near-identical host-labelled downstream records are
      the demonstrated defect. Use `conf/taxonomy_regression/chain_a_reference_candidates.tsv` as the
      reviewed priority subset and `chain_a_lower_tier_adjudication.tsv` for the broader local-only
-     dispositions. Keep confirmed bacterial contaminants, cross-family conflict candidates, and
-     unresolved records as separate release evidence classes; retain all unresolved records unchanged.
+     evidence. The versioned downstream-COI disposition manifest applies the explicit release policy
+     while keeping confirmed contaminants, cross-family conflict candidates, and unresolved records as
+     separate evidence classes; retain all unresolved records unchanged.
    - Rebuild the downstream COI BLAST index from that curated canonical FASTA, use a new reference
      manifest/state identity, and compare legacy versus corrected benchmark expectations. Do not touch
      the FAST/LAST source or index in this sub-release.
@@ -368,28 +369,40 @@ support from the confirmed `GBMIN70259-17` anchor at 96.018% identity over 452 n
 shorter-sequence coverage. The lower-tier rule establishes neither bacterial origin nor which endpoint
 is wrong. The unresolved records were not treated as clean or contaminated by default.
 
+The explicit disposition stage is now complete. The versioned policy
+`chain_a_downstream_coi_release_policy_v1.tsv` maps the five confirmed contaminants and 24 conflict
+candidates to a correctness-first quarantine action and maps all 15 unresolved rows to retain. The
+generic builder emits an authoritative 44-row manifest plus derived quarantine and retained-unresolved
+projections; it does not alter the source FASTA or either index. Release-impact diagnostics disclose
+that the 29 quarantined records represent 27 sequence hashes with no exact retained source copy and
+that stored taxids `1119366`, `1717526`, and `650448` lose their only source record. This is an explicit
+policy consequence, not evidence that every conflict candidate is bacterial.
+
 1. Preserve `legacy_expected.tsv` and the shipped production FASTA/index byte-for-byte as the legacy
    release.
 2. Regenerate both discovery and adjudication artifacts byte-for-byte. If the database, source FASTAs,
    tool, parameters, or scripts change, create a new audit snapshot rather than silently updating one.
-3. Produce an explicit downstream-COI disposition manifest with three non-interchangeable reasons:
-   five `confirmed_reference_sequence_contamination`, 24
-   `cross_family_sequence_label_conflict_candidate`, and 15
-   `unresolved_insufficient_local_discriminator`. For the correctness-first release, quarantining the
-   24 conflict candidates is a conservative release-policy choice, not a biological-origin claim.
-4. Build a new canonical downstream COI FASTA that quarantines the five confirmed contaminants and,
-   once that policy is recorded in the release manifest, the 24 conflict candidates. Retain all 15
-   unresolved records unchanged and list them in release diagnostics; do not silently relabel or remove
-   them.
-5. Build a new downstream BLAST index from that canonical FASTA and publish checksummed manifests plus
+3. **Completed:** freeze the three evidence classes and release actions in the versioned master
+   disposition and its generated 29-row quarantine/15-row retained projections.
+4. Before constructing a canonical FASTA, declare the base snapshot and its nested duplicate-ID policy.
+   The full source contains 792,926 records but only 792,925 unique IDs because its final duplicate
+   `WPB428` record is empty; the legacy BLAST index contains only the 791,433-record prefix. Keeping
+   that prefix excludes the 1,493-record tail, including the duplicated `WPB428` entries. Expanding to
+   the full FASTA requires an explicit `WPB428` decision. All 44 disposition targets are within the
+   legacy prefix. Do not silently repair the duplicate or admit the unindexed tail as part of Chain-A
+   quarantine.
+5. From that explicitly declared base snapshot, build a new canonical downstream COI FASTA that removes
+   the 29 policy-quarantine IDs and retains the 15 unresolved IDs unchanged. Preserve record order and
+   retained bytes; publish the source decision, counts, and checksums.
+6. Build a new downstream BLAST index from that canonical FASTA and publish checksummed manifests plus
    a new reference/state identity. Do not touch the FAST/LAST source or index.
-6. Add a separately versioned corrected benchmark expectation and compare it with the immutable legacy
+7. Add a separately versioned corrected benchmark expectation and compare it with the immutable legacy
    expectation across every report surface before considering release promotion.
 
-Exit criteria for the next stage are a reproducible downstream-only reference release, explicit
-quarantine manifest, retained-unresolved manifest, new state identity, and green legacy-versus-corrected
-regressions. FAST/LAST cleanup, routing thresholds, representative incidence, throughput, and accuracy
-calibration remain separate deferred work.
+Exit criteria for the next stage are a reviewed source-integrity policy and a byte-reproducible canonical
+downstream COI FASTA derived from it. Index construction, state identity, and corrected expectations are
+subsequent stages. FAST/LAST cleanup, routing thresholds, representative incidence, throughput, and
+accuracy calibration remain separate deferred work.
 
 ---
 
