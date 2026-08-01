@@ -48,8 +48,10 @@ operational pre-remediation baseline:
 - the BLAST taxonomy database.
 
 The manifest intentionally describes the installed operational indexes. It does
-not activate the 1,493 FASTA-only COI tail records identified in Phase 1. Tail
-admission remains a separate, audited reference release.
+not activate the 1,493 line-start COI tail records or the embedded header
+candidate subsequently identified by the strict source-integrity audit. Tail
+repair/admission remains a separate, audited reference release; the raw FASTA
+prefix is not an exact serialization of the effective legacy BLAST corpus.
 
 `conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv` pins the exact
 June-2024 TaxonKit baseline used before remediation. The source archive and all
@@ -276,6 +278,15 @@ index, pipeline configuration, or state identity is changed by this manifest
 stage. These diagnostics observe the pinned full shipped FASTA; they do not
 choose the canonical release base.
 
+The subsequent source/index integrity audit supersedes the disposition
+builder's permissive whole-source counts for source-health decisions. It finds
+one non-leading header delimiter at physical record 791,433: analysis-only
+splitting recovers a 524-nt record candidate after the 200-nt indexed sequence.
+The resulting first 791,433 logical records match the legacy BLAST titles,
+signed header taxids, order, and sequences exactly, while the analysis-logical
+tail has 1,494 records. The audit changes no source, policy, database, pipeline,
+or state identity.
+
 Run the benchmark with:
 
 ```bash
@@ -488,8 +499,10 @@ one expected-pass marker. `bin/check_param_registry.py` passes with all runtime
 parameters registered. The full LAST 1542 / BLAST 2.15.0 / TaxonKit 0.14.2
 classification replay matches the committed legacy snapshot.
 
-No taxonomy behavior change is enforced by this phase. Phase 3 starts by
-running `--fast_filter_shadow true` on representative production reads and
-independently adjudicating a reviewed disagreement subset. Reference curation,
-ancestry eligibility, competitive downstream classification, or FAST routing
-changes must remain separate, versioned stages after that measurement gate.
+No taxonomy behavior change is enforced by this phase. The original Phase-3
+FAST/LAST path starts by running `--fast_filter_shadow true` on representative
+production reads and independently adjudicating a reviewed disagreement subset.
+That measurement gate still governs FAST routing, performance, and accuracy
+changes. Separately versioned downstream-only correctness curation can proceed
+from reproduced reference defects without waiting for FAST incidence, while
+ancestry eligibility and competitive classification remain later stages.

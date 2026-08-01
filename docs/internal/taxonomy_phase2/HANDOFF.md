@@ -5,21 +5,23 @@ line of work. Read this top to bottom once, then act. Every claim below was veri
 the code; where a fact must be re-verified before acting, it says so. **Do not trust prose over
 the code — re-run the checks in §9.**
 
-Branch: `agent/taxonomy-state-compatibility-phase-2-1a`. Main branch: `main`.
+Branch: `agent/taxonomy-chain-a-adjudication`. Main branch: `main`.
 
 ---
 
 ## 0. TL;DR — what to do next
 
-The Phase 2 implementation backlog is committed and validated. The next stage is deliberately
-measurement-only:
+The compatibility backlog and the downstream-COI discovery, adjudication,
+disposition, and source-integrity audit stages are committed and validated. The
+next correctness-only stage is deliberately policy-only:
 
-> Run the opt-in, decision-neutral FAST shadow collector on representative production reads,
-> quantify target/off-target competition and HAC/SUP compute impact, and independently adjudicate
-> a reviewed subset of disagreements. See §7 for the exact entry criteria and outputs.
+> Freeze the downstream-COI base/repair policy described in §7. The
+> behavior-preserving candidate is the effective legacy BLAST OID stream; do
+> not slice the malformed raw FASTA or construct a canonical FASTA yet.
 
-Do not curate references or enforce a new routing/classification policy until that evidence exists.
-The deterministic fixture proves downstream defects, but it does not measure their live incidence.
+Representative decision-neutral FAST shadow measurement remains required
+before any FAST/LAST source, routing, performance, or accuracy change. It does
+not block this separately versioned downstream-only correctness remediation.
 
 ---
 
@@ -299,8 +301,10 @@ COI/BLAST curation separate from any FAST/LAST reference or routing release.
    - Treat FAST-reference cleanup (including `SZWG01000034`) and any LAST rebuild as a separate,
      measurement-gated routing release. A LAST rebuild must retain the pinned LAST 1542 format, recheck
      first-hit ordering, publish a new manifest/state identity, and requalify routing behavior.
-   - Audit the known 1,493-record FASTA/BLAST-index desync separately (the shipped index is an exact
-     stale prefix of the FASTA); introduce any appended tail as its own reference version.
+   - Keep the source/index integrity findings separate. There are 1,493 line-start records after the
+     index boundary plus one embedded header candidate at that boundary; the raw FASTA prefix is not
+     an exact serialization of the legacy index. Any repair or admission belongs to its own reference
+     policy/version.
 3. **Superkingdom/ancestry eligibility guard** (fixes B1/B2; **must** land after step 2's homonym fix,
    or it would drop genuine animals):
    - Decide eligibility by **taxid ancestry against a configured target-clade taxid**
@@ -378,31 +382,43 @@ that the 29 quarantined records represent 27 sequence hashes with no exact retai
 that stored taxids `1119366`, `1717526`, and `650448` lose their only source record. This is an explicit
 policy consequence, not evidence that every conflict candidate is bacterial.
 
+The strict source/index integrity audit is also complete. It found one non-leading FASTA header
+delimiter at one-based line 1,582,866 / zero-based byte offset 594,244,630. Physical record 791,433
+contains 200 nt followed without a newline by an embedded header candidate and then a 524-nt sequence
+on the next line. A permissive line-start parser merges these into an apparent 857-character sequence,
+while the legacy BLAST record contains the initial 200 nt and matches the analysis-split record.
+Splitting the delimiter for analysis only yields 792,927 logical records; logical records 1–791,433
+match the entire 791,433-record/485,462,968-base legacy index exactly. The analysis-logical tail is
+therefore 1,494 records, including both duplicate `WPB428` records and the empty terminal copy. The
+audit authorizes no source repair or release action. All 44 disposition targets occur before the defect
+and remain valid.
+
 1. Preserve `legacy_expected.tsv` and the shipped production FASTA/index byte-for-byte as the legacy
    release.
 2. Regenerate both discovery and adjudication artifacts byte-for-byte. If the database, source FASTAs,
    tool, parameters, or scripts change, create a new audit snapshot rather than silently updating one.
 3. **Completed:** freeze the three evidence classes and release actions in the versioned master
    disposition and its generated 29-row quarantine/15-row retained projections.
-4. Before constructing a canonical FASTA, declare the base snapshot and its nested duplicate-ID policy.
-   The full source contains 792,926 records but only 792,925 unique IDs because its final duplicate
-   `WPB428` record is empty; the legacy BLAST index contains only the 791,433-record prefix. Keeping
-   that prefix excludes the 1,493-record tail, including the duplicated `WPB428` entries. Expanding to
-   the full FASTA requires an explicit `WPB428` decision. All 44 disposition targets are within the
-   legacy prefix. Do not silently repair the duplicate or admit the unindexed tail as part of Chain-A
-   quarantine.
-5. From that explicitly declared base snapshot, build a new canonical downstream COI FASTA that removes
+4. **Completed:** freeze the generic, read-only source/index audit and its four anomaly rows. Treat the
+   prior 792,926/792,925 disposition counts as permissive line-start-parser observations, not a source-
+   integrity proof.
+5. Before constructing a canonical FASTA, declare the base and repair policy. The behavior-preserving
+   candidate is the effective legacy BLAST OID stream, not a raw first-791,433-record FASTA slice. An
+   expanded-source policy must separately decide the embedded record candidate, the other 1,493 line-
+   start tail records, the duplicate `WPB428` ID, and its empty copy.
+6. From that explicitly declared base snapshot, build a new canonical downstream COI FASTA that removes
    the 29 policy-quarantine IDs and retains the 15 unresolved IDs unchanged. Preserve record order and
-   retained bytes; publish the source decision, counts, and checksums.
-6. Build a new downstream BLAST index from that canonical FASTA and publish checksummed manifests plus
+   sequence/title content under a declared serialization; publish the source decision, counts, and
+   checksums.
+7. Build a new downstream BLAST index from that canonical FASTA and publish checksummed manifests plus
    a new reference/state identity. Do not touch the FAST/LAST source or index.
-7. Add a separately versioned corrected benchmark expectation and compare it with the immutable legacy
+8. Add a separately versioned corrected benchmark expectation and compare it with the immutable legacy
    expectation across every report surface before considering release promotion.
 
-Exit criteria for the next stage are a reviewed source-integrity policy and a byte-reproducible canonical
-downstream COI FASTA derived from it. Index construction, state identity, and corrected expectations are
-subsequent stages. FAST/LAST cleanup, routing thresholds, representative incidence, throughput, and
-accuracy calibration remain separate deferred work.
+Exit criteria for the next stage are a reviewed base/repair policy. Canonical FASTA construction, index
+construction, state identity, and corrected expectations are subsequent stages. FAST/LAST cleanup,
+routing thresholds, representative incidence, throughput, and accuracy calibration remain separate
+deferred work.
 
 ---
 

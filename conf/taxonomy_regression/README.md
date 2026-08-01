@@ -251,15 +251,70 @@ python3 bin/build_taxonomy_reference_disposition_manifest.py \
     conf/taxonomy_regression/chain_a_downstream_coi_disposition_v1_provenance.tsv
 ```
 
-The pinned shipped FASTA snapshot has 792,926 records but 792,925 unique IDs
-because its final duplicate `WPB428` record is empty. This pre-existing defect
-is outside the 44-record Chain-A queue and is not repaired by the disposition
-stage. The canonical base remains undecided, and the two source questions are
-nested: using the legacy 791,433-record indexed prefix excludes the 1,493-record
-tail, including the duplicated `WPB428` entries; expanding to the full FASTA
-requires an explicit duplicate-ID policy. All 44 disposition targets are in the
-legacy indexed prefix, so the quarantine projection applies under either base
-choice. Neither source change may be folded silently into Chain-A quarantine.
+The disposition provenance's 792,926-record/792,925-unique-ID counts describe
+the permissive line-start parser used by that frozen stage. They are not a
+source-integrity claim. The strict audit below supersedes them for source-health
+and base-selection decisions. All 44 disposition targets precede the discovered
+boundary defect, so their evidence classes and release actions are unaffected.
+
+### Downstream COI source/index integrity audit
+
+`bin/audit_taxonomy_reference_source_integrity.py` performs a generic,
+read-only stream comparison between the pinned source FASTA and the effective
+legacy BLAST records. It verifies every BLAST component against the legacy
+reference manifest, then compares OID order, complete titles (including signed
+header taxids), lengths, sequences, and canonical stream digests. It reports
+non-leading header delimiters without mutating the source or authorizing a
+release policy.
+
+The audit corrects the earlier "exact stale prefix" model. A `>` at one-based
+source line 1,582,866 and zero-based byte offset 594,244,630 follows the first
+200 nt of physical record 791,433 instead of starting a new line. The
+repository's permissive line-start parser therefore merges the delimiter, an
+embedded header candidate, and its 524-nt sequence into an apparent 857-
+character sequence; the BLAST record contains only the initial 200 nt and
+matches the analysis-split record. Splitting that delimiter for comparison only
+produces 792,927 analysis-logical records and makes logical records 1–791,433
+exactly match all 791,433 indexed records (`cf474aa6...` canonical stream
+SHA-256).
+
+Accordingly, there are 1,493 unindexed **line-start** records plus one embedded
+record candidate, or 1,494 analysis-logical records after the index boundary.
+The last two logical records share ID `WPB428`, and the second is empty. The
+four-row anomaly table freezes the boundary, line-oriented mismatch, duplicate,
+and empty record separately. These are observations only: no repair, tail
+admission, canonical base, FASTA, or index is selected by this audit.
+
+Both audit outputs are fully staged before replacement. Each file is atomically
+replaced, and the checksummed provenance output is written last as the artifact-
+set commit marker. Output paths that overlap an input, the audit executable, or
+any pinned BLAST component are rejected before comparison.
+
+Regenerate the audit and its checksummed provenance with:
+
+```bash
+python3 bin/audit_taxonomy_reference_source_integrity.py \
+  --source-fasta db/COInr98_2024Jun_RioNegro_Brazil.fasta \
+  --blast-database db/COInr98_2024Jun_RioNegro_Brazil \
+  --blastdbcmd blastdbcmd \
+  --reference-manifest \
+    conf/state_compatibility/reference_manifest_legacy_v1.tsv \
+  --reference-root . \
+  --disposition-provenance \
+    conf/taxonomy_regression/chain_a_downstream_coi_disposition_v1_provenance.tsv \
+  --disposition-manifest \
+    conf/taxonomy_regression/chain_a_downstream_coi_disposition_v1.tsv \
+  --scope downstream_coi_only \
+  --anomaly-output \
+    conf/taxonomy_regression/chain_a_downstream_coi_source_integrity_v1.tsv \
+  --provenance-output \
+    conf/taxonomy_regression/chain_a_downstream_coi_source_integrity_v1_provenance.tsv
+```
+
+The next source policy must choose between the effective legacy BLAST corpus and
+an explicitly repaired/expanded source. A raw first-791,433-record FASTA slice
+is not valid. Tail admission and duplicate resolution remain separate decisions
+and must not be folded silently into Chain-A quarantine.
 
 Regenerate the discovery table and its checksummed provenance with:
 
