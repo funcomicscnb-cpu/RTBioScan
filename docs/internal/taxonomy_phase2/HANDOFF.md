@@ -100,7 +100,8 @@ the databases) produced a **three-mode defect model** at the *reference-database
   on the shipped snapshot: five priority-review and 39 review. These counts define a review queue,
   not 44 contamination calls and not biological exhaustiveness. All five priority records are now
   confirmed reference-sequence contamination: the sequence evidence is bacterial/endosymbiont coxA
-  even where the host specimen metadata may be valid. The other 39 records remain pending. If a
+  even where the host specimen metadata may be valid. Local-only cross-host adjudication confirms 23
+  more bacterial-like reference/metadata inconsistencies and leaves 16 explicitly unresolved. If a
   bacterial read reaches the animal lane and hits a contaminated record,
   it inherits a clean Metazoa taxid → reported as an animal. The empty-kingdom guard cannot catch this
   (the taxid resolves cleanly to Metazoa).
@@ -286,8 +287,8 @@ COI/BLAST curation separate from any FAST/LAST reference or routing release.
    - First curate the downstream animal COI DB only. The exact LR799917 accession is correctly labelled
      `COI|Bacteria` in the FAST reference; separate near-identical host-labelled downstream records are
      the demonstrated defect. Use `conf/taxonomy_regression/chain_a_reference_candidates.tsv` as the
-     reviewed subset. The broader generated audit remains a pending review queue. Retain tied hits,
-     and do not remove a sequence-similarity candidate until its biological status is adjudicated.
+     reviewed priority subset and `chain_a_lower_tier_adjudication.tsv` for the broader local-only
+     dispositions. Quarantine only confirmed records; retain all unresolved records unchanged.
    - Rebuild the downstream COI BLAST index from that curated canonical FASTA, use a new reference
      manifest/state identity, and compare legacy versus corrected benchmark expectations. Do not touch
      the FAST/LAST source or index in this sub-release.
@@ -345,8 +346,7 @@ expected outcomes.
 
 ## 7. The immediate next step, precisely
 
-**Goal:** adjudicate the remaining lower-tier Chain-A review queue before changing the downstream COI
-classification database.
+**Goal:** prepare the downstream-COI-only curation release from the now-dispositioned Chain-A queue.
 
 The discovery half of this gate is now reproducible. `chain_a_audit_queries.tsv` declares three
 independently supported bacterial controls by accession and sequence SHA-256.
@@ -356,25 +356,29 @@ the tool, parameters, source FASTAs, every BLAST index component, and the genera
 shipped snapshot it emits 44 pending query/reference rows (five priority, 39 review), all explicitly
 `pending_adjudication`.
 
-1. Preserve `legacy_expected.tsv` and the production FASTA/index byte-for-byte.
-2. Independently review every unique record in `chain_a_similarity_audit.tsv`, recording evidence and
-   one explicit disposition: confirmed contamination, rejected candidate, or unresolved. Similarity
-   tier alone never authorizes removal. The five priority records are complete; review the remaining 39.
-3. Keep the reviewed outcome in `chain_a_reference_candidates.tsv` (or a successor with an expanded
-   disposition schema). All five priority records are confirmed. `GBMHH30183-19` is an exact 470/470
-   Wolbachia coxA match under its psyllid host taxid. `ISUP118-14` and `GBMIN70259-17` were resolved by
-   combining their full bacterial-control alignments with strongly discordant, independently sourced
-   same-species mitochondrial COI controls; `chain_a_priority_adjudication.tsv` freezes that evidence.
-4. Regenerate the audit and require byte-identical candidate/provenance output before freezing the
-   reviewed set. If the database, source FASTAs, tool, parameters, or script change, create a new
-   audit snapshot rather than silently updating this one.
-5. Only after all rows have dispositions, create a downstream-COI-only curated FASTA/index release,
-   manifest/state identity, and separate corrected benchmark expectation.
+The disposition gate is now complete within the authorized evidence scope. The five priority records
+are confirmed. `chain_a_lower_tier_adjudication.tsv` gives every remaining record an explicit local-only
+disposition: 23 confirmed cross-host bacterial-like reference clusters and 16 unresolved. Confirmation
+requires both the existing bacterial-control support and a direct ≥95%-identity, ≥80%-shorter-coverage
+match carrying a different host-family assignment. The unresolved records failed that confirmation
+rule; they were not treated as clean or contaminated by default.
 
-Exit criteria are explicit reviewed dispositions for the full protocol-defined queue plus reproducible
-audit artifacts. The following stage is a downstream-COI-only reference release. FAST/LAST cleanup,
-routing thresholds, representative incidence, throughput, and accuracy calibration remain separate
-deferred work.
+1. Preserve `legacy_expected.tsv` and the shipped production FASTA/index byte-for-byte as the legacy
+   release.
+2. Regenerate both discovery and adjudication artifacts byte-for-byte. If the database, source FASTAs,
+   tool, parameters, or scripts change, create a new audit snapshot rather than silently updating one.
+3. Build a new canonical downstream COI FASTA that quarantines only the 28 confirmed records (five
+   priority plus 23 lower-tier). Retain all 16 unresolved records unchanged and list them in release
+   diagnostics; do not silently relabel or remove them.
+4. Build a new downstream BLAST index from that canonical FASTA and publish checksummed manifests plus
+   a new reference/state identity. Do not touch the FAST/LAST source or index.
+5. Add a separately versioned corrected benchmark expectation and compare it with the immutable legacy
+   expectation across every report surface before considering release promotion.
+
+Exit criteria for the next stage are a reproducible downstream-only reference release, explicit
+quarantine manifest, retained-unresolved manifest, new state identity, and green legacy-versus-corrected
+regressions. FAST/LAST cleanup, routing thresholds, representative incidence, throughput, and accuracy
+calibration remain separate deferred work.
 
 ---
 

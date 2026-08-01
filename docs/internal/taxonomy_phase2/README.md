@@ -248,7 +248,15 @@ LR799917-class bacterial coxA, and `GBMIN70259-17` is a full-length 97.021%
 Wolbachia coxA match. Independent same-species animal COI controls are strongly
 discordant with both. `chain_a_priority_adjudication.tsv` pins those controls,
 sequence hashes, pairwise metrics, external evidence status, and dispositions.
-The remaining 39 lower-tier discovery records remain pending. `ISUP118-14`'s
+
+The 39 lower-tier records were then evaluated locally without disclosing
+sequence data. A record is confirmed only when its existing full/near-full
+bacterial-control alignment is accompanied by a direct ≥95%-identity,
+≥80%-shorter-coverage match to another candidate carrying a different host
+family. Twenty-three records satisfy this cross-host discriminator in four
+components (16, 3, 2, and 2 records); 16 remain unresolved and must not be
+automatically curated. `chain_a_lower_tier_adjudication.tsv` and its provenance
+freeze the result and explicitly record the local-only scope. `ISUP118-14`'s
 uniquely mapped synthetic taxid `-2704` must not be conflated with the separate
 `-557`/`-561` namespace collisions.
 

@@ -1,0 +1,17 @@
+field	artifact	value
+schema		chain_a_local_cluster_adjudication_v1
+tool	blastn	blastn: 2.15.0+
+parameter	scope	local_all_vs_all_only
+parameter	task	blastn
+parameter	dust	no
+parameter	evalue	1e-20
+parameter	word_size	11
+parameter	max_hsps	1
+parameter	min_cross_family_pident	95
+parameter	min_cross_family_shorter_sequence_coverage	80
+count	all_review_records	39
+count	confirmed_records	23
+count	unresolved_records	16
+sha256	conf/taxonomy_regression/chain_a_similarity_audit.tsv	e2455862521571ebc5d005f7fba3c8d04f957912d42562b41966ddb1b413c743
+sha256	db/COInr98_2024Jun_RioNegro_Brazil.fasta	d0a1ba27438f16843fdffcb4ed30e6e89369ed310f338ec73c1fa058dffe6741
+sha256	conf/taxonomy_regression/chain_a_lower_tier_adjudication.tsv	b7c9fd1bd176e30a1f193a23d7e747afb75a96f39bcae26268cb0d64c6c8dcaa

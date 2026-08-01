@@ -132,6 +132,52 @@ of full bacterial-control support and strong same-species mitochondrial
 discordance establishes contaminated reference sequence while allowing the
 host specimen metadata itself to remain valid.
 
+### Local-only lower-tier adjudication
+
+`chain_a_lower_tier_adjudication.tsv` evaluates all 39 review-tier records
+without sending sequence data to an external service. The generic offline tool
+`bin/adjudicate_taxonomy_reference_clusters.py` extracts the checksummed
+candidate sequences and runs a local all-versus-all BLAST. It contains no
+record, organism, sample, or database-specific dispositions.
+
+The conservative confirmation rule requires both:
+
+1. the existing discovery alignment to an independently identified bacterial
+   coxA control at at least 85% identity and 80% shorter-sequence coverage; and
+2. a direct local candidate-to-candidate alignment at at least 95% identity and
+   80% shorter-sequence coverage where the two records carry different,
+   non-empty host-family assignments.
+
+The second condition detects sequence clusters that cannot credibly represent
+the different host-family COI assignments simultaneously. It establishes a
+bacterial-like reference/metadata inconsistency suitable for quarantine; it
+does not identify the exact bacterium or challenge the physical specimen IDs.
+Records lacking that direct cross-family discriminator remain unresolved even
+when their bacterial-control similarity is suggestive.
+
+On the shipped snapshot, 23 records satisfy both conditions and 16 remain
+`unresolved_insufficient_local_discriminator`. The confirmed set forms four
+components of sizes 16, 3, 2, and 2. Examples include an Isopoda/Collembola pair
+at 99.380%, a Coleoptera/Hymenoptera link at 97.833%, and identical sequences
+stored under Chalcididae and Halictidae host assignments. The unresolved 16
+must not be automatically removed or relabelled.
+
+Regenerate the local adjudication and provenance with:
+
+```bash
+python3 bin/adjudicate_taxonomy_reference_clusters.py \
+  --audit conf/taxonomy_regression/chain_a_similarity_audit.tsv \
+  --reference-source-fasta db/COInr98_2024Jun_RioNegro_Brazil.fasta \
+  --output conf/taxonomy_regression/chain_a_lower_tier_adjudication.tsv \
+  --provenance-output \
+    conf/taxonomy_regression/chain_a_lower_tier_adjudication_provenance.tsv
+```
+
+The artifact records that its scope is `local_all_vs_all_only`. Resolving the
+remaining 16 requires independently sourced sequence evidence or explicit
+authorization for an external search; absence of that evidence is preserved as
+uncertainty, not converted into a biological conclusion.
+
 Regenerate the discovery table and its checksummed provenance with:
 
 ```bash
