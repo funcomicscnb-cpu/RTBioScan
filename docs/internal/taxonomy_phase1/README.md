@@ -1,8 +1,8 @@
 # Taxonomy remediation Phase 1
 
-Captured: 2026-07-24  
-Repository commit: `258b8f8259578bc4d52dfc66a12645d5302e243e`  
-Branch: `fix/report-frozen-otu-sample-reads`  
+Captured: 2026-07-24\
+Repository commit: `258b8f8259578bc4d52dfc66a12645d5302e243e`\
+Branch: `fix/report-frozen-otu-sample-reads`\
 Worktree: dirty before this audit; pre-existing changes were not modified.
 
 ## Scope
