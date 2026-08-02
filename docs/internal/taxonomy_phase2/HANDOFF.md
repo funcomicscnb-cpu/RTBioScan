@@ -12,12 +12,13 @@ Branch: `agent/taxonomy-chain-a-adjudication`. Main branch: `main`.
 ## 0. TL;DR — what to do next
 
 The compatibility backlog and the downstream-COI discovery, adjudication,
-disposition, and source-integrity audit stages are committed and validated. The
-next correctness-only stage is deliberately policy-only:
+disposition, source-integrity audit, and base/repair policy stages are committed
+and validated. The next correctness-only stage is deliberately construction-
+only:
 
-> Freeze the downstream-COI base/repair policy described in §7. The
-> behavior-preserving candidate is the effective legacy BLAST OID stream; do
-> not slice the malformed raw FASTA or construct a canonical FASTA yet.
+> Construct the downstream-COI canonical FASTA from the selected legacy OID
+> stream as described in §7. Apply exactly the frozen dispositions by full
+> record identity, but do not build or activate a BLAST index in the same stage.
 
 Representative decision-neutral FAST shadow measurement remains required
 before any FAST/LAST source, routing, performance, or accuracy change. It does
@@ -393,6 +394,21 @@ therefore 1,494 records, including both duplicate `WPB428` records and the empty
 audit authorizes no source repair or release action. All 44 disposition targets occur before the defect
 and remain valid.
 
+The policy-only base/repair stage is complete. The selected behavior-preserving corpus base is every
+record in the effective legacy BLAST OID stream, in ascending legacy-OID order: 791,433 records,
+485,462,968 bases, canonical SHA-256 `cf474aa6...`. OIDs are legacy identity/order coordinates only;
+they are not serialized and are not promised stable after deletion. The raw FASTA is validation
+evidence, not a source to slice. All 1,494 analysis-logical tail records remain outside the selected
+base, including the embedded candidate and both duplicate/empty-record findings. This is deferral, not
+quarantine, repair, or a biological-quality conclusion.
+
+The future canonical filter matches each disposition by reference ID, stored taxid, and sequence
+SHA-256. It must exclude all 29 quarantine records individually, retain all 15 unresolved records,
+retain every nonlisted base record, perform no implicit deduplication, and preserve retained relative
+legacy-OID order. The projected record count is 791,404. Projected bases/checksum, a new OID map, the
+canonical FASTA, rebuilt index, corrected benchmark, runtime activation, and new state identity remain
+unproduced.
+
 1. Preserve `legacy_expected.tsv` and the shipped production FASTA/index byte-for-byte as the legacy
    release.
 2. Regenerate both discovery and adjudication artifacts byte-for-byte. If the database, source FASTAs,
@@ -402,21 +418,21 @@ and remain valid.
 4. **Completed:** freeze the generic, read-only source/index audit and its four anomaly rows. Treat the
    prior 792,926/792,925 disposition counts as permissive line-start-parser observations, not a source-
    integrity proof.
-5. Before constructing a canonical FASTA, declare the base and repair policy. The behavior-preserving
-   candidate is the effective legacy BLAST OID stream, not a raw first-791,433-record FASTA slice. An
-   expanded-source policy must separately decide the embedded record candidate, the other 1,493 line-
-   start tail records, the duplicate `WPB428` ID, and its empty copy.
-6. From that explicitly declared base snapshot, build a new canonical downstream COI FASTA that removes
-   the 29 policy-quarantine IDs and retains the 15 unresolved IDs unchanged. Preserve record order and
-   sequence/title content under a declared serialization; publish the source decision, counts, and
-   checksums.
+5. **Completed:** select the effective legacy BLAST OID stream as the corpus base; forbid raw-FASTA
+   slicing, defer all unindexed/anomalous tail material, and require no repair or implicit deduplication.
+6. From that explicitly declared base, build a new canonical downstream COI FASTA that removes the 29
+   policy-quarantine records by `(reference_id, stored_taxid, sequence_sha256)` and retains the 15
+   unresolved records unchanged. Preserve every nonlisted record and retained relative legacy-OID
+   order. Publish the output count/base count/checksum, the excluded legacy OIDs, and the deterministic
+   old-to-new ordinal rule under a new basename.
 7. Build a new downstream BLAST index from that canonical FASTA and publish checksummed manifests plus
    a new reference/state identity. Do not touch the FAST/LAST source or index.
 8. Add a separately versioned corrected benchmark expectation and compare it with the immutable legacy
    expectation across every report surface before considering release promotion.
 
-Exit criteria for the next stage are a reviewed base/repair policy. Canonical FASTA construction, index
-construction, state identity, and corrected expectations are subsequent stages. FAST/LAST cleanup,
+Exit criteria for the next stage are a byte-reproducible canonical FASTA, exact projected-versus-
+observed counts, a frozen checksum, and a reproducible ordinal-remapping rule. Index construction, state
+identity, runtime activation, and corrected expectations are subsequent stages. FAST/LAST cleanup,
 routing thresholds, representative incidence, throughput, and accuracy calibration remain separate
 deferred work.
 

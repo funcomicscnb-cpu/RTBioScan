@@ -311,10 +311,56 @@ python3 bin/audit_taxonomy_reference_source_integrity.py \
     conf/taxonomy_regression/chain_a_downstream_coi_source_integrity_v1_provenance.tsv
 ```
 
-The next source policy must choose between the effective legacy BLAST corpus and
-an explicitly repaired/expanded source. A raw first-791,433-record FASTA slice
-is not valid. Tail admission and duplicate resolution remain separate decisions
-and must not be folded silently into Chain-A quarantine.
+### Downstream COI base/repair policy
+
+`chain_a_downstream_coi_base_repair_policy_v1.tsv` selects the effective legacy
+BLAST OID stream as the behavior-preserving **corpus base**. It does not claim
+that a future rebuilt database will preserve OIDs, tie behavior, or search
+results. The selected base has 791,433 records, 485,462,968 bases, and canonical
+stream SHA-256 `cf474aa6...`. Legacy OIDs define membership and order only; they
+are not serialized, and only the retained records' relative legacy-OID order is
+preserved after later exclusions.
+
+The future serialization is declared as one UTF-8/LF record per two lines:
+complete exported title followed by the uppercase exported index sequence. A
+raw FASTA slice is forbidden. The 1,494-record/2,274,489-base analysis-logical
+tail, including the embedded candidate and both duplicate/empty-record findings,
+is outside the selected base and remains deferred. The boundary mismatch uses
+the current indexed representation for this base. None of those decisions
+repairs the shipped source, admits the tail, or assigns biological quality.
+
+The existing dispositions will be matched by `(reference_id, stored_taxid,
+sequence_sha256)`, not ID or sequence alone. The policy fixes those components
+as the first title token before its first pipe, the signed Kraken taxid token,
+and SHA-256 of the uppercase ASCII sequence. A later canonical builder must
+exclude the 29 quarantine records individually, retain the 15 unresolved
+records without certifying them clean, retain all 791,389 nonlisted base
+records, perform no implicit deduplication, and preserve relative legacy-OID
+order. This projects 791,404 records; projected bases and the stream checksum
+remain uncomputed until that stream is actually constructed.
+
+Validate the policy and all upstream bindings without a database or BLAST tool:
+
+```bash
+python3 bin/validate_taxonomy_reference_base_policy.py \
+  --policy \
+    conf/taxonomy_regression/chain_a_downstream_coi_base_repair_policy_v1.tsv \
+  --source-integrity-anomalies \
+    conf/taxonomy_regression/chain_a_downstream_coi_source_integrity_v1.tsv \
+  --source-integrity-provenance \
+    conf/taxonomy_regression/chain_a_downstream_coi_source_integrity_v1_provenance.tsv \
+  --disposition-manifest \
+    conf/taxonomy_regression/chain_a_downstream_coi_disposition_v1.tsv \
+  --disposition-provenance \
+    conf/taxonomy_regression/chain_a_downstream_coi_disposition_v1_provenance.tsv \
+  --reference-manifest \
+    conf/state_compatibility/reference_manifest_legacy_v1.tsv
+```
+
+This is policy only: no canonical FASTA, rebuilt index, corrected benchmark,
+runtime activation, or new state identity exists yet. The next isolated stage
+is construction and byte-validation of the canonical FASTA; index construction
+and runtime qualification remain subsequent stages.
 
 Regenerate the discovery table and its checksummed provenance with:
 
