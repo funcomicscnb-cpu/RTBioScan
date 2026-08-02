@@ -7,6 +7,25 @@
 // parseBool(), parseBoolStrict() → bottom of this file (hoisted methods)
 // ChannelUtils (strictRoundJoin family) → lib/ChannelUtils.groovy (auto-loaded by Nextflow)
 
+// Reject execution backends that are deliberately retained only as explanatory
+// profile stubs before any input, demultiplexing, or rolling-state work begins.
+def activeProfiles = (workflow.profile ?: '').tokenize(',')*.trim().findAll { it }
+def usingDockerProfile = activeProfiles.contains('docker')
+def usingCondaProfile = activeProfiles.contains('conda')
+def unsupportedContainerProfiles = activeProfiles.findAll { it in ['docker', 'singularity'] }
+if (unsupportedContainerProfiles) {
+    exit 1, """Unsupported RTBioScan execution profile: ${unsupportedContainerProfiles.join(', ')}.
+The inherited hecrp/nanortax container belonged to a different pipeline and has been removed.
+Use a provisioned host runtime for now. Do not resume state created with docker/singularity;
+start with a new --state_id (or reset the rolling state)."""
+}
+if (usingCondaProfile) {
+    exit 1, """The RTBioScan conda profile is not enabled yet.
+Install the platform lock with conda-lock, activate that environment, run
+bin/validate_runtime.sh, and launch RTBioScan without -profile conda.
+Direct Nextflow Conda resolution would bypass the committed lockfile."""
+}
+
 // Compute demultiplexing enablement once and reuse it everywhere.
 // This avoids mismatches where params.demultiplex_mode aliases normalize to the same effective mode.
 def replicateModeCanonical = getReplicateModeCanonical()
@@ -54,10 +73,6 @@ if (!(runModeRaw in ['batch', 'realtime'])) {
 }
 def runMode = runModeRaw
 params.run_mode = runMode
-def activeProfiles = (workflow.profile ?: '').tokenize(',')*.trim().findAll { it }
-def usingDockerProfile = activeProfiles.contains('docker')
-def usingCondaProfile = activeProfiles.contains('conda')
-
 def readsProvided = params.reads?.toString()?.trim()
 def deriveGlobRoot = { pattern ->
     try {
@@ -364,6 +379,18 @@ def shellQuote = { Object value ->
     def s = value == null ? '' : value.toString()
     return "'${s.replace("'", "'\"'\"'")}'"
 }
+def doradoInputMode = params.dorado_input_mode?.toString()?.trim()?.toLowerCase() ?: 'file'
+if (!(doradoInputMode in ['file', 'directory'])) {
+    exit 1, "Invalid --dorado_input_mode '${params.dorado_input_mode}'. Allowed values: file, directory"
+}
+def _doradoSummaryBinRaw = params.dorado_summary_bin?.toString()?.trim()
+def doradoSummaryBin = _doradoSummaryBinRaw
+    ? (_doradoSummaryBinRaw.startsWith('/') ? _doradoSummaryBinRaw : "${baseDir}/${_doradoSummaryBinRaw}")
+    : doradoBin
+def doradoInputCompatHelper = "${baseDir}/bin/dorado_basecaller_input_compat.sh"
+def doradoBasecallerLauncher = doradoInputMode == 'directory'
+    ? "${shellQuote(doradoInputCompatHelper)} directory ${shellQuote(doradoBin)}"
+    : doradoBin
 def resolveModelPath = { String p ->
     if (!p) return null
     p.startsWith('/') ? p : "${baseDir}/${p}"
@@ -391,6 +418,12 @@ def validateDoradoModel = { String paramName, String resolvedPath ->
 }
 if (!file(doradoBin).exists()) {
     exit 1, "Missing Dorado binary: ${doradoBin}"
+}
+if (!file(doradoSummaryBin).exists()) {
+    exit 1, "Missing Dorado summary binary: ${doradoSummaryBin}"
+}
+if (doradoInputMode == 'directory' && !file(doradoInputCompatHelper).exists()) {
+    exit 1, "Missing Dorado input compatibility helper: ${doradoInputCompatHelper}"
 }
 validateDoradoModel('fast_model', doradoFastModel)
 validateDoradoModel('hac_model', doradoHacModel)
@@ -507,6 +540,16 @@ def validateOptionalFile = { String paramName, String rawPath ->
         exit 1, "Configured file for --${paramName} was not found: ${resolved}"
     }
 }
+def validateRequiredFile = { String paramName, String rawPath ->
+    if (!rawPath || rawPath == 'null') {
+        exit 1, "Missing required parameter --${paramName}"
+    }
+    def resolved = resolveConfigPath(rawPath)
+    def f = new File(resolved)
+    if (!f.exists() || !f.isFile()) {
+        exit 1, "Required file for --${paramName} was not found: ${resolved}"
+    }
+}
 def validateOptionalFileOrDisable = { String paramName, String rawPath ->
     if (!rawPath || rawPath == 'null') return
     def resolved = resolveConfigPath(rawPath)
@@ -519,6 +562,48 @@ def validateOptionalFileOrDisable = { String paramName, String rawPath ->
 validateDbPrefix('blast_filter_db', params.blast_filter_db?.toString())
 validateRequiredDir('blast_taxdb', params.blast_taxdb?.toString())
 validateOptionalFile('nonncbi_id2lineage_target', params.nonncbi_id2lineage_target?.toString())
+validateRequiredFile('state_reference_manifest', params.state_reference_manifest?.toString())
+validateRequiredFile('state_taxonomy_release_manifest', params.state_taxonomy_release_manifest?.toString())
+validateRequiredFile('state_toolchain_policy_manifest', params.state_toolchain_policy_manifest?.toString())
+validateRequiredDir('state_taxonomy_data_dir', params.state_taxonomy_data_dir?.toString())
+def stateTaxonomyDataDirResolved = resolveConfigPath(params.state_taxonomy_data_dir.toString())
+def stateTaxonomyReleaseManifestResolved = resolveConfigPath(params.state_taxonomy_release_manifest.toString())
+def stateToolchainPolicyManifestResolved = resolveConfigPath(params.state_toolchain_policy_manifest.toString())
+def stateDoradoReleaseManifestRaw = params.state_dorado_release_manifest?.toString()?.trim()
+def stateDoradoReleaseManifestResolved = ''
+if (stateDoradoReleaseManifestRaw) {
+    validateRequiredFile('state_dorado_release_manifest', stateDoradoReleaseManifestRaw)
+    stateDoradoReleaseManifestResolved = resolveConfigPath(stateDoradoReleaseManifestRaw)
+}
+def stateCompatibilityPolicy = params.state_compatibility_policy?.toString()?.trim()?.toLowerCase()
+if (!(stateCompatibilityPolicy in ['strict', 'adopt_legacy'])) {
+    exit 1, "Invalid --state_compatibility_policy '${params.state_compatibility_policy}'. Allowed values: strict, adopt_legacy"
+}
+def stateReferenceVerification = params.state_reference_verification?.toString()?.trim()?.toLowerCase()
+if (!(stateReferenceVerification in ['cached', 'full'])) {
+    exit 1, "Invalid --state_reference_verification '${params.state_reference_verification}'. Allowed values: cached, full"
+}
+def stateContractMigration = params.state_contract_migration?.toString()?.trim()?.toLowerCase()
+if (!(stateContractMigration in ['strict', 'attest_v1'])) {
+    exit 1, "Invalid --state_contract_migration '${params.state_contract_migration}'. Allowed values: strict, attest_v1"
+}
+def stateVerificationCacheRaw = params.state_verification_cache_dir?.toString()?.trim()
+def stateVerificationCacheDir
+if (stateVerificationCacheRaw) {
+    stateVerificationCacheDir = stateVerificationCacheRaw.startsWith('/')
+        ? stateVerificationCacheRaw
+        : "${workflow.launchDir}/${stateVerificationCacheRaw}"
+} else {
+    stateVerificationCacheDir = "${params.outdir}/temp/_compatibility_cache"
+}
+for (def versionParam : ['state_classifier_policy_version', 'state_scoring_policy_version']) {
+    if (!params."${versionParam}"?.toString()?.trim()) {
+        exit 1, "Missing required parameter --${versionParam}"
+    }
+}
+if (!params.nonncbi_id2lineage_target?.toString()?.trim()) {
+    log.warn "No --nonncbi_id2lineage_target is configured; OTU lineage annotation is disabled by the current classifier implementation"
+}
 
 // --- PREAMBLE §4: Startup operations (restart/restore handler) ---
 // Apply rolling-state restart semantics at script evaluation time (i.e. always runs, even with `-resume`).
@@ -575,9 +660,154 @@ if (!effectiveRestartMode || effectiveRestartMode == 'null') {
     }
 }
 
+// Bind rolling state to the exact reference, taxonomy, and classification contract.
+// This runs after restore/reset so a restored snapshot is checked before any process can consume it.
+def stateRuntimeBackend = System.getenv('CONDA_PREFIX')?.toString()?.trim() ? 'conda' : 'host'
+def stateRuntimeLockManifestResolved = ''
+def stateRuntimeLockManifestRaw = params.state_runtime_lock_manifest?.toString()?.trim()
+if (stateRuntimeBackend == 'conda') {
+    if (!stateRuntimeLockManifestRaw || stateRuntimeLockManifestRaw == 'auto') {
+        def osName = System.getProperty('os.name')?.toLowerCase() ?: ''
+        def lockName
+        if (osName.contains('mac') || osName.contains('darwin')) {
+            lockName = 'conda-lock-osx-64.yml'
+        } else if (osName.contains('linux')) {
+            lockName = 'conda-lock-linux-64.yml'
+        } else {
+            exit 1, "No committed RTBioScan runtime lock is available for operating system '${System.getProperty('os.name')}'"
+        }
+        stateRuntimeLockManifestResolved = "${baseDir}/${lockName}"
+    } else {
+        validateRequiredFile('state_runtime_lock_manifest', stateRuntimeLockManifestRaw)
+        stateRuntimeLockManifestResolved = resolveConfigPath(stateRuntimeLockManifestRaw)
+    }
+} else if (stateRuntimeLockManifestRaw && stateRuntimeLockManifestRaw != 'auto') {
+    exit 1, "--state_runtime_lock_manifest is only valid while an activated Conda environment supplies the runtime"
+}
+
+def stateToolchainFingerprintFile = File.createTempFile('rtbioscan-toolchain-', '.tsv')
+stateToolchainFingerprintFile.deleteOnExit()
+def stateToolchainArgs = [
+    '/usr/bin/env',
+    'perl',
+    "${baseDir}/bin/runtime_toolchain_fingerprint.pl",
+    '--policy-manifest', stateToolchainPolicyManifestResolved,
+    '--runtime-backend', stateRuntimeBackend,
+    '--dorado-bin', doradoBin,
+    '--dorado-summary-bin', doradoSummaryBin,
+    '--dorado-input-mode', doradoInputMode,
+    '--dorado-model', "fast=${doradoFastModel}",
+    '--dorado-model', "hac=${doradoHacModel}",
+    '--dorado-model', "sup=${doradoSupModel}",
+    '--dorado-device', params.dorado_device.toString(),
+    '--dorado-args', "fast=${doradoFastBasecallerArgs}",
+    '--dorado-args', "hac=${doradoHacBasecallerArgs}",
+    '--dorado-args', "sup=${doradoSupBasecallerArgs}",
+    '--output', stateToolchainFingerprintFile.toString()
+]
+if (stateRuntimeLockManifestResolved) {
+    stateToolchainArgs.addAll(['--runtime-lock-manifest', stateRuntimeLockManifestResolved])
+}
+if (stateDoradoReleaseManifestResolved) {
+    stateToolchainArgs.addAll(['--dorado-release-manifest', stateDoradoReleaseManifestResolved])
+}
+if (doradoInputMode == 'directory') {
+    stateToolchainArgs.addAll(['--dorado-input-compat-helper', doradoInputCompatHelper])
+}
+def stateToolchainProc = new ProcessBuilder(stateToolchainArgs.collect { it.toString() }).start()
+def stateToolchainOut = new StringBuffer()
+def stateToolchainErr = new StringBuffer()
+def stateToolchainStdout = Thread.start {
+    stateToolchainProc.inputStream.withReader('UTF-8') { r ->
+        r.eachLine { line -> stateToolchainOut.append(line).append('\n') }
+    }
+}
+def stateToolchainStderr = Thread.start {
+    stateToolchainProc.errorStream.withReader('UTF-8') { r ->
+        r.eachLine { line -> stateToolchainErr.append(line).append('\n') }
+    }
+}
+def stateToolchainExit = stateToolchainProc.waitFor()
+stateToolchainStdout.join()
+stateToolchainStderr.join()
+if (stateToolchainExit != 0) {
+    stateToolchainFingerprintFile.delete()
+    log.error "Runtime toolchain validation failed.\nSTDOUT:\n${stateToolchainOut}\nSTDERR:\n${stateToolchainErr}"
+    throw new RuntimeException("Runtime toolchain validation failed")
+}
+if (stateToolchainErr.toString().trim()) {
+    log.warn stateToolchainErr.toString().trim()
+}
+def stateToolchainFingerprintId = stateToolchainOut.toString().trim()
+if (!(stateToolchainFingerprintId ==~ /[0-9a-f]{64}/)) {
+    stateToolchainFingerprintFile.delete()
+    throw new RuntimeException("Runtime toolchain validator returned an invalid fingerprint ID: '${stateToolchainFingerprintId}'")
+}
+
+def stateCompatibilityArgs = [
+    '/usr/bin/env',
+    'perl',
+    "${baseDir}/bin/state_compatibility_contract.pl",
+    '--state-dir', "${ongoingStateDir}/_state",
+    '--reference-manifest', resolveConfigPath(params.state_reference_manifest.toString()),
+    '--reference-root', baseDir.toString(),
+    '--taxonomy-data-dir', stateTaxonomyDataDirResolved,
+    '--taxonomy-release-manifest', stateTaxonomyReleaseManifestResolved,
+    '--classifier-policy-version', params.state_classifier_policy_version.toString(),
+    '--scoring-policy-version', params.state_scoring_policy_version.toString(),
+    '--targets', params.targets.toString(),
+    '--target-taxa', params.target_taxa.toString(),
+    '--blast-filter-db', params.blast_filter_db.toString(),
+    '--blast-db-specs', params.blast_db_specs.toString(),
+    '--blast-taxdb', params.blast_taxdb.toString(),
+    '--nonncbi-memtax', params.nonncbi_memtax?.toString() ?: '',
+    '--nonncbi-id2lineage', params.nonncbi_id2lineage_target?.toString() ?: '',
+    '--profile', workflow.profile?.toString() ?: '',
+    '--policy', stateCompatibilityPolicy,
+    '--lock-wait', (params.lock_wait_seconds ?: 300).toString(),
+    '--verification-cache-dir', stateVerificationCacheDir,
+    '--verification-mode', stateReferenceVerification,
+    '--toolchain-fingerprint', stateToolchainFingerprintFile.toString(),
+    '--contract-migration', stateContractMigration
+]
+def stateCompatibilityProc = new ProcessBuilder(stateCompatibilityArgs.collect { it.toString() }).start()
+def stateCompatibilityOut = new StringBuffer()
+def stateCompatibilityErr = new StringBuffer()
+def stateCompatibilityStdout = Thread.start {
+    stateCompatibilityProc.inputStream.withReader('UTF-8') { r ->
+        r.eachLine { line -> stateCompatibilityOut.append(line).append('\n') }
+    }
+}
+def stateCompatibilityStderr = Thread.start {
+    stateCompatibilityProc.errorStream.withReader('UTF-8') { r ->
+        r.eachLine { line -> stateCompatibilityErr.append(line).append('\n') }
+    }
+}
+def stateCompatibilityExit = stateCompatibilityProc.waitFor()
+stateCompatibilityStdout.join()
+stateCompatibilityStderr.join()
+stateToolchainFingerprintFile.delete()
+if (stateCompatibilityExit != 0) {
+    log.error "State compatibility validation failed.\nSTDOUT:\n${stateCompatibilityOut}\nSTDERR:\n${stateCompatibilityErr}"
+    throw new RuntimeException("State compatibility validation failed")
+}
+if (stateCompatibilityErr.toString().trim()) {
+    log.warn stateCompatibilityErr.toString().trim()
+}
+def stateCompatibilityContractId = stateCompatibilityOut.toString().trim()
+if (!(stateCompatibilityContractId ==~ /[0-9a-f]{64}/)) {
+    throw new RuntimeException("State compatibility validator returned an invalid contract ID: '${stateCompatibilityContractId}'")
+}
+summary['State Contract'] = stateCompatibilityContractId
+
 // --- PREAMBLE §5: Final computed values and channel bootstrap ---
-// Used to invalidate Nextflow caching on explicit restore/reset runs. Interpolated into process scripts below.
-def restartTokenForCache = (effectiveRestartMode in ['restore','reset']) ? "${effectiveRestartMode}:${custom_runName ?: workflow.runName}" : ''
+// Invalidate cached process scripts on restore/reset or compatibility-contract changes.
+def restartTokenParts = ["compat:${stateCompatibilityContractId}"]
+if (effectiveRestartMode in ['restore', 'reset']) {
+    restartTokenParts << "${effectiveRestartMode}:${custom_runName ?: workflow.runName}"
+}
+def restartTokenForCache = restartTokenParts.join('|')
+def fastFilterShadowEnabled = parseBoolStrict(params.fast_filter_shadow, false, 'fast_filter_shadow')
 
 // formatOtuIdentity() → bottom of this file (hoisted method)
 
@@ -772,6 +1002,12 @@ process fast_on_target_detection {
 	: > \$barcode\\_fast.fasta
 	: > \$barcode\\_qced_reads_kingdom.txt
 	: > \$barcode\\_reads_target.list
+	# FAST shadow state cleanup start
+	SHADOW_STATE_DETAIL="${ongoingStateDir}/\$round_barcode/\$barcode\\_fast_filter_shadow.tsv"
+	SHADOW_STATE_SUMMARY="${ongoingStateDir}/\$round_barcode/\$barcode\\_fast_filter_shadow_summary.tsv"
+	rm -f "\$SHADOW_STATE_DETAIL" "\$SHADOW_STATE_SUMMARY"
+	rm -f \$barcode\\_fast_filter_shadow.tsv \$barcode\\_fast_filter_shadow_summary.tsv
+	# FAST shadow state cleanup end
 		
  	wait_seconds=${params.file_wait_minutes * 60}
     elapsed=0
@@ -792,7 +1028,7 @@ process fast_on_target_detection {
 						fi
 		                    if dorado_basecall_retry "FAST basecalling" "\${barcode}_fast.sam" \
 						${baseDir}/bin/with_dorado_lock.sh "\$DORADO_LOCK" "\$DORADO_LOCK_WAIT" "fast_on_target_detection:\$round_barcode" -- \
-						${doradoBin} basecaller -x ${params.dorado_device} \
+						${doradoBasecallerLauncher} basecaller -x ${params.dorado_device} \
 						${doradoFastBasecallerArgs} \
 						--min-qscore ${params.on_target_quality_score} \
 						${doradoFastModel} ${read_file};
@@ -844,8 +1080,53 @@ process fast_on_target_detection {
 	then
 		echo "Warning: No reads passed QC filtering, please check the quality of your run or modify the min/max read length and quality score thresholds" 1>&2
 		: > \$barcode\\_qced_reads_kingdom.txt
+		if [ "${fastFilterShadowEnabled ? 1 : 0}" -eq 1 ]; then
+			if ! python3 ${baseDir}/bin/fast_filter_shadow.py \
+				--empty \
+				--fasta \$barcode\\_fast.fasta \
+				--legacy-out \$barcode\\_qced_reads_kingdom.txt \
+				--shadow-out \$barcode\\_fast_filter_shadow.tsv \
+				--summary-out \$barcode\\_fast_filter_shadow_summary.tsv \
+				--targets "${params.targets}" \
+				--target-taxa "${params.target_taxa}" \
+				--round-barcode "\$round_barcode";
+			then
+				echo "WARN: FAST shadow instrumentation failed for an empty FASTA; legacy empty result is unchanged" 1>&2
+				rm -f \$barcode\\_fast_filter_shadow.tsv \$barcode\\_fast_filter_shadow_summary.tsv
+			fi
+		fi
 	else
-				if lastal ${baseDir}/${params.blast_filter_db} \$barcode\\_fast.fasta -f BlastTab -P "\$THREADS" | grep -v "^#" | awk '!seen[\$1]++' > \$barcode\\_qced_reads_kingdom.txt;
+			if [ "${fastFilterShadowEnabled ? 1 : 0}" -eq 1 ]; then
+				set +e
+				lastal ${baseDir}/${params.blast_filter_db} \$barcode\\_fast.fasta -f BlastTab -P "\$THREADS" | \
+					python3 ${baseDir}/bin/fast_filter_shadow.py \
+						--fasta \$barcode\\_fast.fasta \
+						--legacy-out \$barcode\\_qced_reads_kingdom.txt \
+						--shadow-out \$barcode\\_fast_filter_shadow.tsv \
+						--summary-out \$barcode\\_fast_filter_shadow_summary.tsv \
+						--targets "${params.targets}" \
+						--target-taxa "${params.target_taxa}" \
+						--round-barcode "\$round_barcode"
+				_shadow_pipe_status=( "\${PIPESTATUS[@]}" )
+				set -e
+				_shadow_last_status="\${_shadow_pipe_status[0]:-1}"
+				_shadow_helper_status="\${_shadow_pipe_status[1]:-1}"
+				if [ "\$_shadow_last_status" -eq 0 ] && [ "\$_shadow_helper_status" -eq 0 ]; then
+					echo "\$barcode\\_qced_reads_kingdom.txt and FAST shadow diagnostics created" 1>&2
+				elif [ "\$_shadow_last_status" -eq 0 ] && [ "\$_shadow_helper_status" -eq 2 ] && [ -f \$barcode\\_qced_reads_kingdom.txt ]; then
+					echo "WARN: FAST shadow diagnostics rejected malformed evidence; preserving first hits from the original LAST stream" 1>&2
+					rm -f \$barcode\\_fast_filter_shadow.tsv \$barcode\\_fast_filter_shadow_summary.tsv
+				else
+					echo "WARN: FAST shadow instrumentation failed; rerunning the unchanged legacy router" 1>&2
+					rm -f \$barcode\\_fast_filter_shadow.tsv \$barcode\\_fast_filter_shadow_summary.tsv
+					if lastal ${baseDir}/${params.blast_filter_db} \$barcode\\_fast.fasta -f BlastTab -P "\$THREADS" | grep -v "^#" | awk '!seen[\$1]++' > \$barcode\\_qced_reads_kingdom.txt; then
+						echo "\$barcode\\_qced_reads_kingdom.txt recovered with the legacy router" 1>&2
+					else
+						echo "WARN: legacy FAST router also failed; continuing with empty placeholders" 1>&2
+						: > \$barcode\\_qced_reads_kingdom.txt
+					fi
+				fi
+			elif lastal ${baseDir}/${params.blast_filter_db} \$barcode\\_fast.fasta -f BlastTab -P "\$THREADS" | grep -v "^#" | awk '!seen[\$1]++' > \$barcode\\_qced_reads_kingdom.txt;
 				then
 					echo "\$barcode\\_qced_reads_kingdom.txt created" 1>&2
 				else
@@ -881,6 +1162,25 @@ process fast_on_target_detection {
 			printf "No target reads for %s\n" "\$round_barcode" > ${ongoingStateDir}/\$round_barcode/ROUND_FAILED.txt
 			: > \$barcode\\_reads_target.list
 		fi
+		# FAST shadow state publish start
+		if [ "${fastFilterShadowEnabled ? 1 : 0}" -eq 1 ] && \
+			[ -f \$barcode\\_fast_filter_shadow.tsv ] && \
+			[ -f \$barcode\\_fast_filter_shadow_summary.tsv ]; then
+			_shadow_detail_tmp="\${SHADOW_STATE_DETAIL}.tmp.\$\$"
+			_shadow_summary_tmp="\${SHADOW_STATE_SUMMARY}.tmp.\$\$"
+			rm -f "\$_shadow_detail_tmp" "\$_shadow_summary_tmp"
+			if cp -f \$barcode\\_fast_filter_shadow.tsv "\$_shadow_detail_tmp" && \
+				cp -f \$barcode\\_fast_filter_shadow_summary.tsv "\$_shadow_summary_tmp" && \
+				mv -f "\$_shadow_detail_tmp" "\$SHADOW_STATE_DETAIL" && \
+				mv -f "\$_shadow_summary_tmp" "\$SHADOW_STATE_SUMMARY"; then
+				:
+			else
+				echo "WARN: FAST shadow diagnostics could not be published; removing partial state" 1>&2
+				rm -f "\$SHADOW_STATE_DETAIL" "\$SHADOW_STATE_SUMMARY" \
+					"\$_shadow_detail_tmp" "\$_shadow_summary_tmp"
+			fi
+		fi
+		# FAST shadow state publish end
 
 			# In full_round mode keep lock ownership until backup_update_and_clean.
 			# In dorado_only mode this handoff/release already happened after FAST basecalling.
@@ -972,7 +1272,7 @@ process _reporting_fast_on_target {
 	# dorado summary can abort if the SAM is empty/invalid (e.g. no reads in this POD5).
 	# In that case we still create a header-only TSV so downstream reporting doesn't fail.
 	if [ -s ${round_fast_sam} ] && grep -q '^@' ${round_fast_sam}; then
-		${doradoBin} summary ${round_fast_sam} > ${barcode}_round_fast.tsv || true
+		${doradoSummaryBin} summary ${round_fast_sam} > ${barcode}_round_fast.tsv || true
 	fi
 	if [ ! -s ${barcode}_round_fast.tsv ]; then
 		printf "%b" "\$DORADO_SUMMARY_HEADER" > ${barcode}_round_fast.tsv
@@ -1069,7 +1369,7 @@ process hac_basecalling {
 					fi
 						if dorado_basecall_retry "HAC basecalling" "${barcode}_hac.sam" \
 							${baseDir}/bin/with_dorado_lock.sh "\$DORADO_LOCK" "\$DORADO_LOCK_WAIT" "hac_basecalling:\$round_barcode" -- \
-							${doradoBin} basecaller -x ${params.dorado_device} \
+							${doradoBasecallerLauncher} basecaller -x ${params.dorado_device} \
 							${doradoHacBasecallerArgs} \
 							--min-qscore ${params.min_quality_score} -l ${barcode}_read_names_hq.list \
 							${doradoHacModel} ${read_file};
@@ -1156,7 +1456,7 @@ process _reporting_hac_basecalling {
 
 	# dorado summary may abort if SAM is empty/invalid; create a header-only TSV in that case.
 	if [ -s ${round_hac_sam} ] && grep -q '^@' ${round_hac_sam}; then
-		${doradoBin} summary ${round_hac_sam} > ${barcode}_round_hac.tsv || true
+		${doradoSummaryBin} summary ${round_hac_sam} > ${barcode}_round_hac.tsv || true
 	fi
 	if [ ! -s ${barcode}_round_hac.tsv ]; then
 		printf "%b" "\$DORADO_SUMMARY_HEADER" > ${barcode}_round_hac.tsv
@@ -2494,6 +2794,13 @@ process blast_OTU_pretax {
 	set -euo pipefail
 	shopt -s nullglob
 	export LC_ALL=C
+	export TAXONKIT_DB="${stateTaxonomyDataDirResolved}"
+	for _taxonomy_file in nodes.dmp names.dmp merged.dmp delnodes.dmp; do
+		if [ ! -r "\$TAXONKIT_DB/\$_taxonomy_file" ]; then
+			echo "ERROR: pinned TaxonKit taxonomy artifact is unavailable inside the execution environment: \$TAXONKIT_DB/\$_taxonomy_file" 1>&2
+			exit 1
+		fi
+	done
 	RESTART_TOKEN="${restartTokenForCache}"
 	THREADS=${task.cpus}
 	OTU_BLAST_MIN_MEMBERS="${otuBlastMinMembersStr}"
@@ -3189,7 +3496,7 @@ process blast_OTU_pretax {
 		    SUP_TASK_CPUS="${task.cpus}"
 		    SUP_FASTA_HQ_QCED="${fasta_hq_qced}"
 		    SUP_BASEDIR="${baseDir}"
-		    SUP_DORADO_BIN="${doradoBin}"
+		    SUP_DORADO_BIN="${doradoSummaryBin}"
 		    SUP_CACHE_LOCK="\${STATE_DIR}/.sup_basecall_cache.lock"
 		    SUP_CACHE_SCHEMA_VERSION="2"
 		    SUP_CACHE_RESTART_TOKEN="${restartTokenForCache ?: workflow.runName}"
@@ -3233,7 +3540,7 @@ process blast_OTU_pretax {
 							_t_dorado_sup_basecaller_start=\$(now_ms)
 							if dorado_basecall_retry "SUP basecalling" "${barcode}_blastreport_sup.sam" \
 							"\$BIN_DIR/with_dorado_lock.sh" "\$DORADO_LOCK" "\$DORADO_LOCK_WAIT" "blast_OTU_pretax:\$round_barcode:sup" -- \
-							${doradoBin} basecaller -x ${params.dorado_device} \
+							${doradoBasecallerLauncher} basecaller -x ${params.dorado_device} \
 							${doradoSupBasecallerArgs} \
 							--min-qscore ${params.hq_quality_score} -l ${barcode}_blastreport_hac_missing.list \
 							${doradoSupModel} ${read_file};
@@ -3921,12 +4228,19 @@ process consensus {
 		// Per-target DB paths are now computed in the bash loop from params.blast_db_specs
 		
 		taxdb_dir = taxdb_dir + params.blast_taxdb
-		// taxonkit DB path removed; TaxonKit will use its default DB (or external env config) if invoked.
+		// TAXONKIT_DB is exported inside the process script from the pinned compatibility release.
 
     """
 	set -euo pipefail
 	shopt -s nullglob
 	export LC_ALL=C
+	export TAXONKIT_DB="${stateTaxonomyDataDirResolved}"
+	for _taxonomy_file in nodes.dmp names.dmp merged.dmp delnodes.dmp; do
+		if [ ! -r "\$TAXONKIT_DB/\$_taxonomy_file" ]; then
+			echo "ERROR: pinned TaxonKit taxonomy artifact is unavailable inside the execution environment: \$TAXONKIT_DB/\$_taxonomy_file" 1>&2
+			exit 1
+		fi
+	done
 	RESTART_TOKEN="${restartTokenForCache}"
 	THREADS=${task.cpus}
 		export RTBIOSCAN_RSCRIPT="${consensusRscriptBin ?: 'Rscript'}"
@@ -4458,6 +4772,7 @@ process consensus {
 							printf '%s\n' "\$_TAXDB_SIG" > "\$TAXONKIT_CACHE_META" 2>/dev/null || true
 						fi
 							fi
+						# consensus provenance failfast start
 										if ! perl ${baseDir}/bin/emit_consensus_round_provenance.pl \
 							--consensus-dir Consensus \
 							--round-barcode "${round_barcode}" \
@@ -4465,6 +4780,7 @@ process consensus {
 							echo "ERROR: failed to emit consensus round provenance" 1>&2
 							exit 1
 						fi
+						# consensus provenance failfast end
 									# Generate recovery list now: OriginalReads are removed by the collect step when keep=1.
 					# -- §6: Consensus state update (assigned OTU keys, protected reads) --
 					RECOVERY_IDS="${round_barcode}_consensus_assigned_reads.list"
@@ -5404,10 +5720,18 @@ process getting_run_summary {
 		ROUND_DEMULT_SIDECAR_LOCAL="${barcode}_demult_rpt.contract.tsv"
 		ROUND_OTU_RPT_LOCAL="${barcode}_otu_def_rpt.txt"
 		ROUND_OTU_SIDECAR_LOCAL="${barcode}_otu_def_rpt.contract.tsv"
+		ROUND_READ_INFO_LOCAL="${barcode}_read_info_rpt.txt"
+		ROUND_ON_TARGET_LOCAL="${barcode}_on_target_rpt.txt"
+		ROUND_BLAST_OTU_LOCAL="${barcode}_blast_otu_pretax_rpt.txt"
+		ROUND_BLAST_CONSENSUS_LOCAL="${barcode}_blast_consensus_tax_rpt.txt"
 		ensure_local_round_alias "${demult_rpt}" "\$ROUND_DEMULT_RPT_LOCAL"
 		ensure_local_round_alias "${demult_rpt_sidecar}" "\$ROUND_DEMULT_SIDECAR_LOCAL"
 		ensure_local_round_alias "${otu_def_rpt}" "\$ROUND_OTU_RPT_LOCAL"
 		ensure_local_round_alias "${otu_def_rpt_sidecar}" "\$ROUND_OTU_SIDECAR_LOCAL"
+		ensure_local_round_alias "${read_info_rpt}" "\$ROUND_READ_INFO_LOCAL"
+		ensure_local_round_alias "${on_target_rpt}" "\$ROUND_ON_TARGET_LOCAL"
+		ensure_local_round_alias "${blast_otu_pretax_rpt}" "\$ROUND_BLAST_OTU_LOCAL"
+		ensure_local_round_alias "${blast_consensus_tax}" "\$ROUND_BLAST_CONSENSUS_LOCAL"
 			export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
 			perl ${baseDir}/bin/reporting_parser_state_preflight.pl \
 				${ongoingStateDir}/_state \
@@ -6360,7 +6684,8 @@ process backup_update_and_clean {
 			state_tables=( "\$STATE_TMP"/read_qscore_rolling.tsv "\$STATE_TMP"/otu_frozen_*.tsv \
 				"\$STATE_TMP"/otu_frozen_reps.fasta "\$STATE_TMP"/otu_frozen_reps.fasta.gz "\$STATE_TMP"/otu_active_pool.fasta \
 				"\$STATE_TMP"/otu_seen_hashes.tsv "\$STATE_TMP"/*consensus_consolidated_ids.txt "\$STATE_TMP"/otu_consolidated_keys.tsv \
-				"\$STATE_TMP"/*_seen_read_ids.tsv "\$STATE_TMP"/*_on_target_state.tsv )
+				"\$STATE_TMP"/*_seen_read_ids.tsv "\$STATE_TMP"/*_on_target_state.tsv \
+				"\$STATE_TMP"/state_compatibility_manifest.tsv )
 			if (( \${#state_tables[@]} )); then
 				sync_changed_files "\$CURRENT_TEMP_ROOT/tables" "\${state_tables[@]}" 2>/dev/null || true
 				sync_changed_files "\$CURRENT_ROOT/tables" "\${state_tables[@]}" 2>/dev/null || true

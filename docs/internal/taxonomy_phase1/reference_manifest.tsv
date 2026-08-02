@@ -1,0 +1,60 @@
+scope	artifact	role	size_bytes	records_or_version	sha256	observed_mtime_or_build_date	notes
+repository	.	git revision	NA	258b8f8259578bc4d52dfc66a12645d5302e243e	NA	2026-07-24	dirty before audit; branch fix/report-frozen-otu-sample-reads
+code	nextflow.config	default configuration	NA	NA	35e7581eab2a0e608b639bbf8ed6b5ec9ff2c253070bf86eb163dd6ece48669f	2026-07-24	hash at audit time
+code	main.nf	pipeline orchestration	NA	NA	85776ece45432cf406be800682565a1e86f3846d30e8337c3c880b8a6170107f	2026-07-24	hash at audit time
+code	bin/blast_otu_pretax.sh	OTU marker BLAST	NA	NA	97e43b01183711d91fdafefb3d3c8b00ae30f8b8d64155732f1058b2678f4ff5	2026-07-24	hash at audit time
+code	bin/get_blast_taxdepth.pl	identity-depth taxid resolver	NA	NA	90dc3b146aea64df4292fc18eb6df4190338ea8cd1d04d876abec728a9462508	2026-07-24	hash at audit time
+code	bin/lib/RTBioScan/OTURefineBlastreport.pm	OTU taxid selection and lineage resolution	NA	NA	700d19a8f3a377588806e958121da689799c25ebf4d4093fe6eb4b3c52a220d6	2026-07-24	hash at audit time
+code	bin/reporting_blast_otu.pl	OTU report taxid join	NA	NA	d7a46fcf91eaa8957674dd9f5a7ccb61517c9e33acd2a1d89e953c4992073103	2026-07-24	hash at audit time
+code	bin/reporting_blast_consensus.pl	consensus report taxid join	NA	NA	69a6ad5db47f3b894189d7cb547e78cdf2509102d6dfb085366adaa377f55f64	2026-07-24	hash at audit time
+code	bin/report_round_json.pl	JSON marker consistency	NA	NA	f878797a7dfb2881c2a1d3cb418ea13e2eb8070eb02e9abfddd425d94c2b2a7d	2026-07-24	hash at audit time
+code	bin/append_reports.pl	legacy report aggregation	NA	NA	3b40930c71e9c5466af610025c964613142bbd0c2837434cd55ba34b732421ae	2026-07-24	hash at audit time
+code	bin/lib/taxon_util.pl	assigned/unassigned predicates	NA	NA	83f0cf3706096ba6a3c95998e2ab561c378abfd59875646bbf525c71471282cf	2026-07-24	hash at audit time
+coi_fasta	db/COInr98_2024Jun_RioNegro_Brazil.fasta	COI source FASTA	596708996	792926	d0a1ba27438f16843fdffcb4ed30e6e89369ed310f338ec73c1fa058dffe6741	2024-07-18T18:16:09+0200	1493-record appended tail is absent from BLAST index
+coi_blast	db/COInr98_2024Jun_RioNegro_Brazil.ndb	BLAST v5 index	20480	791433	6e5b8720162518bd92a5a273e9342072da448b86504ffc889393c2664aea698d	2024-07-16T22:22:59+0200	build date embedded in DB is 2024-07-07
+coi_blast	db/COInr98_2024Jun_RioNegro_Brazil.nhr	BLAST v5 index	158292155	791433	2507698a7a1d7f74c5d1aa0156916ee04d88b58eacc5a1104352a576aef5fe3d	2024-07-16T22:22:59+0200	NA
+coi_blast	db/COInr98_2024Jun_RioNegro_Brazil.nin	BLAST v5 index	9497344	791433	08ecd4c40708f3c4b4b233bf1b600c443db16224dd3f9ecb8dbf3cc6c66f7390	2024-07-16T22:22:58+0200	NA
+coi_blast	db/COInr98_2024Jun_RioNegro_Brazil.njs	BLAST v5 index	684	791433	9f3aabe98f5316f59a2ebdc97ff90fcdab8e34af00c03744cf09c557d2868e4c	2024-07-16T22:22:57+0200	NA
+coi_blast	db/COInr98_2024Jun_RioNegro_Brazil.not	BLAST v5 index	9497204	791433	8559af815c831ec8623ad2a6dce7b312f333b751d20e89269acc55c0b986efff	2024-07-16T22:23:20+0200	NA
+coi_blast	db/COInr98_2024Jun_RioNegro_Brazil.nsq	BLAST v5 index	123284086	791433	742290831c56f20acc7fd319a668bd7a33fecd54b2d6309c656b35454333c5c1	2024-07-16T22:22:56+0200	485462968 indexed bases
+coi_blast	db/COInr98_2024Jun_RioNegro_Brazil.ntf	BLAST v5 index	16384	791433	67982e4d7b1490b09cce06e7c29175c6bd011cd542cfacb1a1c310084a50821a	2024-07-16T22:23:20+0200	NA
+coi_blast	db/COInr98_2024Jun_RioNegro_Brazil.nto	BLAST v5 index	3165736	791433	00b018440d5585c043b9570a6f2e53154f32618652ca40015068a3e21ee46537	2024-07-16T22:23:20+0200	NA
+its2_fasta	db/ITS2nr98_2024Jun_RioNegro_Brazil.fasta	ITS2 source FASTA	47382465	63604	3d351da10ef8b15e88d233dec27a892fbdc6023867666284822e980e2be088e1	2024-07-16T22:22:59+0200	exact title equality with BLAST index
+its2_blast	db/ITS2nr98_2024Jun_RioNegro_Brazil.ndb	BLAST v5 index	20480	63604	7dbd1f5a912fa450aeb5de239b976f82facf7adbb2f540c5184af40eaee88f14	2024-07-16T22:22:59+0200	build date embedded in DB is 2024-07-07
+its2_blast	db/ITS2nr98_2024Jun_RioNegro_Brazil.nhr	BLAST v5 index	13702507	63604	8124fa93e107ed6eacf299f90d79e6d538806304007ff2c00cf718d1f77e75a1	2024-07-16T22:22:59+0200	NA
+its2_blast	db/ITS2nr98_2024Jun_RioNegro_Brazil.nin	BLAST v5 index	763396	63604	640000a520a0b7b146d528894dda919a941de0ebc2f7d4086151089fccea9941	2024-07-16T22:22:57+0200	NA
+its2_blast	db/ITS2nr98_2024Jun_RioNegro_Brazil.njs	BLAST v5 index	689	63604	4a1af187d0e91f56b082ad9afe7cab19d0915108b56f21194859931673132532	2024-07-16T22:22:57+0200	NA
+its2_blast	db/ITS2nr98_2024Jun_RioNegro_Brazil.not	BLAST v5 index	763256	63604	0698ebac0db89ba1afd89f3b3a931168aaf7060b68ce98666fddc7752df98d65	2024-07-16T22:23:20+0200	NA
+its2_blast	db/ITS2nr98_2024Jun_RioNegro_Brazil.nsq	BLAST v5 index	9769284	63604	eca4c4c9ebe4a0c605847d9dd522a7e7569b25f206bb4d05d6eb0f02507dee0d	2024-07-16T22:22:57+0200	37653453 indexed bases
+its2_blast	db/ITS2nr98_2024Jun_RioNegro_Brazil.ntf	BLAST v5 index	16384	63604	67982e4d7b1490b09cce06e7c29175c6bd011cd542cfacb1a1c310084a50821a	2024-07-16T22:23:19+0200	NA
+its2_blast	db/ITS2nr98_2024Jun_RioNegro_Brazil.nto	BLAST v5 index	254420	63604	fe705975ac5b73b1dc869a2fe79441c225fc8c1a9d8fa3d12fbae7907e3d8302	2024-07-16T22:23:18+0200	NA
+fast_fasta	db/targets_All_tagged_nr95.fa	FAST competitive source FASTA	563887138	665527	d91d77e87e29b02e5e950bc0fe5d27d956e9fb51b7aa14965058527b1ebfc509	2026-02-18T17:36:49+0100	category counts recorded in README
+orphan_index	db/targets_All_tagged_nr95.fa.ndb	orphan BLAST v5 component	20480	NA	833978417907ddfd91b6d37dc3823b0ab84a3dbc4ccb8eeca76852206dbf42f2	2024-07-16T22:23:10+0200	no accompanying active BLAST components; not part of February 2026 LAST index
+fast_last	db/targets_All_tagged_nr95.prj	LAST project metadata	549	1542	01715bb5447edb62ddfe3218607e1d0b46c3594b5e9cfb67ea9b27e96ec12a31	2026-02-18T17:35:15+0100	strand=2; 1331054 indexed strand records; 665527 source records
+fast_last	db/targets_All_tagged_nr95.bck	LAST index	1438608896	NA	a87494f9c31360746872dc1b3e4584b6e2b7c91609625f035996615990f66d11	2026-02-18T17:35:12+0100	NA
+fast_last	db/targets_All_tagged_nr95.des	LAST index	35569736	NA	14da70ba867fb291125b0a060e988f8f384df2e76f32942b6dab72ca060a25f4	2026-02-18T17:35:12+0100	NA
+fast_last	db/targets_All_tagged_nr95.sds	LAST index	10648440	NA	ae748f43eec9cc4267ed37fd95ec8942f8e712ad6d5068af5a90d12244d994f4	2026-02-18T17:35:16+0100	NA
+fast_last	db/targets_All_tagged_nr95.ssp	LAST index	10648440	NA	ab40e97c7b03c48d636d88e0bb67b10b3a778f8d7729c98a4e77dba38c3c78e9	2026-02-18T17:35:16+0100	NA
+fast_last	db/targets_All_tagged_nr95.suf	LAST index	3391875240	NA	a3f186b3c18b2721864215bbc7cf3b24f7dd1b0740561c427ddb425e0d1d7710	2026-02-18T17:38:01+0100	NA
+fast_last	db/targets_All_tagged_nr95.tis	LAST index	908314855	NA	fab5f34257d041a5fce3785d2630f01a37e95cfc41b1287d31e2551eb4524df9	2026-02-18T17:38:23+0100	904500062 sequence letters
+lineage	db/COInr_2024Jun_metazoa_memtax1.txt	COI persistent taxid rank map seed	1342618	41303	8e2481d662e96d2d3c15848fb742e3741eb2ae02dab77dceda721f9f040a6d9a	2024-07-16T22:23:20+0200	copied into state once and then updated
+lineage	db/ITS2nr_2024Jun_viridiplantae_memtax2.txt	ITS2 persistent taxid rank map seed	32002	1067	2243d4b6db09250c05527ef9ca472c6afc44c3bfeacaa6904d92cc3bcad7d54a	2024-07-16T22:22:59+0200	copied into state once and then updated
+lineage	db/DBnr_2024Jun_id2lineage.txt	synthetic taxid lineage overrides	4525242	42368_rows_41302_unique	bdca8c19ee08f2cc01b7389640d6d46bb7c994d83f8277eae924d4a06fd69030	2024-07-16T22:23:18+0200	all rows negative; 41302 Metazoa plus 1066 Viridiplantae rows whose IDs collide with Metazoa IDs
+blast_taxonomy	db/taxdb/taxdb.btd	BLAST taxonomy DB	161890850	NA	9e5220f41f97c94d83d65f381965f5509434b04687eb2dbaf56f73d8ce4a3d64	2025-10-15T08:35:07+0200	tracked by current cache signatures
+blast_taxonomy	db/taxdb/taxdb.bti	BLAST taxonomy DB	17000448	NA	34dc5fd314a8ff9a1c654b0421472a12f9093b31400b5127ea93b1157cdfbf84	2025-10-15T08:35:07+0200	tracked by current cache signatures
+repo_taxonomy	db/taxonomy/nodes.dmp	repository NCBI nodes	189317016	NA	3805726c985c3f7a057abe1ab885557493e340e70ed8ddfa4af53ac52814fa45	2025-10-15T08:35:26+0200	not explicitly selected by current TaxonKit calls
+repo_taxonomy	db/taxonomy/names.dmp	repository NCBI names	231647718	NA	24184328d98197dd7fc88907027da519500e65e58a44026f1afac780c4a66c48	2025-10-15T08:35:25+0200	not explicitly selected by current TaxonKit calls
+repo_taxonomy	db/taxonomy/merged.dmp	repository merged taxids	1338616	NA	ea79242ca31b85eaf43d80cac0658a0adb4f81f2a2f35dbe92f4909555754c91	2025-10-15T08:35:26+0200	not explicitly selected by current TaxonKit calls
+repo_taxonomy	db/taxonomy/delnodes.dmp	repository deleted taxids	4488738	NA	8962adc442fb66ed63d52f1a22de46ab25c0c58fa7b773da0dcc507233cccb8b	2025-10-15T08:35:25+0200	not explicitly selected by current TaxonKit calls
+effective_taxonomy	/Users/DavidJuan/.taxonkit/nodes.dmp	effective TaxonKit nodes on audit host	195896358	NA	5314b15ebd7b29245c1e608f4cf8e57e0205abfce4e23c9dd1daee0d069962e7	2024-06-24T12:27:47+0200	default data directory reported by TaxonKit
+effective_taxonomy	/Users/DavidJuan/.taxonkit/names.dmp	effective TaxonKit names on audit host	246724816	NA	65f0730ab036f0a559cbcc420db146ea303cad2eb8310f5876963b536c371498	2024-06-24T12:28:22+0200	default data directory reported by TaxonKit
+effective_taxonomy	/Users/DavidJuan/.taxonkit/merged.dmp	effective merged taxids on audit host	1468588	NA	78a292a17c337d1bf47f16917e2cdd75e5a61a5ee439f21c1c18c2dc51f10663	2024-06-24T12:26:15+0200	default data directory reported by TaxonKit
+effective_taxonomy	/Users/DavidJuan/.taxonkit/delnodes.dmp	effective deleted taxids on audit host	5399138	NA	64d01cb5a2ed8ebe3ee55ff95f596e84507ce2f39c0eab44bc4fbba5d45291b4	2024-06-24T12:26:15+0200	default data directory reported by TaxonKit
+tool	nextflow	workflow engine	NA	23.04.1 build 5866	NA	2026-07-24	host observation
+tool	bash	shell	NA	3.2.57	NA	2026-07-24	host observation
+tool	perl	Perl runtime	NA	5.34.1	NA	2026-07-24	host observation
+tool	blastn	BLAST runtime	NA	2.15.0+	NA	2026-07-24	host observation
+tool	taxonkit	TaxonKit runtime	NA	0.14.2	NA	2026-07-24	default data dir /Users/DavidJuan/.taxonkit
+tool	lastal	FAST aligner runtime	NA	not_found	NA	2026-07-24	LAST index present but executable unavailable on audit host
+tool	seqkit	sequence utility runtime	NA	not_found	NA	2026-07-24	pipeline requires it but executable unavailable on audit host
+tool	dorado	basecaller	NA	0.7.0+71cc7442	NA	2026-07-24	bundled executable

@@ -1,0 +1,14 @@
+kind	name	expected_version
+tool	blastn	2.15.0
+tool	lastal	1542
+tool	taxonkit	0.14.2
+tool	seqkit	2.6.1
+tool	cutadapt	4.6
+tool	vsearch	2.29.1
+tool	cd-hit-est	4.8.1
+tool	samtools	1.21
+tool	seqtk	1.4
+tool	Rscript	4.3.3
+r_package	DECIPHER	2.30.0
+r_package	Biostrings	2.70.1
+dorado	dorado	0.7.0+71cc7442

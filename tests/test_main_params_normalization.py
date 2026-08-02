@@ -2870,6 +2870,10 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'ensure_local_round_alias "${demult_rpt_sidecar}" "\\$ROUND_DEMULT_SIDECAR_LOCAL"' in summary_block
     assert 'ensure_local_round_alias "${otu_def_rpt}" "\\$ROUND_OTU_RPT_LOCAL"' in summary_block
     assert 'ensure_local_round_alias "${otu_def_rpt_sidecar}" "\\$ROUND_OTU_SIDECAR_LOCAL"' in summary_block
+    assert 'ensure_local_round_alias "${read_info_rpt}" "\\$ROUND_READ_INFO_LOCAL"' in summary_block
+    assert 'ensure_local_round_alias "${on_target_rpt}" "\\$ROUND_ON_TARGET_LOCAL"' in summary_block
+    assert 'ensure_local_round_alias "${blast_otu_pretax_rpt}" "\\$ROUND_BLAST_OTU_LOCAL"' in summary_block
+    assert 'ensure_local_round_alias "${blast_consensus_tax}" "\\$ROUND_BLAST_CONSENSUS_LOCAL"' in summary_block
     assert '"\\$ROUND_DEMULT_RPT_LOCAL" \\' in summary_block
     assert '"\\$ROUND_DEMULT_SIDECAR_LOCAL" \\' in summary_block
     assert '"\\$ROUND_OTU_RPT_LOCAL" \\' in summary_block

@@ -19,7 +19,11 @@ __pycache__/
 *.pyc
 .DS_Store
 .codex_backups/
+.vscode/
 *.swp
+runtime/dorado/releases/
+runtime/dorado/qualification/
+runtime/dorado/candidates/
 
 # Bioinformatics data - never commit raw sequencing data
 *.fastq

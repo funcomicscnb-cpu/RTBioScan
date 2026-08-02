@@ -10,15 +10,17 @@ dependencies:
 
   # ── Bioinformatics tools ─────────────────────────────────────────────────────
   # Sequence alignment and clustering
-  - blast >=2.12        # blastn, makeblastdb, blastdbcmd
+  - blast =2.15.0       # matches the validated host BLAST baseline
+  - last =1542          # must match version=1542 in the shipped LAST .prj
   - cd-hit >=4.8        # cd-hit-est for OTU clustering
   - vsearch >=2.21      # consensus + chimera filtering
   - seqtk >=1.3         # FASTA/Q manipulation
+  - seqkit =2.6.1       # FAST read filtering and indexed extraction
   - samtools >=1.15     # SAM/BAM → FASTQ conversion (dorado output)
   # Taxonomy
-  - taxonkit >=0.13     # NCBI lineage lookup
+  - taxonkit =0.14.2    # preserves the audited {k}/{K} rank semantics
   # Read processing
-  - cutadapt >=4.0      # adapter trimming / demultiplexing
+  - cutadapt =4.6       # adapter trimming / demultiplexing
 
   # ── Perl non-core modules ───────────────────────────────────────────────────
   - perl-time-piece     # used in bin/append_reports.pl
@@ -40,7 +42,5 @@ dependencies:
   - bioconductor-decipher >=2.28     # Consensus_simple.R consensus calling
   - bioconductor-muscle >=3.40       # Consensus_simple.R / Consensus_simple.sh
 
-  # ── Python pip packages ──────────────────────────────────────────────────────
-  - pip
-  - pip:
-    - pod5 >=0.3   # ONT POD5 file inspection (pod5 inspect summary)
+  # The wrapper-side pod5 CLI is installed on the host. It is intentionally not
+  # part of this cross-platform process environment.

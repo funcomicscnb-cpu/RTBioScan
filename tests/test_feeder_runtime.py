@@ -420,7 +420,7 @@ def test_feeder_applies_global_prefix_before_sidecar_repair(tmp_path: Path) -> N
     global_dir = tmp_path / "results" / "temp" / "_global" / "feeder_dedup"
     global_dir.mkdir(parents=True, exist_ok=True)
     (global_dir / "slice_completion.tsv").write_text(
-        f"dummy-slice\t{source_fp}\tsample.pod5\t1\t2\t{pod5_root}\t1\n",
+        f"dummy-slice\t{source_fp}\tsample.pod5\t1\t2\t{pod5_root.parent / 'PriorRun'}\t1\n",
         encoding="utf-8",
     )
 

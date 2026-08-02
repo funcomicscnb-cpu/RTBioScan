@@ -7,7 +7,11 @@
 #
 # Notes:
 # - Writes to a temporary file and only replaces the final output on success.
-# - Sleeps 300s between attempts by default (override with DORADO_RETRY_SLEEP_SECONDS).
+# - Sleeps 10s between retryable attempts by default (override with DORADO_RETRY_SLEEP_SECONDS).
+# - Unmistakable Dorado CLI/usage errors fail immediately instead of consuming
+#   the real-time retry budget.
+# - Shell statuses 126 (not executable), 127 (not found), and 132 (SIGILL)
+#   are non-retryable for the selected runtime.
 
 dorado_basecall_retry() {
   local desc="$1"
@@ -18,16 +22,38 @@ dorado_basecall_retry() {
     printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/\..*$//'
   }
 
+  dorado_retry_error_is_permanent() {
+    local error_file="$1"
+    [ -s "$error_file" ] || return 1
+    LC_ALL=C grep -Eiq \
+      '(^|[[:space:]])(unknown argument|unrecognized (argument|option)|usage:[[:space:]]+dorado)([[:space:]:]|$)' \
+      "$error_file"
+  }
+
+  dorado_retry_status_is_permanent() {
+    case "$1" in
+      126|127|132)
+        return 0
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  }
+
   local attempt rc
   local tmp="${out}.tmp"
   local err_tmp="${out}.err.tmp"
-  local sleep_seconds="${DORADO_RETRY_SLEEP_SECONDS:-300}"
+  local sleep_seconds="${DORADO_RETRY_SLEEP_SECONDS:-10}"
   local attempts="${DORADO_RETRY_ATTEMPTS:-3}"
   if ! echo "$attempts" | awk '/^[0-9]+$/{ok=1} END{exit ok?0:1}'; then
     attempts=3
   fi
   if [ "$attempts" -lt 1 ]; then
     attempts=1
+  fi
+  if ! echo "$sleep_seconds" | awk '/^[0-9]+$/{ok=1} END{exit ok?0:1}'; then
+    sleep_seconds=10
   fi
 
   # Optional global lock to prevent multiple concurrent Dorado basecaller runs.
@@ -133,6 +159,14 @@ dorado_basecall_retry() {
     fi
 
     echo "WARN: Dorado ${desc} failed (attempt ${attempt}/${attempts})" 1>&2
+    if dorado_retry_status_is_permanent "$rc"; then
+      echo "ERROR: Dorado ${desc} exited with non-retryable status ${rc}; not retrying" 1>&2
+      return 1
+    fi
+    if dorado_retry_error_is_permanent "$err_tmp"; then
+      echo "ERROR: Dorado ${desc} reported a non-retryable CLI/configuration error; not retrying" 1>&2
+      return 1
+    fi
     if [ "$attempt" -lt "$attempts" ]; then
       sleep "$sleep_seconds"
     fi

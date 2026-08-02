@@ -1,0 +1,13 @@
+query_id	mode	marker	variant	sequence_evidence	source_accession	legacy_defect	target_filter_expectation
+chain_a_lr799917_clean	A	COI	clean	confirmed_bacterial	LR799917	bacterial-origin sequence can inherit a Metazoa host taxid	exclude_off_target
+chain_a_wolbachia_clean	A	COI	clean	confirmed_bacterial	MG988837	bacterial endosymbiont can inherit a Metazoa host taxid	exclude_off_target
+chain_b1_d11038_clean	B1	COI	clean	confirmed_bacterial	D11038_1	bacterial taxid has empty kingdom and the JSON guard fails open	exclude_off_target
+b2_hypothesis_gbbac4514_clean	B2_UNSUPPORTED	COI	clean	off_target_supported	BOLD_COI-5P_GBBAC4514-15	header says Metazoa but sequence evidence supports filtering; exact biological origin is not required	exclude_off_target
+synthetic_collision_coi_neg557_clean	SYNTHETIC	COI	clean	target_metazoa	BOLD_COI-3P_GACAC695-12	global synthetic-id map resolves -557 to the later plant lineage	retain_metazoa
+control_metazoa_human_clean	CONTROL_HUMAN_OFFTARGET	COI	clean	off_target_human	MK248310_1	Human is a distinct exclusion bucket under the shipped Metazoa target policy; a human-contaminated Bacteria record is a secondary competitor	exclude_off_target
+synthetic_collision_its2_neg561_clean	SYNTHETIC	ITS2	clean	target_viridiplantae	BOLD_ITS2_ITSAQ263-14	global synthetic-id map happens to resolve -561 to the later plant lineage	retain_viridiplantae
+control_viridiplantae_arabidopsis_clean	CONTROL	ITS2	clean	target_viridiplantae	LC089989_1	none	retain_viridiplantae
+chain_a_lr799917_hac	A	COI	hac	confirmed_bacterial	LR799917	fixed homopolymer-indel and substitution variant still clears the animal-only BLAST gate	exclude_off_target
+chain_a_lr799917_fast	A	COI	fast	confirmed_bacterial	LR799917	fixed higher-error variant measures the production BLAST threshold boundary	exclude_off_target
+chain_a_wolbachia_hac	A	COI	hac	confirmed_bacterial	MG988837	fixed homopolymer-indel and substitution variant still clears the animal-only BLAST gate	exclude_off_target
+chain_a_wolbachia_fast	A	COI	fast	confirmed_bacterial	MG988837	fixed higher-error variant measures the production BLAST threshold boundary	exclude_off_target
