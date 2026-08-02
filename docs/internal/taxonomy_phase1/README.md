@@ -29,13 +29,16 @@ The catalog records sequence hashes rather than copying database sequences. The 
 
 ### 1. The COI FASTA and BLAST index are desynchronized
 
-- FASTA records: 792,926.
-- Indexed records: 791,433.
-- FASTA-only titles: 1,493.
-- Index-only titles: 0.
-- The FASTA-only records are the contiguous tail at positions 791,434–792,926.
-
-The installed COI BLAST database therefore represents the FASTA prefix, not the complete shipped FASTA.
+Phase 1's line-start comparison observed 792,926 FASTA headers, 791,433 indexed
+records, 1,493 line-start FASTA-only titles, and zero index-only titles. A strict
+Phase-2 source audit later found that this was not an exact raw prefix: the
+sequence line for physical record 791,433 contains a non-leading `>` followed by
+an embedded header candidate. Analysis-only splitting yields 792,927 logical
+records and a 1,494-record logical tail; the first 791,433 logical records then
+match the legacy BLAST corpus exactly. See
+`conf/taxonomy_regression/chain_a_downstream_coi_source_integrity_v1.tsv` and
+its provenance. The original Phase-1 counts remain line-start-parser
+observations, not a canonical-source definition.
 
 ### 2. ITS2 is synchronized
 

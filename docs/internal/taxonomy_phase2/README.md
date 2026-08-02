@@ -48,8 +48,10 @@ operational pre-remediation baseline:
 - the BLAST taxonomy database.
 
 The manifest intentionally describes the installed operational indexes. It does
-not activate the 1,493 FASTA-only COI tail records identified in Phase 1. Tail
-admission remains a separate, audited reference release.
+not activate the 1,493 line-start COI tail records or the embedded header
+candidate subsequently identified by the strict source-integrity audit. Tail
+repair/admission remains a separate, audited reference release; the raw FASTA
+prefix is not an exact serialization of the effective legacy BLAST corpus.
 
 `conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv` pins the exact
 June-2024 TaxonKit baseline used before remediation. The source archive and all
@@ -240,13 +242,60 @@ accession patterns to select downstream hits. On the shipped snapshot it emits
 review-queue results, not automatic contamination calls and not a claim of
 biological exhaustiveness.
 
-`chain_a_reference_candidates.tsv` records the reviewed subset. In addition to
-the two Phase-1-confirmed LR799917 records and pending tied `ISUP118-14`, the
-audit confirms `GBMHH30183-19`: its entire 470-base reference is identical to
-the independent Wolbachia control but carries its psyllid host taxid.
-`GBMIN70259-17` remains pending despite a 97.021% full-control alignment.
-`ISUP118-14`'s uniquely mapped synthetic taxid `-2704` must not be conflated
-with the separate `-557`/`-561` namespace collisions.
+`chain_a_reference_candidates.tsv` records the reviewed subset. All five
+priority records are confirmed reference-sequence contamination. The evidence
+does not require the host specimens to be misidentified: `ISUP118-14` is a
+morphology-identified *Galerita* leg specimen whose submitted sequence is
+LR799917-class bacterial coxA, and `GBMIN70259-17` is a full-length 97.021%
+Wolbachia coxA match. Independent same-species animal COI controls are strongly
+discordant with both. `chain_a_priority_adjudication.tsv` pins those controls,
+sequence hashes, pairwise metrics, external evidence status, and dispositions.
+
+The 39 lower-tier records were then evaluated locally without disclosing
+sequence data. The comparison graph contains those records plus only the five
+priority records explicitly confirmed in `chain_a_reference_candidates.tsv`;
+anchors remain absent from the lower-tier output. A lower-tier row becomes a
+cross-family sequence/label-conflict candidate only when its bacterial-control
+similarity-screen result is accompanied by a direct ≥95%-identity,
+≥80%-shorter-coverage match carrying a different host family. This flags a
+label-conflict candidate under the declared protocol, not bacterial origin or
+which endpoint is wrong. Twenty-four records satisfy the rule: 23 through review
+peers in the existing four components and `GMODL3842-22` through a confirmed priority
+anchor. Fifteen remain unresolved and must not be automatically curated.
+`chain_a_lower_tier_adjudication.tsv` and its provenance freeze the result and
+explicitly distinguish review-peer from confirmed-anchor evidence.
+`ISUP118-14`'s uniquely mapped synthetic taxid `-2704` must not be conflated with
+the separate `-557`/`-561` namespace collisions.
+
+The versioned policy `chain_a_downstream_coi_release_policy_v1.tsv` now keeps
+evidence separate from release action. Its generic builder emits a 44-row master
+disposition, a 29-row correctness-first quarantine projection, and a 15-row
+retained-unresolved projection. The 24 conflict candidates remain labelled as
+policy quarantines rather than confirmed bacterial contamination. Diagnostics
+also disclose that three stored taxids lose their only source record and that no
+exact copy of the 27 quarantined sequence hashes remains. No source FASTA, BLAST
+index, pipeline configuration, or state identity is changed by this manifest
+stage. These diagnostics observe the pinned full shipped FASTA; they do not
+choose the canonical release base.
+
+The subsequent source/index integrity audit supersedes the disposition
+builder's permissive whole-source counts for source-health decisions. It finds
+one non-leading header delimiter at physical record 791,433: analysis-only
+splitting recovers a 524-nt record candidate after the 200-nt indexed sequence.
+The resulting first 791,433 logical records match the legacy BLAST titles,
+signed header taxids, order, and sequences exactly, while the analysis-logical
+tail has 1,494 records. The audit changes no source, policy, database, pipeline,
+or state identity.
+
+The versioned base/repair policy now chooses the entire effective legacy BLAST
+OID stream as the behavior-preserving corpus base. It forbids slicing the raw
+FASTA, admits none of the 1,494-record logical tail, performs no repair or
+implicit deduplication, and uses legacy OIDs only for membership and relative
+order. Future dispositions match the full reference ID/taxid/sequence-hash
+identity: 29 records are projected for exclusion, 15 unresolved records remain,
+and every nonlisted base record remains unchanged. The projected record count is
+791,404, but no canonical FASTA, projected nucleotide count/checksum, new BLAST index,
+runtime activation, or state identity has been produced by this policy stage.
 
 Run the benchmark with:
 
@@ -460,8 +509,10 @@ one expected-pass marker. `bin/check_param_registry.py` passes with all runtime
 parameters registered. The full LAST 1542 / BLAST 2.15.0 / TaxonKit 0.14.2
 classification replay matches the committed legacy snapshot.
 
-No taxonomy behavior change is enforced by this phase. Phase 3 starts by
-running `--fast_filter_shadow true` on representative production reads and
-independently adjudicating a reviewed disagreement subset. Reference curation,
-ancestry eligibility, competitive downstream classification, or FAST routing
-changes must remain separate, versioned stages after that measurement gate.
+No taxonomy behavior change is enforced by this phase. The original Phase-3
+FAST/LAST path starts by running `--fast_filter_shadow true` on representative
+production reads and independently adjudicating a reviewed disagreement subset.
+That measurement gate still governs FAST routing, performance, and accuracy
+changes. Separately versioned downstream-only correctness curation can proceed
+from reproduced reference defects without waiting for FAST incidence, while
+ancestry eligibility and competitive classification remain later stages.

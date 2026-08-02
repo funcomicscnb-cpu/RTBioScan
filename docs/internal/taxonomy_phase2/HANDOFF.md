@@ -5,21 +5,24 @@ line of work. Read this top to bottom once, then act. Every claim below was veri
 the code; where a fact must be re-verified before acting, it says so. **Do not trust prose over
 the code — re-run the checks in §9.**
 
-Branch: `agent/taxonomy-state-compatibility-phase-2-1a`. Main branch: `main`.
+Branch: `agent/taxonomy-chain-a-adjudication`. Main branch: `main`.
 
 ---
 
 ## 0. TL;DR — what to do next
 
-The Phase 2 implementation backlog is committed and validated. The next stage is deliberately
-measurement-only:
+The compatibility backlog and the downstream-COI discovery, adjudication,
+disposition, source-integrity audit, and base/repair policy stages are committed
+and validated. The next correctness-only stage is deliberately construction-
+only:
 
-> Run the opt-in, decision-neutral FAST shadow collector on representative production reads,
-> quantify target/off-target competition and HAC/SUP compute impact, and independently adjudicate
-> a reviewed subset of disagreements. See §7 for the exact entry criteria and outputs.
+> Construct the downstream-COI canonical FASTA from the selected legacy OID
+> stream as described in §7. Apply exactly the frozen dispositions by full
+> record identity, but do not build or activate a BLAST index in the same stage.
 
-Do not curate references or enforce a new routing/classification policy until that evidence exists.
-The deterministic fixture proves downstream defects, but it does not measure their live incidence.
+Representative decision-neutral FAST shadow measurement remains required
+before any FAST/LAST source, routing, performance, or accuracy change. It does
+not block this separately versioned downstream-only correctness remediation.
 
 ---
 
@@ -98,9 +101,12 @@ the databases) produced a **three-mode defect model** at the *reference-database
   deposited under host-arthropod taxonomy). The committed protocol-defined audit uses three
   checksummed, independently identified bacterial coxA controls and finds 44 query/reference rows
   on the shipped snapshot: five priority-review and 39 review. These counts define a review queue,
-  not 44 contamination calls and not biological exhaustiveness. Three records are confirmed in the
-  reviewed subset, including an exact 470/470 Wolbachia match under its host taxid; two priority
-  records remain pending. If a bacterial read reaches the animal lane and hits a contaminated record,
+  not 44 contamination calls and not biological exhaustiveness. All five priority records are now
+  confirmed reference-sequence contamination: the sequence evidence is bacterial/endosymbiont coxA
+  even where the host specimen metadata may be valid. Local-only cross-family adjudication identifies
+  24 lower-tier sequence/host-label-conflict candidates and leaves 15 explicitly unresolved. This
+  lower-tier evidence does not by itself establish bacterial origin or which conflicting endpoint is
+  wrong. If a bacterial read reaches the animal lane and hits a contaminated record,
   it inherits a clean Metazoa taxid → reported as an animal. The empty-kingdom guard cannot catch this
   (the taxid resolves cleanly to Metazoa).
 - **Chain B1** — a genuinely bacterial sequence (`D11038`, *Bacillus* sp. PS3) in the animal DB under
@@ -285,8 +291,10 @@ COI/BLAST curation separate from any FAST/LAST reference or routing release.
    - First curate the downstream animal COI DB only. The exact LR799917 accession is correctly labelled
      `COI|Bacteria` in the FAST reference; separate near-identical host-labelled downstream records are
      the demonstrated defect. Use `conf/taxonomy_regression/chain_a_reference_candidates.tsv` as the
-     reviewed subset. The broader generated audit remains a pending review queue. Retain tied hits,
-     and do not remove a sequence-similarity candidate until its biological status is adjudicated.
+     reviewed priority subset and `chain_a_lower_tier_adjudication.tsv` for the broader local-only
+     evidence. The versioned downstream-COI disposition manifest applies the explicit release policy
+     while keeping confirmed contaminants, cross-family conflict candidates, and unresolved records as
+     separate evidence classes; retain all unresolved records unchanged.
    - Rebuild the downstream COI BLAST index from that curated canonical FASTA, use a new reference
      manifest/state identity, and compare legacy versus corrected benchmark expectations. Do not touch
      the FAST/LAST source or index in this sub-release.
@@ -294,8 +302,10 @@ COI/BLAST curation separate from any FAST/LAST reference or routing release.
    - Treat FAST-reference cleanup (including `SZWG01000034`) and any LAST rebuild as a separate,
      measurement-gated routing release. A LAST rebuild must retain the pinned LAST 1542 format, recheck
      first-hit ordering, publish a new manifest/state identity, and requalify routing behavior.
-   - Audit the known 1,493-record FASTA/BLAST-index desync separately (the shipped index is an exact
-     stale prefix of the FASTA); introduce any appended tail as its own reference version.
+   - Keep the source/index integrity findings separate. There are 1,493 line-start records after the
+     index boundary plus one embedded header candidate at that boundary; the raw FASTA prefix is not
+     an exact serialization of the legacy index. Any repair or admission belongs to its own reference
+     policy/version.
 3. **Superkingdom/ancestry eligibility guard** (fixes B1/B2; **must** land after step 2's homonym fix,
    or it would drop genuine animals):
    - Decide eligibility by **taxid ancestry against a configured target-clade taxid**
@@ -344,8 +354,7 @@ expected outcomes.
 
 ## 7. The immediate next step, precisely
 
-**Goal:** adjudicate the generated Chain-A review queue before changing the downstream COI
-classification database.
+**Goal:** prepare the downstream-COI-only curation release from the now-dispositioned Chain-A queue.
 
 The discovery half of this gate is now reproducible. `chain_a_audit_queries.tsv` declares three
 independently supported bacterial controls by accession and sequence SHA-256.
@@ -355,22 +364,75 @@ the tool, parameters, source FASTAs, every BLAST index component, and the genera
 shipped snapshot it emits 44 pending query/reference rows (five priority, 39 review), all explicitly
 `pending_adjudication`.
 
-1. Preserve `legacy_expected.tsv` and the production FASTA/index byte-for-byte.
-2. Independently review every unique record in `chain_a_similarity_audit.tsv`, recording evidence and
-   one explicit disposition: confirmed contamination, rejected candidate, or unresolved. Similarity
-   tier alone never authorizes removal. Review the five priority records first, then the remaining 39.
-3. Keep the reviewed outcome in `chain_a_reference_candidates.tsv` (or a successor with an expanded
-   disposition schema). Three records are currently confirmed: `GBCL13897-12`, `GBCL13905-12`, and
-   `GBMHH30183-19`; the last is an exact 470/470 match to the independently identified Wolbachia coxA
-   control while stored under its psyllid host taxid. `ISUP118-14` and `GBMIN70259-17` remain pending.
-4. Regenerate the audit and require byte-identical candidate/provenance output before freezing the
-   reviewed set. If the database, source FASTAs, tool, parameters, or script change, create a new
-   audit snapshot rather than silently updating this one.
-5. Only after all rows have dispositions, create a downstream-COI-only curated FASTA/index release,
-   manifest/state identity, and separate corrected benchmark expectation.
+The closed-set omission in the first local adjudication is corrected. The comparison graph now contains
+all 39 review records plus only the five priority records explicitly marked `confirmed` in
+`chain_a_reference_candidates.tsv`; anchors remain absent from the lower-tier output. The five priority
+records are confirmed bacterial/endosymbiont reference-sequence contamination. The lower-tier artifact
+records a different evidence class: 24 cross-family sequence/host-label-conflict candidates and 15
+unresolved records. Twenty-three candidates have direct review-peer support; `GMODL3842-22` has direct
+support from the confirmed `GBMIN70259-17` anchor at 96.018% identity over 452 nt and 95.763%
+shorter-sequence coverage. The lower-tier rule establishes neither bacterial origin nor which endpoint
+is wrong. The unresolved records were not treated as clean or contaminated by default.
 
-Exit criteria are explicit reviewed dispositions for the full protocol-defined queue plus reproducible
-audit artifacts. The following stage is a downstream-COI-only reference release. FAST/LAST cleanup,
+The explicit disposition stage is now complete. The versioned policy
+`chain_a_downstream_coi_release_policy_v1.tsv` maps the five confirmed contaminants and 24 conflict
+candidates to a correctness-first quarantine action and maps all 15 unresolved rows to retain. The
+generic builder emits an authoritative 44-row manifest plus derived quarantine and retained-unresolved
+projections; it does not alter the source FASTA or either index. Release-impact diagnostics disclose
+that the 29 quarantined records represent 27 sequence hashes with no exact retained source copy and
+that stored taxids `1119366`, `1717526`, and `650448` lose their only source record. This is an explicit
+policy consequence, not evidence that every conflict candidate is bacterial.
+
+The strict source/index integrity audit is also complete. It found one non-leading FASTA header
+delimiter at one-based line 1,582,866 / zero-based byte offset 594,244,630. Physical record 791,433
+contains 200 nt followed without a newline by an embedded header candidate and then a 524-nt sequence
+on the next line. A permissive line-start parser merges these into an apparent 857-character sequence,
+while the legacy BLAST record contains the initial 200 nt and matches the analysis-split record.
+Splitting the delimiter for analysis only yields 792,927 logical records; logical records 1–791,433
+match the entire 791,433-record/485,462,968-base legacy index exactly. The analysis-logical tail is
+therefore 1,494 records, including both duplicate `WPB428` records and the empty terminal copy. The
+audit authorizes no source repair or release action. All 44 disposition targets occur before the defect
+and remain valid.
+
+The policy-only base/repair stage is complete. The selected behavior-preserving corpus base is every
+record in the effective legacy BLAST OID stream, in ascending legacy-OID order: 791,433 records,
+485,462,968 bases, canonical SHA-256 `cf474aa6...`. OIDs are legacy identity/order coordinates only;
+they are not serialized and are not promised stable after deletion. The raw FASTA is validation
+evidence, not a source to slice. All 1,494 analysis-logical tail records remain outside the selected
+base, including the embedded candidate and both duplicate/empty-record findings. This is deferral, not
+quarantine, repair, or a biological-quality conclusion.
+
+The future canonical filter matches each disposition by reference ID, stored taxid, and sequence
+SHA-256. It must exclude all 29 quarantine records individually, retain all 15 unresolved records,
+retain every nonlisted base record, perform no implicit deduplication, and preserve retained relative
+legacy-OID order. The projected record count is 791,404. Projected bases/checksum, a new OID map, the
+canonical FASTA, rebuilt index, corrected benchmark, runtime activation, and new state identity remain
+unproduced.
+
+1. Preserve `legacy_expected.tsv` and the shipped production FASTA/index byte-for-byte as the legacy
+   release.
+2. Regenerate both discovery and adjudication artifacts byte-for-byte. If the database, source FASTAs,
+   tool, parameters, or scripts change, create a new audit snapshot rather than silently updating one.
+3. **Completed:** freeze the three evidence classes and release actions in the versioned master
+   disposition and its generated 29-row quarantine/15-row retained projections.
+4. **Completed:** freeze the generic, read-only source/index audit and its four anomaly rows. Treat the
+   prior 792,926/792,925 disposition counts as permissive line-start-parser observations, not a source-
+   integrity proof.
+5. **Completed:** select the effective legacy BLAST OID stream as the corpus base; forbid raw-FASTA
+   slicing, defer all unindexed/anomalous tail material, and require no repair or implicit deduplication.
+6. From that explicitly declared base, build a new canonical downstream COI FASTA that removes the 29
+   policy-quarantine records by `(reference_id, stored_taxid, sequence_sha256)` and retains the 15
+   unresolved records unchanged. Preserve every nonlisted record and retained relative legacy-OID
+   order. Publish the output count/base count/checksum, the excluded legacy OIDs, and the deterministic
+   old-to-new ordinal rule under a new basename.
+7. Build a new downstream BLAST index from that canonical FASTA and publish checksummed manifests plus
+   a new reference/state identity. Do not touch the FAST/LAST source or index.
+8. Add a separately versioned corrected benchmark expectation and compare it with the immutable legacy
+   expectation across every report surface before considering release promotion.
+
+Exit criteria for the next stage are a byte-reproducible canonical FASTA, exact projected-versus-
+observed counts, a frozen checksum, and a reproducible ordinal-remapping rule. Index construction, state
+identity, runtime activation, and corrected expectations are subsequent stages. FAST/LAST cleanup,
 routing thresholds, representative incidence, throughput, and accuracy calibration remain separate
 deferred work.
 

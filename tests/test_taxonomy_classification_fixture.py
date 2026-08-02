@@ -100,7 +100,7 @@ def test_current_chain_a_fixtures_do_not_reproduce_fast_misrouting():
     }
 
 
-def test_chain_a_reference_candidates_capture_tie_without_overclaiming():
+def test_chain_a_reference_candidates_capture_priority_adjudications():
     rows = read_tsv("chain_a_reference_candidates.tsv")
     by_id = {row["reference_id"]: row for row in rows}
 
@@ -111,12 +111,14 @@ def test_chain_a_reference_candidates_capture_tie_without_overclaiming():
         "BOLD_COI-5P_GBMHH30183-19",
         "BOLD_COI-5P_GBMIN70259-17",
     }
+    assert {row["evidence_status"] for row in rows} == {"confirmed"}
+    assert {row["corrected_outcome"] for row in rows} == {"bacterial_or_ambiguous"}
     assert by_id["BOLD_COI-5P_GBCL13897-12"]["evidence_status"] == "confirmed"
     isup = by_id["BOLD_COI-5P_ISUP118-14"]
     assert isup["stored_taxid"] == "-2704"
     assert isup["header_kingdom"] == "Metazoa"
-    assert isup["evidence_status"] == "candidate_pending_adjudication"
-    assert isup["corrected_outcome"] == "adjudicate_before_release"
+    assert isup["evidence_status"] == "confirmed"
+    assert isup["corrected_outcome"] == "bacterial_or_ambiguous"
     assert isup["bitscore"] == by_id["BOLD_COI-5P_GBCL13897-12"]["bitscore"]
     assert isup["pident"] == by_id["BOLD_COI-5P_GBCL13897-12"]["pident"]
     assert isup["aln_length"] == by_id["BOLD_COI-5P_GBCL13897-12"]["aln_length"]
@@ -126,8 +128,8 @@ def test_chain_a_reference_candidates_capture_tie_without_overclaiming():
     assert exact_wolbachia["pident"] == "100.000"
     assert exact_wolbachia["aln_length"] == "470"
     wolbachia_candidate = by_id["BOLD_COI-5P_GBMIN70259-17"]
-    assert wolbachia_candidate["evidence_status"] == "candidate_pending_adjudication"
-    assert wolbachia_candidate["corrected_outcome"] == "adjudicate_before_release"
+    assert wolbachia_candidate["evidence_status"] == "confirmed"
+    assert wolbachia_candidate["corrected_outcome"] == "bacterial_or_ambiguous"
 
     lineage_map = REPO_ROOT / "db" / "DBnr_2024Jun_id2lineage.txt"
     neg2704 = [
