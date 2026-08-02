@@ -3261,7 +3261,7 @@ def main():
     ap.add_argument("--js", required=True, help="Path to JS asset")
     ap.add_argument("--out", required=True, help="Output HTML path")
     ap.add_argument("--state-out", default="", help="Output state JSON path (default: alongside --out as report_state.json)")
-    ap.add_argument("--schema-version", default="1.2", help="Rendered report schema version")
+    ap.add_argument("--schema-version", default="2.0", help="Rendered report schema version")
     ap.add_argument("--auto-refresh-enabled", default="1", help="Enable browser auto-refresh polling (1/0)")
     ap.add_argument("--auto-refresh-seconds", type=int, default=15, help="Auto-refresh polling interval in seconds")
     ap.add_argument("--state-url", default="report_state.json", help="Relative URL used by browser to poll state")

@@ -575,7 +575,7 @@ seed_initial_run_status_if_needed() {
       --barcode "$_barcode" \
       --state-id "$_state_id" \
       --outdir "$_outdir" \
-      --schema-version "1.6" \
+      --schema-version "2.0" \
       --report-rel-path "runs/${_run_name}/report.html" \
       --run-started-utc-file "$_run_started_utc"; then
     echo "WARN: failed to seed initial run status entry for '${_run_name}'." >&2
@@ -620,7 +620,7 @@ seed_initial_run_status_if_needed() {
       --template "${SCRIPT_DIR}/assets/report/template.html" \
       --css "${SCRIPT_DIR}/assets/report/report.css" \
       --js "${SCRIPT_DIR}/assets/report/report.js" \
-      --schema-version "1.6" \
+      --schema-version "2.0" \
       --state-out "$_root_state" \
       --auto-refresh-enabled "$_auto_refresh" \
       --auto-refresh-seconds "$_refresh_seconds" \
@@ -701,7 +701,7 @@ PYEOF
       --template "${SCRIPT_DIR}/assets/report/template.html"
       --css "${SCRIPT_DIR}/assets/report/report.css"
       --js "${SCRIPT_DIR}/assets/report/report.js"
-      --schema-version "1.6"
+      --schema-version "2.0"
       --state-out "$_root_state"
       --state-url "report_state.json"
       --out "$_root_html"
@@ -1602,7 +1602,7 @@ PYEOF
         --template "$_tmpl"
         --css "${SCRIPT_DIR}/assets/report/report.css"
         --js "${SCRIPT_DIR}/assets/report/report.js"
-        --schema-version "1.4"
+        --schema-version "2.0"
         --state-out "$_report_state"
         --state-url "report_state.json"
         --out "$_report_html"

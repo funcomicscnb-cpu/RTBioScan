@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import signal
@@ -31,6 +32,38 @@ def _terminate_process(proc: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
+
+
+def _read_json_lines(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _extract_report_meta(path: Path) -> dict[str, object]:
+    html = path.read_text(encoding="utf-8")
+    marker = "window.REPORT_META = "
+    start = html.index(marker) + len(marker)
+    end = html.index(";\n", start)
+    return json.loads(html[start:end])
+
+
+def _rtbioscan_serve_command(outdir: Path, run_id: str, port: int) -> list[str]:
+    return [
+        "bash",
+        str(RTBIOSCAN),
+        "--serve",
+        "--serve-quiet",
+        "--serve-port",
+        str(port),
+        "--serve-dir",
+        str(outdir),
+        "--run_id",
+        run_id,
+        "--targets",
+        "COI|ITS2",
+        "--outdir",
+        str(outdir),
+        "-resume",
+    ]
 
 
 def _install_open_shim(tmp_path: Path) -> tuple[dict[str, str], Path]:
@@ -422,6 +455,118 @@ def test_rtbioscan_auto_picks_free_default_port_and_writes_url_files(tmp_path: P
     assert chosen_port == "8001"
     assert server_url.read_text(encoding="utf-8").strip() == f"http://127.0.0.1:{chosen_port}/report_html/report.html"
     assert f"http://127.0.0.1:{chosen_port}/report_html/report.html" in result.stdout
+
+
+def test_rtbioscan_fresh_seed_and_graceful_prune_keep_artifact_schema_current(tmp_path: Path) -> None:
+    run_id = f"FreshSchema_{tmp_path.name}"
+    outdir = tmp_path / "results"
+    env = _install_nextflow_shim(tmp_path, run_mode="sleep")
+    py_env, marker_path = _install_python_shim(tmp_path, mode="hold")
+    env = _merge_env(env, py_env)
+    wrapper_log = tmp_path / "fresh-schema.log"
+    report_root = outdir / "report_html"
+    run_json = report_root / "runs" / run_id / "run_report.json"
+    run_index = report_root / "runs_index.jsonl"
+    report_html = report_root / "report.html"
+    report_state = report_root / "report_state.json"
+
+    with wrapper_log.open("w", encoding="utf-8") as handle:
+        proc = subprocess.Popen(
+            _rtbioscan_serve_command(outdir, run_id, 8010),
+            cwd=tmp_path,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+    try:
+        _wait_for(
+            lambda: marker_path.exists()
+            and run_json.exists()
+            and run_index.exists()
+            and report_html.exists()
+            and report_state.exists()
+        )
+
+        seeded = json.loads(run_json.read_text(encoding="utf-8"))
+        indexed = [row for row in _read_json_lines(run_index) if row.get("run_id") == run_id]
+        state = json.loads(report_state.read_text(encoding="utf-8"))
+        meta = _extract_report_meta(report_html)
+        assert seeded["status_label"] == "Fresh"
+        assert seeded["status"] == "running"
+        assert seeded["rounds_count"] == 0
+        assert seeded["schema_version"] == "2.0"
+        assert len(indexed) == 1
+        assert indexed[0]["schema_version"] == "2.0"
+        assert meta["schema_version"] == state["schema_version"] == "2.0"
+
+        proc.terminate()
+        assert proc.wait(timeout=10) == 143
+        assert not run_json.parent.exists()
+        assert not [row for row in _read_json_lines(run_index) if row.get("run_id") == run_id]
+        state = json.loads(report_state.read_text(encoding="utf-8"))
+        meta = _extract_report_meta(report_html)
+        assert meta["schema_version"] == state["schema_version"] == "2.0"
+    finally:
+        _terminate_process(proc)
+
+
+def test_rtbioscan_hard_crash_restart_retains_fresh_schema_seed(tmp_path: Path) -> None:
+    run_id = f"CrashSchema_{tmp_path.name}"
+    outdir = tmp_path / "results"
+    env = _install_nextflow_shim(tmp_path, run_mode="sleep")
+    py_env, marker_path = _install_python_shim(tmp_path, mode="hold")
+    env = _merge_env(env, py_env)
+    wrapper_log = tmp_path / "crash-schema.log"
+    report_root = outdir / "report_html"
+    run_json = report_root / "runs" / run_id / "run_report.json"
+    run_index = report_root / "runs_index.jsonl"
+
+    with wrapper_log.open("w", encoding="utf-8") as handle:
+        proc = subprocess.Popen(
+            _rtbioscan_serve_command(outdir, run_id, 8011),
+            cwd=tmp_path,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+    try:
+        _wait_for(lambda: marker_path.exists() and run_json.exists() and run_index.exists())
+        os.killpg(proc.pid, signal.SIGKILL)
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
+
+    seeded = json.loads(run_json.read_text(encoding="utf-8"))
+    assert seeded["status_label"] == "Fresh"
+    assert seeded["status"] == "running"
+    assert seeded["schema_version"] == "2.0"
+
+    restart_env = _install_nextflow_shim(tmp_path, run_exit=0)
+    restart_py_env, _ = _install_python_shim(tmp_path, mode="hold")
+    restart_env = _merge_env(restart_env, restart_py_env)
+    restarted = subprocess.run(
+        _rtbioscan_serve_command(outdir, run_id, 8011),
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=restart_env,
+        timeout=15,
+    )
+
+    assert restarted.returncode == 0, restarted.stdout + restarted.stderr
+    retained = json.loads(run_json.read_text(encoding="utf-8"))
+    indexed = [row for row in _read_json_lines(run_index) if row.get("run_id") == run_id]
+    assert retained["status_label"] == "Fresh"
+    assert retained["status"] == "running"
+    assert retained["schema_version"] == "2.0"
+    assert len(indexed) == 1
+    assert indexed[0]["schema_version"] == "2.0"
 
 
 def test_rtbioscan_wrapper_sigint_stops_feeder_and_report_server_promptly(tmp_path: Path) -> None:

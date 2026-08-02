@@ -111,7 +111,7 @@ Each analysis round produces a directory under `results/temp/ongoing/state/<stat
 ```
 results/temp/ongoing/state/<state_id>/
   <round_barcode>/
-    round_report.json                             ← machine-readable round metrics (schema v1.7)
+    round_report.json                             ← machine-readable round metrics (schema v2.0)
     run_report.json                               ← run-level summary JSON derived from history after this round
     <barcode>_summary_demult_rpt.txt              ← demultiplexing read counts
     <barcode>_blast_otu_pretax_rpt.txt            ← BLAST OTU assignments (round)

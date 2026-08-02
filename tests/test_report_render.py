@@ -338,8 +338,9 @@ def test_render_html_with_empty_history(tmp_path: Path) -> None:
     html = out_html.read_text(encoding="utf-8")
     assert out_state.exists()
     state = json.loads(out_state.read_text(encoding="utf-8"))
+    meta = _extract_js_json(html, "window.REPORT_META = ")
     assert set(state.keys()) == {"schema_version", "generated_at_utc", "report_revision"}
-    assert state["schema_version"] == "1.2"
+    assert meta["schema_version"] == state["schema_version"] == "2.0"
     assert len(state["report_revision"]) == 64
 
 
@@ -457,6 +458,8 @@ def test_render_embeds_auto_refresh_meta(tmp_path: Path) -> None:
     assert rc.returncode == 0, rc.stderr
     html_text = out_html.read_text(encoding="utf-8")
     meta = _extract_js_json(html_text, "window.REPORT_META = ")
+    state = json.loads(out_state.read_text(encoding="utf-8"))
+    assert meta["schema_version"] == state["schema_version"] == "1.1"
     assert meta["auto_refresh_enabled"] is False
     assert meta["refresh_interval_sec"] == 30
     assert meta["state_url"] == "report_state.json"

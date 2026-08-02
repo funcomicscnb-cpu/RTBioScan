@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import pty
@@ -481,6 +482,19 @@ def _make_wrapper_root(tmp_path: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
     return wrapper_root, script
+
+
+def _install_wrapper_report_renderer(wrapper_root: Path) -> None:
+    for relative_path in (
+        "bin/report_render.py",
+        "assets/report/template.html",
+        "assets/report/report.css",
+        "assets/report/report.js",
+    ):
+        source = REPO_ROOT / relative_path
+        destination = wrapper_root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
 
 
 def _write_wrapper_nextflow_shim(
@@ -1624,6 +1638,87 @@ def test_rtbioscan_clean_run_removes_cache_locks_when_nextflow_clean_fails(tmp_p
         ["clean", "-n", "-k", run_id],
         ["clean", "-f", "-k", run_id],
     ]
+
+
+@pytest.mark.parametrize("keep_surviving_run", [False, True], ids=["empty-index", "surviving-run"])
+def test_rtbioscan_clean_run_rerenders_current_artifact_schema(
+    tmp_path: Path, keep_surviving_run: bool
+) -> None:
+    run_id = "cleaned-report-run"
+    surviving_run_id = "surviving-legacy-run"
+    launch_dir = tmp_path / "launch_root"
+    report_root = launch_dir / "results" / "report_html"
+    run_dir = report_root / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (launch_dir / ".nextflow").mkdir(parents=True)
+    (launch_dir / ".nextflow" / "history").write_text(
+        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\tsession-id\tnextflow run main.nf -name {run_id}\n",
+        encoding="utf-8",
+    )
+    (report_root / "report.html").write_text("<html>stale</html>\n", encoding="utf-8")
+
+    index_rows = [
+        {
+            "schema_version": "2.0",
+            "run_id": run_id,
+            "state_id": run_id,
+            "rounds_count": 0,
+            "status_label": "Fresh",
+        }
+    ]
+    if keep_surviving_run:
+        index_rows.append(
+            {
+                "schema_version": "1.6",
+                "run_id": surviving_run_id,
+                "state_id": surviving_run_id,
+                "rounds_count": 3,
+            }
+        )
+    run_index = report_root / "runs_index.jsonl"
+    run_index.write_text(
+        "".join(json.dumps(row) + "\n" for row in index_rows),
+        encoding="utf-8",
+    )
+
+    wrapper_root, script = _make_wrapper_root(tmp_path)
+    _install_wrapper_report_renderer(wrapper_root)
+    env = os.environ.copy()
+    _write_wrapper_nextflow_shim(wrapper_root, env, clean_stdout="NEXTFLOW_CLEAN_OK\n")
+
+    result = subprocess.run(
+        ["bash", str(script), "--clean", run_id, "--clean-ref", str(launch_dir), "--yes"],
+        cwd=launch_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not run_dir.exists()
+    remaining_rows = [
+        json.loads(line)
+        for line in run_index.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    expected_run_ids = [surviving_run_id] if keep_surviving_run else []
+    assert [row["run_id"] for row in remaining_rows] == expected_run_ids
+
+    report_state = json.loads((report_root / "report_state.json").read_text(encoding="utf-8"))
+    assert report_state["schema_version"] == "2.0"
+    html_text = (report_root / "report.html").read_text(encoding="utf-8")
+
+    def extract_embedded(marker: str) -> dict:
+        start = html_text.index(marker) + len(marker)
+        end = html_text.index(";\n", start)
+        return json.loads(html_text[start:end])
+
+    report_meta = extract_embedded("window.REPORT_META = ")
+    report_payload = extract_embedded("window.REPORT_PAYLOAD = ")
+    assert report_meta["schema_version"] == "2.0"
+    assert [row["run_id"] for row in report_payload["run_index"]] == expected_run_ids
+    if keep_surviving_run:
+        assert report_payload["run_index"][0]["schema_version"] == "1.6"
 
 
 def test_rtbioscan_clean_run_does_not_match_prefix_run_id_feeder(tmp_path: Path) -> None:
