@@ -23,12 +23,20 @@ def iso_to_epoch(ts):
         return None
 
 
-def extract_frozen_counts(assignments_by_level):
+def schema_major_version(schema_version):
+    try:
+        return int(str(schema_version or "").split(".", 1)[0])
+    except Exception:
+        return 0
+
+
+def extract_frozen_counts(assignments_by_level, schema_version=None):
     """Return (species_set, genus_set, family_set, reads_by_rank_marker) for frozen OTUs."""
     species_set = set()
     genus_set = set()
     family_set = set()
     reads_by_rank_marker = {}  # (rank, marker) -> total reads
+    allow_unsuffixed_frozen_reads = schema_major_version(schema_version) >= 2
 
     for level in ("species", "genus", "family"):
         rows = assignments_by_level.get(level, [])
@@ -42,7 +50,11 @@ def extract_frozen_counts(assignments_by_level):
                 continue
             taxon = row.get("taxon") or row.get(level) or ""
             marker = (row.get("marker") or "").upper()
-            reads = row.get("reads_total")
+            # This report is frozen-specific; do not use reads_total, which may
+            # include non-frozen OTU reads co-assigned to the same taxon row.
+            reads = row.get("frozen_otu_reads_sample_total")
+            if reads is None and allow_unsuffixed_frozen_reads:
+                reads = row.get("frozen_otu_reads_total")
             reads = int(reads) if isinstance(reads, (int, float)) else 0
 
             if level == "species" and taxon:
@@ -103,7 +115,7 @@ def main():
         print("INFO: No assignments_by_level; skipping", file=sys.stderr)
         sys.exit(0)
 
-    sp_set, gn_set, fm_set, reads_rm = extract_frozen_counts(abl)
+    sp_set, gn_set, fm_set, reads_rm = extract_frozen_counts(abl, data.get("schema_version"))
 
     run_id = args.run_id
     out_path = Path(args.out)

@@ -214,6 +214,10 @@ results/
     {run_id}_metadata.txt   ← run-filtered metadata TSV rows
     replicate_roster.tsv    ← replicate-level roster, when present
     replicate_identity.tsv  ← collapse/track identity bridge, when present
+    track_demult.fasta      ← track-mode demultiplexing FASTA, when present
+    track_roster.tsv        ← track-mode roster, when present
+    track_active_units.txt  ← track-mode active sample-marker units, when present
+    track_identity.tsv      ← track-mode sample-marker identity map, when present
 ```
 
 ### Disk management: pruning POD5 files during a run
@@ -331,6 +335,8 @@ Key options:
 5. Writes `results/sample_info/{run_id}/replicate_roster.tsv`, when present, and `results/sample_info/{run_id}/replicate_identity.tsv`, when present.
 6. Validates that the output FASTA line count matches the number of emitted demultiplexing records.
 
+When track mode artifacts are generated, each track unit corresponds to one observed sample-marker pair. Samples or replicates that cover only a subset of `--targets` are supported; unobserved markers produce no placeholder rows.
+
 **Input file formats:**
 
 `results/sample_info/{run_id}/demult.fasta` is passed to cutadapt with `-e 0.1` (1st-pass demultiplexing). Each header must be the exact sample name as it will appear throughout the run, or a marker-qualified variant when metadata disambiguation emits multiple marker-specific records for the same barcode key:
@@ -397,6 +403,18 @@ This is conceptually different from the environmental metabarcoding workflow:
 The environmental workflow is optimised for **monitoring biodiversity of taxa that can be assigned to a known species, genus, or family** in the reference database. Unassigned clusters — reads that do not match any known sequence at the configured identity thresholds — accumulate in every run and are typically removed by enabling `--prune_unassigned_clusters true`. This keeps per-round runtimes bounded and the report focused on the taxa of interest.
 
 BLAST assignment in the voucher mode is provided as a suggestion only: the most common scenario is a specimen from a species not yet in the reference database, so the absence of a BLAST match is informative rather than problematic.
+
+For the bundled `test` and `voucher` profiles, the main assigned/unassigned OTU differences are:
+
+| Aspect | `-profile test` | `-profile voucher` |
+|---|---|---|
+| **Assigned OTU protection threshold** | Inherits default `assign_protection_level = genus` | Inherits default `assign_protection_level = genus` |
+| **Taxonomy support for assignment** | No memtax side tables (`nonncbi_memtax = "|"`); relies on the standard DB outputs | Uses per-marker memtax tables to improve assignment coverage |
+| **Assigned-OTU BLAST filtering** | Enforced: `otu_blast_filter_mode = enforce` and `otu_blast_force_use_filtered = true` | Observed only: `otu_blast_filter_mode = observe` and `otu_blast_force_use_filtered = false` |
+| **BLAST-unassigned OTUs** | Enforced pruning path: `otu_blast_unassigned_mode = enforce` | Observed only: `otu_blast_unassigned_mode = observe` |
+| **Repeated unassigned OTUs across rounds** | Enforced pruning path: `otu_unassigned_streak_mode = enforce` | Observed only: `otu_unassigned_streak_mode = observe` |
+| **Consensus-time unassigned cluster pruning** | Disabled by default (`prune_unassigned_clusters = false`) | Disabled by default (`prune_unassigned_clusters = false`) |
+| **If consensus-time unassigned pruning is enabled manually** | Inherits default `prune_unassigned_grace_rounds = 3` and `prune_unassigned_keep_top = 5` | Tightens to `prune_unassigned_grace_rounds = 1` and `prune_unassigned_keep_top = 1` |
 
 > **Keeping unassigned clusters in the environmental workflow**
 >
@@ -1069,6 +1087,7 @@ Pipe-separated list of marker names processed in this run. All per-marker parame
 
 - Default: `COI|ITS2`.
 - These strings are embedded in FASTQ/FASTA headers and must match the marker names expected by your databases and demultiplex setup.
+- The list is the run-wide allowed marker superset; individual samples or replicates may include any subset of these markers. Track-mode artifacts are generated from observed sample-marker combinations only.
 - To add a third marker: `--targets "COI|ITS2|16S"` (and set all matching per-marker params with a third `|`-separated value).
 
 #### `--target_taxa`
@@ -2045,7 +2064,7 @@ Enable or disable incremental HTML report rendering (`${params.outdir}/report_ht
      - run report: `${params.outdir}/report_html/runs/<run_id>/report.html`
 - History dedupe key is `run_id + barcode + round_barcode` (resume-safe).
 - Missing source TSVs are recorded in `warnings[]`; report generation does not fail the round.
-- Report schema version is `1.6`.
+- Report schema version is `2.0`.
 - `otu.canonical.active` is a unique OTU count (`OTU_id`/`otu_id`), not read rows.
 - `blast.mode` reflects pipeline mode (`off|observe|enforce`); `blast.missing_policy` reports `keep|drop`.
 - HTML rendering sorts rounds by `timestamp_utc` (missing timestamps last), then `round_barcode`, then `barcode`.

@@ -191,8 +191,8 @@ def test_track_identity_conflicting_duplicate_unit_fails(tmp_path: Path) -> None
     assert "track identity duplicate conflict for unit_id_track Shared_r1_COI" in result.stderr
 
 
-def test_track_identity_validation_fails_when_track_is_missing_marker(tmp_path: Path) -> None:
-    general = tmp_path / "general_missing_marker.fasta"
+def test_track_identity_accepts_heterogeneous_marker_composition(tmp_path: Path) -> None:
+    general = tmp_path / "general_heterogeneous_markers.fasta"
     general.write_text(
         ">A1_TestPlate\n"
         "COI_LEFT...COI_RIGHT\n"
@@ -208,8 +208,50 @@ def test_track_identity_validation_fails_when_track_is_missing_marker(tmp_path: 
     )
 
     result = _run_metadata(tmp_path, general_fasta=general)
-    assert result.returncode != 0
-    assert "missing required marker_id ITS2 for track_id SampleB_r1" in result.stderr
+    assert result.returncode == 0, f"Script failed:\n{result.stdout}\n{result.stderr}"
+
+    sample_info = tmp_path / "results" / "sample_info" / "TestRun"
+    track_identity = sample_info / "track_identity.tsv"
+    track_active_units = sample_info / "track_active_units.txt"
+    track_demult = sample_info / "track_demult.fasta"
+    track_roster = sample_info / "track_roster.tsv"
+
+    assert track_identity.exists(), "track_identity.tsv not created"
+    identity_rows = track_identity.read_text(encoding="utf-8").splitlines()
+    header = identity_rows[0].split("\t")
+    track_col = header.index("track_id")
+    marker_col = header.index("marker_id")
+    observed_pairs = {
+        (row.split("\t")[track_col], row.split("\t")[marker_col])
+        for row in identity_rows[1:]
+        if row.strip()
+    }
+    assert observed_pairs == {
+        ("SampleA_r1", "COI"),
+        ("SampleA_r1", "ITS2"),
+        ("SampleA_r2", "COI"),
+        ("SampleA_r2", "ITS2"),
+        ("SampleB_r1", "COI"),
+    }
+
+    assert track_active_units.read_text(encoding="utf-8").splitlines() == [
+        "SampleA_r1_COI",
+        "SampleA_r1_ITS2",
+        "SampleA_r2_COI",
+        "SampleA_r2_ITS2",
+        "SampleB_r1_COI",
+    ]
+    track_demult_headers = [
+        line
+        for line in track_demult.read_text(encoding="utf-8").splitlines()
+        if line.startswith(">")
+    ]
+    assert ">SampleB_r1_COI" in track_demult_headers
+    assert ">SampleB_r1_ITS2" not in track_demult_headers
+
+    roster_lines = track_roster.read_text(encoding="utf-8").splitlines()
+    assert len(roster_lines) == 4
+    assert any(line.startswith("SampleB\tSampleB_r1\t") for line in roster_lines[1:])
 
 
 def test_empty_output_fails_validation(tmp_path: Path) -> None:

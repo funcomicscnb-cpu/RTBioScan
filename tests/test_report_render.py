@@ -862,6 +862,28 @@ def test_build_sample_treemap_items_isolates_track_units() -> None:
     assert items_2[0]["taxon"] == "S2"
 
 
+def test_report_js_otu_heatmap_contract_for_frozen_fields() -> None:
+    """Lock report.js field choices that prevent frozen-read scope bleed in the heatmap."""
+    source = JS.read_text(encoding="utf-8")
+
+    assert "frozen_otu_reads_global_total" not in source, (
+        "report.js must not reference frozen_otu_reads_global_total; "
+        "it is diagnostic-only and must stay out of UI paths"
+    )
+    assert 'specialField: "frozen_otu_reads_sample_total"' in source, (
+        "OTU reads heatmap view must use frozen_otu_reads_sample_total"
+    )
+    assert "cell.frozenReads += num(row.frozen_otu_reads_sample_total)" in source, (
+        "Any frozen-read heatmap accumulator must use sample-scoped frozen reads"
+    )
+    assert "cell.frozenReads += num(row.frozen_otu_reads_total)" not in source, (
+        "The heatmap must not accumulate frozen reads from the unsuffixed total"
+    )
+    assert 'specialFallbackField: "frozen_otu_reads_total"' not in source, (
+        "No heatmap view may use frozen_otu_reads_total as a specialFallbackField"
+    )
+
+
 def test_iter_sample_assignment_rows_collapses_track_sample_replicates() -> None:
     report_render = _load_report_render_module()
     round_obj = {
@@ -1314,12 +1336,108 @@ def test_report_js_contains_marker_split_read_fate_mapping() -> None:
     assert "Consensus assignments: consensus" in js_text
     assert "Assignments by ${groupEntityLabel()}" in js_text
     assert "buildAssignmentSampleMatrix" in js_text
-    assert "frozen_otu_reads_total" in js_text
+    assert "function otuSampleReads" in js_text
+    assert "otu_reads_sample_total" in js_text
+    assert "metricFallbackField" in js_text
+    assert 'metricFallbackField: "reads_total"' in js_text
+    assert "displayTotal: true" in js_text
+    assert "cell.total += value" in js_text
+    assert "activeView.displayTotal ? num(cell.total)" in js_text
+    assert "numAny(otuSampleReads(row)) >= OTU_ASSIGNMENT_MIN_READS" in js_text
+    assert 'typeof readValueFn === "function"' in js_text
+    assert "readValueFn(row)" in js_text
+    assert '(sourceKey === "otu" ? num(otuSampleReads(row)) : num(row.reads_total))' in js_text
+    assert "readValueFn: otuSampleReads" in js_text
+    assert "Object.prototype.hasOwnProperty.call(row, metricField)" in js_text
+    assert "frozen_otu_reads_sample_total" in js_text
+    assert 'valueField: "frozen_otu_reads_sample_total"' in js_text
+    assert 'valueField: "consolidated_consensus_reads_total"' in js_text
+    assert "specialFallbackField" in js_text
+    assert 'specialFallbackField: "frozen_otu_reads_total"' not in js_text
+    assert "hasSpecialPresence" in js_text
+    assert "sample-specific frozen-read counts" in js_text
+    assert "consolidated read counts are unavailable" in js_text
+    assert "reads from frozen OTUs (this sample/group)" not in js_text
     assert "consolidated_consensus_reads_total" in js_text
     assert "assignment-special-count" in js_text
     assert "samplesWithReadEvidence" in js_text
-    assert "Cells show total values; bold values in parentheses show" in js_text
+    assert "cellValueDescription" in js_text
+    assert 'activeView.sourceKey === "otu"' in js_text
+    assert "Cells show supported values; low-read-only OTU cells show assignments" in js_text
+    assert ': "Cells show values";' in js_text
+    assert "bold values in parentheses show" in js_text
     assert ".assignment-special-count" in css_text
+
+
+def test_report_render_uses_sample_specific_otu_reads_for_exports() -> None:
+    import importlib.util
+
+    module_path = REPO_ROOT / "bin" / "report_render.py"
+    spec = importlib.util.spec_from_file_location("report_render", module_path)
+    assert spec is not None and spec.loader is not None
+    report_render = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(report_render)
+
+    row = {
+        "sample": "sample_A",
+        "marker": "COI",
+        "taxon": "Species one",
+        "family": "Family one",
+        "genus": "Genus one",
+        "species": "Species one",
+        "reads_total": 100,
+        "otu_reads_sample_total": 4,
+    }
+    round_obj = {"otu": {"assignments_by_level": {"family": [], "genus": [], "species": [row]}}}
+
+    assert report_render.is_supported_otu_assignment_row(row) is False
+    items = report_render.build_sample_treemap_items(round_obj, "sample_A", "species", source_key="otu")
+    assert items == [
+        {"taxon": "Species one", "family": "Family one", "reads_total": 4.0},
+    ]
+
+
+def test_build_run_taxonomy_tree_can_scale_filtered_frozen_rows_by_frozen_reads() -> None:
+    report_render = _load_report_render_module()
+    row = {
+        "sample": "YT.C.spiked_1_MPnew1",
+        "marker": "ITS2",
+        "taxon": "Sorghum",
+        "family": "Poaceae",
+        "genus": "Sorghum",
+        "species": "Sorghum",
+        "reads_total": 14,
+        "otu_reads_sample_total": 14,
+        "frozen_otu_count": 1,
+        "frozen_otu_reads_sample_total": 8,
+    }
+    round_obj = {
+        "otu": {
+            "assignments_by_level": {
+                "family": [],
+                "genus": [],
+                "species": [row],
+            }
+        }
+    }
+
+    frozen_tree = report_render.build_run_taxonomy_tree(
+        round_obj,
+        "otu",
+        "ITS2",
+        include_row=lambda r: (r.get("frozen_otu_count") or 0) > 0,
+        read_field="frozen_otu_reads_sample_total",
+    )
+    total_tree = report_render.build_run_taxonomy_tree(
+        round_obj,
+        "otu",
+        "ITS2",
+        include_row=lambda r: (r.get("frozen_otu_count") or 0) > 0,
+    )
+
+    assert frozen_tree["value"] == 8.0
+    assert frozen_tree["children"][0]["value"] == 8.0
+    assert total_tree["value"] == 14.0
 
 
 def test_report_js_track_detail_matrix_uses_canonical_track_sort_fields() -> None:
@@ -1332,6 +1450,18 @@ def test_report_js_track_detail_matrix_uses_canonical_track_sort_fields() -> Non
     assert "track_sample_replicate_label" in js_text
     assert "track_replicate_label" in js_text
     assert "text.match(/^(.*?_\\d+)_[^_]+$/)" in js_text
+
+
+def test_report_js_assignment_matrix_scopes_special_counts_to_displayed_subset() -> None:
+    js_text = JS.read_text(encoding="utf-8")
+    assert "specialSupported" in js_text
+    assert "specialUnsupported" in js_text
+    assert "frozenSupported" in js_text
+    assert "frozenUnsupported" in js_text
+    assert 'displayScopedValue(cell, "special", "specialSupported", "specialUnsupported")' in js_text
+    assert 'displayScopedValue(cell, "frozen", "frozenSupported", "frozenUnsupported")' in js_text
+    assert 'cellDisplayScopedValue(cell, "special", "specialSupported", "specialUnsupported")' in js_text
+    assert "cell.supported > 0 ? num(cell[supportedKey]) : num(cell[unsupportedKey])" in js_text
 
 
 # ---------------------------------------------------------------------------

@@ -5541,7 +5541,7 @@ process getting_run_summary {
 			--round-barcode "${round_barcode}" \
 			--targets "${params.targets}" \
 			--target-taxa "${params.target_taxa}" \
-			--schema-version "1.6" \
+			--schema-version "2.0" \
 			--asset-snapshot-policy "latest_only" \
 			--timestamp-utc "\$ROUND_TIMESTAMP_UTC" \
 			--out "\$out_path" \
@@ -6557,7 +6557,7 @@ process backup_update_and_clean {
 				--barcode "${barcode}" \
 				--state-id "${stateId}" \
 				--outdir "${params.outdir}" \
-				--schema-version "1.6" \
+				--schema-version "2.0" \
 				--report-rel-path "\$RUN_REPORT_REL_PATH" \
 				--run-started-utc-file "${ongoingStateDir}/_state/run_started_utc.txt"
 			run_json_rc=\$?
@@ -6570,6 +6570,10 @@ process backup_update_and_clean {
 				echo "ERROR: invariant violated - report_run_json.pl did not produce \$RUN_REPORT_JSON" 1>&2
 				exit 1
 			fi
+			mkdir -p "\$RUN_REPORT_DIR"
+			RUN_REPORT_JSON_PUBLIC_TMP="\$RUN_REPORT_DIR/.run_report.json.tmp.\$\$"
+			cp "\$RUN_REPORT_JSON" "\$RUN_REPORT_JSON_PUBLIC_TMP"
+			mv "\$RUN_REPORT_JSON_PUBLIC_TMP" "\$RUN_REPORT_DIR/run_report.json"
 			set +e
 			LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_run_index_update.sh "\$RUN_REPORT_JSON" "\$RUN_INDEX_JSONL" "\$RUN_INDEX_LOCK"
 			run_index_rc=\$?
@@ -6670,35 +6674,79 @@ process async_report_render {
 			HTML_REPORT_REFRESH_SECONDS=${htmlReportRefreshSecondsStr}
 			HTML_REPORT_URL_PREFIX="${htmlReportUrlPrefix}"
 			HTML_REPORT_SAMPLE_PLOT_MAX=${htmlReportSamplePlotMaxStr}
-			RENDER_LOCK_WAIT=5
-			ROOT_LOCK_WAIT=1
+			RENDER_LOCK_WAIT=${params.lock_wait_seconds}
+			ROOT_LOCK_WAIT=${params.lock_wait_seconds}
+			REPORT_LOCK_STALE_TTL_SECONDS="\$(( ${staleLockTtlMinutesStr} * 60 ))"
+			REPORT_LOCK_HOST="\$(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
+			REPORT_STALE_LOCK_DIR=""
 			SNAPSHOT_PATH="report_history.snapshot.jsonl"
 
 			render_lock_acquired=0
 			release_render_lock() {
 				if [ "\${render_lock_acquired:-0}" -eq 1 ]; then
+					rm -f "\${REPORT_RENDER_LOCK}.lockdir/meta.env" 2>/dev/null || true
 					rmdir "\${REPORT_RENDER_LOCK}.lockdir" 2>/dev/null || true
 					render_lock_acquired=0
 				fi
 			}
 			trap release_render_lock EXIT HUP INT TERM
 
+			source "${baseDir}/bin/lib/stale_lock_utils.sh"
+			remove_report_lock_if_stale() {
+				if [ -n "\${REPORT_STALE_LOCK_DIR:-}" ]; then
+					rm -f "\${REPORT_STALE_LOCK_DIR}/meta.env" 2>/dev/null || true
+					rmdir "\$REPORT_STALE_LOCK_DIR" 2>/dev/null || rm -rf "\$REPORT_STALE_LOCK_DIR" 2>/dev/null || true
+				fi
+			}
 			acquire_lock_dir_wait() {
 				local lock_path="\$1"
 				local wait_limit="\$2"
+				local lock_label="\${3:-report lock}"
 				local waited=0
 				local lock_dir="\${lock_path}.lockdir"
+				local lock_meta="\${lock_dir}/meta.env"
+				local started_epoch=""
+				local reclaim_status=0
 				while ! mkdir "\$lock_dir" 2>/dev/null; do
+					REPORT_STALE_LOCK_DIR="\$lock_dir"
+					set +e
+					stale_lock_maybe_reclaim \
+						"\$lock_dir" \
+						"\$lock_meta" \
+						"\$REPORT_LOCK_HOST" \
+						"\$REPORT_LOCK_STALE_TTL_SECONDS" \
+						"\$lock_label" \
+						remove_report_lock_if_stale \
+						0
+					reclaim_status=\$?
+					set -e
+					if [ "\$reclaim_status" -eq 2 ] || [ "\$reclaim_status" -eq 11 ]; then
+						return 1
+					fi
+					if [ "\$reclaim_status" -eq 10 ]; then
+						continue
+					fi
 					if [ "\$waited" -ge "\$wait_limit" ]; then
 						return 1
 					fi
 					sleep 1
 					waited=\$((waited + 1))
 				done
+				started_epoch="\$(date +%s 2>/dev/null || echo 0)"
+				if ! {
+					printf 'pid=%s\n' "\$\$"
+					printf 'host=%s\n' "\$REPORT_LOCK_HOST"
+					printf 'started_epoch=%s\n' "\$started_epoch"
+				} > "\$lock_meta"; then
+					rm -f "\$lock_meta" 2>/dev/null || true
+					rmdir "\$lock_dir" 2>/dev/null || true
+					return 1
+				fi
 				return 0
 			}
 			release_lock_dir() {
 				local lock_path="\$1"
+				rm -f "\${lock_path}.lockdir/meta.env" 2>/dev/null || true
 				rmdir "\${lock_path}.lockdir" 2>/dev/null || true
 			}
 			calc_sha256() {

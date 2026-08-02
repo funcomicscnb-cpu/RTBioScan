@@ -697,8 +697,14 @@ def sample_row_matches(sample_value, sample_label, match_mode="exact"):
     return raw_sample == raw_label
 
 
+def assignment_reads_value(row, source_key):
+    if source_key == "otu" and isinstance(row, dict) and row.get("otu_reads_sample_total") is not None:
+        return num_any(row.get("otu_reads_sample_total"))
+    return num_any(row.get("reads_total") if isinstance(row, dict) else None)
+
+
 def is_supported_otu_assignment_row(row):
-    return num_any(get_path(row, ["reads_total"], None)) >= 5
+    return assignment_reads_value(row, "otu") >= 5
 
 
 def marker_from_filename(name):
@@ -1107,7 +1113,7 @@ def build_sample_taxonomy_tree(round_obj, sample_label, source_key, marker, incl
             include_row=include_row,
             match_mode=match_mode,
         ):
-            reads_total = max(0.0, float(num_any(row.get("reads_total"))))
+            reads_total = max(0.0, float(assignment_reads_value(row, source_key)))
             if reads_total <= 0:
                 continue
             highlight_total = max(0.0, float(num_any(row.get(highlight_field)))) if highlight_field else 0.0
@@ -1212,7 +1218,7 @@ def iter_run_assignment_rows(round_obj, source_key, level, marker=None, include_
     return out
 
 
-def build_run_taxonomy_tree(round_obj, source_key, marker, include_row=None):
+def build_run_taxonomy_tree(round_obj, source_key, marker, include_row=None, read_field=None):
     """Build taxonomy tree aggregated across all samples (no sample filter)."""
     marker_name = canonical_marker_token(marker)
     highlight_spec = assignment_sunburst_highlight_spec(source_key)
@@ -1252,7 +1258,10 @@ def build_run_taxonomy_tree(round_obj, source_key, marker, include_row=None):
 
     for level in ("family", "genus", "species"):
         for row in iter_run_assignment_rows(round_obj, source_key, level, marker_name, include_row=include_row):
-            reads_total = max(0.0, float(num_any(row.get("reads_total"))))
+            if read_field:
+                reads_total = max(0.0, float(num_any(row.get(read_field))))
+            else:
+                reads_total = max(0.0, float(assignment_reads_value(row, source_key)))
             if reads_total <= 0:
                 continue
             highlight_total = max(0.0, float(num_any(row.get(highlight_field)))) if highlight_field else 0.0
@@ -1464,7 +1473,7 @@ def collect_sample_round_metrics(round_obj, sample_id, sample_label):
                     taxon = str(item.get("taxon") or item.get(level) or "").strip()
                     if taxon:
                         taxa.add(taxon)
-                    reads_total += max(0.0, float(num_any(item.get("reads_total"))))
+                    reads_total += max(0.0, float(assignment_reads_value(item, source_key)))
                 counts_by_marker[marker] = len(taxa)
                 reads_by_marker[marker] = reads_total
             for marker in all_markers:
@@ -1965,7 +1974,7 @@ def build_sample_treemap_items(round_obj, sample_label, level, source_key="otu",
         taxon = str(row.get("taxon") or row.get(level) or "").strip()
         if not taxon:
             continue
-        reads_total = max(0.0, float(num_any(row.get("reads_total"))))
+        reads_total = max(0.0, float(assignment_reads_value(row, source_key)))
         if reads_total <= 0:
             continue
         family = str(row.get("family") or "").strip()
@@ -2163,6 +2172,28 @@ def append_generated_sample_figures(sorted_rounds, latest_round, out_path, run_i
 
     generated_ids = {spec["id"] for spec in figure_specs}
 
+    def build_sample_taxonomy_tree_compat(round_obj, sample_label, source_key, marker, include_row=None, match_mode="exact"):
+        try:
+            return build_sample_taxonomy_tree(
+                round_obj,
+                sample_label,
+                source_key,
+                marker,
+                include_row=include_row,
+                match_mode=match_mode,
+            )
+        except TypeError as exc:
+            # Test stubs and older helper overrides may still use the pre-match_mode signature.
+            if "match_mode" not in str(exc):
+                raise
+            return build_sample_taxonomy_tree(
+                round_obj,
+                sample_label,
+                source_key,
+                marker,
+                include_row=include_row,
+            )
+
     for sample_id, raw, _reads_key, _label_key, _sample_key in ordered_samples:
         sample_label = str(raw.get("label") or sample_id or "sample")
         figures = [copy.deepcopy(fig) for fig in raw.get("figures", []) if isinstance(fig, dict) and fig.get("id") not in generated_ids]
@@ -2197,7 +2228,7 @@ def append_generated_sample_figures(sorted_rounds, latest_round, out_path, run_i
                     source_payload = history_rows
                 else:
                     include_row = is_supported_otu_assignment_row if spec["source_key"] == "otu" else None
-                    tree = build_sample_taxonomy_tree(
+                    tree = build_sample_taxonomy_tree_compat(
                         latest_round,
                         sample_label,
                         spec["source_key"],
@@ -2571,17 +2602,35 @@ def collect_sample_replicate_bars(latest_round, sample_entry, collapse_track_uni
     if collapse_track_units:
         if latest_round.get("identity_mode") == "track":
             track_unit_metrics = latest_round.get("track_unit_metrics")
-            if not isinstance(track_unit_metrics, dict):
-                return []
             target_label = str(sample_entry.get("label") or "").strip()
+            if isinstance(track_unit_metrics, dict):
+                replicate_totals = {}
+                for raw in track_unit_metrics.values():
+                    if not isinstance(raw, dict):
+                        continue
+                    if track_sample_label_value(raw) != target_label:
+                        continue
+                    replicate_label = concise_track_replicate_label(raw) or str(raw.get("track_replicate_id") or raw.get("track_unit_id") or "Barcode")
+                    replicate_totals[replicate_label] = replicate_totals.get(replicate_label, 0.0) + max(0.0, num_any(raw.get("reads_demux")))
+                if replicate_totals:
+                    return [
+                        {"label": label, "value": value}
+                        for label, value in sorted(
+                            replicate_totals.items(),
+                            key=lambda item: (natural_round_key(item[0]), natural_round_key(item[0])),
+                        )
+                    ]
+            sample_metrics = latest_round.get("sample_metrics")
+            if not isinstance(sample_metrics, dict):
+                return []
             replicate_totals = {}
-            for raw in track_unit_metrics.values():
+            for sample_id, raw in sample_metrics.items():
                 if not isinstance(raw, dict):
                     continue
-                if track_sample_label_value(raw) != target_label:
+                raw_label = str(raw.get("label") or sample_id or "Barcode").strip()
+                if sample_group_label(raw_label, collapse_track_units=True) != target_label:
                     continue
-                replicate_label = concise_track_replicate_label(raw) or str(raw.get("track_replicate_id") or raw.get("track_unit_id") or "Barcode")
-                replicate_totals[replicate_label] = replicate_totals.get(replicate_label, 0.0) + max(0.0, num_any(raw.get("reads_demux")))
+                replicate_totals[raw_label] = replicate_totals.get(raw_label, 0.0) + max(0.0, num_any(raw.get("reads_demux")))
             return [
                 {"label": label, "value": value}
                 for label, value in sorted(
@@ -2826,11 +2875,11 @@ def build_chart_exports(sorted_rounds, sorted_runs, out_path, run_id):
             return {"pdf_path": raw_pdf_path(filename)}
         return {}
 
-    def add_sunburst_export(chart_id, title, subtitle, source_key, marker, include_row=None):
+    def add_sunburst_export(chart_id, title, subtitle, source_key, marker, include_row=None, read_field=None):
         png_path = chart_dir / f"{chart_id}.png"
         pdf_path = chart_dir / f"{chart_id}.pdf"
         sig_path = _sig_root / f"{chart_id}.sig"
-        tree = build_run_taxonomy_tree(latest_round, source_key, marker, include_row=include_row)
+        tree = build_run_taxonomy_tree(latest_round, source_key, marker, include_row=include_row, read_field=read_field)
         sig = compute_signature({"version": RENDER_EMBEDDED_SIGNATURE_VERSION,
                                   "title": title, "tree": tree})
         if not (sig_path.exists() and pdf_path.exists() and read_signature(sig_path) == sig):
@@ -2968,13 +3017,13 @@ def build_chart_exports(sorted_rounds, sorted_runs, out_path, run_id):
             _slug = marker_slug(_mk)
             _suffix = _mk if _mk in ("COI", "ITS2") else _slug
             _run_sunburst_specs.extend([
-                (f"run_otu_sunburst_{_suffix}", f"OTUs ({_mk})", "otu", _mk, is_supported_otu_assignment_row),
-                (f"run_consensus_sunburst_{_suffix}", f"Consensus ({_mk})", "consensus", _mk, None),
-                (f"run_frozen_otu_sunburst_{_suffix}", f"Frozen OTUs ({_mk})", "otu", _mk, lambda r: (r.get("frozen_otu_count") or 0) > 0),
-                (f"run_consolidated_consensus_sunburst_{_suffix}", f"Consolidated Consensus ({_mk})", "consensus", _mk, lambda r: (r.get("consolidated_consensus_count") or 0) > 0),
+                (f"run_otu_sunburst_{_suffix}", f"OTUs ({_mk})", "wedges scaled by assigned reads ({_mk})", "otu", _mk, is_supported_otu_assignment_row, None),
+                (f"run_consensus_sunburst_{_suffix}", f"Consensus ({_mk})", "wedges scaled by assigned reads ({_mk})", "consensus", _mk, None, None),
+                (f"run_frozen_otu_sunburst_{_suffix}", f"Frozen OTUs ({_mk})", f"wedges scaled by frozen OTU reads ({_mk})", "otu", _mk, lambda r: (r.get("frozen_otu_count") or 0) > 0, "frozen_otu_reads_sample_total"),
+                (f"run_consolidated_consensus_sunburst_{_suffix}", f"Consolidated Consensus ({_mk})", f"wedges scaled by consolidated consensus reads ({_mk})", "consensus", _mk, lambda r: (r.get("consolidated_consensus_count") or 0) > 0, "consolidated_consensus_reads_total"),
             ])
-        for _cid, _title, _src, _mk, _inc in _run_sunburst_specs:
-            exports[_cid] = add_sunburst_export(_cid, _title, f"wedges scaled by assigned reads ({_mk})", _src, _mk, include_row=_inc)
+        for _cid, _title, _subtitle, _src, _mk, _inc, _read_field in _run_sunburst_specs:
+            exports[_cid] = add_sunburst_export(_cid, _title, _subtitle, _src, _mk, include_row=_inc, read_field=_read_field)
     else:
         total_pages = max(1, (len(sorted_runs) + PAGE_SIZE - 1) // PAGE_SIZE)
         for chart_id in ("index_reads_fate", "index_informative_otu", "index_consensus_emitted"):

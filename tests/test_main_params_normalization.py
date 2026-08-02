@@ -2523,6 +2523,12 @@ def test_main_nf_guards_round_barcode_collisions_before_round_dir_use() -> None:
     assert 'if [ "\\$reclaim_status" -eq 10 ]; then' in fast_block
 
 
+def test_main_nf_report_lock_stale_ttl_uses_stale_lock_ttl_minutes() -> None:
+    text = MAIN_NF.read_text(encoding="utf-8")
+    assert 'REPORT_LOCK_STALE_TTL_SECONDS="\\$(( ${staleLockTtlMinutesStr} * 60 ))"' in text
+    assert 'REPORT_LOCK_STALE_TTL_SECONDS=${params.lock_wait_seconds}' not in text
+
+
 def test_main_nf_wires_size_streak_phase_b_in_reporting_otu_definition() -> None:
     text = MAIN_NF.read_text(encoding="utf-8")
     assert text.count('OTU_SIZE_STREAK_MODE="${otuSizeStreakModeCanonical}"') >= 1
@@ -2806,7 +2812,7 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'cp "${barcode}_summary_demult_rpt.txt" "${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt"' in summary_block
     assert '--demult "${demult_rpt}" \\' in summary_block
     assert '--read-fate-demult "${barcode}_read_fate_demult_first_seen.tsv" \\' in summary_block
-    assert '--schema-version "1.6" \\' in summary_block
+    assert '--schema-version "2.0" \\' in summary_block
     assert '--otu-sizes-round "${otu_sizes_round}" \\' in summary_block
     assert '--otu-size-streak "\\$ROUND_DIR/${barcode}_otu_size_streak.tsv" \\' in summary_block
     assert '--active-prune-counts "\\$ACTIVE_PRUNE_COUNTS_OUT" \\' in summary_block
