@@ -2184,6 +2184,20 @@ Lock wait timeout for short-lived filesystem locks used during reporting, restor
 
 - Default: `300`.
 
+#### `--state_lock_stale_seconds`
+[back to Top](#rtbioscan-usage)
+
+Stale-age threshold for the startup state-contract and reference-attestation-cache locks.
+
+- Default: `300`.
+- Same-host owners whose PID and verifiable, boot-aware process-start identity both still match are never reclaimed by age. On Linux, the identity includes the boot ID when available so PID reuse across a reboot is detected.
+- Proven dead same-host PIDs, and reused PIDs with a verifiable process-start identity, are reclaimed immediately.
+- Live PIDs whose process-start identity cannot be verified, unknown/foreign hosts, missing owners, and malformed owners are protected until this age and then reclaimed as fenced leases.
+- Set to `0` to disable age-based reclaim; only proven dead or verifiably reused same-host owners are then reclaimed automatically.
+- Do not set this below the worst-case duration of the protected state/cache publication section; the default leaves five minutes for those short critical sections.
+- Each successful stale recovery retains a small, private `.reclaim-<token>` tombstone. It is an intentional fencing record and does not count as rolling-state material; do not remove these records while validators may still be running.
+- Keep the critical state/cache filesystem on storage that provides coherent atomic `mkdir`, no-replace hard-link creation, and same-filesystem `rename` operations. If `--lock_wait_seconds` is lower than this value, a fresh lease can time out before becoming reclaimable.
+
 #### `--round_lock_wait_minutes`
 [back to Top](#rtbioscan-usage)
 

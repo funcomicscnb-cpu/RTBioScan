@@ -6,15 +6,19 @@ use warnings;
 use Cwd qw(abs_path);
 use Digest::SHA qw(sha256_hex);
 use Fcntl qw(O_CREAT O_EXCL O_WRONLY);
+use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use File::Spec;
 use Getopt::Long qw(GetOptions);
+use IO::Handle ();
 use POSIX qw(strftime);
+use Sys::Hostname qw(hostname);
 use Time::HiRes qw(time usleep);
 
 my %opt = (
     policy                 => 'strict',
     lock_wait              => 300,
+    lock_stale_seconds     => 300,
     profile                => '',
     taxonomy_dir           => '',
     nonncbi_memtax         => '',
@@ -42,6 +46,7 @@ GetOptions(
     'profile=s'                   => \$opt{profile},
     'policy=s'                    => \$opt{policy},
     'lock-wait=i'                 => \$opt{lock_wait},
+    'lock-stale-seconds=i'        => \$opt{lock_stale_seconds},
     'verification-cache-dir=s'    => \$opt{verification_cache_dir},
     'verification-mode=s'         => \$opt{verification_mode},
     'toolchain-fingerprint=s'     => \$opt{toolchain_fingerprint},
@@ -78,16 +83,22 @@ die "ERROR: --policy must be strict or adopt_legacy\n"
     if $opt{policy} ne 'strict' && $opt{policy} ne 'adopt_legacy';
 die "ERROR: --lock-wait must be >= 1\n"
     if !defined $opt{lock_wait} || $opt{lock_wait} < 1;
+die "ERROR: --lock-stale-seconds must be >= 0\n"
+    if !defined $opt{lock_stale_seconds} || $opt{lock_stale_seconds} < 0;
 die "ERROR: --verification-mode must be cached or full\n"
     if $opt{verification_mode} ne 'cached' && $opt{verification_mode} ne 'full';
 die "ERROR: --contract-migration must be strict or attest_v1\n"
     if $opt{contract_migration} ne 'strict' && $opt{contract_migration} ne 'attest_v1';
 
 my @owned_lock_dirs;
+my %owned_lock_token;
+my %owned_lock_kind;
 my @owned_temp_files;
 END {
     unlink($_) for grep { defined($_) && -e $_ } reverse @owned_temp_files;
-    rmdir($_) for grep { defined($_) && -d $_ } reverse @owned_lock_dirs;
+    for my $lock_dir (reverse @owned_lock_dirs) {
+        eval { release_lock_dir($lock_dir, 1); 1 };
+    }
 }
 $SIG{INT} = sub { die "ERROR: state compatibility validation interrupted by SIGINT\n" };
 $SIG{TERM} = sub { die "ERROR: state compatibility validation interrupted by SIGTERM\n" };
@@ -339,6 +350,7 @@ sub state_has_material {
     );
     while (my $entry = readdir($dh)) {
         next if $ignored{$entry};
+        next if $entry =~ /\A\.state_compatibility\.lockdir\.reclaim-[0-9a-f]{64}\z/;
         next if $entry eq '.DS_Store' || $entry =~ /^\._/;
         closedir($dh);
         return 1;
@@ -439,33 +451,507 @@ sub read_attestation_cache {
     };
 }
 
+sub normalized_lock_host {
+    my $value = eval { hostname() } // '';
+    $value = lc(trim($value));
+    $value =~ s/\.\z//;
+    return $value eq '' || $value =~ /[\t\r\n]/ ? 'unknown' : $value;
+}
+
+my $this_lock_host = normalized_lock_host();
+
+sub process_start_identity {
+    my ($pid) = @_;
+    return '' if !defined $pid || $pid !~ /\A[0-9]+\z/ || $pid < 1;
+    my $proc_stat = "/proc/$pid/stat";
+    if (-r $proc_stat && open(my $proc_fh, '<', $proc_stat)) {
+        my $line = <$proc_fh> // '';
+        close($proc_fh);
+        if ($line =~ /\A[0-9]+\s+\(.*\)\s+(.*)\z/s) {
+            my @field = split /\s+/, trim($1);
+            if (@field > 19 && $field[19] =~ /\A[0-9]+\z/) {
+                my $boot_id = '';
+                my $boot_id_path = '/proc/sys/kernel/random/boot_id';
+                if (-r $boot_id_path && open(my $boot_fh, '<', $boot_id_path)) {
+                    $boot_id = lc(trim(<$boot_fh> // ''));
+                    close($boot_fh);
+                    $boot_id = '' if $boot_id !~ /\A[0-9a-f-]+\z/;
+                }
+                return $boot_id eq ''
+                    ? "proc:$field[19]"
+                    : "proc:$boot_id:$field[19]";
+            }
+        }
+    }
+    return '';
+}
+
+sub new_lock_token {
+    my ($lock_dir) = @_;
+    return sha256_hex(join(
+        "\0",
+        $$,
+        $this_lock_host,
+        $lock_dir,
+        sprintf('%.9f', time()),
+        rand(),
+    ));
+}
+
+sub parsed_process_start_identity {
+    my ($value) = @_;
+    return undef if !defined $value;
+    return { ticks => $1, boot_id => undef }
+        if $value =~ /\Aproc:([0-9]+)\z/;
+    return { ticks => $2, boot_id => $1 }
+        if $value =~ /\Aproc:([0-9a-f-]+):([0-9]+)\z/;
+    return undef;
+}
+
+sub process_start_relationship {
+    my ($recorded, $current) = @_;
+    my $recorded_ref = parsed_process_start_identity($recorded);
+    my $current_ref = parsed_process_start_identity($current);
+    return 'unverifiable' if !defined $recorded_ref || !defined $current_ref;
+    return 'reused' if $recorded_ref->{ticks} ne $current_ref->{ticks};
+    return 'unverifiable'
+        if !defined $recorded_ref->{boot_id} || !defined $current_ref->{boot_id};
+    return $recorded_ref->{boot_id} eq $current_ref->{boot_id}
+        ? 'same'
+        : 'reused';
+}
+
+sub lock_owner_path {
+    my ($lock_dir, $token) = @_;
+    return File::Spec->catfile($lock_dir, ".owner-$token.tsv");
+}
+
+sub lock_dir_snapshot {
+    my ($lock_dir, $expected_kind) = @_;
+    my @dir_stat = lstat($lock_dir);
+    if (!@dir_stat) {
+        return undef if $!{ENOENT};
+        die "ERROR: cannot inspect lock '$lock_dir': $!\n";
+    }
+    die "ERROR: lock path is not a regular directory: $lock_dir\n"
+        if !-d _ || -l _;
+    my $newest_epoch = $dir_stat[9];
+    my $dh;
+    if (!opendir($dh, $lock_dir)) {
+        return undef if $!{ENOENT};
+        die "ERROR: cannot inspect lock '$lock_dir': $!\n";
+    }
+    my @owner_name = sort grep { /\A\.owner-[0-9a-f]{64}\.tsv\z/ } readdir($dh);
+    closedir($dh);
+    for my $name (@owner_name) {
+        my @owner_stat = lstat(File::Spec->catfile($lock_dir, $name));
+        $newest_epoch = $owner_stat[9]
+            if @owner_stat && $owner_stat[9] > $newest_epoch;
+    }
+    my $snapshot = {
+        dev          => $dir_stat[0],
+        ino          => $dir_stat[1],
+        newest_epoch => $newest_epoch,
+        valid        => 0,
+    };
+    return $snapshot if @owner_name != 1;
+
+    my $owner_path = File::Spec->catfile($lock_dir, $owner_name[0]);
+    return $snapshot if !-f $owner_path || -l $owner_path;
+    open(my $fh, '<', $owner_path) or return $snapshot;
+    my %value;
+    my $valid = 1;
+    while (my $line = <$fh>) {
+        chomp $line;
+        my ($key, $payload, @extra) = split /\t/, $line, -1;
+        if (
+            !defined $key || !defined $payload || @extra
+            || exists $value{$key}
+        ) {
+            $valid = 0;
+            last;
+        }
+        $value{$key} = $payload;
+    }
+    close($fh);
+    (my $filename_token = $owner_name[0]) =~ s/\A\.owner-//;
+    $filename_token =~ s/\.tsv\z//;
+    $valid = 0
+        if keys(%value) != 7
+        || ($value{schema} // '') ne '1'
+        || ($value{token} // '') ne $filename_token
+        || $filename_token !~ /\A[0-9a-f]{64}\z/
+        || ($value{pid} // '') !~ /\A[0-9]+\z/
+        || ($value{pid} // 0) < 1
+        || ($value{host} // '') eq ''
+        || ($value{host} // '') =~ /[\t\r\n]/
+        || ($value{process_start} // '') eq ''
+        || ($value{process_start} // '') =~ /[\t\r\n]/
+        || ($value{started_epoch} // '') !~ /\A[0-9]+\z/
+        || ($value{kind} // '') ne $expected_kind;
+    if ($valid) {
+        $snapshot->{valid} = 1;
+        $snapshot->{owner_path} = $owner_path;
+        @{$snapshot}{qw(token pid host process_start started_epoch kind)} =
+            @value{qw(token pid host process_start started_epoch kind)};
+    }
+    return $snapshot;
+}
+
+sub lock_stale_reason {
+    my ($snapshot, $stale_seconds) = @_;
+    my $same_host_unverifiable = 0;
+    if (
+        $snapshot->{valid}
+        && $this_lock_host ne 'unknown'
+        && $snapshot->{host} eq $this_lock_host
+    ) {
+        my $alive = kill(0, $snapshot->{pid}) || $!{EPERM};
+        return "dead pid=$snapshot->{pid} host=$snapshot->{host}" if !$alive;
+        my $current_start = process_start_identity($snapshot->{pid});
+        my $relationship = process_start_relationship(
+            $snapshot->{process_start}, $current_start
+        );
+        if ($relationship eq 'reused') {
+            return "reused pid=$snapshot->{pid} host=$snapshot->{host}";
+        }
+        if ($relationship eq 'same') {
+            return undef;
+        }
+        $same_host_unverifiable = 1;
+    }
+    return undef if $stale_seconds == 0;
+    my $now = int(time());
+    my $started = int($snapshot->{newest_epoch} // 0);
+    return undef if $started < 1 || $started > $now;
+    my $age = $now - $started;
+    return undef if $age < $stale_seconds;
+    return "same-host live pid=$snapshot->{pid} has unverifiable process "
+        . "identity age=${age}s ttl=${stale_seconds}s"
+        if $same_host_unverifiable;
+    return $snapshot->{valid}
+        ? "foreign owner host=$snapshot->{host} age=${age}s ttl=${stale_seconds}s"
+        : "missing or malformed owner metadata age=${age}s ttl=${stale_seconds}s";
+}
+
+sub reclaim_generation_path {
+    my ($lock_dir) = @_;
+    return File::Spec->catfile($lock_dir, '.reclaim-generation.tsv');
+}
+
+sub read_reclaim_generation {
+    my ($lock_dir, $expected_kind) = @_;
+    my $path = reclaim_generation_path($lock_dir);
+    my @path_stat = lstat($path);
+    if (!@path_stat) {
+        return undef if $!{ENOENT};
+        die "ERROR: cannot inspect reclaim generation '$path': $!\n";
+    }
+    die "ERROR: reclaim generation is not a regular file: $path\n"
+        if !-f _ || -l _;
+    my $fh;
+    if (!open($fh, '<', $path)) {
+        return undef if $!{ENOENT};
+        die "ERROR: cannot read reclaim generation '$path': $!\n";
+    }
+    my %value;
+    while (my $line = <$fh>) {
+        chomp $line;
+        my ($key, $payload, @extra) = split /\t/, $line, -1;
+        die "ERROR: malformed reclaim generation '$path'\n"
+            if !defined $key || !defined $payload || @extra
+            || exists $value{$key};
+        $value{$key} = $payload;
+    }
+    close($fh)
+        or die "ERROR: cannot close reclaim generation '$path': $!\n";
+    die "ERROR: malformed reclaim generation '$path'\n"
+        if keys(%value) != 3
+        || ($value{schema} // '') ne '1'
+        || ($value{token} // '') !~ /\A[0-9a-f]{64}\z/
+        || ($value{kind} // '') ne $expected_kind;
+    return {
+        path  => $path,
+        token => $value{token},
+        kind  => $value{kind},
+    };
+}
+
+sub install_reclaim_generation {
+    my ($lock_dir, $snapshot, $lock_kind) = @_;
+    my $existing_ref = read_reclaim_generation($lock_dir, $lock_kind);
+    return $existing_ref if defined $existing_ref;
+
+    my $token = new_lock_token("$lock_dir:reclaim-generation");
+    my $claim_path = reclaim_generation_path($lock_dir);
+    my $tmp = File::Spec->catfile(
+        $lock_dir, ".reclaim-generation-$token.tmp"
+    );
+    my $content = join(
+        '',
+        "schema\t1\n",
+        "token\t$token\n",
+        "kind\t$lock_kind\n",
+    );
+    my $fh;
+    if (!sysopen($fh, $tmp, O_WRONLY | O_CREAT | O_EXCL, 0600)) {
+        return undef if $!{ENOENT};
+        die "ERROR: cannot create reclaim generation '$tmp': $!\n";
+    }
+    if (!print {$fh} $content) {
+        my $error = $!;
+        close($fh);
+        unlink($tmp);
+        die "ERROR: cannot write reclaim generation '$tmp': $error\n";
+    }
+    if (!$fh->flush()) {
+        my $error = $!;
+        close($fh);
+        unlink($tmp);
+        die "ERROR: cannot flush reclaim generation '$tmp': $error\n";
+    }
+    if (!$fh->sync()) {
+        my $error = $!;
+        close($fh);
+        unlink($tmp);
+        die "ERROR: cannot sync reclaim generation '$tmp': $error\n";
+    }
+    if (!close($fh)) {
+        my $error = $!;
+        unlink($tmp);
+        die "ERROR: cannot close reclaim generation '$tmp': $error\n";
+    }
+
+    my @current_stat = lstat($lock_dir);
+    my $current_missing = !@current_stat && $!{ENOENT};
+    my $current_error = @current_stat ? '' : "$!";
+    if (
+        !@current_stat
+        || $current_stat[0] != $snapshot->{dev}
+        || $current_stat[1] != $snapshot->{ino}
+    ) {
+        unlink($tmp);
+        return undef if $current_missing;
+        return undef if @current_stat;
+        die "ERROR: cannot inspect stale lock '$lock_dir': $current_error\n";
+    }
+
+    my $linked = link($tmp, $claim_path);
+    my $link_exists = !$linked && $!{EEXIST};
+    my $link_missing = !$linked && $!{ENOENT};
+    my $link_error = $linked ? '' : "$!";
+    unlink($tmp);
+    die "ERROR: cannot install reclaim generation '$claim_path': $link_error\n"
+        if !$linked && !$link_exists && !$link_missing;
+    return undef if !$linked && $link_missing;
+    return read_reclaim_generation($lock_dir, $lock_kind);
+}
+
+sub same_reclaim_generation {
+    my ($left_ref, $right_ref) = @_;
+    return 0 if !defined $left_ref || !defined $right_ref;
+    return $left_ref->{token} eq $right_ref->{token};
+}
+
+sub reclaim_stale_lock {
+    my ($lock_dir, $stale_seconds, $lock_kind) = @_;
+    my $snapshot = lock_dir_snapshot($lock_dir, $lock_kind);
+    return 0 if !defined $snapshot;
+
+    my $generation_ref = read_reclaim_generation($lock_dir, $lock_kind);
+    my $reason;
+    if (defined $generation_ref) {
+        $reason = "recorded reclaim generation=$generation_ref->{token}";
+    } else {
+        $reason = lock_stale_reason($snapshot, $stale_seconds);
+        return 0 if !defined $reason;
+        $generation_ref = install_reclaim_generation(
+            $lock_dir, $snapshot, $lock_kind
+        );
+        return 0 if !defined $generation_ref;
+    }
+
+    my @source_stat = lstat($lock_dir);
+    return 0 if !@source_stat && $!{ENOENT};
+    die "ERROR: cannot inspect stale lock '$lock_dir': $!\n"
+        if !@source_stat;
+    die "ERROR: lock path is not a regular directory: $lock_dir\n"
+        if !-d _ || -l _;
+    return 0
+        if $source_stat[0] != $snapshot->{dev}
+        || $source_stat[1] != $snapshot->{ino};
+    my $current_generation_ref = read_reclaim_generation(
+        $lock_dir, $lock_kind
+    );
+    return 0
+        if !same_reclaim_generation(
+            $generation_ref, $current_generation_ref
+        );
+
+    my $quarantine = "$lock_dir.reclaim-$generation_ref->{token}";
+    if (rename($lock_dir, $quarantine)) {
+        my @moved_stat = lstat($quarantine);
+        die "ERROR: cannot inspect stale lock quarantine '$quarantine': $!\n"
+            if !@moved_stat;
+        die "ERROR: stale lock changed while being quarantined: $lock_dir\n"
+            if $moved_stat[0] != $snapshot->{dev}
+            || $moved_stat[1] != $snapshot->{ino};
+        my $moved_generation_ref = read_reclaim_generation(
+            $quarantine, $lock_kind
+        );
+        die "ERROR: stale lock quarantine lost its reclaim generation: "
+            . "$quarantine\n"
+            if !same_reclaim_generation(
+                $generation_ref, $moved_generation_ref
+            );
+        warn "WARNING: reclaiming stale $lock_kind ($reason) at $lock_dir\n";
+        return 1;
+    }
+
+    my $rename_error = "$!";
+    my $completed_ref = read_reclaim_generation($quarantine, $lock_kind);
+    if (same_reclaim_generation($generation_ref, $completed_ref)) {
+        return -e $lock_dir ? 0 : 1;
+    }
+    my @current_stat = lstat($lock_dir);
+    return 0 if !@current_stat && $!{ENOENT};
+    return 0
+        if @current_stat
+        && ($current_stat[0] != $snapshot->{dev}
+            || $current_stat[1] != $snapshot->{ino});
+    die "ERROR: cannot quarantine stale lock '$lock_dir': $rename_error\n";
+}
+
+sub write_lock_owner {
+    my ($lock_dir, $token, $lock_kind) = @_;
+    my $owner_path = lock_owner_path($lock_dir, $token);
+    my $owner_tmp = "$owner_path.tmp";
+    my $process_start = process_start_identity($$);
+    $process_start = 'unavailable' if $process_start eq '';
+    my $content = join(
+        '',
+        "schema\t1\n",
+        "token\t$token\n",
+        "pid\t$$\n",
+        "host\t$this_lock_host\n",
+        "process_start\t$process_start\n",
+        "started_epoch\t", int(time()), "\n",
+        "kind\t$lock_kind\n",
+    );
+    sysopen(my $fh, $owner_tmp, O_WRONLY | O_CREAT | O_EXCL, 0600)
+        or die "ERROR: cannot create lock owner metadata '$owner_tmp': $!\n";
+    if (!print {$fh} $content) {
+        my $error = $!;
+        close($fh);
+        unlink($owner_tmp);
+        die "ERROR: cannot write lock owner metadata '$owner_tmp': $error\n";
+    }
+    if (!close($fh)) {
+        my $error = $!;
+        unlink($owner_tmp);
+        die "ERROR: cannot close lock owner metadata '$owner_tmp': $error\n";
+    }
+    rename($owner_tmp, $owner_path)
+        or do {
+            my $error = $!;
+            unlink($owner_tmp);
+            die "ERROR: cannot install lock owner metadata '$owner_path': $error\n";
+        };
+}
+
 sub acquire_lock_dir {
-    my ($lock_dir, $wait_seconds) = @_;
+    my ($lock_dir, $wait_seconds, $stale_seconds, $lock_kind) = @_;
     my $waited_ms = 0;
     my $wait_limit_ms = $wait_seconds * 1000;
-    while (!mkdir($lock_dir, 0700)) {
-        if ($!{EEXIST}) {
-            die "ERROR: timed out waiting for lock '$lock_dir'\n"
-                if $waited_ms >= $wait_limit_ms;
-            usleep(100_000);
-            $waited_ms += 100;
-            next;
+    while (1) {
+        if (mkdir($lock_dir, 0700)) {
+            my $token = new_lock_token($lock_dir);
+            eval { write_lock_owner($lock_dir, $token, $lock_kind); 1 } or do {
+                my $error = $@ || "ERROR: cannot initialize lock '$lock_dir'\n";
+                my $owner_path = lock_owner_path($lock_dir, $token);
+                unlink($owner_path);
+                unlink("$owner_path.tmp");
+                rmdir($lock_dir);
+                die $error;
+            };
+            $owned_lock_token{$lock_dir} = $token;
+            $owned_lock_kind{$lock_dir} = $lock_kind;
+            push @owned_lock_dirs, $lock_dir;
+            return $token;
         }
-        die "ERROR: cannot create lock '$lock_dir': $!\n";
+        my $lock_exists = $!{EEXIST};
+        my $mkdir_error = "$!";
+        die "ERROR: cannot create lock '$lock_dir': $mkdir_error\n"
+            if !$lock_exists;
+        next if reclaim_stale_lock($lock_dir, $stale_seconds, $lock_kind);
+        die "ERROR: timed out waiting for lock '$lock_dir'\n"
+            if $waited_ms >= $wait_limit_ms;
+        usleep(100_000);
+        $waited_ms += 100;
     }
-    push @owned_lock_dirs, $lock_dir;
+}
+
+sub assert_lock_owned {
+    my ($lock_dir) = @_;
+    my $token = $owned_lock_token{$lock_dir};
+    my $lock_kind = $owned_lock_kind{$lock_dir};
+    die "ERROR: current process does not own lock '$lock_dir'\n"
+        if !defined $token || !defined $lock_kind;
+    my $reclaim_path = reclaim_generation_path($lock_dir);
+    my @reclaim_stat = lstat($reclaim_path);
+    die "ERROR: ownership of $lock_kind was lost at '$lock_dir'\n"
+        if @reclaim_stat;
+    die "ERROR: cannot inspect reclaim generation '$reclaim_path': $!\n"
+        if !$!{ENOENT};
+    my $snapshot = lock_dir_snapshot($lock_dir, $lock_kind);
+    die "ERROR: ownership of $lock_kind was lost at '$lock_dir'\n"
+        if !defined $snapshot || !$snapshot->{valid}
+        || $snapshot->{token} ne $token || $snapshot->{pid} != $$;
+    return $token;
 }
 
 sub release_lock_dir {
-    my ($lock_dir) = @_;
+    my ($lock_dir, $best_effort) = @_;
+    my $token = $owned_lock_token{$lock_dir};
+    return if !defined $token && $best_effort;
+    die "ERROR: current process does not own lock '$lock_dir'\n"
+        if !defined $token;
+    my $ok = eval { assert_lock_owned($lock_dir); 1 };
+    if (!$ok) {
+        my $error = $@ || "ERROR: ownership of lock '$lock_dir' was lost\n";
+        delete $owned_lock_token{$lock_dir};
+        delete $owned_lock_kind{$lock_dir};
+        @owned_lock_dirs = grep { $_ ne $lock_dir } @owned_lock_dirs;
+        return if $best_effort;
+        die $error;
+    }
+    my @remaining_temp;
+    for my $tmp (@owned_temp_files) {
+        if (dirname($tmp) eq $lock_dir) {
+            unlink($tmp) if -e $tmp;
+            next;
+        }
+        push @remaining_temp, $tmp;
+    }
+    @owned_temp_files = @remaining_temp;
+    my $owner_path = lock_owner_path($lock_dir, $token);
+    unlink($owner_path)
+        or die "ERROR: cannot remove lock owner metadata '$owner_path': $!\n";
     rmdir($lock_dir) or die "ERROR: cannot remove lock '$lock_dir': $!\n";
+    delete $owned_lock_token{$lock_dir};
+    delete $owned_lock_kind{$lock_dir};
     @owned_lock_dirs = grep { $_ ne $lock_dir } @owned_lock_dirs;
 }
 
 sub write_attestation_cache_atomic {
-    my ($path, $meta_ref, $entries_ref, $lock_wait) = @_;
+    my ($path, $meta_ref, $entries_ref, $lock_wait, $lock_stale_seconds) = @_;
     my $lock_dir = "$path.lockdir";
-    acquire_lock_dir($lock_dir, $lock_wait);
+    my $lock_token = acquire_lock_dir(
+        $lock_dir,
+        $lock_wait,
+        $lock_stale_seconds,
+        'attestation cache lock',
+    );
 
     for my $entry (values %{$entries_ref}) {
         my $current = stat_signature($entry->{path});
@@ -498,7 +984,9 @@ sub write_attestation_cache_atomic {
         ) . "\n";
     }
     my $content = $body . "cache_sha256\t" . sha256_hex($body) . "\n";
-    my $tmp = "$path.tmp.$$";
+    my $tmp = File::Spec->catfile(
+        $lock_dir, ".attestation-$lock_token.tmp"
+    );
     my $old_umask = umask(0077);
     sysopen(my $fh, $tmp, O_WRONLY | O_CREAT | O_EXCL, 0600) or do {
         my $error = $!;
@@ -518,6 +1006,7 @@ sub write_attestation_cache_atomic {
         die "ERROR: cannot close attestation cache '$tmp': $error\n";
     }
     umask($old_umask);
+    assert_lock_owned($lock_dir);
     rename($tmp, $path) or die "ERROR: cannot install attestation cache '$path': $!\n";
     @owned_temp_files = grep { $_ ne $tmp } @owned_temp_files;
     release_lock_dir($lock_dir);
@@ -551,6 +1040,7 @@ sub verify_with_attestation {
     my $cache_dir = $args{cache_dir};
     my $meta_ref = $args{meta};
     my $lock_wait = $args{lock_wait};
+    my $lock_stale_seconds = $args{lock_stale_seconds};
     my $cache_allowed = $args{cache_allowed};
 
     my $cache_path;
@@ -604,14 +1094,23 @@ sub verify_with_attestation {
     }
 
     if ($cache_allowed && defined $cache_path && $cache_needs_write) {
-        write_attestation_cache_atomic($cache_path, $meta_ref, \%verified, $lock_wait);
+        write_attestation_cache_atomic(
+            $cache_path,
+            $meta_ref,
+            \%verified,
+            $lock_wait,
+            $lock_stale_seconds,
+        );
     }
     return \%verified;
 }
 
 sub write_contract_atomic {
-    my ($path, $values_ref, $adopted_legacy) = @_;
-    my $tmp = "$path.tmp.$$";
+    my ($path, $values_ref, $adopted_legacy, $lock_dir) = @_;
+    my $lock_token = assert_lock_owned($lock_dir);
+    my $tmp = File::Spec->catfile(
+        $lock_dir, ".contract-$lock_token.tmp"
+    );
     open(my $fh, '>', $tmp) or die "ERROR: cannot write '$tmp': $!\n";
     push @owned_temp_files, $tmp;
     for my $key (sort keys %{$values_ref}) {
@@ -619,6 +1118,7 @@ sub write_contract_atomic {
     }
     print {$fh} "legacy_adopted\t", ($adopted_legacy ? 1 : 0), "\n";
     close($fh) or die "ERROR: failed to close '$tmp': $!\n";
+    assert_lock_owned($lock_dir);
     rename($tmp, $path) or die "ERROR: cannot install state contract '$path': $!\n";
     @owned_temp_files = grep { $_ ne $tmp } @owned_temp_files;
 }
@@ -725,6 +1225,7 @@ my $verified_ref = verify_with_attestation(
     cache_dir     => $cache_dir,
     meta          => \%attestation_meta,
     lock_wait     => $opt{lock_wait},
+    lock_stale_seconds => $opt{lock_stale_seconds},
     cache_allowed => $cache_allowed,
 );
 my %taxonomy_hash = map {
@@ -778,7 +1279,12 @@ $contract{contract_id} = sha256_hex($canonical);
 
 make_path($state_dir) if !-d $state_dir;
 my $lock_dir = File::Spec->catdir($state_dir, '.state_compatibility.lockdir');
-acquire_lock_dir($lock_dir, $opt{lock_wait});
+acquire_lock_dir(
+    $lock_dir,
+    $opt{lock_wait},
+    $opt{lock_stale_seconds},
+    'state compatibility lock',
+);
 
 my $contract_path = File::Spec->catfile($state_dir, 'state_compatibility_manifest.tsv');
 my $exit_code = 0;
@@ -837,7 +1343,9 @@ eval {
             $contract{toolchain_migration_limitation} =
                 'historical_schema_v1_runtime_not_cryptographically_provable';
             my $legacy_adopted = ($existing_ref->{legacy_adopted} // '') eq '1' ? 1 : 0;
-            write_contract_atomic($contract_path, \%contract, $legacy_adopted);
+            write_contract_atomic(
+                $contract_path, \%contract, $legacy_adopted, $lock_dir
+            );
             warn "WARNING: migrated schema-v1 rolling state to schema v2 under an "
                 . "operator-attested legacy runtime assumption; historical toolchain identity "
                 . "was not recorded and cannot be cryptographically proven\n";
@@ -879,7 +1387,9 @@ eval {
                 }
                 my $legacy_adopted =
                     ($existing_ref->{legacy_adopted} // '') eq '1' ? 1 : 0;
-                write_contract_atomic($contract_path, \%contract, $legacy_adopted);
+                write_contract_atomic(
+                    $contract_path, \%contract, $legacy_adopted, $lock_dir
+                );
             }
         }
     } else {
@@ -890,7 +1400,9 @@ eval {
         }
         print STDERR "WARNING: adopting legacy rolling state at '$state_dir' under the current compatibility contract\n"
             if $has_material;
-        write_contract_atomic($contract_path, \%contract, $has_material ? 1 : 0);
+        write_contract_atomic(
+            $contract_path, \%contract, $has_material ? 1 : 0, $lock_dir
+        );
     }
     1;
 } or do {

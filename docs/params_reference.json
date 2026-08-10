@@ -169,6 +169,7 @@
       "round_lock_wait_minutes",
       "stale_lock_ttl_minutes",
       "lock_wait_seconds",
+      "state_lock_stale_seconds",
       "round_lock_scope",
       "delete_input_pod5",
       "delete_from_ori_dir",
@@ -347,6 +348,7 @@
     "round_lock_wait_minutes": {"category": "Concurrency", "default_owner": "nextflow.config", "description": "How long to wait for the round lock before failing.", "list_policy": "scalar", "allow_empty_entries": false},
     "stale_lock_ttl_minutes": {"category": "Concurrency", "default_owner": "nextflow.config", "description": "Stale-lock reclaim TTL for round locks.", "list_policy": "scalar", "allow_empty_entries": false},
     "lock_wait_seconds": {"category": "Concurrency", "default_owner": "nextflow.config", "description": "Portable directory-lock wait timeout.", "list_policy": "scalar", "allow_empty_entries": false},
+    "state_lock_stale_seconds": {"category": "Concurrency", "default_owner": "nextflow.config", "description": "Stale-age threshold for fenced startup state and attestation-cache locks.", "list_policy": "scalar", "allow_empty_entries": false},
     "round_lock_scope": {"category": "Concurrency", "default_owner": "nextflow.config", "description": "Scope of the round lock lifetime.", "list_policy": "scalar", "allow_empty_entries": false, "allowed_values": ["full_round", "dorado_only"]},
 
     "delete_input_pod5": {"category": "Disk management", "default_owner": "nextflow.config", "description": "Delete processed intake POD5 instead of archiving to done_round_pod5.", "list_policy": "scalar", "allow_empty_entries": false},

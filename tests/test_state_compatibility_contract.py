@@ -1,9 +1,14 @@
 import hashlib
 import os
+import signal
+import socket
 import stat
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -119,7 +124,7 @@ def _build_fixture(
     }
 
 
-def _run_contract(
+def _contract_command(
     fixture: dict[str, Path],
     *,
     state: Path | None = None,
@@ -130,58 +135,285 @@ def _run_contract(
     scoring_version: str = "legacy-first-single-hit-v1",
     profile: str = "test",
     contract_migration: str = "strict",
+    lock_wait: int = 2,
+    lock_stale_seconds: int = 300,
+) -> list[str]:
+    return [
+        "perl",
+        str(SCRIPT),
+        "--state-dir",
+        str(state or fixture["state"]),
+        "--reference-manifest",
+        str(fixture["manifest"]),
+        "--reference-root",
+        str(fixture["root"]),
+        "--taxonomy-data-dir",
+        str(fixture["taxonomy"]),
+        "--taxonomy-release-manifest",
+        str(fixture["taxonomy_manifest"]),
+        "--classifier-policy-version",
+        "legacy-rank-string-v1",
+        "--scoring-policy-version",
+        scoring_version,
+        "--targets",
+        "COI",
+        "--target-taxa",
+        "Metazoa",
+        "--blast-filter-db",
+        "db/filter",
+        "--blast-db-specs",
+        "db/coi",
+        "--blast-taxdb",
+        "db/taxdb",
+        "--nonncbi-memtax",
+        memtax,
+        "--nonncbi-id2lineage",
+        lineage,
+        "--policy",
+        policy,
+        "--lock-wait",
+        str(lock_wait),
+        "--lock-stale-seconds",
+        str(lock_stale_seconds),
+        "--verification-cache-dir",
+        str(fixture["cache"]),
+        "--verification-mode",
+        verification_mode,
+        "--profile",
+        profile,
+        "--toolchain-fingerprint",
+        str(fixture["toolchain_fingerprint"]),
+        "--contract-migration",
+        contract_migration,
+    ]
+
+
+def _run_contract(
+    fixture: dict[str, Path],
+    **kwargs: object,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [
-            "perl",
-            str(SCRIPT),
-            "--state-dir",
-            str(state or fixture["state"]),
-            "--reference-manifest",
-            str(fixture["manifest"]),
-            "--reference-root",
-            str(fixture["root"]),
-            "--taxonomy-data-dir",
-            str(fixture["taxonomy"]),
-            "--taxonomy-release-manifest",
-            str(fixture["taxonomy_manifest"]),
-            "--classifier-policy-version",
-            "legacy-rank-string-v1",
-            "--scoring-policy-version",
-            scoring_version,
-            "--targets",
-            "COI",
-            "--target-taxa",
-            "Metazoa",
-            "--blast-filter-db",
-            "db/filter",
-            "--blast-db-specs",
-            "db/coi",
-            "--blast-taxdb",
-            "db/taxdb",
-            "--nonncbi-memtax",
-            memtax,
-            "--nonncbi-id2lineage",
-            lineage,
-            "--policy",
-            policy,
-            "--lock-wait",
-            "2",
-            "--verification-cache-dir",
-            str(fixture["cache"]),
-            "--verification-mode",
-            verification_mode,
-            "--profile",
-            profile,
-            "--toolchain-fingerprint",
-            str(fixture["toolchain_fingerprint"]),
-            "--contract-migration",
-            contract_migration,
-        ],
+        _contract_command(fixture, **kwargs),
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def _write_rename_pause_module(tmp_path: Path) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    module_dir = tmp_path / "perl-test-hook"
+    module_dir.mkdir()
+    (module_dir / "RTBioScanTestPauseRename.pm").write_text(
+        r'''package RTBioScanTestPauseRename;
+use strict;
+use warnings;
+use Time::HiRes qw(usleep);
+
+sub pause_for_test {
+    my $ready = $ENV{RTBIOSCAN_TEST_RENAME_READY};
+    my $release = $ENV{RTBIOSCAN_TEST_RENAME_RELEASE};
+    open(my $fh, '>', $ready) or die "cannot create rename READY marker: $!\n";
+    print {$fh} "ready\n";
+    close($fh) or die "cannot close rename READY marker: $!\n";
+    while (!-e $release) {
+        usleep(10_000);
+    }
+}
+
+sub record_attempt_for_test {
+    my ($env_name, $result, $error_number) = @_;
+    my $path = $ENV{$env_name} // '';
+    return if $path eq '';
+    open(my $fh, '>', $path) or die "cannot create attempt marker: $!\n";
+    print {$fh} "result\t", ($result ? 1 : 0), "\n";
+    print {$fh} "errno\t$error_number\n";
+    close($fh) or die "cannot close attempt marker: $!\n";
+}
+
+BEGIN {
+    no warnings 'redefine';
+    *CORE::GLOBAL::rename = sub {
+        my ($source, $destination) = @_;
+        my $target = $ENV{RTBIOSCAN_TEST_RENAME_TARGET} // '';
+        my $source_target = $ENV{RTBIOSCAN_TEST_RENAME_SOURCE} // '';
+        my $target_is_prefix =
+            ($ENV{RTBIOSCAN_TEST_RENAME_TARGET_IS_PREFIX} // '') eq '1';
+        my $mode = $ENV{RTBIOSCAN_TEST_RENAME_MODE} // '';
+        my $source_matches =
+            $source_target eq '' || $source eq $source_target;
+        my $target_matches = $target_is_prefix
+            ? index($destination, $target) == 0
+            : $destination eq $target;
+        if (!$source_matches || !$target_matches) {
+            return CORE::rename($source, $destination);
+        }
+        RTBioScanTestPauseRename::pause_for_test() if $mode eq 'before';
+        my $result = CORE::rename($source, $destination);
+        my $error_number = $result ? 0 : 0 + $!;
+        RTBioScanTestPauseRename::record_attempt_for_test(
+            'RTBIOSCAN_TEST_RENAME_ATTEMPTED', $result, $error_number
+        );
+        RTBioScanTestPauseRename::pause_for_test()
+            if $result && $mode eq 'after';
+        $! = $error_number;
+        return $result;
+    };
+
+    *CORE::GLOBAL::link = sub {
+        my ($source, $destination) = @_;
+        my $target = $ENV{RTBIOSCAN_TEST_LINK_TARGET} // '';
+        my $mode = $ENV{RTBIOSCAN_TEST_LINK_MODE} // '';
+        if ($target eq '' || $destination ne $target) {
+            return CORE::link($source, $destination);
+        }
+        RTBioScanTestPauseRename::pause_for_test() if $mode eq 'before';
+        my $result = CORE::link($source, $destination);
+        my $error_number = $result ? 0 : 0 + $!;
+        RTBioScanTestPauseRename::record_attempt_for_test(
+            'RTBIOSCAN_TEST_LINK_ATTEMPTED', $result, $error_number
+        );
+        RTBioScanTestPauseRename::pause_for_test()
+            if $result && $mode eq 'after';
+        $! = $error_number;
+        return $result;
+    };
+}
+
+1;
+''',
+        encoding="utf-8",
+    )
+    return module_dir
+
+
+def _start_paused_contract(
+    fixture: dict[str, Path],
+    *,
+    state: Path,
+    rename_target: Path | None = None,
+    rename_mode: str = "",
+    hook_root: Path,
+    rename_source: Path | None = None,
+    rename_target_is_prefix: bool = False,
+    rename_attempted: Path | None = None,
+    link_target: Path | None = None,
+    link_mode: str = "",
+    link_attempted: Path | None = None,
+    **kwargs: object,
+) -> tuple[subprocess.Popen[str], Path, Path]:
+    module_dir = _write_rename_pause_module(hook_root)
+    ready = hook_root / "rename.ready"
+    release = hook_root / "rename.release"
+    env = dict(os.environ)
+    env["PERL5LIB"] = os.pathsep.join(
+        part for part in [str(module_dir), env.get("PERL5LIB", "")] if part
+    )
+    env["PERL5OPT"] = " ".join(
+        part
+        for part in ["-MRTBioScanTestPauseRename", env.get("PERL5OPT", "")]
+        if part
+    )
+    env["RTBIOSCAN_TEST_RENAME_TARGET"] = (
+        "" if rename_target is None else str(rename_target)
+    )
+    env["RTBIOSCAN_TEST_RENAME_SOURCE"] = (
+        "" if rename_source is None else str(rename_source)
+    )
+    env["RTBIOSCAN_TEST_RENAME_TARGET_IS_PREFIX"] = (
+        "1" if rename_target_is_prefix else "0"
+    )
+    env["RTBIOSCAN_TEST_RENAME_ATTEMPTED"] = (
+        "" if rename_attempted is None else str(rename_attempted)
+    )
+    env["RTBIOSCAN_TEST_LINK_TARGET"] = (
+        "" if link_target is None else str(link_target)
+    )
+    env["RTBIOSCAN_TEST_LINK_MODE"] = link_mode
+    env["RTBIOSCAN_TEST_LINK_ATTEMPTED"] = (
+        "" if link_attempted is None else str(link_attempted)
+    )
+    env["RTBIOSCAN_TEST_RENAME_MODE"] = rename_mode
+    env["RTBIOSCAN_TEST_RENAME_READY"] = str(ready)
+    env["RTBIOSCAN_TEST_RENAME_RELEASE"] = str(release)
+    process = subprocess.Popen(
+        _contract_command(fixture, state=state, **kwargs),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    return process, ready, release
+
+
+def _wait_for_ready(process: subprocess.Popen[str], ready: Path) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if ready.is_file():
+            return
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(
+                f"paused contract exited early ({process.returncode})\n"
+                f"stdout:\n{stdout}\nstderr:\n{stderr}"
+            )
+        time.sleep(0.01)
+    process.kill()
+    stdout, stderr = process.communicate(timeout=5)
+    raise AssertionError(
+        f"timed out waiting for rename hook\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    )
+
+
+def _lock_owner_files(lock_dir: Path) -> list[Path]:
+    return sorted(lock_dir.glob(".owner-*.tsv"))
+
+
+def _reclaim_quarantines(lock_dir: Path) -> list[Path]:
+    prefix = f"{lock_dir.name}.reclaim-"
+    quarantines = []
+    for path in lock_dir.parent.glob(f"{prefix}*"):
+        suffix = path.name[len(prefix) :]
+        if (
+            path.is_dir()
+            and len(suffix) == 64
+            and all(char in "0123456789abcdef" for char in suffix)
+        ):
+            quarantines.append(path)
+    return sorted(quarantines)
+
+
+def _linux_process_start_ticks(pid: int) -> str | None:
+    stat_path = Path(f"/proc/{pid}/stat")
+    if not stat_path.is_file():
+        return None
+    tail = stat_path.read_text(encoding="utf-8").rsplit(") ", 1)[-1].split()
+    return tail[19] if len(tail) > 19 and tail[19].isdigit() else None
+
+
+def _write_manual_lock_owner(
+    lock_dir: Path,
+    *,
+    pid: int,
+    host: str,
+    process_start: str,
+    started_epoch: int,
+    kind: str = "state compatibility lock",
+    token: str = "a" * 64,
+) -> Path:
+    lock_dir.mkdir(parents=True)
+    owner = lock_dir / f".owner-{token}.tsv"
+    owner.write_text(
+        "schema\t1\n"
+        f"token\t{token}\n"
+        f"pid\t{pid}\n"
+        f"host\t{host}\n"
+        f"process_start\t{process_start}\n"
+        f"started_epoch\t{started_epoch}\n"
+        f"kind\t{kind}\n",
+        encoding="utf-8",
+    )
+    return owner
 
 
 def _cache_file(fixture: dict[str, Path]) -> Path:
@@ -728,6 +960,676 @@ def test_concurrent_cache_seed_is_atomic(tmp_path: Path) -> None:
     )
 
 
+def test_state_lock_recovers_after_hard_kill(tmp_path: Path) -> None:
+    fixture = _build_fixture(tmp_path)
+    seeded = _run_contract(fixture, state=tmp_path / "seed-state")
+    assert seeded.returncode == 0, seeded.stderr
+
+    state = tmp_path / "state-hard-kill"
+    contract = state / "state_compatibility_manifest.tsv"
+    process, ready, _ = _start_paused_contract(
+        fixture,
+        state=state,
+        rename_target=contract,
+        rename_mode="after",
+        hook_root=tmp_path / "state-hook",
+    )
+    try:
+        _wait_for_ready(process, ready)
+        lock_dir = state / ".state_compatibility.lockdir"
+        owners = _lock_owner_files(lock_dir)
+        assert contract.is_file()
+        assert len(owners) == 1
+        owner_text = owners[0].read_text(encoding="utf-8")
+        assert f"pid\t{process.pid}\n" in owner_text
+        assert "process_start\t" in owner_text
+        process.kill()
+        assert process.wait(timeout=5) == -signal.SIGKILL
+        assert lock_dir.is_dir()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    recovered = _run_contract(fixture, state=state)
+    assert recovered.returncode == 0, recovered.stderr
+    assert "reclaiming stale state compatibility lock (dead pid=" in recovered.stderr
+    assert recovered.stdout.strip() == _contract_values(contract)["contract_id"]
+    assert not lock_dir.exists()
+    quarantines = _reclaim_quarantines(lock_dir)
+    assert len(quarantines) == 1
+    assert (quarantines[0] / ".reclaim-generation.tsv").is_file()
+
+
+def test_attestation_cache_lock_recovers_after_hard_kill(tmp_path: Path) -> None:
+    fixture = _build_fixture(tmp_path)
+    seeded = _run_contract(fixture, state=tmp_path / "seed-state")
+    assert seeded.returncode == 0, seeded.stderr
+    cache_file = _cache_file(fixture)
+    cache_file.unlink()
+
+    state = tmp_path / "cache-hard-kill-state"
+    process, ready, _ = _start_paused_contract(
+        fixture,
+        state=state,
+        rename_target=cache_file,
+        rename_mode="before",
+        hook_root=tmp_path / "cache-hook",
+    )
+    cache_lock = Path(f"{cache_file}.lockdir")
+    try:
+        _wait_for_ready(process, ready)
+        owners = _lock_owner_files(cache_lock)
+        assert not cache_file.exists()
+        assert len(owners) == 1
+        assert f"pid\t{process.pid}\n" in owners[0].read_text(encoding="utf-8")
+        assert len(list(cache_lock.glob(".attestation-*.tmp"))) == 1
+        process.kill()
+        assert process.wait(timeout=5) == -signal.SIGKILL
+        assert cache_lock.is_dir()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    recovered = _run_contract(fixture, state=state)
+    assert recovered.returncode == 0, recovered.stderr
+    assert "reclaiming stale attestation cache lock (dead pid=" in recovered.stderr
+    assert stat.S_IMODE(cache_file.stat().st_mode) == 0o600
+    assert _cache_verified_times(cache_file)
+    assert cache_file.read_text(encoding="utf-8").splitlines()[-1].startswith(
+        "cache_sha256\t"
+    )
+    assert not cache_lock.exists()
+    quarantines = _reclaim_quarantines(cache_lock)
+    assert len(quarantines) == 1
+    assert (quarantines[0] / ".reclaim-generation.tsv").is_file()
+
+
+def test_verifiably_live_same_host_state_lock_is_never_stolen_by_age(
+    tmp_path: Path,
+) -> None:
+    if not Path(f"/proc/{os.getpid()}/stat").is_file() or not Path(
+        "/proc/sys/kernel/random/boot_id"
+    ).is_file():
+        pytest.skip("verifiable process-start identity is unavailable on this host")
+    fixture = _build_fixture(tmp_path)
+    seeded = _run_contract(fixture, state=tmp_path / "seed-state")
+    assert seeded.returncode == 0, seeded.stderr
+
+    state = tmp_path / "state-live-owner"
+    contract = state / "state_compatibility_manifest.tsv"
+    process, ready, release = _start_paused_contract(
+        fixture,
+        state=state,
+        rename_target=contract,
+        rename_mode="after",
+        hook_root=tmp_path / "live-owner-hook",
+    )
+    lock_dir = state / ".state_compatibility.lockdir"
+    try:
+        _wait_for_ready(process, ready)
+        owner = _lock_owner_files(lock_dir)[0]
+        owner_before = owner.read_bytes()
+        os.utime(owner, (1, 1))
+        os.utime(lock_dir, (1, 1))
+
+        contender = _run_contract(
+            fixture,
+            state=state,
+            lock_wait=1,
+            lock_stale_seconds=1,
+        )
+        assert contender.returncode != 0
+        assert "timed out waiting for lock" in contender.stderr
+        assert owner.read_bytes() == owner_before
+        assert process.poll() is None
+
+        release.write_text("release\n", encoding="utf-8")
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr
+        assert len(stdout.strip()) == 64
+        assert not lock_dir.exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_reclaimed_owner_cannot_publish_or_remove_replacement_lock(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    seeded = _run_contract(fixture, state=tmp_path / "seed-state")
+    assert seeded.returncode == 0, seeded.stderr
+
+    state = tmp_path / "state-fenced-owner"
+    contract = state / "state_compatibility_manifest.tsv"
+    process, ready, release = _start_paused_contract(
+        fixture,
+        state=state,
+        rename_target=contract,
+        rename_mode="before",
+        hook_root=tmp_path / "fenced-owner-hook",
+    )
+    lock_dir = state / ".state_compatibility.lockdir"
+    replacement_process = None
+    replacement_release = None
+    try:
+        _wait_for_ready(process, ready)
+        owner = _lock_owner_files(lock_dir)[0]
+        owner_lines = owner.read_text(encoding="utf-8").splitlines()
+        owner.write_text(
+            "\n".join(
+                "host\tforeign-host.invalid"
+                if line.startswith("host\t")
+                else "started_epoch\t1"
+                if line.startswith("started_epoch\t")
+                else line
+                for line in owner_lines
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.utime(owner, (1, 1))
+        os.utime(lock_dir, (1, 1))
+
+        replacement_process, replacement_ready, replacement_release = (
+            _start_paused_contract(
+                fixture,
+                state=state,
+                rename_target=contract,
+                rename_mode="after",
+                hook_root=tmp_path / "replacement-owner-hook",
+                lock_wait=2,
+                lock_stale_seconds=1,
+            )
+        )
+        _wait_for_ready(replacement_process, replacement_ready)
+        replacement_owner = _lock_owner_files(lock_dir)[0]
+        replacement_owner_bytes = replacement_owner.read_bytes()
+        assert f"pid\t{replacement_process.pid}\n" in replacement_owner_bytes.decode(
+            "utf-8"
+        )
+        replacement_contract = contract.read_bytes()
+        assert replacement_process.poll() is None
+
+        release.write_text("release\n", encoding="utf-8")
+        _, stale_stderr = process.communicate(timeout=10)
+        assert process.returncode != 0
+        assert (
+            "cannot install state contract" in stale_stderr
+            or "ownership of state compatibility lock was lost" in stale_stderr
+        )
+        assert contract.read_bytes() == replacement_contract
+        assert replacement_process.poll() is None
+        assert lock_dir.is_dir()
+        assert replacement_owner.is_file()
+        assert replacement_owner.read_bytes() == replacement_owner_bytes
+
+        replacement_release.write_text("release\n", encoding="utf-8")
+        replacement_stdout, replacement_stderr = replacement_process.communicate(
+            timeout=10
+        )
+        assert replacement_process.returncode == 0, replacement_stderr
+        assert "foreign owner host=foreign-host.invalid" in replacement_stderr
+        assert len(replacement_stdout.strip()) == 64
+        assert contract.read_bytes() == replacement_contract
+        assert not lock_dir.exists()
+    finally:
+        if process.poll() is None:
+            release.write_text("release\n", encoding="utf-8")
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        if replacement_process is not None and replacement_process.poll() is None:
+            assert replacement_release is not None
+            replacement_release.write_text("release\n", encoding="utf-8")
+            try:
+                replacement_process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                replacement_process.kill()
+                replacement_process.wait(timeout=5)
+
+
+def test_concurrent_malformed_lock_reclaimers_preserve_replacement_lock(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    seeded = _run_contract(fixture, state=tmp_path / "seed-state")
+    assert seeded.returncode == 0, seeded.stderr
+
+    state = tmp_path / "state-concurrent-malformed-reclaim"
+    lock_dir = state / ".state_compatibility.lockdir"
+    lock_dir.mkdir(parents=True)
+    malformed_owner = lock_dir / ".owner-malformed.tsv"
+    malformed_owner.write_text("malformed\n", encoding="utf-8")
+    os.utime(malformed_owner, (1, 1))
+    os.utime(lock_dir, (1, 1))
+    contract = state / "state_compatibility_manifest.tsv"
+    stale_attempted = tmp_path / "stale-malformed-hook" / "rename.attempted"
+
+    stale_process, stale_ready, stale_release = _start_paused_contract(
+        fixture,
+        state=state,
+        rename_source=lock_dir,
+        rename_target=Path(f"{lock_dir}.reclaim-"),
+        rename_target_is_prefix=True,
+        rename_mode="before",
+        rename_attempted=stale_attempted,
+        hook_root=tmp_path / "stale-malformed-hook",
+        lock_wait=3,
+        lock_stale_seconds=60,
+    )
+    replacement_process = None
+    replacement_release = None
+    try:
+        _wait_for_ready(stale_process, stale_ready)
+        generation = lock_dir / ".reclaim-generation.tsv"
+        assert generation.is_file()
+        original_inode = lock_dir.stat().st_ino
+
+        replacement_process, replacement_ready, replacement_release = (
+            _start_paused_contract(
+                fixture,
+                state=state,
+                rename_target=contract,
+                rename_mode="after",
+                hook_root=tmp_path / "malformed-replacement-hook",
+                lock_wait=3,
+                lock_stale_seconds=60,
+            )
+        )
+        _wait_for_ready(replacement_process, replacement_ready)
+        quarantines = _reclaim_quarantines(lock_dir)
+        assert len(quarantines) == 1
+        assert quarantines[0].stat().st_ino == original_inode
+        replacement_inode = lock_dir.stat().st_ino
+        replacement_owner = _lock_owner_files(lock_dir)[0]
+        replacement_owner_bytes = replacement_owner.read_bytes()
+        replacement_contract = contract.read_bytes()
+
+        stale_release.write_text("release\n", encoding="utf-8")
+        _wait_for_ready(stale_process, stale_attempted)
+        assert "result\t0\n" in stale_attempted.read_text(encoding="utf-8")
+        assert stale_process.poll() is None
+        assert replacement_process.poll() is None
+        assert lock_dir.stat().st_ino == replacement_inode
+        assert replacement_owner.read_bytes() == replacement_owner_bytes
+        assert contract.read_bytes() == replacement_contract
+
+        replacement_release.write_text("release\n", encoding="utf-8")
+        replacement_stdout, replacement_stderr = replacement_process.communicate(
+            timeout=10
+        )
+        assert replacement_process.returncode == 0, replacement_stderr
+        stale_stdout, stale_stderr = stale_process.communicate(timeout=10)
+        assert stale_process.returncode == 0, stale_stderr
+        assert stale_stdout.strip() == replacement_stdout.strip()
+        assert len(stale_stdout.strip()) == 64
+        assert contract.read_bytes() == replacement_contract
+        assert not lock_dir.exists()
+        assert _reclaim_quarantines(lock_dir) == quarantines
+    finally:
+        if stale_process.poll() is None:
+            stale_release.write_text("release\n", encoding="utf-8")
+            try:
+                stale_process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                stale_process.kill()
+                stale_process.wait(timeout=5)
+        if replacement_process is not None and replacement_process.poll() is None:
+            assert replacement_release is not None
+            replacement_release.write_text("release\n", encoding="utf-8")
+            try:
+                replacement_process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                replacement_process.kill()
+                replacement_process.wait(timeout=5)
+
+
+def test_delayed_generation_link_cannot_poison_replacement_lock(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    seeded = _run_contract(fixture, state=tmp_path / "seed-state")
+    assert seeded.returncode == 0, seeded.stderr
+
+    state = tmp_path / "state-delayed-generation-link"
+    lock_dir = state / ".state_compatibility.lockdir"
+    lock_dir.mkdir(parents=True)
+    os.utime(lock_dir, (1, 1))
+    contract = state / "state_compatibility_manifest.tsv"
+    generation = lock_dir / ".reclaim-generation.tsv"
+    link_attempted = tmp_path / "delayed-link-hook" / "link.attempted"
+    stale_process, stale_ready, stale_release = _start_paused_contract(
+        fixture,
+        state=state,
+        link_target=generation,
+        link_mode="before",
+        link_attempted=link_attempted,
+        hook_root=tmp_path / "delayed-link-hook",
+        lock_wait=3,
+        lock_stale_seconds=60,
+    )
+    replacement_process = None
+    replacement_release = None
+    try:
+        _wait_for_ready(stale_process, stale_ready)
+        assert not generation.exists()
+        assert len(list(lock_dir.glob(".reclaim-generation-*.tmp"))) == 1
+        for child in lock_dir.iterdir():
+            os.utime(child, (1, 1))
+        os.utime(lock_dir, (1, 1))
+        original_inode = lock_dir.stat().st_ino
+
+        replacement_process, replacement_ready, replacement_release = (
+            _start_paused_contract(
+                fixture,
+                state=state,
+                rename_target=contract,
+                rename_mode="after",
+                hook_root=tmp_path / "delayed-link-replacement-hook",
+                lock_wait=3,
+                lock_stale_seconds=60,
+            )
+        )
+        _wait_for_ready(replacement_process, replacement_ready)
+        quarantines = _reclaim_quarantines(lock_dir)
+        assert len(quarantines) == 1
+        assert quarantines[0].stat().st_ino == original_inode
+        replacement_inode = lock_dir.stat().st_ino
+        replacement_owner = _lock_owner_files(lock_dir)[0]
+        replacement_owner_bytes = replacement_owner.read_bytes()
+        replacement_contract = contract.read_bytes()
+        assert not generation.exists()
+
+        stale_release.write_text("release\n", encoding="utf-8")
+        _wait_for_ready(stale_process, link_attempted)
+        assert "result\t0\n" in link_attempted.read_text(encoding="utf-8")
+        assert stale_process.poll() is None
+        assert replacement_process.poll() is None
+        assert lock_dir.stat().st_ino == replacement_inode
+        assert replacement_owner.read_bytes() == replacement_owner_bytes
+        assert contract.read_bytes() == replacement_contract
+        assert not generation.exists()
+
+        replacement_release.write_text("release\n", encoding="utf-8")
+        replacement_stdout, replacement_stderr = replacement_process.communicate(
+            timeout=10
+        )
+        assert replacement_process.returncode == 0, replacement_stderr
+        stale_stdout, stale_stderr = stale_process.communicate(timeout=10)
+        assert stale_process.returncode == 0, stale_stderr
+        assert stale_stdout.strip() == replacement_stdout.strip()
+        assert len(stale_stdout.strip()) == 64
+        assert contract.read_bytes() == replacement_contract
+        assert not lock_dir.exists()
+        assert _reclaim_quarantines(lock_dir) == quarantines
+    finally:
+        if stale_process.poll() is None:
+            stale_release.write_text("release\n", encoding="utf-8")
+            try:
+                stale_process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                stale_process.kill()
+                stale_process.wait(timeout=5)
+        if replacement_process is not None and replacement_process.poll() is None:
+            assert replacement_release is not None
+            replacement_release.write_text("release\n", encoding="utf-8")
+            try:
+                replacement_process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                replacement_process.kill()
+                replacement_process.wait(timeout=5)
+
+
+def test_reclaim_generation_resumes_immediately_after_hard_kill(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    seeded = _run_contract(fixture, state=tmp_path / "seed-state")
+    assert seeded.returncode == 0, seeded.stderr
+
+    state = tmp_path / "state-killed-reclaimer"
+    lock_dir = state / ".state_compatibility.lockdir"
+    lock_dir.mkdir(parents=True)
+    os.utime(lock_dir, (1, 1))
+    contract = state / "state_compatibility_manifest.tsv"
+    process, ready, _ = _start_paused_contract(
+        fixture,
+        state=state,
+        rename_source=lock_dir,
+        rename_target=Path(f"{lock_dir}.reclaim-"),
+        rename_target_is_prefix=True,
+        rename_mode="before",
+        hook_root=tmp_path / "killed-reclaimer-hook",
+        lock_wait=2,
+        lock_stale_seconds=1,
+    )
+    try:
+        _wait_for_ready(process, ready)
+        generation = lock_dir / ".reclaim-generation.tsv"
+        assert generation.is_file()
+        generation_bytes = generation.read_bytes()
+        assert b"lock_dev\t" not in generation_bytes
+        assert b"lock_ino\t" not in generation_bytes
+        process.kill()
+        assert process.wait(timeout=5) == -signal.SIGKILL
+        assert lock_dir.is_dir()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    recovered = _run_contract(
+        fixture,
+        state=state,
+        lock_wait=2,
+        lock_stale_seconds=300,
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert "recorded reclaim generation=" in recovered.stderr
+    assert contract.is_file()
+    assert not lock_dir.exists()
+    quarantines = _reclaim_quarantines(lock_dir)
+    assert len(quarantines) == 1
+    assert (quarantines[0] / ".reclaim-generation.tsv").read_bytes() == (
+        generation_bytes
+    )
+
+
+def test_reclaim_generation_flushes_before_sync_and_publication() -> None:
+    script_text = SCRIPT.read_text(encoding="utf-8")
+    start = script_text.index("sub install_reclaim_generation {")
+    end = script_text.index("sub same_reclaim_generation {", start)
+    install_block = script_text[start:end]
+    assert install_block.index("$fh->flush()") < install_block.index("$fh->sync()")
+    assert install_block.index("$fh->sync()") < install_block.index(
+        "link($tmp, $claim_path)"
+    )
+
+
+def test_reused_same_host_pid_is_reclaimed_immediately(tmp_path: Path) -> None:
+    if not Path(f"/proc/{os.getpid()}/stat").is_file():
+        pytest.skip("portable PID start identity is unavailable on this host")
+    fixture = _build_fixture(tmp_path)
+    state = fixture["state"]
+    lock_dir = state / ".state_compatibility.lockdir"
+    local_host = socket.gethostname().strip().lower().rstrip(".") or "unknown"
+    _write_manual_lock_owner(
+        lock_dir,
+        pid=os.getpid(),
+        host=local_host,
+        process_start="proc:0",
+        started_epoch=int(time.time()),
+    )
+
+    result = _run_contract(fixture, lock_stale_seconds=300)
+    assert result.returncode == 0, result.stderr
+    assert "reclaiming stale state compatibility lock (reused pid=" in result.stderr
+    assert not lock_dir.exists()
+
+
+def test_legacy_process_start_without_boot_id_uses_lease(
+    tmp_path: Path,
+) -> None:
+    ticks = _linux_process_start_ticks(os.getpid())
+    if ticks is None:
+        pytest.skip("Linux process-start ticks are unavailable on this host")
+    fixture = _build_fixture(tmp_path)
+    lock_dir = fixture["state"] / ".state_compatibility.lockdir"
+    local_host = socket.gethostname().strip().lower().rstrip(".") or "unknown"
+    owner = _write_manual_lock_owner(
+        lock_dir,
+        pid=os.getpid(),
+        host=local_host,
+        process_start=f"proc:{ticks}",
+        started_epoch=1,
+    )
+    os.utime(owner, (1, 1))
+    os.utime(lock_dir, (1, 1))
+
+    result = _run_contract(fixture, lock_stale_seconds=1)
+    assert result.returncode == 0, result.stderr
+    assert "unverifiable process identity" in result.stderr
+    assert "reused pid=" not in result.stderr
+
+
+def test_unverifiable_same_host_live_pid_is_reclaimed_after_lease(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    lock_dir = fixture["state"] / ".state_compatibility.lockdir"
+    local_host = socket.gethostname().strip().lower().rstrip(".") or "unknown"
+    owner = _write_manual_lock_owner(
+        lock_dir,
+        pid=os.getpid(),
+        host=local_host,
+        process_start="unavailable",
+        started_epoch=1,
+    )
+    os.utime(owner, (1, 1))
+    os.utime(lock_dir, (1, 1))
+
+    result = _run_contract(fixture, lock_stale_seconds=1)
+    assert result.returncode == 0, result.stderr
+    assert "same-host live pid=" in result.stderr
+    assert "unverifiable process identity" in result.stderr
+    assert not lock_dir.exists()
+
+
+@pytest.mark.parametrize("stale_seconds,backdate", [(60, False), (0, True)])
+def test_unverifiable_same_host_live_pid_is_protected_by_lease(
+    tmp_path: Path,
+    stale_seconds: int,
+    backdate: bool,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    lock_dir = fixture["state"] / ".state_compatibility.lockdir"
+    local_host = socket.gethostname().strip().lower().rstrip(".") or "unknown"
+    owner = _write_manual_lock_owner(
+        lock_dir,
+        pid=os.getpid(),
+        host=local_host,
+        process_start="unavailable",
+        started_epoch=1 if backdate else int(time.time()),
+    )
+    if backdate:
+        os.utime(owner, (1, 1))
+        os.utime(lock_dir, (1, 1))
+
+    result = _run_contract(
+        fixture,
+        lock_wait=1,
+        lock_stale_seconds=stale_seconds,
+    )
+    assert result.returncode != 0
+    assert "timed out waiting for lock" in result.stderr
+    assert lock_dir.is_dir()
+
+
+def test_expired_foreign_and_malformed_state_locks_are_reclaimed(
+    tmp_path: Path,
+) -> None:
+    for lock_type in ["foreign", "malformed"]:
+        fixture = _build_fixture(tmp_path / lock_type)
+        lock_dir = fixture["state"] / ".state_compatibility.lockdir"
+        if lock_type == "foreign":
+            owner = _write_manual_lock_owner(
+                lock_dir,
+                pid=1,
+                host="foreign-host.invalid",
+                process_start="unavailable",
+                started_epoch=1,
+            )
+            os.utime(owner, (1, 1))
+        else:
+            lock_dir.mkdir(parents=True)
+            (lock_dir / ".owner-malformed.tsv").write_text(
+                "malformed\n", encoding="utf-8"
+            )
+            os.utime(lock_dir / ".owner-malformed.tsv", (1, 1))
+        os.utime(lock_dir, (1, 1))
+
+        result = _run_contract(fixture, lock_stale_seconds=1)
+        assert result.returncode == 0, result.stderr
+        assert "reclaiming stale state compatibility lock" in result.stderr
+        assert not lock_dir.exists()
+
+
+def test_abandoned_reclaim_quarantine_is_inert_without_legacy_adoption(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    fixture["state"].mkdir(parents=True)
+    quarantine = (
+        fixture["state"]
+        / f".state_compatibility.lockdir.reclaim-{'b' * 64}"
+    )
+    quarantine.mkdir()
+    (quarantine / ".contract-orphan.tmp").write_text(
+        "incomplete\n", encoding="utf-8"
+    )
+
+    result = _run_contract(fixture)
+    assert result.returncode == 0, result.stderr
+    assert quarantine.is_dir()
+    values = _contract_values(
+        fixture["state"] / "state_compatibility_manifest.tsv"
+    )
+    assert values["legacy_adopted"] == "0"
+
+
+def test_fresh_foreign_and_malformed_state_locks_fail_closed(
+    tmp_path: Path,
+) -> None:
+    for lock_type in ["foreign", "malformed"]:
+        fixture = _build_fixture(tmp_path / lock_type)
+        lock_dir = fixture["state"] / ".state_compatibility.lockdir"
+        if lock_type == "foreign":
+            _write_manual_lock_owner(
+                lock_dir,
+                pid=1,
+                host="foreign-host.invalid",
+                process_start="unavailable",
+                started_epoch=int(time.time()),
+            )
+        else:
+            lock_dir.mkdir(parents=True)
+
+        result = _run_contract(
+            fixture,
+            lock_wait=1,
+            lock_stale_seconds=60,
+        )
+        assert result.returncode != 0
+        assert "timed out waiting for lock" in result.stderr
+        assert lock_dir.is_dir()
+
+
 def test_duplicate_manifest_artifact_is_rejected(tmp_path: Path) -> None:
     fixture = _build_fixture(tmp_path)
     lines = fixture["manifest"].read_text(encoding="utf-8").splitlines()
@@ -773,6 +1675,7 @@ def test_main_wires_schema_v2_runtime_fingerprint_before_state_contract() -> Non
     assert fingerprint_call < contract_call
     assert "'--toolchain-fingerprint', stateToolchainFingerprintFile.toString()" in main_text
     assert "'--contract-migration', stateContractMigration" in main_text
+    assert "'--lock-stale-seconds', stateLockStaleSeconds" in main_text
     assert "'--dorado-bin', doradoBin" in main_text
     assert "'--dorado-device', params.dorado_device.toString()" in main_text
     assert '"fast=${doradoFastBasecallerArgs}"' in main_text
@@ -784,3 +1687,4 @@ def test_main_wires_schema_v2_runtime_fingerprint_before_state_contract() -> Non
         '"conf/runtime_compatibility/toolchain_legacy_v1.tsv"'
     ) in config_text
     assert 'state_contract_migration = "strict"' in config_text
+    assert 'state_lock_stale_seconds = 300' in config_text

@@ -587,6 +587,10 @@ def stateContractMigration = params.state_contract_migration?.toString()?.trim()
 if (!(stateContractMigration in ['strict', 'attest_v1'])) {
     exit 1, "Invalid --state_contract_migration '${params.state_contract_migration}'. Allowed values: strict, attest_v1"
 }
+def stateLockStaleSeconds = params.state_lock_stale_seconds?.toString()?.trim()
+if (!(stateLockStaleSeconds ==~ /[0-9]+/)) {
+    exit 1, "Invalid --state_lock_stale_seconds '${params.state_lock_stale_seconds}'. Provide an integer >= 0."
+}
 def stateVerificationCacheRaw = params.state_verification_cache_dir?.toString()?.trim()
 def stateVerificationCacheDir
 if (stateVerificationCacheRaw) {
@@ -765,6 +769,7 @@ def stateCompatibilityArgs = [
     '--profile', workflow.profile?.toString() ?: '',
     '--policy', stateCompatibilityPolicy,
     '--lock-wait', (params.lock_wait_seconds ?: 300).toString(),
+    '--lock-stale-seconds', stateLockStaleSeconds,
     '--verification-cache-dir', stateVerificationCacheDir,
     '--verification-mode', stateReferenceVerification,
     '--toolchain-fingerprint', stateToolchainFingerprintFile.toString(),
