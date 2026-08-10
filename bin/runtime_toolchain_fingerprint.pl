@@ -71,6 +71,14 @@ sub file_sha256 {
     return $sha->hexdigest;
 }
 
+sub safe_relative_path {
+    my ($path) = @_;
+    return 0 if !defined $path || $path eq '' || File::Spec->file_name_is_absolute($path);
+    return 0 if $path =~ m{(?:\A|/)\.\.(?:/|\z)};
+    return 0 if $path =~ m{//} || $path =~ m{\A\./};
+    return $path =~ m{\A[A-Za-z0-9_.@+/-]+\z} ? 1 : 0;
+}
+
 sub directory_content_sha256 {
     my ($root) = @_;
     my @files;
@@ -201,6 +209,8 @@ sub read_dorado_release_manifest {
     while (my $line = <$fh>) {
         chomp $line;
         if (!$header_seen && $line =~ /\A# ([a-z_]+)=(.+)\z/) {
+            die "ERROR: duplicate Dorado release metadata key '$1'\n"
+                if exists $meta{$1};
             $meta{$1} = $2;
             next;
         }
@@ -214,21 +224,56 @@ sub read_dorado_release_manifest {
         next if $line eq '';
         my ($kind, $artifact, $sha, $bytes, $mode, $role, @extra) = split /\t/, $line, -1;
         die "ERROR: malformed Dorado release manifest row: $line\n"
-            if !defined $artifact || !defined $sha || $sha !~ /\A[0-9a-f]{64}\z/ || @extra;
+            if !defined $kind || ($kind ne 'archive' && $kind ne 'runtime' && $kind ne 'model')
+            || !safe_relative_path($artifact)
+            || !defined $sha || $sha !~ /\A[0-9a-f]{64}\z/
+            || !defined $bytes || $bytes !~ /\A[0-9]+\z/
+            || !defined $mode || ($mode ne '-' && $mode !~ /\A0[0-7]{3}\z/)
+            || !defined $role || $role eq '' || @extra;
+        die "ERROR: duplicate Dorado release artifact: $artifact\n"
+            if exists $entry{$artifact};
+        die "ERROR: archive artifact must be a basename: $artifact\n"
+            if $kind eq 'archive' && $artifact =~ m{/};
+        die "ERROR: model artifact must be installed below models/: $artifact\n"
+            if $kind eq 'model' && $artifact !~ m{\Amodels/};
         $entry{$artifact} = {
             kind   => $kind,
             sha256 => $sha,
             bytes  => $bytes,
             mode   => $mode,
+            role   => $role,
         };
     }
     close($fh);
     die "ERROR: Dorado release manifest has no artifact header\n" if !$header_seen;
-    for my $required (qw(release_id platform expected_version)) {
+    for my $required (qw(release_id platform expected_version source_url)) {
         die "ERROR: Dorado release manifest is missing metadata '$required'\n"
             if !defined $meta{$required} || $meta{$required} eq '';
     }
+    my @archives = grep { $entry{$_}{kind} eq 'archive' } keys %entry;
+    die "ERROR: Dorado release manifest must contain exactly one archive row\n"
+        if @archives != 1;
+    die "ERROR: Dorado release manifest is missing runtime artifact 'bin/dorado'\n"
+        if !exists $entry{'bin/dorado'} || $entry{'bin/dorado'}{kind} ne 'runtime';
     return (\%meta, \%entry);
+}
+
+sub verify_qualified_release_artifact {
+    my ($release_root, $artifact, $entry_ref) = @_;
+    my $path = File::Spec->catfile($release_root, split m{/}, $artifact);
+    my $absolute = abs_path($path);
+    die "ERROR: qualified Dorado release artifact is not a regular non-symlink file: $artifact\n"
+        if !defined $absolute || !-f $absolute || -l $path;
+    die "ERROR: qualified Dorado release artifact resolves outside its declared layout: $artifact\n"
+        if $absolute ne $path;
+    my $actual_bytes = -s $absolute;
+    die "ERROR: qualified Dorado release artifact size mismatch for '$artifact': "
+        . "manifest=$entry_ref->{bytes} actual=$actual_bytes\n"
+        if $actual_bytes != $entry_ref->{bytes};
+    my $actual_sha = file_sha256($absolute);
+    die "ERROR: qualified Dorado release artifact checksum mismatch for '$artifact': "
+        . "manifest=$entry_ref->{sha256} actual=$actual_sha\n"
+        if $actual_sha ne $entry_ref->{sha256};
 }
 
 my $policy_path = require_regular_file($opt{policy_manifest}, 'toolchain policy manifest');
@@ -261,6 +306,33 @@ my $dorado_bin = resolve_executable($opt{dorado_bin});
 my $dorado_summary_bin = $opt{dorado_summary_bin} eq ''
     ? $dorado_bin
     : resolve_executable($opt{dorado_summary_bin});
+my (
+    $qualified_manifest_path,
+    $qualified_release_meta_ref,
+    $qualified_release_entries_ref,
+    $qualified_release_root,
+);
+if ($opt{dorado_release_manifest} ne '') {
+    $qualified_manifest_path = require_regular_file(
+        $opt{dorado_release_manifest}, 'Dorado release manifest'
+    );
+    ($qualified_release_meta_ref, $qualified_release_entries_ref) =
+        read_dorado_release_manifest($qualified_manifest_path);
+    $qualified_release_root = dirname(dirname($dorado_bin));
+    my $expected_binary = File::Spec->catfile(
+        $qualified_release_root, 'bin', 'dorado'
+    );
+    die "ERROR: selected Dorado binary is not in the qualified release layout\n"
+        if $expected_binary ne $dorado_bin;
+    for my $artifact (sort keys %{$qualified_release_entries_ref}) {
+        next if $qualified_release_entries_ref->{$artifact}{kind} eq 'archive';
+        verify_qualified_release_artifact(
+            $qualified_release_root,
+            $artifact,
+            $qualified_release_entries_ref->{$artifact},
+        );
+    }
+}
 my %resolved_tool = map { $_ => resolve_executable($_) } @tool_names;
 my $rscript = resolve_executable('Rscript');
 my $probe_script = require_regular_file(
@@ -352,27 +424,15 @@ for my $stage (qw(fast hac sup)) {
 }
 
 if ($opt{dorado_release_manifest} ne '') {
-    my $manifest_path = require_regular_file(
-        $opt{dorado_release_manifest}, 'Dorado release manifest'
-    );
-    my ($release_meta_ref, $release_entries_ref) =
-        read_dorado_release_manifest($manifest_path);
+    my $manifest_path = $qualified_manifest_path;
+    my $release_meta_ref = $qualified_release_meta_ref;
+    my $release_entries_ref = $qualified_release_entries_ref;
+    my $release_root = $qualified_release_root;
     die "ERROR: selected Dorado version does not match release manifest: "
         . "$dorado_version != $release_meta_ref->{expected_version}\n"
         if $dorado_version ne $release_meta_ref->{expected_version};
-    die "ERROR: Dorado release manifest does not declare bin/dorado\n"
-        if !exists $release_entries_ref->{'bin/dorado'};
-    my $actual_binary_bytes = -s $dorado_bin;
-    my $expected_binary_bytes = $release_entries_ref->{'bin/dorado'}{bytes};
-    die "ERROR: selected Dorado binary size does not match release manifest: "
-        . "manifest=$expected_binary_bytes actual=$actual_binary_bytes\n"
-        if "$actual_binary_bytes" ne "$expected_binary_bytes";
     $fingerprint{dorado_binary_sha256} =
         $release_entries_ref->{'bin/dorado'}{sha256};
-    my $release_root = dirname(dirname($dorado_bin));
-    my $expected_binary = abs_path(File::Spec->catfile($release_root, 'bin', 'dorado'));
-    die "ERROR: selected Dorado binary is not in the qualified release layout\n"
-        if !defined $expected_binary || $expected_binary ne $dorado_bin;
     for my $stage (qw(fast hac sup)) {
         my $artifact = "models/$fingerprint{\"dorado_${stage}_model\"}/config.toml";
         my $expected_model = abs_path(
@@ -385,7 +445,8 @@ if ($opt{dorado_release_manifest} ne '') {
         die "ERROR: selected Dorado $stage model is outside the qualified release layout\n"
             if !defined $expected_model || $expected_model ne $model_path{$stage};
         die "ERROR: selected Dorado $stage model is not declared by the release manifest\n"
-            if !exists $release_entries_ref->{$artifact};
+            if !exists $release_entries_ref->{$artifact}
+            || $release_entries_ref->{$artifact}{kind} ne 'model';
         die "ERROR: selected Dorado $stage model config does not match the release manifest\n"
             if $fingerprint{"dorado_${stage}_model_config_sha256"}
                 ne $release_entries_ref->{$artifact}{sha256};
@@ -396,15 +457,6 @@ if ($opt{dorado_release_manifest} ne '') {
             if !@declared_model_artifacts;
         my $model_canonical = '';
         for my $declared (@declared_model_artifacts) {
-            my $relative = substr($declared, length($model_prefix));
-            my $path = File::Spec->catfile($model_path{$stage}, split m{/}, $relative);
-            die "ERROR: qualified Dorado model artifact is missing: $path\n"
-                if !-f $path || -l $path;
-            my $actual_bytes = -s $path;
-            my $expected_bytes = $release_entries_ref->{$declared}{bytes};
-            die "ERROR: qualified Dorado model artifact size mismatch for '$path': "
-                . "manifest=$expected_bytes actual=$actual_bytes\n"
-                if "$actual_bytes" ne "$expected_bytes";
             $model_canonical .=
                 "$declared\t$release_entries_ref->{$declared}{sha256}\n";
         }

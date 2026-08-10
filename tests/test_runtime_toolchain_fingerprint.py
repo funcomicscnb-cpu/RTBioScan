@@ -3,6 +3,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "bin" / "runtime_toolchain_fingerprint.pl"
@@ -41,6 +43,12 @@ def _fake_runtime(tmp_path: Path) -> dict[str, Path]:
     }
     for name, output in outputs.items():
         _write_executable(bindir / name, output)
+    with (bindir / "dorado").open("a", encoding="utf-8") as handle:
+        handle.write("# qualified hash-check padding\n")
+
+    metallib = tmp_path / "lib" / "default.metallib"
+    metallib.parent.mkdir()
+    metallib.write_bytes(b"qualified Metal runtime library\n")
 
     models = tmp_path / "models"
     model_names = {
@@ -56,8 +64,16 @@ def _fake_runtime(tmp_path: Path) -> dict[str, Path]:
             f"[model]\nstage = \"{stage}\"\n",
             encoding="utf-8",
         )
+        (path / "weights.tensor").write_bytes(
+            f"qualified {stage} model weights\n".encode()
+        )
         model_paths[stage] = path
-    return {"bindir": bindir, "dorado": bindir / "dorado", **model_paths}
+    return {
+        "bindir": bindir,
+        "dorado": bindir / "dorado",
+        "metallib": metallib,
+        **model_paths,
+    }
 
 
 def _run(
@@ -128,6 +144,54 @@ def _values(path: Path) -> dict[str, str]:
         line.split("\t", 1)
         for line in path.read_text(encoding="utf-8").splitlines()
     )
+
+
+def _qualified_manifest(tmp_path: Path, runtime: dict[str, Path]) -> Path:
+    archive_payload = b"manifest-only qualified archive fixture\n"
+    rows = [
+        "# release_id=dorado-0.7.0-test",
+        "# platform=test",
+        "# expected_version=0.7.0+71cc7442",
+        "# source_url=https://example.invalid/dorado.zip",
+        "kind\tartifact\tsha256\tbytes\tmode\trole",
+        (
+            "archive\tdorado.zip\t"
+            f"{hashlib.sha256(archive_payload).hexdigest()}\t"
+            f"{len(archive_payload)}\t-\tDorado archive"
+        ),
+        (
+            "runtime\tbin/dorado\t"
+            f"{hashlib.sha256(runtime['dorado'].read_bytes()).hexdigest()}\t"
+            f"{runtime['dorado'].stat().st_size}\t0555\tDorado executable"
+        ),
+        (
+            "runtime\tlib/default.metallib\t"
+            f"{hashlib.sha256(runtime['metallib'].read_bytes()).hexdigest()}\t"
+            f"{runtime['metallib'].stat().st_size}\t0444\tMetal runtime library"
+        ),
+    ]
+    for stage in ["fast", "hac", "sup"]:
+        for filename in ["config.toml", "weights.tensor"]:
+            artifact = runtime[stage] / filename
+            rows.append(
+                "model\t"
+                f"models/{runtime[stage].name}/{filename}\t"
+                f"{hashlib.sha256(artifact.read_bytes()).hexdigest()}\t"
+                f"{artifact.stat().st_size}\t0444\t{stage} {filename}"
+            )
+    manifest = tmp_path / "dorado-release.tsv"
+    manifest.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return manifest
+
+
+def _tamper_same_size(path: Path) -> None:
+    before = path.read_bytes()
+    assert len(before) >= 2
+    tampered = bytearray(before)
+    tampered[-2] ^= 1
+    path.write_bytes(tampered)
+    assert path.stat().st_size == len(before)
+    assert hashlib.sha256(path.read_bytes()).digest() != hashlib.sha256(before).digest()
 
 
 def test_fingerprint_binds_live_versions_dorado_models_device_and_args(
@@ -259,28 +323,7 @@ def test_qualified_dorado_manifest_binds_selected_release_layout(
     tmp_path: Path,
 ) -> None:
     runtime = _fake_runtime(tmp_path)
-    rows = [
-        "# release_id=dorado-0.7.0-test",
-        "# platform=test",
-        "# expected_version=0.7.0+71cc7442",
-        "# source_url=https://example.invalid/dorado.zip",
-        "kind\tartifact\tsha256\tbytes\tmode\trole",
-        (
-            "runtime\tbin/dorado\t"
-            f"{hashlib.sha256(runtime['dorado'].read_bytes()).hexdigest()}\t"
-            f"{runtime['dorado'].stat().st_size}\t0555\tDorado executable"
-        ),
-    ]
-    for stage in ["fast", "hac", "sup"]:
-        config = runtime[stage] / "config.toml"
-        rows.append(
-            "model\t"
-            f"models/{runtime[stage].name}/config.toml\t"
-            f"{hashlib.sha256(config.read_bytes()).hexdigest()}\t"
-            f"{config.stat().st_size}\t0444\t{stage} config"
-        )
-    manifest = tmp_path / "dorado-release.tsv"
-    manifest.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    manifest = _qualified_manifest(tmp_path, runtime)
 
     result = _run(tmp_path, runtime, release_manifest=manifest)
     assert result.returncode == 0, result.stderr
@@ -288,6 +331,95 @@ def test_qualified_dorado_manifest_binds_selected_release_layout(
     values = _values(tmp_path / "fingerprint.tsv")
     assert values["dorado_release_status"] == "qualified_manifest"
     assert values["dorado_release_id"] == "dorado-0.7.0-test"
+    assert not (tmp_path / "dorado.zip").exists()
     assert values["dorado_release_manifest_sha256"] == hashlib.sha256(
         manifest.read_bytes()
     ).hexdigest()
+    # Golden produced by the vulnerable 78ed692 implementation from this fixture.
+    assert values["fingerprint_id"] == (
+        "77a32dc156092f7ca75cc7b420960934733288aedcde30149f376bc25a65dece"
+    )
+    assert "dorado_metallib_sha256" not in values
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    ["binary", "metallib", "fast_tensor", "hac_tensor", "sup_tensor"],
+)
+def test_qualified_dorado_manifest_rejects_same_size_artifact_tamper(
+    tmp_path: Path, artifact: str
+) -> None:
+    runtime = _fake_runtime(tmp_path)
+    manifest = _qualified_manifest(tmp_path, runtime)
+    if artifact == "binary":
+        target = runtime["dorado"]
+        declared = "bin/dorado"
+    elif artifact == "metallib":
+        target = runtime["metallib"]
+        declared = "lib/default.metallib"
+    else:
+        stage = artifact.removesuffix("_tensor")
+        target = runtime[stage] / "weights.tensor"
+        declared = f"models/{runtime[stage].name}/weights.tensor"
+    _tamper_same_size(target)
+
+    if artifact == "binary":
+        probe = subprocess.run(
+            [str(target), "--version"], capture_output=True, text=True, check=False
+        )
+        assert probe.returncode == 0
+        assert probe.stdout.strip() == "0.7.0+71cc7442"
+
+    result = _run(tmp_path, runtime, release_manifest=manifest)
+    assert result.returncode != 0
+    assert declared in result.stderr
+    assert "checksum mismatch" in result.stderr
+
+
+@pytest.mark.parametrize("artifact_state", ["missing", "symlink"])
+def test_qualified_dorado_manifest_rejects_non_regular_runtime_artifact(
+    tmp_path: Path, artifact_state: str
+) -> None:
+    runtime = _fake_runtime(tmp_path)
+    manifest = _qualified_manifest(tmp_path, runtime)
+    metallib = runtime["metallib"]
+    if artifact_state == "missing":
+        metallib.unlink()
+    else:
+        external = tmp_path / "external.metallib"
+        external.write_bytes(metallib.read_bytes())
+        metallib.unlink()
+        metallib.symlink_to(external)
+
+    result = _run(tmp_path, runtime, release_manifest=manifest)
+    assert result.returncode != 0
+    assert "lib/default.metallib" in result.stderr
+    assert "not a regular non-symlink file" in result.stderr
+
+
+@pytest.mark.parametrize("invalid_row", ["duplicate", "traversal"])
+def test_qualified_dorado_manifest_rejects_unsafe_artifact_rows(
+    tmp_path: Path, invalid_row: str
+) -> None:
+    runtime = _fake_runtime(tmp_path)
+    manifest = _qualified_manifest(tmp_path, runtime)
+    if invalid_row == "duplicate":
+        row = next(
+            line
+            for line in manifest.read_text(encoding="utf-8").splitlines()
+            if line.startswith("runtime\tlib/default.metallib\t")
+        )
+    else:
+        row = (
+            "runtime\t../escape\t"
+            f"{'0' * 64}\t1\t0444\tunsafe traversal fixture"
+        )
+    with manifest.open("a", encoding="utf-8") as handle:
+        handle.write(row + "\n")
+
+    result = _run(tmp_path, runtime, release_manifest=manifest)
+    assert result.returncode != 0
+    if invalid_row == "duplicate":
+        assert "duplicate Dorado release artifact" in result.stderr
+    else:
+        assert "malformed Dorado release manifest row" in result.stderr
