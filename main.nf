@@ -7034,17 +7034,18 @@ process async_report_render {
 				local reclaim_status=0
 				while ! mkdir "\$lock_dir" 2>/dev/null; do
 					REPORT_STALE_LOCK_DIR="\$lock_dir"
-					set +e
-					stale_lock_maybe_reclaim \
+					if stale_lock_maybe_reclaim \
 						"\$lock_dir" \
 						"\$lock_meta" \
 						"\$REPORT_LOCK_HOST" \
 						"\$REPORT_LOCK_STALE_TTL_SECONDS" \
 						"\$lock_label" \
 						remove_report_lock_if_stale \
-						0
-					reclaim_status=\$?
-					set -e
+						0; then
+						reclaim_status=0
+					else
+						reclaim_status=\$?
+					fi
 					if [ "\$reclaim_status" -eq 2 ] || [ "\$reclaim_status" -eq 11 ]; then
 						return 1
 					fi
@@ -7250,12 +7251,21 @@ PY
 						--refresh-seconds "\$HTML_REPORT_REFRESH_SECONDS" \
 						--sample-plot-max "\$HTML_REPORT_SAMPLE_PLOT_MAX" &
 					track_detail_render_pid=\$!
-					wait "\$sample_render_pid"
-					sample_render_rc=\$?
-					wait "\$replicate_render_pid"
-					replicate_render_rc=\$?
-					wait "\$track_detail_render_pid"
-					track_detail_render_rc=\$?
+					if wait "\$sample_render_pid"; then
+						sample_render_rc=0
+					else
+						sample_render_rc=\$?
+					fi
+					if wait "\$replicate_render_pid"; then
+						replicate_render_rc=0
+					else
+						replicate_render_rc=\$?
+					fi
+					if wait "\$track_detail_render_pid"; then
+						track_detail_render_rc=0
+					else
+						track_detail_render_rc=\$?
+					fi
 					if [ "\$sample_render_rc" -ne 0 ] || [ "\$replicate_render_rc" -ne 0 ] || [ "\$track_detail_render_rc" -ne 0 ]; then
 						echo "WARN: async report_rebuild.sh failed for round=${round_barcode} sample_rc=\$sample_render_rc replicate_rc=\$replicate_render_rc track_detail_rc=\$track_detail_render_rc" 1>&2
 						break
