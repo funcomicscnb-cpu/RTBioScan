@@ -290,7 +290,10 @@ The cumulative-state design is what lets RTBioScan resume interrupted runs and c
 
 Profiles bundle parameter choices for common contexts:
 
-- `docker`, `conda`, and `singularity` select execution environments.
+- `conda` is an explanatory disabled stub. Install and activate a committed
+  platform lock, then run without an execution profile.
+- `docker` and `singularity` are explanatory erroring stubs until RTBioScan
+  publishes and validates its own container image.
 - `test` points to the test database configuration.
 - `barcoding` is intended for batch-mode diversity runs from pre-collected POD5 files.
 - `voucher` is intended for reference-sequence generation from a known specimen.

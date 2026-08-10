@@ -1032,9 +1032,9 @@ validate_track_artifacts() {
 				target = toupper(trim_cr(targets[i]))
 				if (target == "") continue
 				allowed[target] = 1
-				allowed_order[++allowed_order_count] = target
+				allowed_target_count++
 			}
-			if (allowed_order_count == 0) {
+			if (allowed_target_count == 0) {
 				fail("ERROR: validate_track_artifacts requires at least one configured target marker")
 			}
 		}
@@ -1078,19 +1078,6 @@ validate_track_artifacts() {
 			pair_key = track_id SUBSEP marker_id
 			if (seen_pair[pair_key]++) {
 				fail("ERROR: track_identity.tsv contains duplicate track_id/marker_id pair " track_id "/" marker_id)
-			}
-			track_seen[track_id] = 1
-			track_marker_seen[pair_key] = 1
-		}
-		END {
-			for (track_id in track_seen) {
-				for (i = 1; i <= allowed_order_count; i++) {
-					marker_id = allowed_order[i]
-					pair_key = track_id SUBSEP marker_id
-					if (!(pair_key in track_marker_seen)) {
-						fail("ERROR: track_identity.tsv is missing required marker_id " marker_id " for track_id " track_id)
-					}
-				}
 			}
 		}
 	' "$track_identity_path"; then

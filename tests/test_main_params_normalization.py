@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import pty
@@ -481,6 +482,19 @@ def _make_wrapper_root(tmp_path: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
     return wrapper_root, script
+
+
+def _install_wrapper_report_renderer(wrapper_root: Path) -> None:
+    for relative_path in (
+        "bin/report_render.py",
+        "assets/report/template.html",
+        "assets/report/report.css",
+        "assets/report/report.js",
+    ):
+        source = REPO_ROOT / relative_path
+        destination = wrapper_root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
 
 
 def _write_wrapper_nextflow_shim(
@@ -1626,6 +1640,87 @@ def test_rtbioscan_clean_run_removes_cache_locks_when_nextflow_clean_fails(tmp_p
     ]
 
 
+@pytest.mark.parametrize("keep_surviving_run", [False, True], ids=["empty-index", "surviving-run"])
+def test_rtbioscan_clean_run_rerenders_current_artifact_schema(
+    tmp_path: Path, keep_surviving_run: bool
+) -> None:
+    run_id = "cleaned-report-run"
+    surviving_run_id = "surviving-legacy-run"
+    launch_dir = tmp_path / "launch_root"
+    report_root = launch_dir / "results" / "report_html"
+    run_dir = report_root / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (launch_dir / ".nextflow").mkdir(parents=True)
+    (launch_dir / ".nextflow" / "history").write_text(
+        f"2026-03-21 00:00:00\t1s\t{run_id}\tOK\thash\tsession-id\tnextflow run main.nf -name {run_id}\n",
+        encoding="utf-8",
+    )
+    (report_root / "report.html").write_text("<html>stale</html>\n", encoding="utf-8")
+
+    index_rows = [
+        {
+            "schema_version": "2.0",
+            "run_id": run_id,
+            "state_id": run_id,
+            "rounds_count": 0,
+            "status_label": "Fresh",
+        }
+    ]
+    if keep_surviving_run:
+        index_rows.append(
+            {
+                "schema_version": "1.6",
+                "run_id": surviving_run_id,
+                "state_id": surviving_run_id,
+                "rounds_count": 3,
+            }
+        )
+    run_index = report_root / "runs_index.jsonl"
+    run_index.write_text(
+        "".join(json.dumps(row) + "\n" for row in index_rows),
+        encoding="utf-8",
+    )
+
+    wrapper_root, script = _make_wrapper_root(tmp_path)
+    _install_wrapper_report_renderer(wrapper_root)
+    env = os.environ.copy()
+    _write_wrapper_nextflow_shim(wrapper_root, env, clean_stdout="NEXTFLOW_CLEAN_OK\n")
+
+    result = subprocess.run(
+        ["bash", str(script), "--clean", run_id, "--clean-ref", str(launch_dir), "--yes"],
+        cwd=launch_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not run_dir.exists()
+    remaining_rows = [
+        json.loads(line)
+        for line in run_index.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    expected_run_ids = [surviving_run_id] if keep_surviving_run else []
+    assert [row["run_id"] for row in remaining_rows] == expected_run_ids
+
+    report_state = json.loads((report_root / "report_state.json").read_text(encoding="utf-8"))
+    assert report_state["schema_version"] == "2.0"
+    html_text = (report_root / "report.html").read_text(encoding="utf-8")
+
+    def extract_embedded(marker: str) -> dict:
+        start = html_text.index(marker) + len(marker)
+        end = html_text.index(";\n", start)
+        return json.loads(html_text[start:end])
+
+    report_meta = extract_embedded("window.REPORT_META = ")
+    report_payload = extract_embedded("window.REPORT_PAYLOAD = ")
+    assert report_meta["schema_version"] == "2.0"
+    assert [row["run_id"] for row in report_payload["run_index"]] == expected_run_ids
+    if keep_surviving_run:
+        assert report_payload["run_index"][0]["schema_version"] == "1.6"
+
+
 def test_rtbioscan_clean_run_does_not_match_prefix_run_id_feeder(tmp_path: Path) -> None:
     run_id = "prefix-run-1"
     other_run_id = "prefix-run-12"
@@ -2523,6 +2618,12 @@ def test_main_nf_guards_round_barcode_collisions_before_round_dir_use() -> None:
     assert 'if [ "\\$reclaim_status" -eq 10 ]; then' in fast_block
 
 
+def test_main_nf_report_lock_stale_ttl_uses_stale_lock_ttl_minutes() -> None:
+    text = MAIN_NF.read_text(encoding="utf-8")
+    assert 'REPORT_LOCK_STALE_TTL_SECONDS="\\$(( ${staleLockTtlMinutesStr} * 60 ))"' in text
+    assert 'REPORT_LOCK_STALE_TTL_SECONDS=${params.lock_wait_seconds}' not in text
+
+
 def test_main_nf_wires_size_streak_phase_b_in_reporting_otu_definition() -> None:
     text = MAIN_NF.read_text(encoding="utf-8")
     assert text.count('OTU_SIZE_STREAK_MODE="${otuSizeStreakModeCanonical}"') >= 1
@@ -2806,7 +2907,7 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'cp "${barcode}_summary_demult_rpt.txt" "${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt"' in summary_block
     assert '--demult "${demult_rpt}" \\' in summary_block
     assert '--read-fate-demult "${barcode}_read_fate_demult_first_seen.tsv" \\' in summary_block
-    assert '--schema-version "1.6" \\' in summary_block
+    assert '--schema-version "2.0" \\' in summary_block
     assert '--otu-sizes-round "${otu_sizes_round}" \\' in summary_block
     assert '--otu-size-streak "\\$ROUND_DIR/${barcode}_otu_size_streak.tsv" \\' in summary_block
     assert '--active-prune-counts "\\$ACTIVE_PRUNE_COUNTS_OUT" \\' in summary_block
@@ -2864,6 +2965,10 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'ensure_local_round_alias "${demult_rpt_sidecar}" "\\$ROUND_DEMULT_SIDECAR_LOCAL"' in summary_block
     assert 'ensure_local_round_alias "${otu_def_rpt}" "\\$ROUND_OTU_RPT_LOCAL"' in summary_block
     assert 'ensure_local_round_alias "${otu_def_rpt_sidecar}" "\\$ROUND_OTU_SIDECAR_LOCAL"' in summary_block
+    assert 'ensure_local_round_alias "${read_info_rpt}" "\\$ROUND_READ_INFO_LOCAL"' in summary_block
+    assert 'ensure_local_round_alias "${on_target_rpt}" "\\$ROUND_ON_TARGET_LOCAL"' in summary_block
+    assert 'ensure_local_round_alias "${blast_otu_pretax_rpt}" "\\$ROUND_BLAST_OTU_LOCAL"' in summary_block
+    assert 'ensure_local_round_alias "${blast_consensus_tax}" "\\$ROUND_BLAST_CONSENSUS_LOCAL"' in summary_block
     assert '"\\$ROUND_DEMULT_RPT_LOCAL" \\' in summary_block
     assert '"\\$ROUND_DEMULT_SIDECAR_LOCAL" \\' in summary_block
     assert '"\\$ROUND_OTU_RPT_LOCAL" \\' in summary_block

@@ -1,0 +1,108 @@
+{
+  "schema_version": "fast-filter-shadow-measurement-plan-v1",
+  "plan_id": "REPLACE_WITH_VERSIONED_PLAN_ID",
+  "created_utc": "REPLACE_WITH_UTC_TIMESTAMP",
+  "repository_commit": "REPLACE_WITH_FULL_COMMIT_SHA",
+  "dataset": {
+    "representativeness_rationale": "REPLACE_WITH_DATASET_AND_DEPLOYMENT_RATIONALE",
+    "artifacts": [
+      {
+        "artifact_id": "REPLACE_WITH_UNIQUE_ARTIFACT_ID",
+        "path": "REPLACE_WITH_INPUT_POD5_OR_FAST5_PATH",
+        "sha256": "REPLACE_WITH_INPUT_SHA256",
+        "bytes": 0,
+        "material_classes": [
+          "coi_target",
+          "its2_target",
+          "off_target"
+        ],
+        "evidence_path": "REPLACE_WITH_INDEPENDENT_COMPOSITION_EVIDENCE_PATH",
+        "evidence_sha256": "REPLACE_WITH_EVIDENCE_SHA256"
+      }
+    ]
+  },
+  "runtime": {
+    "nextflow_bin": "nextflow",
+    "nextflow_bin_sha256": "REPLACE_WITH_NEXTFLOW_WRAPPER_SHA256",
+    "nextflow_version": "22.10.8",
+    "lastal_bin": "REPLACE_WITH_QUALIFIED_LASTAL_PATH",
+    "lastal_bin_sha256": "REPLACE_WITH_LASTAL_BINARY_SHA256",
+    "lastal_version": "1542",
+    "last_index_prj": "db/targets_All_tagged_nr95.prj",
+    "last_index_prj_sha256": "01715bb5447edb62ddfe3218607e1d0b46c3594b5e9cfb67ea9b27e96ec12a31",
+    "reference_manifest": "conf/state_compatibility/reference_manifest_legacy_v1.tsv",
+    "reference_manifest_sha256": "cf04ad3c0c3c0580bf9620ad9a26d4e77dddcf0ad8679b36b51b4c62753ad299",
+    "dorado_release_manifest": "conf/runtime_compatibility/dorado_release_0.7.0_osx-arm64.tsv",
+    "dorado_release_manifest_sha256": "67290dd059d01481621673cf288bc0358f4688e9572156304abc14528a73ee89",
+    "dorado_qualification_report": "REPLACE_WITH_SUCCESSFUL_ACCELERATOR_REPORT_PATH",
+    "dorado_qualification_report_sha256": "REPLACE_WITH_QUALIFICATION_REPORT_SHA256",
+    "hardware_backend": "REPLACE_WITH_METAL_OR_CUDA",
+    "hardware_identity": "REPLACE_WITH_DEPLOYMENT_HARDWARE_IDENTITY"
+  },
+  "namespace": {
+    "stable_state_id": "REPLACE_WITH_STABLE_STATE_ID",
+    "candidate_state_id": "REPLACE_WITH_FRESH_CANDIDATE_STATE_ID",
+    "candidate_output_dir": "REPLACE_WITH_FRESH_OUTPUT_DIRECTORY",
+    "fast_filter_shadow": true,
+    "taxonomy_behavior_change": false
+  },
+  "performance_budgets": {
+    "minimum_reads_per_second": {
+      "fast": 0,
+      "hac": 0,
+      "sup": 0
+    },
+    "minimum_bases_per_second": {
+      "fast": 0,
+      "hac": 0,
+      "sup": 0
+    },
+    "maximum_p95_round_latency_seconds": 0,
+    "maximum_total_basecalling_time_ratio": 0,
+    "minimum_sequencer_input_headroom_ratio": 0
+  },
+  "analysis": {
+    "read_length_bins": [
+      0,
+      "REPLACE_WITH_PREDECLARED_BOUNDARIES"
+    ],
+    "alignment_identity_bins": [
+      0,
+      "REPLACE_WITH_PREDECLARED_BOUNDARIES_ENDING_AT_100"
+    ],
+    "error_stratification_protocol_path": "REPLACE_WITH_ERROR_STRATIFICATION_PROTOCOL_PATH",
+    "error_stratification_protocol_sha256": "REPLACE_WITH_ERROR_PROTOCOL_SHA256",
+    "near_tie_policy": "retain"
+  },
+  "adjudication": {
+    "sampling_strategy": "REPLACE_WITH_PREDECLARED_SAMPLING_STRATEGY",
+    "sample_per_marker_status": 0,
+    "random_seed": 0,
+    "references": [
+      {
+        "marker": "COI",
+        "name": "REPLACE_WITH_REFERENCE_NAME",
+        "release": "REPLACE_WITH_REFERENCE_RELEASE",
+        "reference_manifest_path": "REPLACE_WITH_REFERENCE_MANIFEST_PATH",
+        "reference_manifest_sha256": "REPLACE_WITH_REFERENCE_MANIFEST_SHA256",
+        "search_tool": "REPLACE_WITH_SEARCH_TOOL",
+        "search_tool_version": "REPLACE_WITH_SEARCH_TOOL_VERSION",
+        "protocol_path": "REPLACE_WITH_REVIEWED_PROTOCOL_PATH",
+        "protocol_sha256": "REPLACE_WITH_PROTOCOL_SHA256",
+        "independent_from_routing_database": true
+      },
+      {
+        "marker": "ITS2",
+        "name": "REPLACE_WITH_REFERENCE_NAME",
+        "release": "REPLACE_WITH_REFERENCE_RELEASE",
+        "reference_manifest_path": "REPLACE_WITH_REFERENCE_MANIFEST_PATH",
+        "reference_manifest_sha256": "REPLACE_WITH_REFERENCE_MANIFEST_SHA256",
+        "search_tool": "REPLACE_WITH_SEARCH_TOOL",
+        "search_tool_version": "REPLACE_WITH_SEARCH_TOOL_VERSION",
+        "protocol_path": "REPLACE_WITH_REVIEWED_PROTOCOL_PATH",
+        "protocol_sha256": "REPLACE_WITH_PROTOCOL_SHA256",
+        "independent_from_routing_database": true
+      }
+    ]
+  }
+}

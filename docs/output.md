@@ -111,7 +111,7 @@ Each analysis round produces a directory under `results/temp/ongoing/state/<stat
 ```
 results/temp/ongoing/state/<state_id>/
   <round_barcode>/
-    round_report.json                             ← machine-readable round metrics (schema v1.6)
+    round_report.json                             ← machine-readable round metrics (schema v2.0)
     run_report.json                               ← run-level summary JSON derived from history after this round
     <barcode>_summary_demult_rpt.txt              ← demultiplexing read counts
     <barcode>_blast_otu_pretax_rpt.txt            ← BLAST OTU assignments (round)
@@ -130,7 +130,7 @@ Additional audit and diagnostic files may also be present in the round directory
 ### `round_report.json`
 [back to Top](#rtbioscan-output)
 
-Machine-readable metrics for each round, consumed by the HTML report renderer. Schema version: `1.6`. Key namespaces: `reads`, `otu`, `blast`, `consensus`, `read_fate`, `sample_metrics`, and `figures`. See `report_schema.md` for the full field reference.
+Machine-readable metrics for each round, consumed by the HTML report renderer. Schema version: `2.0`. Key namespaces: `reads`, `otu`, `blast`, `consensus`, `read_fate`, `sample_metrics`, and `figures`. See `report_schema.md` for the full field reference.
 
 ### `run_report.json`
 [back to Top](#rtbioscan-output)

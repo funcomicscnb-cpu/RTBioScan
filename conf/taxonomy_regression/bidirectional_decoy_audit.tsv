@@ -1,0 +1,2 @@
+query_id	first_subject	first_label	first_pident	first_aln_length	first_bitscore	bacterial_competitor_subject	bacterial_competitor_label	bacterial_competitor_pident	bacterial_competitor_aln_length	bacterial_competitor_query_coverage	bacterial_competitor_bitscore	human_minus_bacterial_score_margin	operational_target_expectation
+control_metazoa_human_clean	COI|Human|lcl|EU586511.1_gene_1	COI|Human	99.06	532	827	COI|Bacteria|lcl|SZWG01000034.1_cds_FCN23_09505_1	COI|Bacteria	99.41	511	96.05	800	27	exclude_off_target

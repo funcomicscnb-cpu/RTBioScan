@@ -8,7 +8,6 @@ MANIFEST_REL="docs/internal/public_release_manifest.md"
 OUTDIR="${REPO_ROOT}/release/RTBioScan_public"
 PROFILES=""
 INCLUDE_NEXTFLOW=1
-INCLUDE_DORADO=1
 INCLUDE_TESTS=0
 STRICT=0
 FORCE=0
@@ -28,13 +27,13 @@ Options:
                        Supported: barcoding,voucher,xprize,test
   --with-tests         Include tests/, pytest.ini, and Makefile
   --no-nextflow        Do not bundle the local ./nextflow binary
-  --no-dorado          Do not bundle bin/dorado/
   --strict             Fail if a manifest-required file/prefix/dir is missing
   --force              Remove an existing output directory first
   -h, --help           Show this help
 
 Notes:
   - The script always copies the core runtime files and docs.
+  - Platform-specific Dorado binaries/models are never copied; provision them separately.
   - Database prefixes/files are added from the manifest rules plus the selected profiles.
   - By default, missing required items produce warnings and the release is still generated.
 EOF
@@ -126,20 +125,9 @@ should_copy_bin() {
 			return 1
 			;;
 		bin/dorado/*)
-			if [ "$INCLUDE_DORADO" -ne 1 ]; then
-				return 1
-			fi
-			case "$rel" in
-				bin/dorado/bin/dorado|\
-				bin/dorado/bin/dna_r10.4.1_e8.2_400bps_fast@v5.0.0/*|\
-				bin/dorado/bin/dna_r10.4.1_e8.2_400bps_hac@v5.0.0/*|\
-				bin/dorado/bin/dna_r10.4.1_e8.2_400bps_sup@v4.3.0/*)
-					return 0
-					;;
-				*)
-					return 1
-					;;
-			esac
+			# Dorado is a platform-specific, independently licensed/provisioned
+			# runtime. Never copy arbitrary local bytes into a public release.
+			return 1
 			;;
 		*)
 			return 0
@@ -211,10 +199,6 @@ while [ "$#" -gt 0 ]; do
 			INCLUDE_NEXTFLOW=0
 			shift
 			;;
-		--no-dorado)
-			INCLUDE_DORADO=0
-			shift
-			;;
 		--strict)
 			STRICT=1
 			shift
@@ -279,6 +263,9 @@ CORE_TOP=(
 	RTBioScan.sh
 	main.nf
 	nextflow.config
+	environment.yml
+	conda-lock-linux-64.yml
+	conda-lock-osx-64.yml
 )
 
 CORE_CONF=(
@@ -286,6 +273,13 @@ CORE_CONF=(
 	conf/barcoding.config
 	conf/voucher.config
 	conf/xprize.config
+	conf/state_compatibility/reference_manifest_legacy_v1.tsv
+	conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv
+	conf/runtime_compatibility/dorado_release_0.7.0_osx-arm64.tsv
+	conf/runtime_compatibility/dorado_qualification_fixture_v0.7.0.tsv
+	conf/runtime_compatibility/toolchain_legacy_v1.tsv
+	conf/runtime_validation/fast_routing_endosymbionts.fa
+	conf/runtime_validation/fast_routing_endosymbionts.expected.tsv
 )
 
 CORE_LIB=(
@@ -369,6 +363,7 @@ DB_FILES=(
 
 DB_DIRS=(
 	"db/taxdb"
+	"db/taxonomy/releases/ncbi-taxdump-2024-06-24"
 )
 
 if profile_enabled barcoding; then
@@ -418,10 +413,6 @@ for rel in "${DB_DIRS[@]}"; do
 		copy_path "$rel"
 	fi
 done
-
-if [ ! -f "${REPO_ROOT}/environment.yml" ]; then
-	warn "environment.yml is absent in the source repo; the bundled conda profile remains incomplete"
-fi
 
 printf 'Release directory prepared at: %s\n' "$OUTDIR"
 if [ -n "$PROFILES" ]; then

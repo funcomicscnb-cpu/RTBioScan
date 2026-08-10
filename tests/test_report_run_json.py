@@ -56,6 +56,7 @@ def test_report_run_json_from_history(tmp_path: Path) -> None:
     rc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     assert rc.returncode == 0, rc.stderr
     data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["schema_version"] == "2.0"
     assert data["run_id"] == "runA"
     assert data["rounds_count"] == 2
     assert data["started_utc"] == "2026-03-06T00:01:00Z"

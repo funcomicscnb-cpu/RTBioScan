@@ -68,12 +68,12 @@ NXF_OPTS='-Xms1g -Xmx4g'
 
 **Pipeline only** — POD5 chunks already present in `reads_rt_round_pod5/`:
 ```bash
-./RTBioScan.sh --run_id MY_RUN -profile docker -resume
+./RTBioScan.sh --run_id MY_RUN -resume
 ```
 
 **Pipeline + live report in browser** — resume with auto-refreshing report:
 ```bash
-./RTBioScan.sh --run_id MY_RUN --serve --serve-open -profile docker -resume
+./RTBioScan.sh --run_id MY_RUN --serve --serve-open -resume
 ```
 
 **First-time real-time run** — metadata setup + feeder + pipeline + report:
@@ -85,8 +85,7 @@ NXF_OPTS='-Xms1g -Xmx4g'
   --metadata   /path/to/Pipeline_Information.tsv \
   --general_fasta /path/to/demult_general.fasta \
   --primers_fasta /path/to/demult_primers.fasta \
-  --serve --serve-open \
-  -profile docker
+  --serve --serve-open
 ```
 
 **Subsequent real-time rounds** — feeder + pipeline (metadata already set up):
@@ -96,13 +95,13 @@ NXF_OPTS='-Xms1g -Xmx4g'
   --run_id MY_RUN_ID \
   --input_folder /path/to/minknow/output \
   --serve --serve-open \
-  -profile docker -resume
+  -resume
 ```
 
 **Independent parameter reruns on the same prepared input data**:
 ```bash
-./RTBioScan.sh --run_id MY_RUN -name MY_RUN_params_A -profile docker --outdir results_params_A
-./RTBioScan.sh --run_id MY_RUN -name MY_RUN_params_B -profile docker --outdir results_params_B
+./RTBioScan.sh --run_id MY_RUN -name MY_RUN_params_A --outdir results_params_A
+./RTBioScan.sh --run_id MY_RUN -name MY_RUN_params_B --outdir results_params_B
 ```
 
 Use this pattern only when you intentionally want to reuse the same `results/pod5/<run_id>/` and `results/sample_info/<run_id>/` inputs. For fully independent wrapper-driven runs, use a different `--run_id` for each run and make sure the metadata TSV contains matching rows for each `run_id`.
@@ -111,7 +110,7 @@ Use this pattern only when you intentionally want to reuse the same `results/pod
 ```bash
 ./RTBioScan.sh \
   --serve --serve-open \
-  -profile docker --run_mode batch \
+  --run_mode batch \
   --reads "/path/to/pod5/chunks/*.pod5"
 ```
 
@@ -214,6 +213,10 @@ results/
     {run_id}_metadata.txt   ← run-filtered metadata TSV rows
     replicate_roster.tsv    ← replicate-level roster, when present
     replicate_identity.tsv  ← collapse/track identity bridge, when present
+    track_demult.fasta      ← track-mode demultiplexing FASTA, when present
+    track_roster.tsv        ← track-mode roster, when present
+    track_active_units.txt  ← track-mode active sample-marker units, when present
+    track_identity.tsv      ← track-mode sample-marker identity map, when present
 ```
 
 ### Disk management: pruning POD5 files during a run
@@ -331,6 +334,8 @@ Key options:
 5. Writes `results/sample_info/{run_id}/replicate_roster.tsv`, when present, and `results/sample_info/{run_id}/replicate_identity.tsv`, when present.
 6. Validates that the output FASTA line count matches the number of emitted demultiplexing records.
 
+When track mode artifacts are generated, each track unit corresponds to one observed sample-marker pair. Samples or replicates that cover only a subset of `--targets` are supported; unobserved markers produce no placeholder rows.
+
 **Input file formats:**
 
 `results/sample_info/{run_id}/demult.fasta` is passed to cutadapt with `-e 0.1` (1st-pass demultiplexing). Each header must be the exact sample name as it will appear throughout the run, or a marker-qualified variant when metadata disambiguation emits multiple marker-specific records for the same barcode key:
@@ -355,7 +360,6 @@ To run on a pre-existing set of POD5 chunks without the feeder, use `RTBioScan.s
 
 ```bash
 ./RTBioScan.sh \
-  -profile docker \
   --run_mode batch \
   --reads "/path/to/pod5/chunks/*.pod5"
 ```
@@ -370,7 +374,7 @@ In batch mode (`--watch false` is implied), the pipeline processes all matching 
   --general_fasta /path/to/demult_general.fasta \
   --primers_fasta /path/to/demult_primers.fasta \
   --skip_pod5 \
-  -profile docker --run_mode batch \
+  --run_mode batch \
   --reads "/path/to/pod5/chunks/*.pod5"
 ```
 
@@ -397,6 +401,18 @@ This is conceptually different from the environmental metabarcoding workflow:
 The environmental workflow is optimised for **monitoring biodiversity of taxa that can be assigned to a known species, genus, or family** in the reference database. Unassigned clusters — reads that do not match any known sequence at the configured identity thresholds — accumulate in every run and are typically removed by enabling `--prune_unassigned_clusters true`. This keeps per-round runtimes bounded and the report focused on the taxa of interest.
 
 BLAST assignment in the voucher mode is provided as a suggestion only: the most common scenario is a specimen from a species not yet in the reference database, so the absence of a BLAST match is informative rather than problematic.
+
+For the bundled `test` and `voucher` profiles, the main assigned/unassigned OTU differences are:
+
+| Aspect | `-profile test` | `-profile voucher` |
+|---|---|---|
+| **Assigned OTU protection threshold** | Inherits default `assign_protection_level = genus` | Inherits default `assign_protection_level = genus` |
+| **Taxonomy support for assignment** | No memtax side tables (`nonncbi_memtax = "|"`); relies on the standard DB outputs | Uses per-marker memtax tables to improve assignment coverage |
+| **Assigned-OTU BLAST filtering** | Enforced: `otu_blast_filter_mode = enforce` and `otu_blast_force_use_filtered = true` | Observed only: `otu_blast_filter_mode = observe` and `otu_blast_force_use_filtered = false` |
+| **BLAST-unassigned OTUs** | Enforced pruning path: `otu_blast_unassigned_mode = enforce` | Observed only: `otu_blast_unassigned_mode = observe` |
+| **Repeated unassigned OTUs across rounds** | Enforced pruning path: `otu_unassigned_streak_mode = enforce` | Observed only: `otu_unassigned_streak_mode = observe` |
+| **Consensus-time unassigned cluster pruning** | Disabled by default (`prune_unassigned_clusters = false`) | Disabled by default (`prune_unassigned_clusters = false`) |
+| **If consensus-time unassigned pruning is enabled manually** | Inherits default `prune_unassigned_grace_rounds = 3` and `prune_unassigned_keep_top = 5` | Tightens to `prune_unassigned_grace_rounds = 1` and `prune_unassigned_keep_top = 1` |
 
 > **Keeping unassigned clusters in the environmental workflow**
 >
@@ -475,13 +491,13 @@ The recommended way to launch the pipeline is via `RTBioScan.sh` (see [Quick sta
 ```bash
 ./RTBioScan.sh --feeder --serve --serve-open \
   --run_id MY_RUN_ID --input_folder /path/to/minknow/output \
-  -profile docker -resume
+  -resume
 ```
 
 Direct Nextflow invocation (when the feeder and server are managed separately):
 
 ```bash
-NXF_VER=22.10.8 nextflow run main.nf -name 'my_run' -profile docker -resume
+NXF_VER=22.10.8 nextflow run main.nf -name 'my_run' -resume
 ```
 
 When you launch through `RTBioScan.sh` and provide `--run_id`, the wrapper auto-injects `--run_id`, `--reads`, `--ori_dir`, `--indexes`, and `--primer_indexes` if you did not pass them explicitly. Raw `nextflow run` does not do this.
@@ -739,15 +755,18 @@ Nextflow execution name.
 ### `-profile`
 [back to Top](#rtbioscan-usage)
 
-Selects a configuration profile. Profiles set default parameters and control how software is executed. Multiple profiles can be combined: `-profile docker,xprize` (later profiles override earlier ones).
+Selects a configuration profile. Profiles set default parameters and, where
+supported, control how software is executed. Multiple domain profiles can be
+combined, for example `-profile xprize,debug` (later profiles override earlier
+ones).
 
 Available profiles:
 
 | Profile | Notes | Description |
 |---|---|---|
-| `docker` | Linux/CUDA only | Runs all analysis tools inside `hecrp/nanortax:latest`. **Not suitable for macOS basecalling**: the default `dorado_device = "metal"` is incompatible with Docker containers (Metal GPU not accessible). For Linux, add `--dorado_device cuda:0`; for CPU-only testing use `--dorado_device cpu`. |
-| `conda` | macOS + Linux | Uses the Conda environment in `environment.yml`. Dorado runs as a local binary so Metal GPU works on macOS. Requires the environment to be installed first. |
-| `singularity` | Linux only | Singularity with auto-mounts. Same Metal incompatibility as Docker — only suitable for Linux/CUDA. |
+| `docker` | Unsupported | Explanatory erroring stub. RTBioScan does not publish a validated Docker image; the former NanoRTax image belonged to another pipeline. |
+| `conda` | Disabled stub | Install and activate the committed platform lock, validate it, then run without an execution profile. Direct Nextflow Conda resolution would bypass the lock. |
+| `singularity` | Unsupported | Explanatory erroring stub until RTBioScan publishes and validates its own image. |
 | `debug` | — | Identical to the default profile, adds `$HOSTNAME` logging at the start of each process. |
 | `xprize` | Requires XPrize databases | COI+ITS2 parameter presets for the XPrize/Tumbira deployment (`conf/xprize.config`). Requires XPrize-specific databases in `db/` and species-of-interest lists. |
 | `test` | Requires `db/toDefault/` | Test configuration pointing to `db/toDefault/` databases (`conf/test.config`). Requires those databases to be present; no bundled test data. |
@@ -929,6 +948,103 @@ Stable rolling-state namespace under `${outdir}/temp/{ongoing,current}/state/`.
 - Use this when you want multiple Nextflow invocations to reuse the same rolling state even if the run name changes.
 - For independent reruns, do not reuse `--state_id` unless shared rolling state is intentional.
 
+#### `--state_compatibility_policy`
+[back to Top](#rtbioscan-usage)
+
+Controls handling of rolling state that predates the compatibility manifest.
+
+- Default: `strict`.
+- `strict`: reject legacy state without a manifest.
+- `adopt_legacy`: explicitly attest and adopt eligible legacy state once.
+
+#### `--state_reference_manifest`
+[back to Top](#rtbioscan-usage)
+
+Checksummed manifest for the complete operational reference set bound to rolling state.
+
+- Default: `conf/state_compatibility/reference_manifest_legacy_v1.tsv`.
+- Custom reference selections require a corresponding reviewed manifest.
+
+#### `--state_taxonomy_data_dir`
+[back to Top](#rtbioscan-usage)
+
+Pinned TaxonKit runtime directory used for classification and compatibility verification.
+
+- Default: `db/taxonomy/releases/ncbi-taxdump-2024-06-24`.
+- The directory must contain the release artifacts declared by `--state_taxonomy_release_manifest`.
+
+#### `--state_taxonomy_release_manifest`
+[back to Top](#rtbioscan-usage)
+
+Manifest containing the expected taxonomy archive and runtime-file hashes.
+
+- Default: `conf/state_compatibility/taxonomy_release_ncbi_2024-06-24.tsv`.
+
+#### `--state_reference_verification`
+[back to Top](#rtbioscan-usage)
+
+Controls verification of declared reference and taxonomy files at startup.
+
+- Default: `cached`.
+- `cached`: reuse private attestations only while identity, ownership, permissions, size, and timestamps remain unchanged; changed entries are rehashed.
+- `full`: rehash every declared reference and taxonomy file.
+
+#### `--state_verification_cache_dir`
+[back to Top](#rtbioscan-usage)
+
+Optional root for private per-user reference-verification attestations.
+
+- Default: empty, deriving `${outdir}/temp/_compatibility_cache` with a private `uid-N` child.
+
+#### `--state_classifier_policy_version`
+[back to Top](#rtbioscan-usage)
+
+Manual compatibility version for classifier semantics.
+
+- Default: `legacy-rank-string-v1`.
+- Increment this value only as part of a reviewed classifier behavior change and state-migration plan.
+
+#### `--state_scoring_policy_version`
+[back to Top](#rtbioscan-usage)
+
+Manual compatibility version for scoring and selection semantics.
+
+- Default: `legacy-first-single-hit-v1`.
+- Increment this value only as part of a reviewed scoring behavior change and state-migration plan.
+
+#### `--state_toolchain_policy_manifest`
+[back to Top](#rtbioscan-usage)
+
+Manifest of supported runtime tools and R-package versions included in the state identity.
+
+- Default: `conf/runtime_compatibility/toolchain_legacy_v1.tsv`.
+
+#### `--state_runtime_lock_manifest`
+[back to Top](#rtbioscan-usage)
+
+Conda runtime lock manifest included in the toolchain fingerprint.
+
+- Default: `auto`.
+- In an activated Conda environment, `auto` selects the committed lock for the current platform; an explicit manifest path is also accepted.
+- An explicit runtime lock is rejected when the run is using the host runtime instead of Conda.
+
+#### `--state_dorado_release_manifest`
+[back to Top](#rtbioscan-usage)
+
+Optional qualified Dorado release manifest included in the toolchain fingerprint.
+
+- Default: empty.
+- Without a manifest, an explicit Dorado installation is still fingerprinted but recorded as unqualified.
+
+#### `--state_contract_migration`
+[back to Top](#rtbioscan-usage)
+
+Controls migration of schema-v1 compatibility state to schema v2.
+
+- Default: `strict`.
+- `strict`: reject schema-v1 state.
+- `attest_v1`: perform the explicit one-time v1-to-v2 attestation migration.
+
 #### `--restart_mode`
 [back to Top](#rtbioscan-usage)
 
@@ -1069,6 +1185,7 @@ Pipe-separated list of marker names processed in this run. All per-marker parame
 
 - Default: `COI|ITS2`.
 - These strings are embedded in FASTQ/FASTA headers and must match the marker names expected by your databases and demultiplex setup.
+- The list is the run-wide allowed marker superset; individual samples or replicates may include any subset of these markers. Track-mode artifacts are generated from observed sample-marker combinations only.
 - To add a third marker: `--targets "COI|ITS2|16S"` (and set all matching per-marker params with a third `|`-separated value).
 
 #### `--target_taxa`
@@ -1079,6 +1196,16 @@ Pipe-separated list of taxon filters for the fast on-target detection pass, in t
 - Default: `Metazoa|Viridiplantae`.
 - Empty entries still count toward the required 1:1 alignment with `--targets`.
 - Example with a third marker that accepts any taxon: `--target_taxa "Metazoa|Viridiplantae|"`
+
+#### `--fast_filter_shadow`
+[back to Top](#rtbioscan-usage)
+
+Write per-read and per-round TSV diagnostics that compare the current FAST first-hit routing decision with the best target and off-target LAST scores.
+
+- Default: `false`.
+- Diagnostic only: enabling it preserves the legacy first-emitted hit and does not change which reads are retained.
+- Diagnostics are written into the corresponding round state directory only after both TSV files are complete.
+- Use representative run data to evaluate competition margins; small fixtures validate wiring, not biological thresholds.
 
 #### `--on_target_quality_score`
 [back to Top](#rtbioscan-usage)
@@ -1109,7 +1236,9 @@ Device string passed to Dorado.
 
 - Default: `metal`.
 - Examples: `metal`, `cpu`, `cuda:0`.
-- On macOS, use a local/Conda execution mode so Dorado can access Metal directly.
+- On macOS, use a provisioned local execution mode so Dorado can access Metal directly.
+- The selected hardware backend is part of Dorado qualification and must not
+  be changed inside an existing rolling state.
 
 #### `--dorado_bin`
 [back to Top](#rtbioscan-usage)
@@ -1118,6 +1247,35 @@ Path to the Dorado executable.
 
 - Default: `bin/dorado/bin/dorado`.
 - Relative paths are resolved from the pipeline root.
+- The default preserves the legacy installation layout. New or candidate
+  releases are installed side-by-side and selected explicitly only after
+  `bin/validate_dorado_release.sh` passes.
+
+#### `--dorado_input_mode`
+[back to Top](#rtbioscan-usage)
+
+Controls how the final POD5 argument is presented to Dorado.
+
+- Default: `file`.
+- Allowed values: `file`, `directory`.
+- Use `directory` only for legacy Dorado releases such as `0.2.3` that require
+  an input directory. RTBioScan stages a symlink to the single round POD5 in a
+  private temporary directory and removes that directory after the basecaller
+  exits.
+- The selected mode and compatibility-helper checksum are included in the
+  rolling-state toolchain fingerprint.
+
+#### `--dorado_summary_bin`
+[back to Top](#rtbioscan-usage)
+
+Optional path to a Dorado executable that provides the `summary` subcommand.
+
+- Default: empty, which uses `--dorado_bin`.
+- A separate summary binary is required for Dorado `0.2.3`, whose SAM output
+  is accepted by Dorado `0.7.0 summary`.
+- When different from `--dorado_bin`, its version and checksum are included in
+  the rolling-state toolchain fingerprint and must be declared by the selected
+  toolchain policy.
 
 #### `--fast_model`
 [back to Top](#rtbioscan-usage)
@@ -1125,6 +1283,7 @@ Path to the Dorado executable.
 Dorado model used for the initial FAST on-target screening pass.
 
 - Default: `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_fast@v5.0.0`.
+- Binary and model paths must come from the same qualified release.
 
 #### `--hac_model`
 [back to Top](#rtbioscan-usage)
@@ -1132,6 +1291,7 @@ Dorado model used for the initial FAST on-target screening pass.
 Dorado model used for the main HAC basecalling pass.
 
 - Default: `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_hac@v5.0.0`.
+- Binary and model paths must come from the same qualified release.
 
 #### `--sup_model`
 [back to Top](#rtbioscan-usage)
@@ -1139,6 +1299,7 @@ Dorado model used for the main HAC basecalling pass.
 Dorado model used for SUP consensus-support basecalling.
 
 - Default: `bin/dorado/bin/dna_r10.4.1_e8.2_400bps_sup@v4.3.0`.
+- Binary and model paths must come from the same qualified release.
 
 #### `--dorado_retry_attempts`
 [back to Top](#rtbioscan-usage)
@@ -1152,7 +1313,16 @@ Retry count for Dorado basecalling wrapper failures.
 
 Sleep interval between Dorado retry attempts.
 
-- Default: `300`.
+- Default: `10`.
+- The global Dorado lock remains held during this short backoff so another
+  round cannot start basecalling against a potentially unstable accelerator.
+- Unmistakable Dorado CLI/usage errors are non-retryable and fail immediately;
+  backend initialization failures and other non-zero exits retain the normal
+  retry allowance.
+- Process statuses `126` (not executable), `127` (not found), and `132`
+  (`SIGILL`, normally an incompatible executable/runtime) also fail
+  immediately. Ambiguous loader failures and memory-pressure failures remain
+  retryable.
 
 #### `--align_threads`, `--blast_threads`, `--cluster_threads`
 [back to Top](#rtbioscan-usage)
@@ -1663,6 +1833,13 @@ CPU budget passed to the consensus helper for internal parallelism decisions.
 - Default: `0`.
 - `0` means auto-detect: P-cores on Apple Silicon, `nproc - 2` on other platforms.
 
+#### `--rscript_bin`
+[back to Top](#rtbioscan-usage)
+
+Rscript executable name or path used by consensus reporting helpers.
+
+- Default: `Rscript`.
+
 #### `--consensus_zero_emit_policy`
 [back to Top](#rtbioscan-usage)
 
@@ -2007,6 +2184,20 @@ Lock wait timeout for short-lived filesystem locks used during reporting, restor
 
 - Default: `300`.
 
+#### `--state_lock_stale_seconds`
+[back to Top](#rtbioscan-usage)
+
+Stale-age threshold for the startup state-contract and reference-attestation-cache locks.
+
+- Default: `300`.
+- Same-host owners whose PID and verifiable, boot-aware process-start identity both still match are never reclaimed by age. On Linux, the identity includes the boot ID when available so PID reuse across a reboot is detected.
+- Proven dead same-host PIDs, and reused PIDs with a verifiable process-start identity, are reclaimed immediately.
+- Live PIDs whose process-start identity cannot be verified, unknown/foreign hosts, missing owners, and malformed owners are protected until this age and then reclaimed as fenced leases.
+- Set to `0` to disable age-based reclaim; only proven dead or verifiably reused same-host owners are then reclaimed automatically.
+- Do not set this below the worst-case duration of the protected state/cache publication section; the default leaves five minutes for those short critical sections.
+- Each successful stale recovery retains a small, private `.reclaim-<token>` tombstone. It is an intentional fencing record and does not count as rolling-state material; do not remove these records while validators may still be running.
+- Keep the critical state/cache filesystem on storage that provides coherent atomic `mkdir`, no-replace hard-link creation, and same-filesystem `rename` operations. If `--lock_wait_seconds` is lower than this value, a fresh lease can time out before becoming reclaimable.
+
 #### `--round_lock_wait_minutes`
 [back to Top](#rtbioscan-usage)
 
@@ -2045,7 +2236,8 @@ Enable or disable incremental HTML report rendering (`${params.outdir}/report_ht
      - run report: `${params.outdir}/report_html/runs/<run_id>/report.html`
 - History dedupe key is `run_id + barcode + round_barcode` (resume-safe).
 - Missing source TSVs are recorded in `warnings[]`; report generation does not fail the round.
-- Report schema version is `1.6`.
+- Report schema version is `2.0`.
+- Round and run records retain their own data `schema_version`; `REPORT_META.schema_version` and `report_state.json.schema_version` identify the rendered HTML/sidecar artifact produced by the current renderer.
 - `otu.canonical.active` is a unique OTU count (`OTU_id`/`otu_id`), not read rows.
 - `blast.mode` reflects pipeline mode (`off|observe|enforce`); `blast.missing_policy` reports `keep|drop`.
 - HTML rendering sorts rounds by `timestamp_utc` (missing timestamps last), then `round_barcode`, then `barcode`.
