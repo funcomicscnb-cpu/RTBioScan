@@ -434,9 +434,82 @@ installs and syncs the new provenance last. Thus a process failure or a
 filesystem crash honoring `fsync` ordering cannot leave an old provenance file
 claiming that a partially replaced artifact set is valid.
 
-Index construction, a new reference/state identity, corrected benchmark
-expectations, runtime qualification, and activation remain subsequent,
-separately reviewed stages.
+### Downstream COI canonical BLAST index candidate
+
+`bin/build_taxonomy_canonical_blastdb.py` constructs a non-activated BLAST
+database from the frozen external canonical FASTA. Before construction it
+revalidates the complete versioned policy/provenance chain, every legacy index
+component, the FASTA SHA-256, 791,404-record count, and 485,444,705-base count.
+The controlled `makeblastdb` invocation deliberately omits `-parse_seqids` and
+`-taxid_map`: production taxonomy is encoded in the subject title's
+`|kraken:taxid|` token, while the legacy index exposes `BL_ORD_ID:<oid>` as
+`%a` and zero as `%T`.
+
+After construction the builder streams every candidate and indexed record. It
+requires identical titles, sequences, lengths, and order; `%a` equal to the
+current `BL_ORD_ID:<oid>`; `%T` equal to zero; the frozen canonical stream
+SHA-256; and the complete legacy-to-new OID rule
+`new_oid = legacy_oid - count(excluded_oid < legacy_oid)`. A BLAST search also
+checks that `sseqid` retains the embedded-taxid identifier consumed by the
+pipeline.
+
+`makeblastdb` components are fixed release artifacts, not byte-reproducible
+containers: `.njs` includes a build timestamp. The generated provenance
+therefore records the exact tool versions and command plus the size and SHA-256
+of every component for tamper detection, while the canonical-stream SHA-256 is
+the reproducible content identity. Provenance is written last in an adjacent
+staging directory, and the complete artifact directory is installed by one
+same-filesystem rename. Existing release directories are never overwritten.
+The qualified BLAST 2.15.0 candidate is frozen in
+`chain_a_downstream_coi_canonical_blastdb_v1_provenance.tsv`; its eight-
+component fixed-artifact fingerprint is
+`9ce3d2a872ac9146dcab2eb3eba8af85f18748075b554dc12bed56bdab0d58bc`.
+That fingerprint can be checked only against the separately supplied fixed
+release directory; it is not a clone-only or byte-reproducible rebuild claim.
+The default suite therefore skips fixed-component verification. Set
+`RTBIOSCAN_CANONICAL_BLASTDB_RELEASE` to the release directory to enable it.
+A fresh clone can instead rebuild and verify the canonical stream digest,
+record count, base count, complete OID remap, and BLAST identifier contracts;
+its timestamp-bearing component hashes are expected to differ.
+
+Build into a fresh external directory. The output must remain outside the
+repository and outside `db/`:
+
+```bash
+fasta_release=/path/to/downstream-coi-chain-a-canonical-v1
+index_release=/path/to/downstream-coi-chain-a-canonical-blastdb-v1
+
+python3 bin/build_taxonomy_canonical_blastdb.py \
+  --canonical-fasta \
+    "$fasta_release/downstream_coi_chain_a_canonical_v1.fasta" \
+  --construction-provenance \
+    conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv \
+  --excluded-oids \
+    conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv \
+  --release-policy \
+    conf/taxonomy_regression/chain_a_downstream_coi_release_policy_v1.tsv \
+  --disposition-manifest \
+    conf/taxonomy_regression/chain_a_downstream_coi_disposition_v1.tsv \
+  --disposition-provenance \
+    conf/taxonomy_regression/chain_a_downstream_coi_disposition_v1_provenance.tsv \
+  --quarantine-projection \
+    conf/taxonomy_regression/chain_a_downstream_coi_quarantine_v1.tsv \
+  --retained-projection \
+    conf/taxonomy_regression/chain_a_downstream_coi_retained_unresolved_v1.tsv \
+  --base-policy \
+    conf/taxonomy_regression/chain_a_downstream_coi_base_repair_policy_v1.tsv \
+  --reference-root . \
+  --legacy-blast-database db/COInr98_2024Jun_RioNegro_Brazil \
+  --repository-root . \
+  --release-id downstream_coi_chain_a_canonical_v1 \
+  --index-basename downstream_coi_chain_a_canonical_v1 \
+  --output-dir "$index_release"
+```
+
+This stage does not change `blast_db_specs`, `blast_taxdb`, routing, runtime
+reference manifests, or rolling-state identity. Runtime qualification, a new
+reference/state identity, corrected benchmark expectations, and activation
+remain subsequent, separately reviewed stages.
 
 Regenerate the discovery table and its checksummed provenance with:
 
