@@ -5,20 +5,21 @@ line of work. Read this top to bottom once, then act. Every claim below was veri
 the code; where a fact must be re-verified before acting, it says so. **Do not trust prose over
 the code — re-run the checks in §9.**
 
-Branch: `agent/taxonomy-chain-a-adjudication`. Main branch: `main`.
+Construction branch: `feat/downstream-coi-canonical-fasta`, based on
+`main@9c379b1389c8c5eb15308007064a0b6de5ee8bc3`. Main branch: `main`.
 
 ---
 
 ## 0. TL;DR — what to do next
 
 The compatibility backlog and the downstream-COI discovery, adjudication,
-disposition, source-integrity audit, and base/repair policy stages are committed
-and validated. The next correctness-only stage is deliberately construction-
-only:
-
-> Construct the downstream-COI canonical FASTA from the selected legacy OID
-> stream as described in §7. Apply exactly the frozen dispositions by full
-> record identity, but do not build or activate a BLAST index in the same stage.
+disposition, source-integrity audit, base/repair policy, and construction-only
+canonical FASTA stages are complete and validated. The construction produced
+791,404 records / 485,444,705 bases with canonical SHA-256
+`d0b3aca535fbadcd0da8dfc7218c08e7b4151c9562ffe3fd37baf6cdcaef1775`.
+It did not build or activate a BLAST index, change runtime configuration, or
+create a state identity. The next taxonomy stage is the separately reviewed
+index-construction boundary described in §7.
 
 Representative decision-neutral FAST shadow measurement remains required
 before any FAST/LAST source, routing, performance, or accuracy change. It does
@@ -352,7 +353,7 @@ expected outcomes.
 
 ---
 
-## 7. The immediate next step, precisely
+## 7. Construction closeout and the next boundary
 
 **Goal:** prepare the downstream-COI-only curation release from the now-dispositioned Chain-A queue.
 
@@ -402,12 +403,28 @@ evidence, not a source to slice. All 1,494 analysis-logical tail records remain 
 base, including the embedded candidate and both duplicate/empty-record findings. This is deferral, not
 quarantine, repair, or a biological-quality conclusion.
 
-The future canonical filter matches each disposition by reference ID, stored taxid, and sequence
-SHA-256. It must exclude all 29 quarantine records individually, retain all 15 unresolved records,
-retain every nonlisted base record, perform no implicit deduplication, and preserve retained relative
-legacy-OID order. The projected record count is 791,404. Projected bases/checksum, a new OID map, the
-canonical FASTA, rebuilt index, corrected benchmark, runtime activation, and new state identity remain
+The canonical construction matches each disposition by reference ID, stored taxid, and sequence
+SHA-256. It excludes all 29 quarantine records individually, retains all 15 unresolved records and
+every nonlisted base record, performs no implicit deduplication, and preserves retained relative
+legacy-OID order. The result is 791,404 records / 485,444,705 bases under the new basename
+`downstream_coi_chain_a_canonical_v1.fasta`, with SHA-256
+`d0b3aca535fbadcd0da8dfc7218c08e7b4151c9562ffe3fd37baf6cdcaef1775`. The 29 excluded OIDs and the
+rule `retained_new_oid=legacy_oid-count(excluded_legacy_oid<legacy_oid)` are frozen in the construction
+artifacts. A rebuilt index, corrected benchmark, runtime activation, and new state identity remain
 unproduced.
+
+The canonical FASTA is a large external release-candidate artifact: reproduce it into a dedicated
+directory outside `db/`, never over the legacy FASTA/index. The exact command and post-build `cmp`
+checks are maintained in `conf/taxonomy_regression/README.md` under "Downstream COI canonical FASTA
+construction". The committed small artifacts are:
+
+- `conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv`;
+- `conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv`.
+
+Existing outputs are rejected unless `--replace` is explicit. Replacement first invalidates and syncs
+removal of any old provenance marker, then installs and syncs the new provenance last. A process
+failure or filesystem crash honoring `fsync` ordering therefore cannot leave stale provenance at the
+canonical path.
 
 1. Preserve `legacy_expected.tsv` and the shipped production FASTA/index byte-for-byte as the legacy
    release.
@@ -420,21 +437,26 @@ unproduced.
    integrity proof.
 5. **Completed:** select the effective legacy BLAST OID stream as the corpus base; forbid raw-FASTA
    slicing, defer all unindexed/anomalous tail material, and require no repair or implicit deduplication.
-6. From that explicitly declared base, build a new canonical downstream COI FASTA that removes the 29
-   policy-quarantine records by `(reference_id, stored_taxid, sequence_sha256)` and retains the 15
-   unresolved records unchanged. Preserve every nonlisted record and retained relative legacy-OID
-   order. Publish the output count/base count/checksum, the excluded legacy OIDs, and the deterministic
+6. **Completed:** from that explicitly declared base, build the new canonical downstream COI FASTA,
+   remove the 29 policy-quarantine records by `(reference_id, stored_taxid, sequence_sha256)`, retain
+   the 15 unresolved records unchanged, and freeze the counts/checksum, excluded OIDs, and deterministic
    old-to-new ordinal rule under a new basename.
-7. Build a new downstream BLAST index from that canonical FASTA and publish checksummed manifests plus
-   a new reference/state identity. Do not touch the FAST/LAST source or index.
-8. Add a separately versioned corrected benchmark expectation and compare it with the immutable legacy
-   expectation across every report surface before considering release promotion.
+7. Build a new downstream BLAST index from that canonical FASTA, under a new basename, and publish an
+   index-component manifest with byte counts and checksums. Do not change runtime configuration or
+   state identity and do not touch the FAST/LAST source or index.
+8. Define a separately versioned reference manifest and state identity for the constructed FASTA and
+   index. Do not activate it or permit legacy state reuse.
+9. Qualify the new index, manifest, and required toolchain without changing production routing.
+10. Add a separately versioned corrected benchmark expectation and compare it with the immutable legacy
+    expectation across every report surface.
+11. Consider runtime activation only as a final, separately reviewed promotion after the preceding
+    boundaries pass.
 
-Exit criteria for the next stage are a byte-reproducible canonical FASTA, exact projected-versus-
-observed counts, a frozen checksum, and a reproducible ordinal-remapping rule. Index construction, state
-identity, runtime activation, and corrected expectations are subsequent stages. FAST/LAST cleanup,
-routing thresholds, representative incidence, throughput, and accuracy calibration remain separate
-deferred work.
+The construction-stage exit criteria are satisfied: the FASTA is byte-reproducible, projected and
+observed record counts agree, the output/base counts and checksum are frozen, and the ordinal-remapping
+rule is reproducible. The next boundary starts at item 7. Index construction, state identity, runtime
+activation, and corrected expectations remain subsequent stages. FAST/LAST cleanup, routing thresholds,
+representative incidence, throughput, and accuracy calibration remain separate deferred work.
 
 ---
 
