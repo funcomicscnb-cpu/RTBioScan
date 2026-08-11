@@ -362,6 +362,49 @@ The policy file remains policy-only and therefore retains its `deferred` and
 `not_computed` values. Completion is recorded in the separate construction
 provenance below; those historical policy fields must not be rewritten.
 
+### Downstream COI database origin and curation
+
+The immediate source for the canonical release is the deployed legacy BLAST
+database `db/COInr98_2024Jun_RioNegro_Brazil`. That database was created
+following the COInr/mkCOInr approach described by Meglécz (2023), which
+integrates COI barcode records from NCBI and BOLD into a coherent taxonomy and
+applies source-level quality control and taxonomically aware dereplication:
+
+> Meglécz, E. (2023). COInr and mkCOInr: Building and customizing a
+> nonredundant barcoding reference database from BOLD and NCBI using a
+> semi-automated pipeline. *Molecular Ecology Resources*, 23(4), 933-945.
+> <https://doi.org/10.1111/1755-0998.13756>
+
+The upstream COInr controls include selection of COI records, rejection of
+sequences outside 100-2,000 nucleotides or with more than five consecutive
+internal `N` bases, exclusion of unsuitable NCBI environmental, metagenomic,
+intron-bearing, or non-COI records, use of valid Latin taxon names, coherent
+taxID assignment for BOLD lineages, and removal of taxonomically redundant
+substrings within taxa.
+
+The project-specific database supplemented the public COInr-derived records
+with locally generated barcode sequences. It was then clustered with CD-HIT at
+98% nucleotide identity. To reduce redundancy and limit sensitivity to the
+stochastic choice of a cluster representative, each representative was
+assigned to the last common ancestor of the records contained in its 98%
+identity cluster.
+
+RTBioScan subsequently applied a frozen, correctness-first review to the exact
+deployed BLAST OID stream. Candidate discovery required at least 85% nucleotide
+identity and 80% shorter-sequence coverage against the frozen audit controls;
+priority evidence required at least 97% identity and 90% coverage. The local
+review classified a cross-family conflict only at 95% identity and 80% coverage
+or greater. It excluded 29 specifically identified records: five with
+independently confirmed reference-sequence contamination and 24 with
+cross-family sequence/label conflicts. The latter are conservative exclusions
+and do not claim which conflicting endpoint is biologically incorrect. Fifteen
+additional reviewed records lacked a sufficient local discriminator and were
+retained rather than assigned an unsupported conclusion. Each disposition was
+applied only after an exact reference-ID, stored-taxID, and sequence-SHA-256
+match. Every unlisted record was retained unchanged; no implicit deduplication,
+relabeling, sequence repair, or reordering was performed during this final
+canonicalization.
+
 ### Downstream COI canonical FASTA construction
 
 `bin/build_taxonomy_canonical_fasta.py` consumes the verified legacy BLAST OID
@@ -372,9 +415,9 @@ runtime configuration or state identity.
 
 The frozen result is:
 
-- release ID: `downstream_coi_chain_a_canonical_v1`;
+- release ID: `rtbioscan_coi_canonical_v1`;
 - FASTA basename:
-  `downstream_coi_chain_a_canonical_v1.fasta`;
+  `rtbioscan_coi_canonical_v1.fasta`;
 - 791,404 records and 485,444,705 bases;
 - 29 excluded legacy OIDs / 18,263 excluded bases and all 15 retained
   dispositions preserved;
@@ -384,8 +427,8 @@ The frozen result is:
 The large release-candidate FASTA is deliberately kept outside version control. It
 must be written to a dedicated release directory outside `db/`; never use the
 production database directory as an output. The small committed
-`chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv` and
-`chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv` freeze the excluded
+`rtbioscan_coi_canonical_v1_excluded_oids.tsv` and
+`rtbioscan_coi_canonical_v1_fasta_provenance.tsv` freeze the excluded
 coordinates, ordinal-remapping rule, counts, hashes, inputs, and exact output
 basename.
 
@@ -393,7 +436,7 @@ Reproduce into a fresh external directory and compare the generated small
 artifacts with the committed copies:
 
 ```bash
-release_dir=/path/to/downstream-coi-chain-a-canonical-v1
+release_dir=/path/to/rtbioscan-coi-canonical-v1
 mkdir -p "$release_dir"
 
 python3 bin/build_taxonomy_canonical_fasta.py \
@@ -413,18 +456,18 @@ python3 bin/build_taxonomy_canonical_fasta.py \
   --blast-database db/COInr98_2024Jun_RioNegro_Brazil \
   --blastdbcmd blastdbcmd \
   --scope downstream_coi_only \
-  --release-id downstream_coi_chain_a_canonical_v1 \
+  --release-id rtbioscan_coi_canonical_v1 \
   --output-fasta \
-    "$release_dir/downstream_coi_chain_a_canonical_v1.fasta" \
+    "$release_dir/rtbioscan_coi_canonical_v1.fasta" \
   --excluded-oids-output \
-    "$release_dir/chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv" \
+    "$release_dir/rtbioscan_coi_canonical_v1_excluded_oids.tsv" \
   --provenance-output \
-    "$release_dir/chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv"
+    "$release_dir/rtbioscan_coi_canonical_v1_fasta_provenance.tsv"
 
-cmp "$release_dir/chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv" \
-  conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv
-cmp "$release_dir/chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv" \
-  conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv
+cmp "$release_dir/rtbioscan_coi_canonical_v1_excluded_oids.tsv" \
+  conf/taxonomy_regression/rtbioscan_coi_canonical_v1_excluded_oids.tsv
+cmp "$release_dir/rtbioscan_coi_canonical_v1_fasta_provenance.tsv" \
+  conf/taxonomy_regression/rtbioscan_coi_canonical_v1_fasta_provenance.tsv
 ```
 
 Existing outputs are rejected by default. Intentional regeneration requires
@@ -461,9 +504,9 @@ the reproducible content identity. Provenance is written last in an adjacent
 staging directory, and the complete artifact directory is installed by one
 same-filesystem rename. Existing release directories are never overwritten.
 The qualified BLAST 2.15.0 candidate is frozen in
-`chain_a_downstream_coi_canonical_blastdb_v1_provenance.tsv`; its eight-
+`rtbioscan_coi_canonical_v1_blastdb_provenance.tsv`; its eight-
 component fixed-artifact fingerprint is
-`9ce3d2a872ac9146dcab2eb3eba8af85f18748075b554dc12bed56bdab0d58bc`.
+`37cb99a4604c87096f524c3b11ad84ffbb86dec4c1407dce3bea2daa420a3eac`.
 That fingerprint can be checked only against the separately supplied fixed
 release directory; it is not a clone-only or byte-reproducible rebuild claim.
 The default suite therefore skips fixed-component verification. Set
@@ -476,16 +519,16 @@ Build into a fresh external directory. The output must remain outside the
 repository and outside `db/`:
 
 ```bash
-fasta_release=/path/to/downstream-coi-chain-a-canonical-v1
-index_release=/path/to/downstream-coi-chain-a-canonical-blastdb-v1
+fasta_release=/path/to/rtbioscan-coi-canonical-v1
+index_release=/path/to/rtbioscan-coi-canonical-blastdb-v1
 
 python3 bin/build_taxonomy_canonical_blastdb.py \
   --canonical-fasta \
-    "$fasta_release/downstream_coi_chain_a_canonical_v1.fasta" \
+    "$fasta_release/rtbioscan_coi_canonical_v1.fasta" \
   --construction-provenance \
-    conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv \
+    conf/taxonomy_regression/rtbioscan_coi_canonical_v1_fasta_provenance.tsv \
   --excluded-oids \
-    conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv \
+    conf/taxonomy_regression/rtbioscan_coi_canonical_v1_excluded_oids.tsv \
   --release-policy \
     conf/taxonomy_regression/chain_a_downstream_coi_release_policy_v1.tsv \
   --disposition-manifest \
@@ -501,8 +544,8 @@ python3 bin/build_taxonomy_canonical_blastdb.py \
   --reference-root . \
   --legacy-blast-database db/COInr98_2024Jun_RioNegro_Brazil \
   --repository-root . \
-  --release-id downstream_coi_chain_a_canonical_v1 \
-  --index-basename downstream_coi_chain_a_canonical_v1 \
+  --release-id rtbioscan_coi_canonical_v1 \
+  --index-basename rtbioscan_coi_canonical_v1 \
   --output-dir "$index_release"
 ```
 

@@ -1,6 +1,6 @@
 field	artifact	value
 schema		taxonomy_reference_canonical_fasta_v1
-release	release_id	downstream_coi_chain_a_canonical_v1
+release	release_id	rtbioscan_coi_canonical_v1
 scope	database	downstream_coi_only
 scope	stage	construction_only
 scope	source_mutation	none
@@ -18,8 +18,8 @@ decision	nonlisted_base_records	retain_unmodified
 decision	implicit_deduplication	none
 decision	canonical_serialization	greater_than_title_lf_uppercase_sequence_lf
 decision	old_to_new_ordinal_rule	retained_new_oid=legacy_oid-count(excluded_legacy_oid<legacy_oid)
-artifact	canonical_fasta_basename	downstream_coi_chain_a_canonical_v1.fasta
-artifact	excluded_legacy_oids_basename	chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv
+artifact	canonical_fasta_basename	rtbioscan_coi_canonical_v1.fasta
+artifact	excluded_legacy_oids_basename	rtbioscan_coi_canonical_v1_excluded_oids.tsv
 tool	blastdbcmd	blastdbcmd: 2.15.0+
 count	base_records	791433
 count	base_bases	485462968

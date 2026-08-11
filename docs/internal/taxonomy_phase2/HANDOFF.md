@@ -407,7 +407,7 @@ The canonical construction matches each disposition by reference ID, stored taxi
 SHA-256. It excludes all 29 quarantine records individually, retains all 15 unresolved records and
 every nonlisted base record, performs no implicit deduplication, and preserves retained relative
 legacy-OID order. The result is 791,404 records / 485,444,705 bases under the new basename
-`downstream_coi_chain_a_canonical_v1.fasta`, with SHA-256
+`rtbioscan_coi_canonical_v1.fasta`, with SHA-256
 `d0b3aca535fbadcd0da8dfc7218c08e7b4151c9562ffe3fd37baf6cdcaef1775`. The 29 excluded OIDs and the
 rule `retained_new_oid=legacy_oid-count(excluded_legacy_oid<legacy_oid)` are frozen in the construction
 artifacts. A rebuilt index, corrected benchmark, runtime activation, and new state identity remain
@@ -418,8 +418,8 @@ directory outside `db/`, never over the legacy FASTA/index. The exact command an
 checks are maintained in `conf/taxonomy_regression/README.md` under "Downstream COI canonical FASTA
 construction". The committed small artifacts are:
 
-- `conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv`;
-- `conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv`.
+- `conf/taxonomy_regression/rtbioscan_coi_canonical_v1_excluded_oids.tsv`;
+- `conf/taxonomy_regression/rtbioscan_coi_canonical_v1_fasta_provenance.tsv`.
 
 Existing outputs are rejected unless `--replace` is explicit. Replacement first invalidates and syncs
 removal of any old provenance marker, then installs and syncs the new provenance last. A process

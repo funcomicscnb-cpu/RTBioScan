@@ -482,6 +482,12 @@ substitute for static/live release qualification.
 
 The BLAST databases are **not included in the repository** due to their size. They must be placed in the `db/` directory before running the pipeline.
 
+The methodological origins and project-specific curation of the default COI
+and ITS2 references are documented in [Reference database
+provenance](reference_databases.md). The COI and ITS2 resources have distinct
+upstream curation lineages; the currently published canonical bundle contains
+the COI reference only.
+
 For the conceptual role of marker-specific barcoding databases and taxonomy resources, see [Concepts](concepts.md#taxonomy-and-reporting-aids). For parameter behavior and examples, see [Database parameters](usage.md#database-parameters).
 
 The pipeline expects, relative to the RTBioScan root:

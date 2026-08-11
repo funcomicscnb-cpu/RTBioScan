@@ -954,9 +954,7 @@ def build(args: argparse.Namespace) -> BuildResult:
         metadata = read_index_metadata(index_prefix, expected)
         component_paths = enumerate_components(index_prefix, metadata)
         component_set_sha, component_rows = component_fingerprint(component_paths)
-        provenance_name = (
-            "chain_a_downstream_coi_canonical_blastdb_v1_provenance.tsv"
-        )
+        provenance_name = f"{args.index_basename}_blastdb_provenance.tsv"
         provenance_path = staging / provenance_name
         write_synced(
             provenance_path,
