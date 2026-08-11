@@ -329,15 +329,16 @@ is outside the selected base and remains deferred. The boundary mismatch uses
 the current indexed representation for this base. None of those decisions
 repairs the shipped source, admits the tail, or assigns biological quality.
 
-The existing dispositions will be matched by `(reference_id, stored_taxid,
+The existing dispositions are matched by `(reference_id, stored_taxid,
 sequence_sha256)`, not ID or sequence alone. The policy fixes those components
 as the first title token before its first pipe, the signed Kraken taxid token,
-and SHA-256 of the uppercase ASCII sequence. A later canonical builder must
-exclude the 29 quarantine records individually, retain the 15 unresolved
-records without certifying them clean, retain all 791,389 nonlisted base
-records, perform no implicit deduplication, and preserve relative legacy-OID
-order. This projects 791,404 records; projected bases and the stream checksum
-remain uncomputed until that stream is actually constructed.
+and SHA-256 of the uppercase ASCII sequence. The canonical builder
+excludes the 29 quarantine records individually, retains the 15 unresolved
+records without certifying them clean, retains all 791,389 nonlisted base
+records, performs no implicit deduplication, and preserves relative legacy-OID
+order. The frozen policy records the pre-construction projection of 791,404
+records and deliberately remains unchanged as historical input to the completed
+construction stage.
 
 Validate the policy and all upstream bindings without a database or BLAST tool:
 
@@ -357,10 +358,85 @@ python3 bin/validate_taxonomy_reference_base_policy.py \
     conf/state_compatibility/reference_manifest_legacy_v1.tsv
 ```
 
-This is policy only: no canonical FASTA, rebuilt index, corrected benchmark,
-runtime activation, or new state identity exists yet. The next isolated stage
-is construction and byte-validation of the canonical FASTA; index construction
-and runtime qualification remain subsequent stages.
+The policy file remains policy-only and therefore retains its `deferred` and
+`not_computed` values. Completion is recorded in the separate construction
+provenance below; those historical policy fields must not be rewritten.
+
+### Downstream COI canonical FASTA construction
+
+`bin/build_taxonomy_canonical_fasta.py` consumes the verified legacy BLAST OID
+stream, not a raw-FASTA slice. It verifies every live index component against
+the legacy reference manifest, validates the frozen policy chain, and applies
+all 44 dispositions by full identity. It emits no BLAST index and changes no
+runtime configuration or state identity.
+
+The frozen result is:
+
+- release ID: `downstream_coi_chain_a_canonical_v1`;
+- FASTA basename:
+  `COInr98_2024Jun_RioNegro_Brazil_chain_a_correctness_first_v1.fasta`;
+- 791,404 records and 485,444,705 bases;
+- 29 excluded legacy OIDs / 18,263 excluded bases and all 15 retained
+  dispositions preserved;
+- canonical FASTA SHA-256
+  `d0b3aca535fbadcd0da8dfc7218c08e7b4151c9562ffe3fd37baf6cdcaef1775`.
+
+The large release-candidate FASTA is deliberately kept outside version control. It
+must be written to a dedicated release directory outside `db/`; never use the
+production database directory as an output. The small committed
+`chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv` and
+`chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv` freeze the excluded
+coordinates, ordinal-remapping rule, counts, hashes, inputs, and exact output
+basename.
+
+Reproduce into a fresh external directory and compare the generated small
+artifacts with the committed copies:
+
+```bash
+release_dir=/path/to/downstream-coi-chain-a-canonical-v1
+mkdir -p "$release_dir"
+
+python3 bin/build_taxonomy_canonical_fasta.py \
+  --policy \
+    conf/taxonomy_regression/chain_a_downstream_coi_base_repair_policy_v1.tsv \
+  --source-integrity-anomalies \
+    conf/taxonomy_regression/chain_a_downstream_coi_source_integrity_v1.tsv \
+  --source-integrity-provenance \
+    conf/taxonomy_regression/chain_a_downstream_coi_source_integrity_v1_provenance.tsv \
+  --disposition-manifest \
+    conf/taxonomy_regression/chain_a_downstream_coi_disposition_v1.tsv \
+  --disposition-provenance \
+    conf/taxonomy_regression/chain_a_downstream_coi_disposition_v1_provenance.tsv \
+  --reference-manifest \
+    conf/state_compatibility/reference_manifest_legacy_v1.tsv \
+  --reference-root . \
+  --blast-database db/COInr98_2024Jun_RioNegro_Brazil \
+  --blastdbcmd blastdbcmd \
+  --scope downstream_coi_only \
+  --release-id downstream_coi_chain_a_canonical_v1 \
+  --output-fasta \
+    "$release_dir/COInr98_2024Jun_RioNegro_Brazil_chain_a_correctness_first_v1.fasta" \
+  --excluded-oids-output \
+    "$release_dir/chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv" \
+  --provenance-output \
+    "$release_dir/chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv"
+
+cmp "$release_dir/chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv" \
+  conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv
+cmp "$release_dir/chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv" \
+  conf/taxonomy_regression/chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv
+```
+
+Existing outputs are rejected by default. Intentional regeneration requires
+`--replace`; replacement invalidates and durably records removal of the old
+provenance marker before installing the FASTA and excluded-OID table, then
+installs and syncs the new provenance last. Thus a process failure or a
+filesystem crash honoring `fsync` ordering cannot leave an old provenance file
+claiming that a partially replaced artifact set is valid.
+
+Index construction, a new reference/state identity, corrected benchmark
+expectations, runtime qualification, and activation remain subsequent,
+separately reviewed stages.
 
 Regenerate the discovery table and its checksummed provenance with:
 

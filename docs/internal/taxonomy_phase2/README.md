@@ -287,15 +287,19 @@ signed header taxids, order, and sequences exactly, while the analysis-logical
 tail has 1,494 records. The audit changes no source, policy, database, pipeline,
 or state identity.
 
-The versioned base/repair policy now chooses the entire effective legacy BLAST
+The versioned base/repair policy chooses the entire effective legacy BLAST
 OID stream as the behavior-preserving corpus base. It forbids slicing the raw
 FASTA, admits none of the 1,494-record logical tail, performs no repair or
 implicit deduplication, and uses legacy OIDs only for membership and relative
-order. Future dispositions match the full reference ID/taxid/sequence-hash
-identity: 29 records are projected for exclusion, 15 unresolved records remain,
-and every nonlisted base record remains unchanged. The projected record count is
-791,404, but no canonical FASTA, projected nucleotide count/checksum, new BLAST index,
-runtime activation, or state identity has been produced by this policy stage.
+order. The subsequent construction matched the full reference
+ID/taxid/sequence-hash identity: it excluded the 29 policy-quarantine records,
+preserved all 15 unresolved dispositions and every nonlisted base record, and
+produced 791,404 records / 485,444,705 bases with canonical SHA-256
+`d0b3aca535fbadcd0da8dfc7218c08e7b4151c9562ffe3fd37baf6cdcaef1775`.
+The frozen policy remains unchanged with its pre-construction `deferred` values;
+completion is recorded separately in
+`chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv`. No BLAST index,
+runtime activation, or state identity has been produced.
 
 Run the benchmark with:
 
