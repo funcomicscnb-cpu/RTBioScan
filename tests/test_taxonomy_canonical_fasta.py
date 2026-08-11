@@ -36,9 +36,7 @@ CANONICAL_PROVENANCE = (
 EXCLUDED_OIDS = (
     FIXTURE_DIR / "chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv"
 )
-CANONICAL_BASENAME = (
-    "COInr98_2024Jun_RioNegro_Brazil_chain_a_correctness_first_v1.fasta"
-)
+CANONICAL_BASENAME = "downstream_coi_chain_a_canonical_v1.fasta"
 RELEASE_ID = "downstream_coi_chain_a_canonical_v1"
 
 
@@ -376,9 +374,10 @@ def test_nonreplacement_install_never_overwrites_a_racing_target(tmp_path):
 def test_committed_construction_metadata_is_frozen_and_generic():
     assert CANONICAL_PROVENANCE.is_file()
     assert EXCLUDED_OIDS.is_file()
+    provenance_rows = read_tsv(CANONICAL_PROVENANCE)
     values = {
         (row["field"], row["artifact"]): row["value"]
-        for row in read_tsv(CANONICAL_PROVENANCE)
+        for row in provenance_rows
     }
     assert values[("schema", "")] == "taxonomy_reference_canonical_fasta_v1"
     assert values[("release", "release_id")] == RELEASE_ID
@@ -388,10 +387,28 @@ def test_committed_construction_metadata_is_frozen_and_generic():
     assert values[("count", "disposition:retain")] == "15"
     assert values[("count", "canonical_records")] == "791404"
     assert values[("sha256", "builder_script")] == sha256(SCRIPT.read_bytes())
+    assert values[("sha256", "legacy_reference_manifest")] == sha256(
+        REFERENCE_MANIFEST.read_bytes()
+    )
     assert values[("sha256", "excluded_legacy_oids")] == sha256(
         EXCLUDED_OIDS.read_bytes()
     )
     assert len(read_tsv(EXCLUDED_OIDS)) == 29
+
+    expected_legacy_components = {
+        row["artifact"]: row["sha256"]
+        for row in read_tsv(REFERENCE_MANIFEST)
+        if row["role"] == "COI BLAST index"
+    }
+    component_prefix = "legacy_blast_component:"
+    recorded_legacy_components = {
+        row["artifact"][len(component_prefix) :]: row["value"]
+        for row in provenance_rows
+        if row["field"] == "sha256"
+        and row["artifact"].startswith(component_prefix)
+    }
+    assert len(expected_legacy_components) == 8
+    assert recorded_legacy_components == expected_legacy_components
 
     source = SCRIPT.read_text(encoding="utf-8")
     for forbidden in ("COInr98", "791433", "791404", "BOLD_COI"):

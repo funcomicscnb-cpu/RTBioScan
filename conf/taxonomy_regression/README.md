@@ -374,7 +374,7 @@ The frozen result is:
 
 - release ID: `downstream_coi_chain_a_canonical_v1`;
 - FASTA basename:
-  `COInr98_2024Jun_RioNegro_Brazil_chain_a_correctness_first_v1.fasta`;
+  `downstream_coi_chain_a_canonical_v1.fasta`;
 - 791,404 records and 485,444,705 bases;
 - 29 excluded legacy OIDs / 18,263 excluded bases and all 15 retained
   dispositions preserved;
@@ -415,7 +415,7 @@ python3 bin/build_taxonomy_canonical_fasta.py \
   --scope downstream_coi_only \
   --release-id downstream_coi_chain_a_canonical_v1 \
   --output-fasta \
-    "$release_dir/COInr98_2024Jun_RioNegro_Brazil_chain_a_correctness_first_v1.fasta" \
+    "$release_dir/downstream_coi_chain_a_canonical_v1.fasta" \
   --excluded-oids-output \
     "$release_dir/chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv" \
   --provenance-output \
