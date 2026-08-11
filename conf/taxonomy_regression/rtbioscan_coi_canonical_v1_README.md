@@ -70,6 +70,29 @@ BLAST database, construction and index provenance, and the excluded legacy-OID
 table. The provenance files define the exact input identities, filtering
 decisions, record counts, build tools, and artifact hashes.
 
+## Artifact identity and integrity
+
+`rtbioscan_coi_canonical_v1` is the semantic database release identifier. The
+GitHub tag `taxonomy-reference-coi-canonical-v1` denotes its first publication
+revision. If the same semantic release ever needs corrected packaging, later
+publication tags use `taxonomy-reference-coi-canonical-v1-rN`, where `N` is an
+integer greater than 1. A publication revision does not by itself define new
+database content.
+
+The provenance committed at the release tag defines the canonical database
+identity. In particular, it pins the decompressed FASTA SHA-256 and the hashes
+and fixed-build fingerprint of the eight BLAST components. `SHA256SUMS` is the
+transport inventory for every uploaded release asset other than
+`SHA256SUMS` itself. A valid download must have the exact documented inventory,
+satisfy every `SHA256SUMS` entry, and agree with the committed provenance. If
+any of those checks disagree, reject the bundle and investigate; do not choose
+one source as an override.
+
+The fixed BLAST container is intended to be transported and verified, not
+rebuilt during installation. A rebuilt index can encode the same canonical
+FASTA while having different container bytes and therefore requires separately
+reviewed provenance before activation.
+
 ## License
 
 The database release is distributed under the
