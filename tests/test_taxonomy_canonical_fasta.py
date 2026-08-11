@@ -31,13 +31,13 @@ REFERENCE_MANIFEST = (
     REPO_ROOT / "conf" / "state_compatibility" / "reference_manifest_legacy_v1.tsv"
 )
 CANONICAL_PROVENANCE = (
-    FIXTURE_DIR / "chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv"
+    FIXTURE_DIR / "rtbioscan_coi_canonical_v1_fasta_provenance.tsv"
 )
 EXCLUDED_OIDS = (
-    FIXTURE_DIR / "chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv"
+    FIXTURE_DIR / "rtbioscan_coi_canonical_v1_excluded_oids.tsv"
 )
-CANONICAL_BASENAME = "downstream_coi_chain_a_canonical_v1.fasta"
-RELEASE_ID = "downstream_coi_chain_a_canonical_v1"
+CANONICAL_BASENAME = "rtbioscan_coi_canonical_v1.fasta"
+RELEASE_ID = "rtbioscan_coi_canonical_v1"
 
 
 def sha256(data: bytes) -> str:

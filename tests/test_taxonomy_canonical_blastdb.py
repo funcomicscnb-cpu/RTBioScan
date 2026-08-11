@@ -19,14 +19,14 @@ import build_taxonomy_canonical_blastdb as builder  # noqa: E402
 SCRIPT = BIN_DIR / "build_taxonomy_canonical_blastdb.py"
 FIXTURE_DIR = REPO_ROOT / "conf" / "taxonomy_regression"
 INDEX_PROVENANCE = (
-    FIXTURE_DIR / "chain_a_downstream_coi_canonical_blastdb_v1_provenance.tsv"
+    FIXTURE_DIR / "rtbioscan_coi_canonical_v1_blastdb_provenance.tsv"
 )
 INPUT_ARTIFACTS = {
     "construction_provenance": (
-        FIXTURE_DIR / "chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv"
+        FIXTURE_DIR / "rtbioscan_coi_canonical_v1_fasta_provenance.tsv"
     ),
     "excluded_legacy_oids": (
-        FIXTURE_DIR / "chain_a_downstream_coi_canonical_fasta_v1_excluded_oids.tsv"
+        FIXTURE_DIR / "rtbioscan_coi_canonical_v1_excluded_oids.tsv"
     ),
     "release_policy": (
         FIXTURE_DIR / "chain_a_downstream_coi_release_policy_v1.tsv"
@@ -221,9 +221,7 @@ def test_committed_index_provenance_freezes_build_and_semantic_contracts():
     rows, values = read_provenance(INDEX_PROVENANCE)
     assert len(values) == len(rows)
     assert values[("schema", "")] == "taxonomy_reference_canonical_blastdb_v1"
-    assert values[("release", "release_id")] == (
-        "downstream_coi_chain_a_canonical_v1"
-    )
+    assert values[("release", "release_id")] == "rtbioscan_coi_canonical_v1"
     assert values[("scope", "stage")] == "index_candidate_only"
     assert values[("scope", "runtime_activation")] == "none"
     assert values[("scope", "state_identity")] == "unproduced"
@@ -262,7 +260,7 @@ def test_committed_index_provenance_freezes_build_and_semantic_contracts():
     assert Path(command[0]).name == "makeblastdb"
     assert command[1::2] == ["-in", "-dbtype", "-out", "-title"]
     assert command[4] == "nucl"
-    assert command[8] == "downstream_coi_chain_a_canonical_v1"
+    assert command[8] == "rtbioscan_coi_canonical_v1"
     assert "-parse_seqids" not in command
     assert "-taxid_map" not in command
 
@@ -310,7 +308,7 @@ def test_external_fixed_index_matches_committed_fingerprint_when_requested():
         assert component.stat().st_size == sizes[name]
         assert builder.sha256_file(component) == hashes[name]
     metadata = json.loads(
-        (artifact_dir / "downstream_coi_chain_a_canonical_v1.njs").read_text(
+        (artifact_dir / "rtbioscan_coi_canonical_v1.njs").read_text(
             encoding="utf-8"
         )
     )

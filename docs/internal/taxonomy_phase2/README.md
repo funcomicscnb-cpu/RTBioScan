@@ -298,7 +298,7 @@ produced 791,404 records / 485,444,705 bases with canonical SHA-256
 `d0b3aca535fbadcd0da8dfc7218c08e7b4151c9562ffe3fd37baf6cdcaef1775`.
 The frozen policy remains unchanged with its pre-construction `deferred` values;
 completion is recorded separately in
-`chain_a_downstream_coi_canonical_fasta_v1_provenance.tsv`. No BLAST index,
+`rtbioscan_coi_canonical_v1_fasta_provenance.tsv`. No BLAST index,
 runtime activation, or state identity has been produced.
 
 Run the benchmark with:
