@@ -443,125 +443,16 @@ def test_unmodified_control_release_still_succeeds(tmp_path: Path) -> None:
     assert not (state / ".round_inflight.lockdir").exists()
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "KNOWN DEFECT, not fixed, and this marker does NOT gate it: xfail "
-        "exits 0 on both XFAIL and XPASS, so this reproducer is explicitly "
-        "non-gating while the branch is incomplete. strict=True would not help "
-        "either -- it only fails on XPASS and still accepts the known failure. "
-        "The marker must be deleted, not tightened, once the fix lands.\n\n"
-        "Concurrent recovery of one interrupted release is not idempotent. "
-        "Every read in recover_quarantines can observe the quarantine vanish "
-        "under it, producing three failure classes: concurrent remove_tree, "
-        "'pending release lost its authenticated process pin', and 'quarantine "
-        "lacks a valid transition'. Measured 13 failures in 96 concurrent "
-        "recoveries.\n\n"
-        "A cleanup-claim protocol was attempted and withdrawn in 371c1f3: "
-        "claiming by rename moved the tree outside the recovery scan namespace "
-        "(orphaning it on crash), and making claims enumerable to fix that made "
-        "live claims stealable. The fix needs an owner-identity and liveness "
-        "contract, not another rename."
-    ),
-)
-def test_concurrent_release_recovery_is_single_winner(tmp_path: Path) -> None:
-    """Many recoverers of one interrupted release must all succeed.
+def _interrupted_release(state: Path) -> tuple[list[str], dict[str, str], Path, dict[str, str]]:
+    """Drive one release to the ``after-quarantine-rename`` failpoint.
 
-    Cleanup previously let every recoverer enter ``remove_tree`` on the same
-    quarantine, so they deleted entries out from under one another's traversal.
-    Measured before the fix: 13 failures in 96 concurrent recoveries, in three
-    shapes -- ``pending release lost its authenticated process pin`` and two
-    ``cannot remove ... No such file or directory`` variants.
+    Shared by the concurrency regression and its setup gate so the two cannot
+    drift apart -- the gate has to exercise the exact preparation the
+    regression runs, not a copy of it.
 
-    Cleanup now claims the tree by atomic rename, so exactly one process
-    removes it; the rest confirm the operation-bound receipt instead. Uses
-    ``Popen`` rather than shell jobs, which spawn too slowly to hit the window.
+    Returns the CLI base arguments, the acquisition tokens, the single
+    quarantine left behind, and its parsed transition record.
     """
-    failures: list[str] = []
-    total = 0
-    for trial in range(6):
-        state = tmp_path / f"state-{trial}"
-        state.mkdir()
-        base = [
-            "--state-dir", str(state), "--round-barcode", "r",
-            "--scope", "dorado_only", "--owner-pid", str(os.getpid()),
-            "--stale-seconds", "30", "--wait-seconds", "5",
-        ]
-        acquired = subprocess.run(
-            ["perl", str(SCRIPT), "acquire", *base],
-            capture_output=True, text=True, check=False,
-        )
-        assert acquired.returncode == 0, acquired.stderr
-        tokens = dict(
-            line.split("=", 1)
-            for line in acquired.stdout.strip().splitlines()
-            if "=" in line
-        )
-
-        env = dict(os.environ)
-        env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-quarantine-rename"
-        injected = subprocess.run(
-            ["perl", str(SCRIPT), "early-release", *base,
-             "--token", tokens["generation_token"],
-             "--pin-token", tokens["pin_token"]],
-            capture_output=True, text=True, check=False, env=env,
-        )
-        # Prove the interleaving was actually established. Without these, a
-        # failpoint that silently stopped working would leave the recoverers
-        # running against whatever state happened to exist.
-        assert injected.returncode != 0, injected.stdout
-        assert "injected failure" in injected.stderr, injected.stderr
-
-        quarantines = [
-            path for path in state.glob(".round_inflight.lockdir.*")
-            if path.is_dir()
-        ]
-        assert len(quarantines) == 1, quarantines
-        quarantine = quarantines[0]
-        transition = dict(
-            line.split("\t", 1)
-            for line in (quarantine / "transition.tsv").read_text(
-                encoding="utf-8"
-            ).splitlines()
-            if "\t" in line
-        )
-        assert transition["action"] == "release", transition
-        assert quarantine.name.endswith(transition["operation_token"]), (
-            quarantine.name, transition["operation_token"],
-        )
-
-        procs = [
-            subprocess.Popen(
-                ["perl", str(SCRIPT), "verify-release", *base,
-                 "--token", tokens["generation_token"]],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            for _ in range(8)
-        ]
-        for proc in procs:
-            _, stderr = proc.communicate()
-            total += 1
-            if proc.returncode != 0:
-                failures.append(stderr.strip().splitlines()[0] if stderr.strip() else "?")
-
-    assert total == 48
-    assert not failures, f"{len(failures)}/{total} recoveries failed: {failures[:3]}"
-
-
-def test_after_quarantine_rename_failpoint_establishes_the_interleaving(
-    tmp_path: Path,
-) -> None:
-    """Gate the reproducer's setup, which its own xfail marker cannot.
-
-    The concurrency reproducer below is marked xfail, and that marker absorbs
-    setup failures as XFAIL exactly as it absorbs the defect -- verified by
-    disabling the failpoint, which produced XFAIL rather than an error. Its
-    inline setup assertions are therefore documentation, not enforcement.
-
-    This test is unmarked and must pass, so a failpoint that silently stopped
-    working fails here instead of masquerading as the race reproducing.
-    """
-    state = tmp_path / "state"
     state.mkdir()
     base = [
         "--state-dir", str(state), "--round-barcode", "r",
@@ -587,20 +478,92 @@ def test_after_quarantine_rename_failpoint_establishes_the_interleaving(
          "--pin-token", tokens["pin_token"]],
         capture_output=True, text=True, check=False, env=env,
     )
+    # Prove the interleaving was actually established. A failpoint that
+    # silently stopped working would otherwise leave callers running against
+    # whatever state happened to exist.
     assert injected.returncode != 0, injected.stdout
     assert "injected failure" in injected.stderr, injected.stderr
 
     quarantines = [
-        path for path in state.glob(".round_inflight.lockdir.*") if path.is_dir()
+        path for path in state.glob(".round_inflight.lockdir.*")
+        if path.is_dir()
     ]
     assert len(quarantines) == 1, quarantines
+    quarantine = quarantines[0]
     transition = dict(
         line.split("\t", 1)
-        for line in (quarantines[0] / "transition.tsv").read_text(
+        for line in (quarantine / "transition.tsv").read_text(
             encoding="utf-8"
         ).splitlines()
         if "\t" in line
     )
     assert transition["action"] == "release", transition
-    assert quarantines[0].name.endswith(transition["operation_token"])
+    assert quarantine.name.endswith(transition["operation_token"]), (
+        quarantine.name, transition["operation_token"],
+    )
     assert not (state / ".round_inflight.lockdir").exists()
+    return base, tokens, quarantine, transition
+
+
+def test_concurrent_release_recovery_is_single_winner(tmp_path: Path) -> None:
+    """Many concurrent recoverers of one interrupted release must all succeed.
+
+    KNOWN DEFECT: this test currently FAILS, and is deliberately left unmarked
+    so the branch stays visibly red until the recovery protocol lands. It was
+    previously ``xfail(strict=False)``, which exits 0 on both XFAIL and XPASS
+    and so gated nothing; ``strict=True`` would not have helped either, since
+    it only fails on XPASS and still accepts the known failure.
+
+    Concurrent recovery of one interrupted release is not idempotent. Every
+    read in ``recover_quarantines`` can observe the quarantine vanish under it,
+    producing three failure classes: concurrent ``remove_tree``, ``pending
+    release lost its authenticated process pin``, and ``quarantine lacks a
+    valid transition``. Measured 13 failures in 96 concurrent recoveries; the
+    rate is nondeterministic, so individual runs can pass outright.
+
+    A cleanup-claim protocol was attempted and withdrawn in 371c1f3: claiming
+    by rename moved the tree outside the recovery scan namespace, orphaning it
+    on crash, and making claims enumerable to fix that made live claims
+    stealable. The fix needs an owner-identity and liveness contract, not
+    another rename.
+
+    Uses ``Popen`` rather than shell jobs, which spawn too slowly to hit the
+    window.
+    """
+    failures: list[str] = []
+    total = 0
+    for trial in range(6):
+        base, tokens, _quarantine, _transition = _interrupted_release(
+            tmp_path / f"state-{trial}"
+        )
+
+        procs = [
+            subprocess.Popen(
+                ["perl", str(SCRIPT), "verify-release", *base,
+                 "--token", tokens["generation_token"]],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for _ in range(8)
+        ]
+        for proc in procs:
+            _, stderr = proc.communicate()
+            total += 1
+            if proc.returncode != 0:
+                failures.append(stderr.strip().splitlines()[0] if stderr.strip() else "?")
+
+    assert total == 48
+    assert not failures, f"{len(failures)}/{total} recoveries failed: {failures[:3]}"
+
+
+def test_after_quarantine_rename_failpoint_establishes_the_interleaving(
+    tmp_path: Path,
+) -> None:
+    """Gate the shared preparation the concurrency regression depends on.
+
+    That regression is expected to fail on the known recovery defect for as
+    long as the protocol is unfinished, so its own failure carries no
+    information about whether the failpoint still works. This test runs the
+    same ``_interrupted_release`` helper and nothing else, separating "red
+    because of the known defect" from "red because the setup broke".
+    """
+    _interrupted_release(tmp_path / "state")
