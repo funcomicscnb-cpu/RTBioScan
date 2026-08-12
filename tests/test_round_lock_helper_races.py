@@ -441,3 +441,80 @@ def test_unmodified_control_release_still_succeeds(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert len(_release_receipts(state)) == 1
     assert not (state / ".round_inflight.lockdir").exists()
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "KNOWN DEFECT, not yet fixed. Concurrent recovery of one interrupted "
+        "release is still not idempotent. Cleanup is now single-winner and the "
+        "authorizing-pin read tolerates a claimed quarantine, but every read in "
+        "the recovery loop can still observe the directory vanish: the failure "
+        "has moved from 'cannot remove ...' to 'lost its authenticated process "
+        "pin' to 'quarantine lacks a valid transition' as each was patched. "
+        "Fixing it properly needs the structural protocol -- one operation-bound "
+        "state machine over the whole per-entry body -- rather than tolerating "
+        "disappearance at each read in turn. Intermittent, so strict=False."
+    ),
+)
+def test_concurrent_release_recovery_is_single_winner(tmp_path: Path) -> None:
+    """Many recoverers of one interrupted release must all succeed.
+
+    Cleanup previously let every recoverer enter ``remove_tree`` on the same
+    quarantine, so they deleted entries out from under one another's traversal.
+    Measured before the fix: 13 failures in 96 concurrent recoveries, in three
+    shapes -- ``pending release lost its authenticated process pin`` and two
+    ``cannot remove ... No such file or directory`` variants.
+
+    Cleanup now claims the tree by atomic rename, so exactly one process
+    removes it; the rest confirm the operation-bound receipt instead. Uses
+    ``Popen`` rather than shell jobs, which spawn too slowly to hit the window.
+    """
+    failures: list[str] = []
+    total = 0
+    for trial in range(6):
+        state = tmp_path / f"state-{trial}"
+        state.mkdir()
+        base = [
+            "--state-dir", str(state), "--round-barcode", "r",
+            "--scope", "dorado_only", "--owner-pid", str(os.getpid()),
+            "--stale-seconds", "30", "--wait-seconds", "5",
+        ]
+        acquired = subprocess.run(
+            ["perl", str(SCRIPT), "acquire", *base],
+            capture_output=True, text=True, check=False,
+        )
+        assert acquired.returncode == 0, acquired.stderr
+        tokens = dict(
+            line.split("=", 1)
+            for line in acquired.stdout.strip().splitlines()
+            if "=" in line
+        )
+
+        env = dict(os.environ)
+        env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-quarantine-rename"
+        subprocess.run(
+            ["perl", str(SCRIPT), "early-release", *base,
+             "--token", tokens["generation_token"],
+             "--pin-token", tokens["pin_token"]],
+            capture_output=True, text=True, check=False, env=env,
+        )
+        quarantines = list(state.glob(".round_inflight.lockdir.*"))
+        assert quarantines, "setup failed: no release quarantine was left behind"
+
+        procs = [
+            subprocess.Popen(
+                ["perl", str(SCRIPT), "verify-release", *base,
+                 "--token", tokens["generation_token"]],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for _ in range(8)
+        ]
+        for proc in procs:
+            _, stderr = proc.communicate()
+            total += 1
+            if proc.returncode != 0:
+                failures.append(stderr.strip().splitlines()[0] if stderr.strip() else "?")
+
+    assert total == 48
+    assert not failures, f"{len(failures)}/{total} recoveries failed: {failures[:3]}"

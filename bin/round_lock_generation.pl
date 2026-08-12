@@ -949,25 +949,78 @@ sub validate_release_transition_authority {
     my $allowed_pin = read_ready_pin(
         $arg{lock_path}, $transition->{allowed_pin_token}, $snapshot,
     );
-    die "ERROR: pending release lost its authenticated process pin\n"
-        if !defined($allowed_pin);
+    if (!defined($allowed_pin)) {
+        # A concurrent recoverer may have claimed and removed this quarantine
+        # between our enumeration and this read. That is success only when the
+        # operation-bound receipt proves this exact transition finished; a bare
+        # disappearance of the pin is not evidence of anything.
+        confirm_release_completed(
+            state_dir => $arg{state_dir}, transition => $transition,
+        );
+        return 0;
+    }
     my $required_role = release_pin_role($reason);
     die "ERROR: pending release process pin role mismatch\n"
         if $allowed_pin->{role} ne $required_role;
+    return 1;
+}
+
+sub confirm_release_completed {
+    my (%arg) = @_;
+    my $transition = $arg{transition};
+    my $receipt = release_record(
+        state_dir => $arg{state_dir},
+        token => $transition->{owner_token},
+        round_barcode => $transition->{round_barcode},
+        scope => $transition->{scope},
+    );
+    die "ERROR: release quarantine disappeared without an operation-bound "
+        . "receipt for $transition->{operation_token}\n"
+        if !defined($receipt);
+    die "ERROR: release quarantine disappeared but its receipt records a "
+        . "different transition: $receipt->{operation_token} != "
+        . "$transition->{operation_token}\n"
+        if $receipt->{operation_token} ne $transition->{operation_token};
 }
 
 sub remove_release_quarantine {
     my (%arg) = @_;
     return if $arg{transition}->{action} ne 'release';
     my $path = $arg{path};
+    # Claiming the tree by rename makes cleanup single-winner. Concurrent
+    # recoverers previously all entered remove_tree together and deleted
+    # entries out from under one another's traversal.
+    my $claim = "$path.cleanup-$arg{transition}->{operation_token}";
     my @st = lstat($path);
-    return if !@st && $!{ENOENT};
+    if (!@st && $!{ENOENT}) {
+        # Someone else claimed it. That is success only when this exact
+        # transition is proven finished; a bare disappearance is not evidence.
+        confirm_release_completed(%arg);
+        return;
+    }
     die "ERROR: cannot inspect completed release quarantine '$path': $!\n"
         if !@st;
     die "ERROR: completed release quarantine is not a real directory: $path\n"
         if -l _ || !-d _;
     die "ERROR: completed release quarantine identity changed: $path\n"
         if $st[0] != $arg{snapshot}->{dev} || $st[1] != $arg{snapshot}->{ino};
+
+    # A claim left behind by a crashed winner carries this same operation
+    # token, so finishing its removal before re-claiming is safe.
+    if (-e $claim) {
+        my $stale_errors;
+        remove_tree($claim, { error => \$stale_errors });
+    }
+    if (!rename($path, $claim)) {
+        my $lost_claim = $!{ENOENT};
+        my $rename_error = "$!";
+        die "ERROR: cannot claim completed release quarantine '$path': "
+            . "$rename_error\n"
+            if !$lost_claim;
+        confirm_release_completed(%arg);
+        return;
+    }
+    $path = $claim;
 
     my $errors;
     remove_tree($path, { error => \$errors });
@@ -1081,10 +1134,15 @@ sub recover_quarantines {
         my $expected = $transition->{action} eq 'reclaim' ? 'reclaim' : 'release';
         die "ERROR: quarantine name/action mismatch: $path\n"
             if $entry ne ".round_inflight.lockdir.$expected-$transition->{operation_token}";
-        validate_release_transition_authority(
-            state_dir => $state_dir, lock_path => $path,
-            snapshot => $snapshot, transition => $transition,
-        ) if $transition->{action} eq 'release';
+        if ($transition->{action} eq 'release') {
+            # Zero means another recoverer already finished this exact
+            # transition, proven by its operation-bound receipt. Nothing is
+            # left to record or remove.
+            next if !validate_release_transition_authority(
+                state_dir => $state_dir, lock_path => $path,
+                snapshot => $snapshot, transition => $transition,
+            );
+        }
         record_transition_outcome(
             state_dir => $state_dir, snapshot => $snapshot, transition => $transition,
             reason => $transition->{reason},
