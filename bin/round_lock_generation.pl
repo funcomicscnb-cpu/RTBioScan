@@ -4,8 +4,8 @@ use strict;
 use warnings;
 
 use Digest::SHA qw(sha256_hex);
-use Errno qw(EEXIST ENOENT EPERM);
-use Fcntl qw(:DEFAULT);
+use Errno qw(EEXIST ELOOP ENOENT EPERM);
+use Fcntl qw(:DEFAULT O_NOFOLLOW O_RDONLY);
 use File::Basename qw(dirname);
 use File::Path qw(make_path remove_tree);
 use File::Spec;
@@ -14,6 +14,16 @@ use IO::Handle;
 use POSIX qw(strftime);
 use Sys::Hostname qw(hostname);
 use Time::HiRes qw(time usleep);
+
+# Records are opened with O_NOFOLLOW so a symlink substituted for a record path
+# is refused rather than followed. Its value is platform-specific, and on a
+# platform that defines it as zero the flag would be silently inert, so this
+# fails closed instead of degrading to an ordinary follow-the-path open.
+BEGIN {
+    die "ERROR: Fcntl O_NOFOLLOW is unavailable or inert; refusing to read "
+        . "lock records without symlink protection\n"
+        if !O_NOFOLLOW;
+}
 
 my $SCHEMA = '1';
 my $TOKEN_RE = qr/\A[0-9a-f]{64}\z/;
@@ -291,20 +301,46 @@ sub parse_record {
         && $path =~ m{/ready\.\Q$1\E\.tsv\z}) {
         unlink($path);
     }
+    if ($failpoint =~ /\Areplace-ready-pin-with-file:([0-9a-f]{64})\z/
+        && $path =~ m{/ready\.\Q$1\E\.tsv\z}) {
+        # Substitute a different regular file, which the dev/ino check rejects.
+        my $decoy = "$path.decoy";
+        if (open(my $decoy_fh, '>', $decoy)) {
+            print {$decoy_fh} "decoy\n";
+            close($decoy_fh);
+            rename($decoy, $path);
+        }
+    }
+    if ($failpoint =~ /\Areplace-ready-pin-with-symlink:([0-9a-f]{64})\z/
+        && $path =~ m{/ready\.\Q$1\E\.tsv\z}) {
+        # Substitute a symlink to the candidate hard link. Both names share one
+        # inode, so this defeats a dev/ino comparison and is refused only by
+        # O_NOFOLLOW.
+        (my $candidate = $path) =~ s{/ready\.}{/candidate.};
+        unlink($path);
+        symlink($candidate, $path);
+    }
+    # O_NOFOLLOW is what actually enforces the non-symlink half of the record
+    # contract. A dev/ino comparison alone cannot: ready.<token>.tsv and
+    # candidate.<token>.tsv are hard links to one inode, so a symlink swapped in
+    # for the ready path resolves to that same inode and would compare equal.
     my $fh;
-    if (!open($fh, '<:raw', $path)) {
-        # The record was removed between the lstat above and this open. Report
-        # absence exactly as for a record that was already gone, so each caller
-        # keeps its own meaning for absence: blocking_pins skips a concurrently
-        # unpinned worker, while guard_pin treats a missing authorization pin
-        # as lost authority and fails closed.
+    if (!sysopen($fh, $path, O_RDONLY | O_NOFOLLOW)) {
+        # Removed between the lstat above and this open. Report absence exactly
+        # as for a record that was already gone, so each caller keeps its own
+        # meaning for absence: blocking_pins skips a concurrently unpinned
+        # worker, while guard_pin treats a missing authorization pin as lost
+        # authority and fails closed.
         return undef if $!{ENOENT};
+        # O_NOFOLLOW refuses a symlink with ELOOP. That is substitution, not a
+        # readable record, and must never be parsed.
+        die "ERROR: record path is a symlink: $path\n" if $!{ELOOP};
         die "ERROR: cannot read '$path': $!\n";
     }
-    # Validate the descriptor actually opened. Between the lstat and the open
-    # the pathname could have been replaced by a different file or a symlink to
-    # one, so identity is confirmed against the inode that was inspected rather
-    # than trusting the path a second time.
+    binmode($fh, ':raw')
+        or die "ERROR: cannot set raw mode on '$path': $!\n";
+    # Secondary check: O_NOFOLLOW rejects a substituted symlink, and this
+    # rejects a substituted regular file with a different identity.
     my @fst = stat($fh);
     die "ERROR: cannot inspect open record '$path': $!\n" if !@fst;
     die "ERROR: record is not a regular file: $path\n" if !-f _;
@@ -345,7 +381,7 @@ my @GENERATION_ORDER = qw(schema token round_barcode scope pid host process_star
 my @PIN_ORDER = qw(schema token pin_token round_barcode scope role pid host process_start created_epoch lock_dev lock_ino);
 my @TRANSITION_ORDER = qw(schema action operation_token owner_token round_barcode scope reason effective_ttl_seconds lock_dev lock_ino allowed_pin_token started_epoch);
 my @MARKER_ORDER = qw(schema token round_barcode scope outcome created_epoch);
-my @RELEASE_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds released_epoch lock_dev lock_ino);
+my @RELEASE_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds release_transition_epoch lock_dev lock_ino);
 my @REVOCATION_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds revoked_epoch lock_dev lock_ino operation_token);
 my @EVENT_ORDER = qw(schema event_id generation_token round_barcode scope event outcome effective_ttl_seconds event_epoch lock_dev lock_ino);
 my @INFLIGHT_ORDER = qw(round_barcode started_utc read_file generation_token scope lock_dev lock_ino);
@@ -676,7 +712,7 @@ sub release_record {
         || $record->{outcome} ne 'released'
         || $record->{reason} !~ /\A(?:full_round_released|dorado_only_early|pre_handoff_abort)\z/
         || $record->{effective_ttl_seconds} !~ /\A[0-9]+\z/
-        || $record->{released_epoch} !~ /\A[0-9]+\z/
+        || $record->{release_transition_epoch} !~ /\A[0-9]+\z/
         || $record->{lock_dev} !~ /\A[0-9]+\z/
         || $record->{lock_ino} !~ /\A[0-9]+\z/;
     return $record;
@@ -785,7 +821,7 @@ sub install_release {
         schema => $SCHEMA, token => $arg{token}, round_barcode => $arg{round_barcode},
         scope => $arg{scope}, outcome => 'released', reason => $arg{reason},
         effective_ttl_seconds => $arg{effective_ttl_seconds},
-        released_epoch => $arg{event_epoch} // int(time()),
+        release_transition_epoch => $arg{event_epoch} // int(time()),
         lock_dev => $arg{lock_dev}, lock_ino => $arg{lock_ino},
     );
     my $path = release_path($arg{state_dir}, $arg{token});

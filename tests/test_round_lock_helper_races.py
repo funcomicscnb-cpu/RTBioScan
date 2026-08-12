@@ -138,9 +138,7 @@ def test_abort_with_a_valid_pin_releases_the_lock(tmp_path: Path) -> None:
     before calling ``abort`` cannot reach ``blocking_pins`` at all, because
     ``release_generation`` authenticates that same pin through ``guard_pin``
     first and ``abort`` is best-effort, so the call returns 0 having done
-    nothing. Reproducing the real interleaving -- the record present at
-    ``readdir`` and absent at the subsequent read -- needs fault injection the
-    helper does not expose.
+    nothing.
 
     The protection for that path is ``next if !defined($pin)`` in
     ``blocking_pins``: that is what handles a benign concurrent unpin. The
@@ -353,3 +351,93 @@ def test_missing_authorization_pin_fails_closed(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "process pin is absent" in result.stderr
+
+
+def _release_receipts(state: Path) -> list[Path]:
+    return sorted(state.glob(".round_lock_release.*.tsv"))
+
+
+def _revocations(state: Path) -> list[Path]:
+    return sorted(state.glob(".round_lock_revocation.*.tsv"))
+
+
+def test_authorizing_pin_replaced_by_a_different_file_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """A substituted regular file must be refused by the identity check."""
+    state = tmp_path / "state"
+    state.mkdir()
+    token, finisher, _worker = _handed_off_generation(state)
+    lock_dir = state / ".round_inflight.lockdir"
+
+    result = _finish(
+        state, token, finisher,
+        failpoint=f"replace-ready-pin-with-file:{finisher}",
+    )
+
+    assert result.returncode != 0
+    assert "record was replaced while being opened" in result.stderr
+    # The tamper must not have advanced release state in any way.
+    assert lock_dir.is_dir(), "canonical lock was removed by a rejected read"
+    assert _release_receipts(state) == []
+    assert _revocations(state) == []
+    # A competing acquisition must still be blocked by the surviving lock.
+    contender = _acquire(state, "run_contender")
+    assert contender.returncode != 0
+
+
+def test_authorizing_pin_replaced_by_a_symlink_is_rejected(tmp_path: Path) -> None:
+    """A symlink substituted for the record path must be refused.
+
+    ``ready.<token>.tsv`` and ``candidate.<token>.tsv`` are hard links to one
+    inode, so a symlink pointing at the candidate resolves to the very inode
+    the earlier ``lstat`` observed. A device/inode comparison therefore cannot
+    reject it; ``O_NOFOLLOW`` is what does, and it rejects at the read itself.
+
+    NOTE: removing ``O_NOFOLLOW`` does not make this substitution succeed in
+    the current ``finish`` flow -- a later ``parse_record`` call re-``lstat``s
+    the path and rejects it with a different message. So this test does not
+    demonstrate that the record would otherwise be *accepted*; it pins that
+    rejection happens at the read, rather than depending on some later reader
+    incidentally noticing.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+    token, finisher, _worker = _handed_off_generation(state)
+    lock_dir = state / ".round_inflight.lockdir"
+
+    result = _finish(
+        state, token, finisher,
+        failpoint=f"replace-ready-pin-with-symlink:{finisher}",
+    )
+
+    assert result.returncode != 0
+    assert "record path is a symlink" in result.stderr
+    assert lock_dir.is_dir(), "canonical lock was removed by a rejected read"
+    assert _release_receipts(state) == []
+    assert _revocations(state) == []
+    contender = _acquire(state, "run_contender")
+    assert contender.returncode != 0
+
+
+def test_unmodified_control_release_still_succeeds(tmp_path: Path) -> None:
+    """Control: the same flow without substitution releases cleanly.
+
+    Without this, the rejection tests above could pass because the flow is
+    broken rather than because tampering was detected.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+    token, finisher, worker = _handed_off_generation(state)
+
+    unpin = _helper(
+        "unpin", state, token=token, round_barcode="run_toctou",
+        scope="full_round", pin_token=worker,
+    )
+    assert unpin.returncode == 0, unpin.stderr
+
+    result = _finish(state, token, finisher)
+
+    assert result.returncode == 0, result.stderr
+    assert len(_release_receipts(state)) == 1
+    assert not (state / ".round_inflight.lockdir").exists()
