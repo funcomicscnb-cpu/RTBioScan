@@ -7,7 +7,7 @@ use Digest::SHA qw(sha256_hex);
 use Errno qw(EEXIST ENOENT EPERM);
 use Fcntl qw(:DEFAULT);
 use File::Basename qw(dirname);
-use File::Path qw(make_path);
+use File::Path qw(make_path remove_tree);
 use File::Spec;
 use Getopt::Long qw(GetOptionsFromArray);
 use IO::Handle;
@@ -805,6 +805,77 @@ sub record_transition_outcome {
     }
 }
 
+sub release_pin_role {
+    my ($reason) = @_;
+    return 'backup_update_and_clean' if $reason eq 'full_round_complete';
+    return 'fast_acquisition'
+        if $reason eq 'dorado_only_early' || $reason eq 'pre_handoff_abort';
+    die "ERROR: unsupported release reason: $reason\n";
+}
+
+sub validate_release_transition_authority {
+    my (%arg) = @_;
+    my $snapshot = $arg{snapshot};
+    my $transition = $arg{transition};
+    my $generation = $snapshot->{generation};
+    my $reason = $transition->{reason};
+    my $reason_matches_scope = $generation->{scope} eq 'full_round'
+        ? ($reason eq 'full_round_complete' || $reason eq 'pre_handoff_abort')
+        : ($reason eq 'dorado_only_early' || $reason eq 'pre_handoff_abort');
+    die "ERROR: pending release reason does not match generation scope: $generation->{token}\n"
+        if !$reason_matches_scope;
+    my %generation_arg = (
+        state_dir => $arg{state_dir}, token => $generation->{token},
+        round_barcode => $generation->{round_barcode}, scope => $generation->{scope},
+    );
+    if ($reason eq 'full_round_complete' || $reason eq 'dorado_only_early') {
+        validate_marker(%generation_arg);
+    } elsif (-e marker_path($arg{state_dir}, $generation->{token})) {
+        die "ERROR: pre-handoff release conflicts with an existing handoff marker\n";
+    }
+    my $allowed_pin = read_ready_pin(
+        $arg{lock_path}, $transition->{allowed_pin_token}, $snapshot,
+    );
+    die "ERROR: pending release lost its authenticated process pin\n"
+        if !defined($allowed_pin);
+    my $required_role = release_pin_role($reason);
+    die "ERROR: pending release process pin role mismatch\n"
+        if $allowed_pin->{role} ne $required_role;
+}
+
+sub remove_release_quarantine {
+    my (%arg) = @_;
+    return if $arg{transition}->{action} ne 'release';
+    my $path = $arg{path};
+    my @st = lstat($path);
+    return if !@st && $!{ENOENT};
+    die "ERROR: cannot inspect completed release quarantine '$path': $!\n"
+        if !@st;
+    die "ERROR: completed release quarantine is not a real directory: $path\n"
+        if -l _ || !-d _;
+    die "ERROR: completed release quarantine identity changed: $path\n"
+        if $st[0] != $arg{snapshot}->{dev} || $st[1] != $arg{snapshot}->{ino};
+
+    my $errors;
+    remove_tree($path, { error => \$errors });
+    if (defined($errors) && @{$errors}) {
+        my @messages;
+        for my $item (@{$errors}) {
+            for my $failed_path (sort keys(%{$item})) {
+                push(@messages, "$failed_path: $item->{$failed_path}");
+            }
+        }
+        die "ERROR: cannot remove completed release quarantine '$path': "
+            . join('; ', @messages) . "\n";
+    }
+    my @remaining = lstat($path);
+    die "ERROR: completed release quarantine remains after cleanup: $path\n"
+        if @remaining;
+    die "ERROR: cannot verify completed release quarantine cleanup '$path': $!\n"
+        if !$!{ENOENT};
+    sync_directory($arg{state_dir});
+}
+
 sub finalize_transition {
     my (%arg) = @_;
     my $dir = lock_dir($arg{state_dir});
@@ -815,12 +886,19 @@ sub finalize_transition {
     }
     return 0 if !same_identity($snapshot, $dir);
     return 0 if !validate_transition_for_snapshot($transition, $snapshot);
+    validate_release_transition_authority(
+        state_dir => $arg{state_dir}, lock_path => $dir,
+        snapshot => $snapshot, transition => $transition,
+    ) if $transition->{action} eq 'release';
     if ($snapshot->{valid}) {
         my $allowed = $transition->{action} eq 'release'
             ? $transition->{allowed_pin_token}
             : undef;
         my @blocking = blocking_pins($dir, $snapshot, $allowed);
         return 0 if @blocking;
+        remove_inflight_for_snapshot(
+            state_dir => $arg{state_dir}, snapshot => $snapshot,
+        );
     }
     my $suffix = $transition->{action} eq 'reclaim' ? 'reclaim' : 'release';
     my $quarantine = "$dir.$suffix-$transition->{operation_token}";
@@ -838,6 +916,10 @@ sub finalize_transition {
             record_transition_outcome(
                 state_dir => $arg{state_dir}, snapshot => $moved_snapshot,
                 transition => $moved, reason => $moved->{reason},
+            );
+            remove_release_quarantine(
+                state_dir => $arg{state_dir}, path => $quarantine,
+                snapshot => $moved_snapshot, transition => $moved,
             );
             return 1;
         }
@@ -861,6 +943,10 @@ sub finalize_transition {
     }
 
     record_transition_outcome(%arg);
+    remove_release_quarantine(
+        state_dir => $arg{state_dir}, path => $quarantine,
+        snapshot => $snapshot, transition => $transition,
+    );
     return 1;
 }
 
@@ -882,11 +968,47 @@ sub recover_quarantines {
         my $expected = $transition->{action} eq 'reclaim' ? 'reclaim' : 'release';
         die "ERROR: quarantine name/action mismatch: $path\n"
             if $entry ne ".round_inflight.lockdir.$expected-$transition->{operation_token}";
+        validate_release_transition_authority(
+            state_dir => $state_dir, lock_path => $path,
+            snapshot => $snapshot, transition => $transition,
+        ) if $transition->{action} eq 'release';
         record_transition_outcome(
             state_dir => $state_dir, snapshot => $snapshot, transition => $transition,
             reason => $transition->{reason},
         );
+        remove_release_quarantine(
+            state_dir => $state_dir, path => $path,
+            snapshot => $snapshot, transition => $transition,
+        );
     }
+}
+
+sub recover_pending_release {
+    my (%arg) = @_;
+    my $dir = lock_dir($arg{state_dir});
+    my $snapshot = lock_snapshot($dir);
+    return 0 if !defined($snapshot) || !$snapshot->{valid};
+    my $generation = $snapshot->{generation};
+    return 0 if $generation->{token} ne $arg{token}
+        || $generation->{round_barcode} ne $arg{round_barcode}
+        || $generation->{scope} ne $arg{scope};
+    my $transition = transition_record($dir);
+    return 0 if !defined($transition);
+    die "ERROR: canonical generation has an invalid release transition: $arg{token}\n"
+        if !validate_transition_for_snapshot($transition, $snapshot)
+        || $transition->{action} ne 'release'
+        || $transition->{owner_token} ne $arg{token};
+    validate_release_transition_authority(
+        state_dir => $arg{state_dir}, lock_path => $dir,
+        snapshot => $snapshot, transition => $transition,
+    );
+    my $finalized = finalize_transition(
+        state_dir => $arg{state_dir}, snapshot => $snapshot,
+        transition => $transition, reason => $transition->{reason},
+    );
+    die "ERROR: pending release is blocked by another live generation pin\n"
+        if !$finalized;
+    return 1;
 }
 
 sub stale_reason {
@@ -1016,6 +1138,7 @@ sub acquire_generation {
 
 sub release_generation {
     my (%arg) = @_;
+    recover_quarantines($arg{state_dir});
     my $existing = completion_record(%arg);
     my $revoked = revocation_record(%arg);
     die "ERROR: generation has both completion and revocation receipts: $arg{token}\n"
@@ -1033,10 +1156,14 @@ sub release_generation {
         return 0 if $arg{best_effort};
         die "ERROR: cannot release revoked generation $arg{token}\n";
     }
+    die "ERROR: missing pin-token\n" if !defined($arg{pin_token});
+    my $required_role = release_pin_role($arg{reason});
     my ($snapshot, $generation);
     my $ok = eval {
-        guard_pin(%arg);
-        ($snapshot, $generation) = assert_generation(%arg);
+        ($snapshot) = guard_pin(%arg, role => $required_role);
+        $generation = $snapshot->{generation};
+        validate_marker(%arg) if $arg{reason} eq 'full_round_complete';
+        install_marker(%arg) if $arg{reason} eq 'dorado_only_early';
         1;
     };
     if (!$ok) {
@@ -1057,8 +1184,12 @@ sub release_generation {
         effective_ttl_seconds => $generation->{effective_ttl_seconds},
         allowed_pin_token => $arg{pin_token},
     );
-    if (!defined($transition) || $transition->{action} ne 'release'
-        || $transition->{owner_token} ne $arg{token}) {
+    if (!defined($transition)
+        || !validate_transition_for_snapshot($transition, $snapshot)
+        || $transition->{action} ne 'release'
+        || $transition->{owner_token} ne $arg{token}
+        || $transition->{reason} ne $arg{reason}
+        || $transition->{allowed_pin_token} ne $arg{pin_token}) {
         return 0 if $arg{best_effort};
         die "ERROR: release lost transition race for generation $arg{token}\n";
     }
@@ -1073,23 +1204,46 @@ sub release_generation {
     return 1;
 }
 
+sub assert_inflight_for_snapshot {
+    my ($record, $arg_ref, $snapshot) = @_;
+    die "ERROR: immutable inflight record conflicts: $arg_ref->{token}\n"
+        if $record->{round_barcode} ne $arg_ref->{round_barcode}
+        || $record->{started_utc}
+            !~ /\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\z/
+        || $record->{read_file} ne $arg_ref->{read_file}
+        || $record->{generation_token} ne $arg_ref->{token}
+        || $record->{scope} ne $arg_ref->{scope}
+        || $record->{lock_dev} ne "$snapshot->{dev}"
+        || $record->{lock_ino} ne "$snapshot->{ino}";
+}
+
 sub write_inflight {
     my (%arg) = @_;
     my ($snapshot) = guard_pin(%arg);
-    my %value = (
-        round_barcode => $arg{round_barcode},
-        started_utc => strftime('%Y-%m-%dT%H:%M:%SZ', gmtime()),
-        read_file => $arg{read_file}, generation_token => $arg{token},
-        scope => $arg{scope}, lock_dev => $snapshot->{dev}, lock_ino => $snapshot->{ino},
-    );
-    my $content = checksummed_content(\%value, \@INFLIGHT_ORDER);
     my $generation_path = inflight_generation_path($arg{state_dir}, $arg{token});
-    my $installed = install_immutable($generation_path, $content);
-    if (!$installed) {
-        my $existing = record_for($generation_path, \@INFLIGHT_ORDER);
-        die "ERROR: immutable inflight record conflicts: $arg{token}\n"
-            if canonical_body($existing, \@INFLIGHT_ORDER)
-                ne canonical_body(\%value, \@INFLIGHT_ORDER);
+    my $existing = record_for($generation_path, \@INFLIGHT_ORDER);
+    my %value;
+    if (defined($existing)) {
+        assert_inflight_for_snapshot($existing, \%arg, $snapshot);
+        %value = %{$existing};
+    } else {
+        %value = (
+            round_barcode => $arg{round_barcode},
+            started_utc => strftime('%Y-%m-%dT%H:%M:%SZ', gmtime()),
+            read_file => $arg{read_file}, generation_token => $arg{token},
+            scope => $arg{scope}, lock_dev => $snapshot->{dev},
+            lock_ino => $snapshot->{ino},
+        );
+        my $installed = install_immutable(
+            $generation_path, checksummed_content(\%value, \@INFLIGHT_ORDER),
+        );
+        if (!$installed) {
+            $existing = record_for($generation_path, \@INFLIGHT_ORDER);
+            die "ERROR: immutable inflight record disappeared: $arg{token}\n"
+                if !defined($existing);
+            assert_inflight_for_snapshot($existing, \%arg, $snapshot);
+            %value = %{$existing};
+        }
     }
     guard_pin(%arg);
     my $compat_body = join(
@@ -1105,19 +1259,81 @@ sub write_inflight {
     my $compat_content = $compat_body
         . "record_sha256=" . sha256_hex($compat_body) . "\n";
     my $dir = lock_dir($arg{state_dir});
-    my $compat_tmp = File::Spec->catfile($dir, ".round_inflight.$arg{pin_token}.tmp");
-    write_temp_file($compat_tmp, $compat_content);
-    guard_pin(%arg);
-    if (($ENV{RTBIOSCAN_ROUND_LOCK_FAILPOINT} // '') eq 'before-compat-publish') {
-        die "ERROR: injected failure before compatibility inflight publish\n";
+    my $compat_tmp = File::Spec->catfile(
+        $dir,
+        ".round_inflight.$arg{pin_token}." . new_token("inflight:$arg{token}") . '.tmp',
+    );
+    my $temp_created = 0;
+    my $ok = eval {
+        write_temp_file($compat_tmp, $compat_content);
+        $temp_created = 1;
+        guard_pin(%arg);
+        if (($ENV{RTBIOSCAN_ROUND_LOCK_FAILPOINT} // '') eq 'before-compat-publish') {
+            die "ERROR: injected failure before compatibility inflight publish\n";
+        }
+        rename($compat_tmp, inflight_compat_path($arg{state_dir}))
+            or die "ERROR: cannot publish generation-bound inflight diagnostic: $!\n";
+        $temp_created = 0;
+        sync_directory($arg{state_dir});
+        guard_pin(%arg);
+        1;
+    };
+    if (!$ok) {
+        my $error = $@ || "ERROR: cannot publish generation-bound inflight diagnostic\n";
+        unlink($compat_tmp) if $temp_created;
+        die $error;
     }
-    if (!rename($compat_tmp, inflight_compat_path($arg{state_dir}))) {
-        my $error = $!;
-        unlink($compat_tmp) if -e $compat_tmp;
-        die "ERROR: cannot publish generation-bound inflight diagnostic: $error\n";
+}
+
+sub remove_inflight_for_snapshot {
+    my (%arg) = @_;
+    my $snapshot = $arg{snapshot};
+    return if !$snapshot->{valid};
+    my $generation = $snapshot->{generation};
+    my $path = inflight_generation_path(
+        $arg{state_dir}, $generation->{token},
+    );
+    my $record = record_for($path, \@INFLIGHT_ORDER);
+    return if !defined($record);
+    die "ERROR: generation-bound inflight record does not match the active lock\n"
+        if $record->{generation_token} ne $generation->{token}
+        || $record->{round_barcode} ne $generation->{round_barcode}
+        || $record->{scope} ne $generation->{scope}
+        || $record->{lock_dev} ne "$snapshot->{dev}"
+        || $record->{lock_ino} ne "$snapshot->{ino}";
+    my $compat_body = join(
+        '',
+        "round_barcode=$record->{round_barcode}\n",
+        "started_utc=$record->{started_utc}\n",
+        "read_file=$record->{read_file}\n",
+        "generation_token=$record->{generation_token}\n",
+        "scope=$record->{scope}\n",
+        "lock_dev=$record->{lock_dev}\n",
+        "lock_ino=$record->{lock_ino}\n",
+    );
+    my $expected_compat = $compat_body
+        . "record_sha256=" . sha256_hex($compat_body) . "\n";
+    my $compat_path = inflight_compat_path($arg{state_dir});
+    if (-e $compat_path || -l $compat_path) {
+        my @compat_st = lstat($compat_path);
+        die "ERROR: cannot inspect compatibility inflight diagnostic: $!\n"
+            if !@compat_st;
+        die "ERROR: compatibility inflight diagnostic is not a regular file\n"
+            if -l _ || !-f _;
+        open(my $compat_fh, '<', $compat_path)
+            or die "ERROR: cannot read compatibility inflight diagnostic: $!\n";
+        local $/;
+        my $content = <$compat_fh> // '';
+        close($compat_fh)
+            or die "ERROR: cannot close compatibility inflight diagnostic: $!\n";
+        die "ERROR: compatibility inflight diagnostic does not match the active generation\n"
+            if $content ne $expected_compat;
+        unlink($compat_path)
+            or die "ERROR: cannot remove compatibility inflight diagnostic: $!\n";
     }
+    unlink($path)
+        or die "ERROR: cannot remove generation-bound inflight diagnostic '$path': $!\n";
     sync_directory($arg{state_dir});
-    guard_pin(%arg);
 }
 
 sub remove_exact_marker {
@@ -1186,16 +1402,33 @@ if ($command eq 'inflight') {
 } elsif ($command eq 'handoff') {
     die "ERROR: missing pin-token\n" if !defined($opt{pin_token});
     die "ERROR: handoff is only valid for full_round\n" if $opt{scope} ne 'full_round';
+    recover_quarantines($opt{state_dir});
     my $marker = marker_path($opt{state_dir}, $opt{token});
     if (-e $marker) {
         validate_marker(%opt);
-        my $snapshot = lock_snapshot(lock_dir($opt{state_dir}));
-        if (defined($snapshot) && $snapshot->{valid}
-            && $snapshot->{generation}->{token} eq $opt{token}) {
+        my $receipt = completion_record(%opt);
+        my $revoked = revocation_record(%opt);
+        die "ERROR: generation has both completion and revocation receipts: $opt{token}\n"
+            if defined($receipt) && defined($revoked);
+        die "ERROR: cannot hand off revoked generation $opt{token}\n"
+            if defined($revoked);
+        if (defined($receipt)) {
+            die "ERROR: handoff completion reason conflicts for generation $opt{token}\n"
+                if $receipt->{reason} ne 'full_round_complete';
+            my $current = lock_snapshot(lock_dir($opt{state_dir}));
+            die "ERROR: completed generation is still the canonical lock: $opt{token}\n"
+                if defined($current) && $current->{valid}
+                && $current->{generation}->{token} eq $opt{token};
+        } else {
+            my ($snapshot) = assert_generation(%opt);
             my $pin = read_ready_pin(
                 lock_dir($opt{state_dir}), $opt{pin_token}, $snapshot
             );
-            unpin_generation(%opt) if defined($pin);
+			if (defined($pin)) {
+				die "ERROR: handoff pin role mismatch\n"
+					if $pin->{role} ne 'fast_acquisition';
+                unpin_generation(%opt);
+            }
         }
     } else {
         my ($snapshot, $pin) = guard_pin(%opt, role => 'fast_acquisition');
@@ -1225,26 +1458,27 @@ if ($command eq 'inflight') {
     die $@ if !$ok && !$opt{best_effort};
 } elsif ($command eq 'verify-completion') {
     recover_quarantines($opt{state_dir});
+    recover_pending_release(%opt);
     my $receipt = completion_record(%opt);
     my $revoked = revocation_record(%opt);
     die "ERROR: generation has both completion and revocation receipts: $opt{token}\n"
         if defined($receipt) && defined($revoked);
-    die "ERROR: missing authenticated completion receipt for generation $opt{token}\n"
-        if !defined($receipt);
-    print "$receipt->{reason}\n";
+	die "ERROR: missing authenticated completion receipt for generation $opt{token}\n"
+		if !defined($receipt);
+	die "ERROR: pre-handoff abort is not a resumable completion for generation $opt{token}\n"
+		if $receipt->{reason} eq 'pre_handoff_abort';
+	print "$receipt->{reason}\n";
 } elsif ($command eq 'early-release') {
     die "ERROR: missing pin-token\n" if !defined($opt{pin_token});
     die "ERROR: early-release is only valid for dorado_only\n"
         if $opt{scope} ne 'dorado_only';
-    guard_pin(%opt, role => 'fast_acquisition');
-    install_marker(%opt) if !-e marker_path($opt{state_dir}, $opt{token});
     release_generation(%opt, reason => 'dorado_only_early', unless_handoff => 0);
 } elsif ($command eq 'finish') {
     if ($opt{scope} eq 'full_round') {
-        validate_marker(%opt);
         release_generation(%opt, reason => 'full_round_complete', unless_handoff => 0);
         remove_exact_marker(%opt);
     } else {
+        recover_quarantines($opt{state_dir});
         my $receipt = completion_record(%opt);
         die "ERROR: dorado_only generation lacks authenticated early-release receipt\n"
             if !defined($receipt) || $receipt->{reason} ne 'dorado_only_early';
