@@ -16,6 +16,7 @@ foreign-host pin -- blocking release indefinitely.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -484,10 +485,19 @@ def _interrupted_release(state: Path) -> tuple[list[str], dict[str, str], Path, 
     assert injected.returncode != 0, injected.stdout
     assert "injected failure" in injected.stderr, injected.stderr
 
-    quarantines = [
-        path for path in state.glob(".round_inflight.lockdir.*")
-        if path.is_dir()
-    ]
+    # One lstat per candidate, not Path.is_dir(): is_dir() follows symlinks, so
+    # a symlink pointing at a directory would be accepted, and pairing it with
+    # a separate is_symlink() call leaves a window between the two checks. The
+    # helper holds itself to exactly this standard at
+    # bin/round_lock_generation.pl:963-969 before removing a quarantine.
+    quarantines = []
+    for path in state.glob(".round_inflight.lockdir.*"):
+        try:
+            entry = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(entry.st_mode):
+            quarantines.append(path)
     assert len(quarantines) == 1, quarantines
     quarantine = quarantines[0]
     transition = dict(
@@ -498,9 +508,19 @@ def _interrupted_release(state: Path) -> tuple[list[str], dict[str, str], Path, 
         if "\t" in line
     )
     assert transition["action"] == "release", transition
-    assert quarantine.name.endswith(transition["operation_token"]), (
-        quarantine.name, transition["operation_token"],
+    # Exact equality, not endswith. recover_quarantines scans an anchored
+    # namespace, /\A\.round_inflight\.lockdir\.(?:reclaim|release)-[0-9a-f]{64}\z/,
+    # and re-derives this same name at bin/round_lock_generation.pl:1083, so the
+    # name is part of the recovery contract. A suffixed variant such as
+    # ...release-<op>.cleanup-<op> satisfies endswith while falling outside that
+    # anchor -- invisible to recovery, which is the orphaning defect withdrawn
+    # in 371c1f3. This assertion is deliberately coupled to the current naming:
+    # when the protocol legitimately renames the intermediate, it must fail here
+    # and be updated consciously.
+    expected_name = ".round_inflight.lockdir.release-{}".format(
+        transition["operation_token"]
     )
+    assert quarantine.name == expected_name, (quarantine.name, expected_name)
     assert not (state / ".round_inflight.lockdir").exists()
     return base, tokens, quarantine, transition
 
