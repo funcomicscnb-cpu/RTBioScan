@@ -130,44 +130,37 @@ def test_non_eexist_directory_failures_are_still_reported(tmp_path: Path) -> Non
     assert EVENTS_DIR_NAME in result.stderr
 
 
-def test_release_is_not_blocked_when_no_ready_pins_remain(tmp_path: Path) -> None:
-    """Release must succeed once every ready pin has been removed.
+def test_abort_with_a_valid_pin_releases_the_lock(tmp_path: Path) -> None:
+    """Release must actually release: rc 0, lock gone, next acquisition free.
 
-    NOTE ON COVERAGE: this does *not* reproduce the enumeration race it sits
-    beside. Removing the record before the call means ``readdir`` never
-    enumerates it, so ``read_ready_pin`` is never asked for a missing file.
-    Verified vacuous: this test also passes against the unfixed helper.
+    NOTE ON COVERAGE: this does *not* reproduce the ready-pin enumeration race
+    that motivated the ``blocking_pins`` fix. A test that deletes the pin
+    before calling ``abort`` cannot reach ``blocking_pins`` at all, because
+    ``release_generation`` authenticates that same pin through ``guard_pin``
+    first and ``abort`` is best-effort, so the call returns 0 having done
+    nothing. Reproducing the real interleaving -- the record present at
+    ``readdir`` and absent at the subsequent read -- needs fault injection the
+    helper does not expose. Until that exists, the protection for that path is
+    the ``die`` guard in ``pin_is_blocking``, which turns an undefined record
+    from a silent foreign-host misclassification into a loud internal error.
 
-    Reproducing the real interleaving -- present at ``readdir``, absent at the
-    subsequent read -- requires fault injection the helper does not expose.
-    The durable protection for that path is instead the ``die`` guard in
-    ``pin_is_blocking``, which converts an undefined record from a silent
-    foreign-host misclassification into a loud internal error.
+    What this test does cover is the release contract itself, which the earlier
+    version of this test did not: it would have passed even with the lock left
+    in place.
     """
     state = tmp_path / "state"
     state.mkdir()
 
-    acquire = _acquire(state, "run_race")
+    acquire = _acquire(state, "run_release")
     assert acquire.returncode == 0, acquire.stderr
     tokens = dict(
         line.split("=", 1)
         for line in acquire.stdout.strip().splitlines()
         if "=" in line
     )
-    generation_token = tokens["generation_token"]
-    pin_token = tokens["pin_token"]
 
-    # Asserted rather than skipped: a layout change must fail this regression
-    # loudly instead of silently retiring it.
-    pins_dir = state / ".round_inflight.lockdir" / "pins"
-    assert pins_dir.is_dir(), f"expected generation pin directory at {pins_dir}"
-    ready = list(pins_dir.glob("ready.*.tsv"))
-    assert ready, f"expected a ready pin record in {pins_dir}"
-
-    # Remove the ready record exactly as a legitimate concurrent unpin would,
-    # then ask the helper whether anything blocks release.
-    for record in ready:
-        record.unlink()
+    lock_dir = state / ".round_inflight.lockdir"
+    assert lock_dir.is_dir(), f"expected round lock at {lock_dir}"
 
     result = subprocess.run(
         [
@@ -177,13 +170,13 @@ def test_release_is_not_blocked_when_no_ready_pins_remain(tmp_path: Path) -> Non
             "--state-dir",
             str(state),
             "--round-barcode",
-            "run_race",
+            "run_release",
             "--scope",
             "full_round",
             "--token",
-            generation_token,
+            tokens["generation_token"],
             "--pin-token",
-            pin_token,
+            tokens["pin_token"],
             "--owner-pid",
             str(os.getpid()),
             "--stale-seconds",
@@ -196,5 +189,10 @@ def test_release_is_not_blocked_when_no_ready_pins_remain(tmp_path: Path) -> Non
         check=False,
     )
 
+    assert result.returncode == 0, result.stderr
     assert "Use of uninitialized value" not in result.stderr, result.stderr
-    assert "blocked by another live generation pin" not in result.stderr, result.stderr
+    assert not lock_dir.exists(), "abort returned 0 but left the round lock in place"
+
+    # The generation is genuinely released, not merely reported as released.
+    again = _acquire(state, "run_release_2")
+    assert again.returncode == 0, again.stderr

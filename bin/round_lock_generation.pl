@@ -202,6 +202,10 @@ sub ensure_real_directory {
         if !@st;
     die "ERROR: expected a real directory, not a symlink: $path\n"
         if -l _ || !-d _;
+    # Sync the parent on this path too. The winner may have died between its
+    # mkdir and its own sync, so observing the entry does not establish that it
+    # is durable; without this the loser proceeds on an unflushed directory.
+    sync_directory(dirname($path));
     return;
 }
 
