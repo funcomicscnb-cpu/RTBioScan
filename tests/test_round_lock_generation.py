@@ -1171,11 +1171,12 @@ def test_script_has_no_handoff_or_inflight_glob_cleanup() -> None:
     assert "unlink($path)" in text
 
 
-def _captured_transition_started_epoch(state: Path) -> str:
-    """Read started_epoch straight from the durable transition record."""
+def _captured_transition(state: Path) -> dict[str, str]:
+    """Read the whole durable transition record, before recovery consumes it."""
     record = _read_record(state / ".round_inflight.lockdir" / "transition.tsv")
     assert record["started_epoch"].isdigit(), record
-    return record["started_epoch"]
+    _assert_token(record["operation_token"])
+    return record
 
 
 def test_release_receipt_and_event_both_equal_the_captured_transition_start(
@@ -1206,15 +1207,12 @@ def test_release_receipt_and_event_both_equal_the_captured_transition_start(
         capture_output=True, text=True, check=False, env=env,
     )
     assert interrupted.returncode != 0
-    captured = _captured_transition_started_epoch(state)
+    captured = _captured_transition(state)
 
     recovered = _run(
         "verify-release", state, token=token, scope="dorado_only",
     )
     assert recovered.returncode == 0, recovered.stderr
-
-    receipt = _read_record(_release_receipt(state, token))
-    assert receipt["release_transition_epoch"] == captured
 
     release_events = [
         event
@@ -1222,7 +1220,59 @@ def test_release_receipt_and_event_both_equal_the_captured_transition_start(
         if event["generation_token"] == token and event["event"] == "release"
     ]
     assert len(release_events) == 1, release_events
-    assert release_events[0]["event_epoch"] == captured
+    receipt = _read_record(_release_receipt(state, token))
 
-    # The receipt is bound to the exact transition, not merely to the generation.
-    assert receipt["operation_token"] == release_events[0]["event_id"]
+    # Every value is anchored to the captured transition record, never to a
+    # sibling output. Receipt and event are produced from the same source, so
+    # comparing them to each other would pass even if both drifted together.
+    assert receipt["release_transition_epoch"] == captured["started_epoch"]
+    assert release_events[0]["event_epoch"] == captured["started_epoch"]
+    assert receipt["operation_token"] == captured["operation_token"]
+    assert release_events[0]["event_id"] == captured["operation_token"]
+
+
+def test_revocation_receipt_and_event_both_equal_the_captured_reclaim_transition(
+    tmp_path: Path,
+) -> None:
+    """The reclaim counterpart of the release binding test.
+
+    ``reclaim_transition_epoch`` was renamed from ``revoked_epoch`` without any
+    test referencing it, which is how ``completed_epoch`` survived two
+    misleading names. Both the revocation receipt and the reclaim event are
+    anchored to the captured transition record rather than to each other.
+    """
+    state = tmp_path / "state"
+    token_a, pin_a = _acquire(state, stale_seconds=1)
+    assert _run(
+        "handoff", state, token=token_a, pin_token=pin_a, stale_seconds=1
+    ).returncode == 0
+    _backdate_lock(state)
+
+    env = dict(os.environ)
+    env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-transition-install"
+    interrupted = subprocess.run(
+        _command(
+            "acquire", state, round_barcode="run_2",
+            owner_pid=os.getpid(), stale_seconds=1, wait_seconds=1,
+        ),
+        capture_output=True, text=True, check=False, env=env,
+    )
+    assert interrupted.returncode != 0
+    captured = _captured_transition(state)
+    assert captured["action"] == "reclaim", captured
+
+    recovered = _acquire(state, round_barcode="run_3", stale_seconds=1)
+    assert recovered[0] != token_a
+
+    receipt = _read_record(_revocation(state, token_a))
+    reclaim_events = [
+        event
+        for event in _event_records(state)
+        if event["generation_token"] == token_a and event["event"] == "reclaim"
+    ]
+    assert len(reclaim_events) == 1, reclaim_events
+
+    assert receipt["reclaim_transition_epoch"] == captured["started_epoch"]
+    assert reclaim_events[0]["event_epoch"] == captured["started_epoch"]
+    assert receipt["operation_token"] == captured["operation_token"]
+    assert reclaim_events[0]["event_id"] == captured["operation_token"]
