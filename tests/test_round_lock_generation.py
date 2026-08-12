@@ -1171,36 +1171,58 @@ def test_script_has_no_handoff_or_inflight_glob_cleanup() -> None:
     assert "unlink($path)" in text
 
 
-def test_release_receipt_timestamp_is_the_release_transition_start(
+def _captured_transition_started_epoch(state: Path) -> str:
+    """Read started_epoch straight from the durable transition record."""
+    record = _read_record(state / ".round_inflight.lockdir" / "transition.tsv")
+    assert record["started_epoch"].isdigit(), record
+    return record["started_epoch"]
+
+
+def test_release_receipt_and_event_both_equal_the_captured_transition_start(
     tmp_path: Path,
 ) -> None:
-    """The receipt timestamp is the release transition's start, in name and value.
+    """Both timestamps are anchored to the transition record on disk.
 
-    This field has been misnamed twice -- first ``completed_epoch``, then
-    ``released_epoch`` -- while always holding the transition's
-    ``started_epoch``. A format-only assertion would have survived both names,
-    so this binds the receipt field to the release event's ``event_epoch``
-    instead: that pins the semantics rather than the syntax, and the shared
-    value is what keeps a replayed receipt byte-identical.
+    Comparing the receipt against the release event is not sufficient: both are
+    supplied from ``$transition->{started_epoch}`` at their own call sites, so a
+    change to that shared source moves them together and a receipt-vs-event
+    assertion still passes. This captures ``transition.tsv`` while the release
+    is interrupted, then recovers, then requires both values to equal what was
+    durably recorded before either existed.
+
+    The field has now been named ``completed_epoch``, ``released_epoch``, and
+    ``release_transition_epoch``; only the last describes the value.
     """
     state = tmp_path / "state"
-    token, acquisition_pin = _acquire(state)
+    token, acquisition_pin = _acquire(state, scope="dorado_only")
 
-    handoff = _run("handoff", state, token=token, pin_token=acquisition_pin)
-    assert handoff.returncode == 0, handoff.stderr
+    env = dict(os.environ)
+    env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-transition-install"
+    interrupted = subprocess.run(
+        _command(
+            "early-release", state, token=token, pin_token=acquisition_pin,
+            scope="dorado_only", owner_pid=os.getpid(),
+        ),
+        capture_output=True, text=True, check=False, env=env,
+    )
+    assert interrupted.returncode != 0
+    captured = _captured_transition_started_epoch(state)
 
-    finisher_pin = _pin(state, token, role="backup_update_and_clean")
-    finish = _run("finish", state, token=token, pin_token=finisher_pin)
-    assert finish.returncode == 0, finish.stderr
+    recovered = _run(
+        "verify-release", state, token=token, scope="dorado_only",
+    )
+    assert recovered.returncode == 0, recovered.stderr
 
     receipt = _read_record(_release_receipt(state, token))
+    assert receipt["release_transition_epoch"] == captured
+
     release_events = [
         event
         for event in _event_records(state)
         if event["generation_token"] == token and event["event"] == "release"
     ]
     assert len(release_events) == 1, release_events
+    assert release_events[0]["event_epoch"] == captured
 
-    assert "release_transition_epoch" in receipt, sorted(receipt)
-    assert receipt["release_transition_epoch"].isdigit()
-    assert receipt["release_transition_epoch"] == release_events[0]["event_epoch"]
+    # The receipt is bound to the exact transition, not merely to the generation.
+    assert receipt["operation_token"] == release_events[0]["event_id"]

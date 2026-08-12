@@ -396,8 +396,8 @@ my @GENERATION_ORDER = qw(schema token round_barcode scope pid host process_star
 my @PIN_ORDER = qw(schema token pin_token round_barcode scope role pid host process_start created_epoch lock_dev lock_ino);
 my @TRANSITION_ORDER = qw(schema action operation_token owner_token round_barcode scope reason effective_ttl_seconds lock_dev lock_ino allowed_pin_token started_epoch);
 my @MARKER_ORDER = qw(schema token round_barcode scope outcome created_epoch);
-my @RELEASE_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds release_transition_epoch lock_dev lock_ino);
-my @REVOCATION_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds revoked_epoch lock_dev lock_ino operation_token);
+my @RELEASE_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds release_transition_epoch lock_dev lock_ino operation_token);
+my @REVOCATION_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds reclaim_transition_epoch lock_dev lock_ino operation_token);
 my @EVENT_ORDER = qw(schema event_id generation_token round_barcode scope event outcome effective_ttl_seconds event_epoch lock_dev lock_ino);
 my @INFLIGHT_ORDER = qw(round_barcode started_utc read_file generation_token scope lock_dev lock_ino);
 
@@ -729,7 +729,8 @@ sub release_record {
         || $record->{effective_ttl_seconds} !~ /\A[0-9]+\z/
         || $record->{release_transition_epoch} !~ /\A[0-9]+\z/
         || $record->{lock_dev} !~ /\A[0-9]+\z/
-        || $record->{lock_ino} !~ /\A[0-9]+\z/;
+        || $record->{lock_ino} !~ /\A[0-9]+\z/
+        || $record->{operation_token} !~ $TOKEN_RE;
     return $record;
 }
 
@@ -746,7 +747,7 @@ sub revocation_record {
         || $record->{outcome} ne 'revoked'
         || $record->{reason} eq '' || $record->{reason} =~ /[\t\r\n]/
         || $record->{effective_ttl_seconds} !~ /\A[0-9]+\z/
-        || $record->{revoked_epoch} !~ /\A[0-9]+\z/
+        || $record->{reclaim_transition_epoch} !~ /\A[0-9]+\z/
         || $record->{lock_dev} !~ /\A[0-9]+\z/
         || $record->{lock_ino} !~ /\A[0-9]+\z/
         || $record->{operation_token} !~ $TOKEN_RE;
@@ -838,6 +839,7 @@ sub install_release {
         effective_ttl_seconds => $arg{effective_ttl_seconds},
         release_transition_epoch => $arg{event_epoch} // int(time()),
         lock_dev => $arg{lock_dev}, lock_ino => $arg{lock_ino},
+        operation_token => $arg{operation_token},
     );
     my $path = release_path($arg{state_dir}, $arg{token});
     my $installed = install_immutable($path, checksummed_content(\%value, \@RELEASE_ORDER));
@@ -856,7 +858,7 @@ sub install_revocation {
         schema => $SCHEMA, token => $arg{token}, round_barcode => $arg{round_barcode},
         scope => $arg{scope}, outcome => 'revoked', reason => $arg{reason},
         effective_ttl_seconds => $arg{effective_ttl_seconds},
-        revoked_epoch => $arg{event_epoch} // int(time()),
+        reclaim_transition_epoch => $arg{event_epoch} // int(time()),
         lock_dev => $arg{lock_dev}, lock_ino => $arg{lock_ino},
         operation_token => $arg{operation_token},
     );
@@ -903,6 +905,7 @@ sub record_transition_outcome {
             scope => $scope, reason => $arg{reason}, effective_ttl_seconds => $ttl,
             lock_dev => $snapshot->{dev}, lock_ino => $snapshot->{ino},
             event_epoch => $transition->{started_epoch},
+            operation_token => $transition->{operation_token},
         );
         write_event(
             state_dir => $arg{state_dir}, generation_token => $token,
