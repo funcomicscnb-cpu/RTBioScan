@@ -185,8 +185,24 @@ sub ensure_real_directory {
         return;
     }
     die "ERROR: cannot inspect directory '$path': $!\n" if !$!{ENOENT};
-    mkdir($path, $mode) or die "ERROR: cannot create directory '$path': $!\n";
-    sync_directory(dirname($path));
+    if (mkdir($path, $mode)) {
+        sync_directory(dirname($path));
+        return;
+    }
+    # Capture both before any later syscall resets errno.
+    my $lost_creation_race = $!{EEXIST};
+    my $mkdir_error = "$!";
+    die "ERROR: cannot create directory '$path': $mkdir_error\n"
+        if !$lost_creation_race;
+    # A concurrent first acquisition created the directory between our lstat
+    # and our mkdir. That is benign, but only once the winner is confirmed to
+    # have installed a real directory rather than a file or a symlink.
+    @st = lstat($path);
+    die "ERROR: cannot inspect directory '$path' after concurrent creation: $!\n"
+        if !@st;
+    die "ERROR: expected a real directory, not a symlink: $path\n"
+        if -l _ || !-d _;
+    return;
 }
 
 sub canonical_body {
@@ -475,6 +491,11 @@ sub read_ready_pin {
 
 sub pin_is_blocking {
     my ($pin) = @_;
+    # Callers must resolve a missing pin before asking whether it blocks. An
+    # undefined record would otherwise compare an undefined host against this
+    # host and be misread as a foreign-host pin.
+    die "ERROR: internal: pin_is_blocking requires a pin record\n"
+        if !defined($pin);
     return 1 if $pin->{host} ne $THIS_HOST;
     my $alive = kill(0, $pin->{pid}) || $!{EPERM};
     return 0 if !$alive;
@@ -498,8 +519,15 @@ sub blocking_pins {
     my @blocking;
     for my $entry (@entries) {
         my ($pin_token) = $entry =~ /\Aready\.([0-9a-f]{64})\.tsv\z/;
-        my $pin = read_ready_pin($dir, $pin_token, $snapshot);
         next if defined($allowed_pin) && $pin_token eq $allowed_pin;
+        my $pin = read_ready_pin($dir, $pin_token, $snapshot);
+        # A concurrent legitimate unpin can remove the record between readdir
+        # and this read. read_ready_pin returns undef only when the file is
+        # absent; malformed records die inside parse_record. A pin that no
+        # longer exists holds nothing and must be skipped, because
+        # pin_is_blocking would otherwise read an undefined host and classify
+        # it as a foreign-host pin, blocking release indefinitely.
+        next if !defined($pin);
         push(@blocking, $pin) if pin_is_blocking($pin);
     }
     return @blocking;
