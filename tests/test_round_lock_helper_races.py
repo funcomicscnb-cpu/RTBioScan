@@ -140,9 +140,15 @@ def test_abort_with_a_valid_pin_releases_the_lock(tmp_path: Path) -> None:
     first and ``abort`` is best-effort, so the call returns 0 having done
     nothing. Reproducing the real interleaving -- the record present at
     ``readdir`` and absent at the subsequent read -- needs fault injection the
-    helper does not expose. Until that exists, the protection for that path is
-    the ``die`` guard in ``pin_is_blocking``, which turns an undefined record
-    from a silent foreign-host misclassification into a loud internal error.
+    helper does not expose.
+
+    The protection for that path is ``next if !defined($pin)`` in
+    ``blocking_pins``: that is what handles a benign concurrent unpin. The
+    ``die`` in ``pin_is_blocking`` is only a backstop against a future caller
+    passing an undefined record; it never fires for the disappearance case,
+    because ``blocking_pins`` skips first. The two are not interchangeable --
+    removing the ``next`` in the belief that the die guard covers it would turn
+    a benign unpin into a crash.
 
     What this test does cover is the release contract itself, which the earlier
     version of this test did not: it would have passed even with the lock left
@@ -196,3 +202,154 @@ def test_abort_with_a_valid_pin_releases_the_lock(tmp_path: Path) -> None:
     # The generation is genuinely released, not merely reported as released.
     again = _acquire(state, "run_release_2")
     assert again.returncode == 0, again.stderr
+
+
+def _sub_body(name: str) -> str:
+    """Return the source of a top-level Perl sub, brace-to-brace at column 0."""
+    source = SCRIPT.read_text(encoding="utf-8")
+    marker = f"\nsub {name} {{\n"
+    start = source.index(marker) + len(marker)
+    end = source.index("\n}\n", start)
+    return source[start:end]
+
+
+def test_both_directory_creation_outcomes_sync_the_parent() -> None:
+    """Durability guard for ``ensure_real_directory``.
+
+    Two outcomes create the directory as far as this caller is concerned: this
+    process won the ``mkdir``, or it lost the race to a concurrent first
+    acquisition. Both must fsync the parent, because observing the entry does
+    not prove it is durable -- the winner may have died between its ``mkdir``
+    and its own sync.
+
+    This is asserted structurally. Power loss is not reproducible in-suite, and
+    the concurrency test above cannot cover it: that test asserts only that no
+    EEXIST error surfaced, which stays true if the loser-side sync is deleted.
+    """
+    body = _sub_body("ensure_real_directory")
+    sync_call = "sync_directory(dirname($path));"
+
+    assert body.count(sync_call) == 2, (
+        "expected exactly two parent syncs in ensure_real_directory: one for "
+        "the winning mkdir and one for the lost creation race"
+    )
+
+    # The pre-existing-directory path must NOT sync: it created nothing.
+    before_mkdir, after_mkdir = body.split("if (mkdir($path, $mode)) {", 1)
+    assert sync_call not in before_mkdir
+
+    # The lost-race branch specifically must sync after revalidating the target.
+    lost_race_branch = after_mkdir.split("lost_creation_race", 1)[1]
+    assert sync_call in lost_race_branch, (
+        "the EEXIST path returns without syncing the parent directory"
+    )
+
+
+def _helper(action: str, state: Path, **opts: str) -> subprocess.CompletedProcess[str]:
+    argv = ["perl", str(SCRIPT), action, "--state-dir", str(state)]
+    for key, value in opts.items():
+        argv += [f"--{key.replace('_', '-')}", value]
+    argv += ["--owner-pid", str(os.getpid()), "--stale-seconds", "30", "--wait-seconds", "5"]
+    return subprocess.run(argv, capture_output=True, text=True, check=False)
+
+
+def _handed_off_generation(state: Path) -> tuple[str, str, str]:
+    """Acquire, hand off, and return (token, finisher_pin, worker_pin)."""
+    acquire = _acquire(state, "run_toctou")
+    assert acquire.returncode == 0, acquire.stderr
+    tokens = dict(
+        line.split("=", 1)
+        for line in acquire.stdout.strip().splitlines()
+        if "=" in line
+    )
+    token = tokens["generation_token"]
+
+    handoff = _helper(
+        "handoff", state, token=token, round_barcode="run_toctou",
+        scope="full_round", pin_token=tokens["pin_token"],
+    )
+    assert handoff.returncode == 0, handoff.stderr
+
+    pins = {}
+    for role in ("backup_update_and_clean", "state_writer"):
+        result = _helper(
+            "pin", state, token=token, round_barcode="run_toctou",
+            scope="full_round", role=role,
+        )
+        assert result.returncode == 0, result.stderr
+        pins[role] = result.stdout.strip()
+    return token, pins["backup_update_and_clean"], pins["state_writer"]
+
+
+def _finish(state: Path, token: str, pin: str, failpoint: str | None = None):
+    argv = [
+        "perl", str(SCRIPT), "finish", "--state-dir", str(state),
+        "--token", token, "--round-barcode", "run_toctou",
+        "--scope", "full_round", "--pin-token", pin,
+        "--owner-pid", str(os.getpid()),
+        "--stale-seconds", "30", "--wait-seconds", "5",
+    ]
+    env = dict(os.environ)
+    if failpoint:
+        env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = failpoint
+    return subprocess.run(argv, capture_output=True, text=True, check=False, env=env)
+
+
+def test_live_worker_pin_blocks_release(tmp_path: Path) -> None:
+    """Control: a genuinely live worker pin must block release."""
+    state = tmp_path / "state"
+    state.mkdir()
+    token, finisher, _worker = _handed_off_generation(state)
+
+    result = _finish(state, token, finisher)
+
+    assert result.returncode != 0
+    assert "blocked by another live generation pin" in result.stderr
+
+
+def test_worker_pin_removed_between_lstat_and_open_does_not_block_release(
+    tmp_path: Path,
+) -> None:
+    """Deterministic TOCTOU: a concurrently unpinned worker must be skipped.
+
+    The failpoint removes the worker's record between ``parse_record``'s
+    ``lstat`` and its ``open``, which is the exact interleaving a legitimate
+    concurrent unpin produces. Without the ENOENT-on-open handling this dies
+    with ``cannot read '...': No such file or directory`` and release fails
+    spuriously; verified against a build carrying the failpoint but not the
+    fix.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+    token, finisher, worker = _handed_off_generation(state)
+
+    result = _finish(
+        state, token, finisher,
+        failpoint=f"unlink-ready-pin-before-open:{worker}",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "cannot read" not in result.stderr
+    assert "Use of uninitialized value" not in result.stderr
+    assert "blocked by another live generation pin" not in result.stderr
+
+
+def test_missing_authorization_pin_fails_closed(tmp_path: Path) -> None:
+    """The same disappearance on the caller's own pin must fail closed.
+
+    ``read_ready_pin`` reports absence; each caller decides what absence means.
+    ``blocking_pins`` skips a vanished worker, while ``guard_pin`` treats a
+    vanished authorization pin as lost authority. Both meanings are pinned so a
+    future change to undef semantics cannot silently flip one of them.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+    token, finisher, _worker = _handed_off_generation(state)
+
+    result = _finish(
+        state, token, finisher,
+        failpoint=f"unlink-ready-pin-before-open:{finisher}",
+    )
+
+    assert result.returncode != 0
+    assert "process pin is absent" in result.stderr

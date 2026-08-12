@@ -282,7 +282,34 @@ sub parse_record {
     die "ERROR: cannot inspect record '$path': $!\n" if !@st;
     die "ERROR: record is not a regular non-symlink file: $path\n"
         if !-f _ || -l _;
-    open(my $fh, '<:raw', $path) or die "ERROR: cannot read '$path': $!\n";
+    # Test-only fault injection for the window between the lstat above and the
+    # open below. Scoped to one named ready pin so a test can target either a
+    # concurrently unpinned worker (benign, skipped) or the caller's own
+    # authorization pin (lost authority, fail closed).
+    my $failpoint = $ENV{RTBIOSCAN_ROUND_LOCK_FAILPOINT} // '';
+    if ($failpoint =~ /\Aunlink-ready-pin-before-open:([0-9a-f]{64})\z/
+        && $path =~ m{/ready\.\Q$1\E\.tsv\z}) {
+        unlink($path);
+    }
+    my $fh;
+    if (!open($fh, '<:raw', $path)) {
+        # The record was removed between the lstat above and this open. Report
+        # absence exactly as for a record that was already gone, so each caller
+        # keeps its own meaning for absence: blocking_pins skips a concurrently
+        # unpinned worker, while guard_pin treats a missing authorization pin
+        # as lost authority and fails closed.
+        return undef if $!{ENOENT};
+        die "ERROR: cannot read '$path': $!\n";
+    }
+    # Validate the descriptor actually opened. Between the lstat and the open
+    # the pathname could have been replaced by a different file or a symlink to
+    # one, so identity is confirmed against the inode that was inspected rather
+    # than trusting the path a second time.
+    my @fst = stat($fh);
+    die "ERROR: cannot inspect open record '$path': $!\n" if !@fst;
+    die "ERROR: record is not a regular file: $path\n" if !-f _;
+    die "ERROR: record was replaced while being opened: $path\n"
+        if $fst[0] != $st[0] || $fst[1] != $st[1];
     my @lines = <$fh>;
     close($fh) or die "ERROR: cannot close '$path': $!\n";
     my %value;
