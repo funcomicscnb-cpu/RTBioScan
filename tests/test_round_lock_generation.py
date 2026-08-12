@@ -1169,3 +1169,38 @@ def test_script_has_no_handoff_or_inflight_glob_cleanup() -> None:
     assert "round_lock_handoff.$round_barcode" not in text
     assert "glob(" not in text
     assert "unlink($path)" in text
+
+
+def test_release_receipt_timestamp_is_the_release_transition_start(
+    tmp_path: Path,
+) -> None:
+    """The receipt timestamp is the release transition's start, in name and value.
+
+    This field has been misnamed twice -- first ``completed_epoch``, then
+    ``released_epoch`` -- while always holding the transition's
+    ``started_epoch``. A format-only assertion would have survived both names,
+    so this binds the receipt field to the release event's ``event_epoch``
+    instead: that pins the semantics rather than the syntax, and the shared
+    value is what keeps a replayed receipt byte-identical.
+    """
+    state = tmp_path / "state"
+    token, acquisition_pin = _acquire(state)
+
+    handoff = _run("handoff", state, token=token, pin_token=acquisition_pin)
+    assert handoff.returncode == 0, handoff.stderr
+
+    finisher_pin = _pin(state, token, role="backup_update_and_clean")
+    finish = _run("finish", state, token=token, pin_token=finisher_pin)
+    assert finish.returncode == 0, finish.stderr
+
+    receipt = _read_record(_release_receipt(state, token))
+    release_events = [
+        event
+        for event in _event_records(state)
+        if event["generation_token"] == token and event["event"] == "release"
+    ]
+    assert len(release_events) == 1, release_events
+
+    assert "release_transition_epoch" in receipt, sorted(receipt)
+    assert receipt["release_transition_epoch"].isdigit()
+    assert receipt["release_transition_epoch"] == release_events[0]["event_epoch"]

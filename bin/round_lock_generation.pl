@@ -296,20 +296,32 @@ sub parse_record {
     # open below. Scoped to one named ready pin so a test can target either a
     # concurrently unpinned worker (benign, skipped) or the caller's own
     # authorization pin (lost authority, fail closed).
+    # Every mutation below aborts with a distinct setup error if it cannot
+    # establish the requested interleaving. Injection that silently fails would
+    # let the code under test run unperturbed while the test still reports the
+    # outcome it was asserting, which is a false green.
     my $failpoint = $ENV{RTBIOSCAN_ROUND_LOCK_FAILPOINT} // '';
     if ($failpoint =~ /\Aunlink-ready-pin-before-open:([0-9a-f]{64})\z/
         && $path =~ m{/ready\.\Q$1\E\.tsv\z}) {
-        unlink($path);
+        unlink($path)
+            or die "ERROR: failpoint setup failed: cannot remove '$path': $!\n";
     }
     if ($failpoint =~ /\Areplace-ready-pin-with-file:([0-9a-f]{64})\z/
         && $path =~ m{/ready\.\Q$1\E\.tsv\z}) {
         # Substitute a different regular file, which the dev/ino check rejects.
         my $decoy = "$path.decoy";
-        if (open(my $decoy_fh, '>', $decoy)) {
-            print {$decoy_fh} "decoy\n";
-            close($decoy_fh);
-            rename($decoy, $path);
-        }
+        open(my $decoy_fh, '>', $decoy)
+            or die "ERROR: failpoint setup failed: cannot create decoy "
+                . "'$decoy': $!\n";
+        print {$decoy_fh} "decoy\n"
+            or die "ERROR: failpoint setup failed: cannot write decoy "
+                . "'$decoy': $!\n";
+        close($decoy_fh)
+            or die "ERROR: failpoint setup failed: cannot close decoy "
+                . "'$decoy': $!\n";
+        rename($decoy, $path)
+            or die "ERROR: failpoint setup failed: cannot install decoy at "
+                . "'$path': $!\n";
     }
     if ($failpoint =~ /\Areplace-ready-pin-with-symlink:([0-9a-f]{64})\z/
         && $path =~ m{/ready\.\Q$1\E\.tsv\z}) {
@@ -317,8 +329,11 @@ sub parse_record {
         # inode, so this defeats a dev/ino comparison and is refused only by
         # O_NOFOLLOW.
         (my $candidate = $path) =~ s{/ready\.}{/candidate.};
-        unlink($path);
-        symlink($candidate, $path);
+        unlink($path)
+            or die "ERROR: failpoint setup failed: cannot remove '$path': $!\n";
+        symlink($candidate, $path)
+            or die "ERROR: failpoint setup failed: cannot symlink '$path' -> "
+                . "'$candidate': $!\n";
     }
     # O_NOFOLLOW is what actually enforces the non-symlink half of the record
     # contract. A dev/ino comparison alone cannot: ready.<token>.tsv and
