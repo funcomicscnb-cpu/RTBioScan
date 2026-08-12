@@ -29,7 +29,7 @@ Commands:
   pin            acquire a process pin for a handed-off full_round generation
   guard-pin      assert an exact live process pin
   unpin          end an exact process pin
-  verify-completion  authenticate an idempotent completion receipt for resume
+  verify-release  authenticate an idempotent release receipt for resume
   early-release  create a dorado_only marker and release with the acquisition pin
   finish         release full_round, or clean the exact dorado_only marker
   abort          best-effort pre-handoff release with the acquisition pin
@@ -161,7 +161,7 @@ sub pins_dir { return File::Spec->catdir($_[0], 'pins'); }
 sub pin_candidate_path { return File::Spec->catfile(pins_dir($_[0]), "candidate.$_[1].tsv"); }
 sub pin_ready_path { return File::Spec->catfile(pins_dir($_[0]), "ready.$_[1].tsv"); }
 sub marker_path { return File::Spec->catfile($_[0], ".round_lock_handoff.$_[1].tsv"); }
-sub completion_path { return File::Spec->catfile($_[0], ".round_lock_completion.$_[1].tsv"); }
+sub release_path { return File::Spec->catfile($_[0], ".round_lock_release.$_[1].tsv"); }
 sub revocation_path { return File::Spec->catfile($_[0], ".round_lock_revocation.$_[1].tsv"); }
 sub inflight_generation_path { return File::Spec->catfile($_[0], ".round_inflight.$_[1].tsv"); }
 sub inflight_compat_path { return File::Spec->catfile($_[0], 'round_inflight.txt'); }
@@ -345,7 +345,7 @@ my @GENERATION_ORDER = qw(schema token round_barcode scope pid host process_star
 my @PIN_ORDER = qw(schema token pin_token round_barcode scope role pid host process_start created_epoch lock_dev lock_ino);
 my @TRANSITION_ORDER = qw(schema action operation_token owner_token round_barcode scope reason effective_ttl_seconds lock_dev lock_ino allowed_pin_token started_epoch);
 my @MARKER_ORDER = qw(schema token round_barcode scope outcome created_epoch);
-my @COMPLETION_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds completed_epoch lock_dev lock_ino);
+my @RELEASE_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds released_epoch lock_dev lock_ino);
 my @REVOCATION_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds revoked_epoch lock_dev lock_ino operation_token);
 my @EVENT_ORDER = qw(schema event_id generation_token round_barcode scope event outcome effective_ttl_seconds event_epoch lock_dev lock_ino);
 my @INFLIGHT_ORDER = qw(round_barcode started_utc read_file generation_token scope lock_dev lock_ino);
@@ -663,20 +663,20 @@ sub validate_marker {
     return $path;
 }
 
-sub completion_record {
+sub release_record {
     my (%arg) = @_;
-    my $path = completion_path($arg{state_dir}, $arg{token});
-    my $record = record_for($path, \@COMPLETION_ORDER);
+    my $path = release_path($arg{state_dir}, $arg{token});
+    my $record = record_for($path, \@RELEASE_ORDER);
     return undef if !defined($record);
-    die "ERROR: completion receipt does not match generation $arg{token}\n"
+    die "ERROR: release receipt does not match generation $arg{token}\n"
         if $record->{schema} ne $SCHEMA
         || $record->{token} ne $arg{token}
         || $record->{round_barcode} ne $arg{round_barcode}
         || $record->{scope} ne $arg{scope}
         || $record->{outcome} ne 'released'
-        || $record->{reason} !~ /\A(?:full_round_complete|dorado_only_early|pre_handoff_abort)\z/
+        || $record->{reason} !~ /\A(?:full_round_released|dorado_only_early|pre_handoff_abort)\z/
         || $record->{effective_ttl_seconds} !~ /\A[0-9]+\z/
-        || $record->{completed_epoch} !~ /\A[0-9]+\z/
+        || $record->{released_epoch} !~ /\A[0-9]+\z/
         || $record->{lock_dev} !~ /\A[0-9]+\z/
         || $record->{lock_ino} !~ /\A[0-9]+\z/;
     return $record;
@@ -769,7 +769,7 @@ sub validate_transition_for_snapshot {
         return 0 if $transition->{action} eq 'release'
             && ($transition->{allowed_pin_token} !~ $TOKEN_RE
                 || $transition->{reason}
-                    !~ /\A(?:full_round_complete|dorado_only_early|pre_handoff_abort)\z/);
+                    !~ /\A(?:full_round_released|dorado_only_early|pre_handoff_abort)\z/);
         return 1;
     }
     return $transition->{action} eq 'reclaim'
@@ -779,22 +779,22 @@ sub validate_transition_for_snapshot {
         && $transition->{allowed_pin_token} eq 'none';
 }
 
-sub install_completion {
+sub install_release {
     my (%arg) = @_;
     my %value = (
         schema => $SCHEMA, token => $arg{token}, round_barcode => $arg{round_barcode},
         scope => $arg{scope}, outcome => 'released', reason => $arg{reason},
         effective_ttl_seconds => $arg{effective_ttl_seconds},
-        completed_epoch => $arg{event_epoch} // int(time()),
+        released_epoch => $arg{event_epoch} // int(time()),
         lock_dev => $arg{lock_dev}, lock_ino => $arg{lock_ino},
     );
-    my $path = completion_path($arg{state_dir}, $arg{token});
-    my $installed = install_immutable($path, checksummed_content(\%value, \@COMPLETION_ORDER));
+    my $path = release_path($arg{state_dir}, $arg{token});
+    my $installed = install_immutable($path, checksummed_content(\%value, \@RELEASE_ORDER));
     if (!$installed) {
-        my $existing = completion_record(%arg);
-        die "ERROR: immutable completion receipt conflicts: $arg{token}\n"
-            if canonical_body($existing, \@COMPLETION_ORDER)
-                ne canonical_body(\%value, \@COMPLETION_ORDER);
+        my $existing = release_record(%arg);
+        die "ERROR: immutable release receipt conflicts: $arg{token}\n"
+            if canonical_body($existing, \@RELEASE_ORDER)
+                ne canonical_body(\%value, \@RELEASE_ORDER);
     }
 }
 
@@ -847,7 +847,7 @@ sub record_transition_outcome {
             event_epoch => $transition->{started_epoch},
         );
     } else {
-        install_completion(
+        install_release(
             state_dir => $arg{state_dir}, token => $token, round_barcode => $round,
             scope => $scope, reason => $arg{reason}, effective_ttl_seconds => $ttl,
             lock_dev => $snapshot->{dev}, lock_ino => $snapshot->{ino},
@@ -866,7 +866,7 @@ sub record_transition_outcome {
 
 sub release_pin_role {
     my ($reason) = @_;
-    return 'backup_update_and_clean' if $reason eq 'full_round_complete';
+    return 'backup_update_and_clean' if $reason eq 'full_round_released';
     return 'fast_acquisition'
         if $reason eq 'dorado_only_early' || $reason eq 'pre_handoff_abort';
     die "ERROR: unsupported release reason: $reason\n";
@@ -879,7 +879,7 @@ sub validate_release_transition_authority {
     my $generation = $snapshot->{generation};
     my $reason = $transition->{reason};
     my $reason_matches_scope = $generation->{scope} eq 'full_round'
-        ? ($reason eq 'full_round_complete' || $reason eq 'pre_handoff_abort')
+        ? ($reason eq 'full_round_released' || $reason eq 'pre_handoff_abort')
         : ($reason eq 'dorado_only_early' || $reason eq 'pre_handoff_abort');
     die "ERROR: pending release reason does not match generation scope: $generation->{token}\n"
         if !$reason_matches_scope;
@@ -887,7 +887,7 @@ sub validate_release_transition_authority {
         state_dir => $arg{state_dir}, token => $generation->{token},
         round_barcode => $generation->{round_barcode}, scope => $generation->{scope},
     );
-    if ($reason eq 'full_round_complete' || $reason eq 'dorado_only_early') {
+    if ($reason eq 'full_round_released' || $reason eq 'dorado_only_early') {
         validate_marker(%generation_arg);
     } elsif (-e marker_path($arg{state_dir}, $generation->{token})) {
         die "ERROR: pre-handoff release conflicts with an existing handoff marker\n";
@@ -1198,15 +1198,15 @@ sub acquire_generation {
 sub release_generation {
     my (%arg) = @_;
     recover_quarantines($arg{state_dir});
-    my $existing = completion_record(%arg);
+    my $existing = release_record(%arg);
     my $revoked = revocation_record(%arg);
-    die "ERROR: generation has both completion and revocation receipts: $arg{token}\n"
+    die "ERROR: generation has both release and revocation receipts: $arg{token}\n"
         if defined($existing) && defined($revoked);
     if (defined($existing)) {
-        die "ERROR: completion reason conflicts for generation $arg{token}\n"
+        die "ERROR: release reason conflicts for generation $arg{token}\n"
             if $existing->{reason} ne $arg{reason};
         my $current = lock_snapshot(lock_dir($arg{state_dir}));
-        die "ERROR: completed generation is still the canonical lock: $arg{token}\n"
+        die "ERROR: released generation is still the canonical lock: $arg{token}\n"
             if defined($current) && $current->{valid}
             && $current->{generation}->{token} eq $arg{token};
         return 1;
@@ -1221,7 +1221,7 @@ sub release_generation {
     my $ok = eval {
         ($snapshot) = guard_pin(%arg, role => $required_role);
         $generation = $snapshot->{generation};
-        validate_marker(%arg) if $arg{reason} eq 'full_round_complete';
+        validate_marker(%arg) if $arg{reason} eq 'full_round_released';
         install_marker(%arg) if $arg{reason} eq 'dorado_only_early';
         1;
     };
@@ -1465,17 +1465,17 @@ if ($command eq 'inflight') {
     my $marker = marker_path($opt{state_dir}, $opt{token});
     if (-e $marker) {
         validate_marker(%opt);
-        my $receipt = completion_record(%opt);
+        my $receipt = release_record(%opt);
         my $revoked = revocation_record(%opt);
-        die "ERROR: generation has both completion and revocation receipts: $opt{token}\n"
+        die "ERROR: generation has both release and revocation receipts: $opt{token}\n"
             if defined($receipt) && defined($revoked);
         die "ERROR: cannot hand off revoked generation $opt{token}\n"
             if defined($revoked);
         if (defined($receipt)) {
-            die "ERROR: handoff completion reason conflicts for generation $opt{token}\n"
-                if $receipt->{reason} ne 'full_round_complete';
+            die "ERROR: handoff release reason conflicts for generation $opt{token}\n"
+                if $receipt->{reason} ne 'full_round_released';
             my $current = lock_snapshot(lock_dir($opt{state_dir}));
-            die "ERROR: completed generation is still the canonical lock: $opt{token}\n"
+            die "ERROR: released generation is still the canonical lock: $opt{token}\n"
                 if defined($current) && $current->{valid}
                 && $current->{generation}->{token} eq $opt{token};
         } else {
@@ -1515,16 +1515,16 @@ if ($command eq 'inflight') {
     die "ERROR: missing pin-token\n" if !defined($opt{pin_token});
     my $ok = eval { unpin_generation(%opt); 1 };
     die $@ if !$ok && !$opt{best_effort};
-} elsif ($command eq 'verify-completion') {
+} elsif ($command eq 'verify-release') {
     recover_quarantines($opt{state_dir});
     recover_pending_release(%opt);
-    my $receipt = completion_record(%opt);
+    my $receipt = release_record(%opt);
     my $revoked = revocation_record(%opt);
-    die "ERROR: generation has both completion and revocation receipts: $opt{token}\n"
+    die "ERROR: generation has both release and revocation receipts: $opt{token}\n"
         if defined($receipt) && defined($revoked);
-	die "ERROR: missing authenticated completion receipt for generation $opt{token}\n"
+	die "ERROR: missing authenticated release receipt for generation $opt{token}\n"
 		if !defined($receipt);
-	die "ERROR: pre-handoff abort is not a resumable completion for generation $opt{token}\n"
+	die "ERROR: pre-handoff abort is not a resumable release for generation $opt{token}\n"
 		if $receipt->{reason} eq 'pre_handoff_abort';
 	print "$receipt->{reason}\n";
 } elsif ($command eq 'early-release') {
@@ -1534,11 +1534,11 @@ if ($command eq 'inflight') {
     release_generation(%opt, reason => 'dorado_only_early', unless_handoff => 0);
 } elsif ($command eq 'finish') {
     if ($opt{scope} eq 'full_round') {
-        release_generation(%opt, reason => 'full_round_complete', unless_handoff => 0);
+        release_generation(%opt, reason => 'full_round_released', unless_handoff => 0);
         remove_exact_marker(%opt);
     } else {
         recover_quarantines($opt{state_dir});
-        my $receipt = completion_record(%opt);
+        my $receipt = release_record(%opt);
         die "ERROR: dorado_only generation lacks authenticated early-release receipt\n"
             if !defined($receipt) || $receipt->{reason} ne 'dorado_only_early';
         die "ERROR: dorado_only generation was revoked\n"

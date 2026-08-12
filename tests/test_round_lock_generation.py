@@ -150,8 +150,8 @@ def _marker(state: Path, token: str) -> Path:
     return state / f".round_lock_handoff.{token}.tsv"
 
 
-def _completion(state: Path, token: str) -> Path:
-    return state / f".round_lock_completion.{token}.tsv"
+def _release_receipt(state: Path, token: str) -> Path:
+    return state / f".round_lock_release.{token}.tsv"
 
 
 def _revocation(state: Path, token: str) -> Path:
@@ -262,12 +262,12 @@ def test_full_round_handoff_pins_release_and_exit_are_generation_bound(
     assert not (state / f".round_inflight.{token_a}.tsv").exists()
     assert not _marker(state, token_a).exists()
     assert list(state.glob(".round_inflight.lockdir.release-*")) == []
-    completion = _read_record(_completion(state, token_a))
-    assert completion["reason"] == "full_round_complete"
-    assert completion["effective_ttl_seconds"] == "37"
-    verified = _run("verify-completion", state, token=token_a)
+    receipt = _read_record(_release_receipt(state, token_a))
+    assert receipt["reason"] == "full_round_released"
+    assert receipt["effective_ttl_seconds"] == "37"
+    verified = _run("verify-release", state, token=token_a)
     assert verified.returncode == 0, verified.stderr
-    assert verified.stdout.strip() == "full_round_complete"
+    assert verified.stdout.strip() == "full_round_released"
 
     token_b, _pin_b = _acquire(state, round_barcode="run_2")
     generation_b_bytes = (
@@ -281,7 +281,7 @@ def test_full_round_handoff_pins_release_and_exit_are_generation_bound(
         best_effort=True,
     )
     assert late_exit.returncode != 0
-    assert "completion reason conflicts" in late_exit.stderr
+    assert "release reason conflicts" in late_exit.stderr
     assert (
         state / ".round_inflight.lockdir" / "generation.tsv"
     ).read_bytes() == generation_b_bytes
@@ -290,7 +290,7 @@ def test_full_round_handoff_pins_release_and_exit_are_generation_bound(
     events = _event_records(state)
     a_events = {event["event"]: event for event in events if event["generation_token"] == token_a}
     assert {"acquire", "handoff", "release"} <= set(a_events)
-    assert a_events["release"]["outcome"] == "full_round_complete"
+    assert a_events["release"]["outcome"] == "full_round_released"
     assert all(event["scope"] == "full_round" for event in a_events.values())
     assert all(event["effective_ttl_seconds"] == "37" for event in a_events.values())
 
@@ -323,7 +323,7 @@ def test_dorado_only_marker_without_lock_and_prefix_cleanup_are_safe(
     assert not (state / f".round_inflight.{token_1}.tsv").exists()
     assert list(state.glob(".round_inflight.lockdir.release-*")) == []
     verified_1 = _run(
-        "verify-completion",
+        "verify-release",
         state,
         round_barcode="run_1",
         scope="dorado_only",
@@ -383,7 +383,7 @@ def test_reclaimed_full_round_cannot_publish_release_or_remove_replacement(
     assert revocation_a["outcome"] == "revoked"
     assert revocation_a["effective_ttl_seconds"] == "1"
     _assert_token(revocation_a["operation_token"])
-    assert not _completion(state, token_a).exists()
+    assert not _release_receipt(state, token_a).exists()
     assert _marker(state, token_a).is_file()
     assert not (state / f".round_inflight.{token_a}.tsv").exists()
     late_handoff = _run(
@@ -455,14 +455,14 @@ def test_reclaimed_full_round_cannot_publish_release_or_remove_replacement(
     ).read_bytes() == generation_b
     assert (state / "round_inflight.txt").read_bytes() == inflight_b
     assert _generation(state)["token"] == token_b
-    revoked_completion = _run(
-        "verify-completion",
+    revoked_release = _run(
+        "verify-release",
         state,
         round_barcode="same",
         token=token_a,
     )
-    assert revoked_completion.returncode != 0
-    assert "missing authenticated completion receipt" in revoked_completion.stderr
+    assert revoked_release.returncode != 0
+    assert "missing authenticated release receipt" in revoked_release.stderr
 
 
 def test_existing_handoff_marker_rejects_a_displaced_generation(
@@ -736,12 +736,12 @@ def test_release_crash_recovers_authenticated_receipt_and_late_exit_is_safe(
     )
     assert interrupted.returncode != 0
     assert _marker(state, token_a).is_file()
-    assert not _completion(state, token_a).exists()
+    assert not _release_receipt(state, token_a).exists()
 
     token_b, _pin_b = _acquire(
         state, round_barcode="run_2", stale_seconds=30
     )
-    receipt = _read_record(_completion(state, token_a))
+    receipt = _read_record(_release_receipt(state, token_a))
     assert receipt["reason"] == "dorado_only_early"
     assert receipt["effective_ttl_seconds"] == "19"
     assert list(state.glob(".round_inflight.lockdir.release-*")) == []
@@ -757,7 +757,7 @@ def test_release_crash_recovers_authenticated_receipt_and_late_exit_is_safe(
         best_effort=True,
     )
     assert late_abort.returncode != 0
-    assert "completion reason conflicts" in late_abort.stderr
+    assert "release reason conflicts" in late_abort.stderr
     assert (
         state / ".round_inflight.lockdir" / "generation.tsv"
     ).read_bytes() == generation_b
@@ -793,9 +793,9 @@ def test_full_release_crash_is_recovered_without_minting_a_new_pin(
 
     if failpoint == "after-transition-install":
         assert (state / ".round_inflight.lockdir" / "transition.tsv").is_file()
-        recovered = _run("verify-completion", state, token=token)
+        recovered = _run("verify-release", state, token=token)
         assert recovered.returncode == 0, recovered.stderr
-        assert recovered.stdout.strip() == "full_round_complete"
+        assert recovered.stdout.strip() == "full_round_released"
     else:
         assert len(list(state.glob(".round_inflight.lockdir.release-*"))) == 1
         recovered = _run("finish", state, token=token)
@@ -803,7 +803,7 @@ def test_full_release_crash_is_recovered_without_minting_a_new_pin(
 
     replay = _run("finish", state, token=token)
     assert replay.returncode == 0, replay.stderr
-    assert _read_record(_completion(state, token))["reason"] == "full_round_complete"
+    assert _read_record(_release_receipt(state, token))["reason"] == "full_round_released"
     assert not _marker(state, token).exists()
     assert not (state / ".round_inflight.lockdir").exists()
     assert list(state.glob(".round_inflight.lockdir.release-*")) == []
@@ -839,7 +839,7 @@ def test_pending_release_recovery_revalidates_the_transition_pin_role(
     pin_record["role"] = "state_writer"
     _rewrite_record(ready, pin_record)
 
-    verified = _run("verify-completion", state, token=token)
+    verified = _run("verify-release", state, token=token)
     assert verified.returncode != 0
     assert "pending release process pin role mismatch" in verified.stderr
     replacement = _run(
@@ -852,7 +852,7 @@ def test_pending_release_recovery_revalidates_the_transition_pin_role(
     assert replacement.returncode != 0
     assert "pending release process pin role mismatch" in replacement.stderr
     assert _generation(state)["token"] == token
-    assert not _completion(state, token).exists()
+    assert not _release_receipt(state, token).exists()
 
 
 def test_inflight_publish_retry_reuses_the_immutable_record_and_cleans_temp(
@@ -920,7 +920,7 @@ def test_fast_release_paths_reject_a_different_pin_role(tmp_path: Path) -> None:
     assert early.returncode != 0
     assert "process pin role mismatch" in early.stderr
     assert (dorado_state / ".round_inflight.lockdir").is_dir()
-    assert not _completion(dorado_state, dorado_token).exists()
+    assert not _release_receipt(dorado_state, dorado_token).exists()
 
     abort_state = tmp_path / "abort-state"
     abort_token, abort_pin = _acquire(abort_state)
@@ -936,10 +936,10 @@ def test_fast_release_paths_reject_a_different_pin_role(tmp_path: Path) -> None:
     aborted = _run("abort", abort_state, token=abort_token, pin_token=abort_pin)
     assert aborted.returncode == 0, aborted.stderr
     assert (abort_state / ".round_inflight.lockdir").is_dir()
-    assert not _completion(abort_state, abort_token).exists()
+    assert not _release_receipt(abort_state, abort_token).exists()
 
 
-def test_tampered_completion_receipt_fails_closed(tmp_path: Path) -> None:
+def test_tampered_release_receipt_fails_closed(tmp_path: Path) -> None:
     state = tmp_path / "state"
     token, pin_token = _acquire(state, scope="dorado_only")
     assert _run(
@@ -949,14 +949,14 @@ def test_tampered_completion_receipt_fails_closed(tmp_path: Path) -> None:
         token=token,
         pin_token=pin_token,
     ).returncode == 0
-    receipt = _completion(state, token)
+    receipt = _release_receipt(state, token)
     receipt.write_text(
         receipt.read_text(encoding="utf-8").replace(
             "reason\tdorado_only_early", "reason\tforged"
         ),
         encoding="utf-8",
     )
-    verified = _run("verify-completion", state, scope="dorado_only", token=token)
+    verified = _run("verify-release", state, scope="dorado_only", token=token)
     assert verified.returncode != 0
     assert "malformed record" in verified.stderr
 
@@ -985,18 +985,18 @@ def test_early_release_validates_an_existing_exact_marker(tmp_path: Path) -> Non
     assert released.returncode != 0
     assert "handoff marker does not match" in released.stderr
     assert (state / ".round_inflight.lockdir").is_dir()
-    assert not _completion(state, token).exists()
+    assert not _release_receipt(state, token).exists()
 
 
-def test_pre_handoff_abort_is_not_a_resumable_completion(tmp_path: Path) -> None:
+def test_pre_handoff_abort_is_not_a_resumable_release_receipt(tmp_path: Path) -> None:
     state = tmp_path / "state"
     token, pin_token = _acquire(state)
     aborted = _run("abort", state, token=token, pin_token=pin_token)
     assert aborted.returncode == 0, aborted.stderr
-    assert _read_record(_completion(state, token))["reason"] == "pre_handoff_abort"
-    verified = _run("verify-completion", state, token=token)
+    assert _read_record(_release_receipt(state, token))["reason"] == "pre_handoff_abort"
+    verified = _run("verify-release", state, token=token)
     assert verified.returncode != 0
-    assert "pre-handoff abort is not a resumable completion" in verified.stderr
+    assert "pre-handoff abort is not a resumable release" in verified.stderr
 
 
 def test_dead_same_host_pid_is_reclaimed_without_waiting_for_ttl(tmp_path: Path) -> None:
