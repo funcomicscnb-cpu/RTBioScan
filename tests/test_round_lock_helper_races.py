@@ -446,15 +446,22 @@ def test_unmodified_control_release_still_succeeds(tmp_path: Path) -> None:
 @pytest.mark.xfail(
     strict=False,
     reason=(
-        "KNOWN DEFECT, not yet fixed. Concurrent recovery of one interrupted "
-        "release is still not idempotent. Cleanup is now single-winner and the "
-        "authorizing-pin read tolerates a claimed quarantine, but every read in "
-        "the recovery loop can still observe the directory vanish: the failure "
-        "has moved from 'cannot remove ...' to 'lost its authenticated process "
-        "pin' to 'quarantine lacks a valid transition' as each was patched. "
-        "Fixing it properly needs the structural protocol -- one operation-bound "
-        "state machine over the whole per-entry body -- rather than tolerating "
-        "disappearance at each read in turn. Intermittent, so strict=False."
+        "KNOWN DEFECT, not fixed, and this marker does NOT gate it: xfail "
+        "exits 0 on both XFAIL and XPASS, so this reproducer is explicitly "
+        "non-gating while the branch is incomplete. strict=True would not help "
+        "either -- it only fails on XPASS and still accepts the known failure. "
+        "The marker must be deleted, not tightened, once the fix lands.\n\n"
+        "Concurrent recovery of one interrupted release is not idempotent. "
+        "Every read in recover_quarantines can observe the quarantine vanish "
+        "under it, producing three failure classes: concurrent remove_tree, "
+        "'pending release lost its authenticated process pin', and 'quarantine "
+        "lacks a valid transition'. Measured 13 failures in 96 concurrent "
+        "recoveries.\n\n"
+        "A cleanup-claim protocol was attempted and withdrawn in 371c1f3: "
+        "claiming by rename moved the tree outside the recovery scan namespace "
+        "(orphaning it on crash), and making claims enumerable to fix that made "
+        "live claims stealable. The fix needs an owner-identity and liveness "
+        "contract, not another rename."
     ),
 )
 def test_concurrent_release_recovery_is_single_winner(tmp_path: Path) -> None:
@@ -493,14 +500,35 @@ def test_concurrent_release_recovery_is_single_winner(tmp_path: Path) -> None:
 
         env = dict(os.environ)
         env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-quarantine-rename"
-        subprocess.run(
+        injected = subprocess.run(
             ["perl", str(SCRIPT), "early-release", *base,
              "--token", tokens["generation_token"],
              "--pin-token", tokens["pin_token"]],
             capture_output=True, text=True, check=False, env=env,
         )
-        quarantines = list(state.glob(".round_inflight.lockdir.*"))
-        assert quarantines, "setup failed: no release quarantine was left behind"
+        # Prove the interleaving was actually established. Without these, a
+        # failpoint that silently stopped working would leave the recoverers
+        # running against whatever state happened to exist.
+        assert injected.returncode != 0, injected.stdout
+        assert "injected failure" in injected.stderr, injected.stderr
+
+        quarantines = [
+            path for path in state.glob(".round_inflight.lockdir.*")
+            if path.is_dir()
+        ]
+        assert len(quarantines) == 1, quarantines
+        quarantine = quarantines[0]
+        transition = dict(
+            line.split("\t", 1)
+            for line in (quarantine / "transition.tsv").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if "\t" in line
+        )
+        assert transition["action"] == "release", transition
+        assert quarantine.name.endswith(transition["operation_token"]), (
+            quarantine.name, transition["operation_token"],
+        )
 
         procs = [
             subprocess.Popen(
@@ -518,3 +546,61 @@ def test_concurrent_release_recovery_is_single_winner(tmp_path: Path) -> None:
 
     assert total == 48
     assert not failures, f"{len(failures)}/{total} recoveries failed: {failures[:3]}"
+
+
+def test_after_quarantine_rename_failpoint_establishes_the_interleaving(
+    tmp_path: Path,
+) -> None:
+    """Gate the reproducer's setup, which its own xfail marker cannot.
+
+    The concurrency reproducer below is marked xfail, and that marker absorbs
+    setup failures as XFAIL exactly as it absorbs the defect -- verified by
+    disabling the failpoint, which produced XFAIL rather than an error. Its
+    inline setup assertions are therefore documentation, not enforcement.
+
+    This test is unmarked and must pass, so a failpoint that silently stopped
+    working fails here instead of masquerading as the race reproducing.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+    base = [
+        "--state-dir", str(state), "--round-barcode", "r",
+        "--scope", "dorado_only", "--owner-pid", str(os.getpid()),
+        "--stale-seconds", "30", "--wait-seconds", "5",
+    ]
+    acquired = subprocess.run(
+        ["perl", str(SCRIPT), "acquire", *base],
+        capture_output=True, text=True, check=False,
+    )
+    assert acquired.returncode == 0, acquired.stderr
+    tokens = dict(
+        line.split("=", 1)
+        for line in acquired.stdout.strip().splitlines()
+        if "=" in line
+    )
+
+    env = dict(os.environ)
+    env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-quarantine-rename"
+    injected = subprocess.run(
+        ["perl", str(SCRIPT), "early-release", *base,
+         "--token", tokens["generation_token"],
+         "--pin-token", tokens["pin_token"]],
+        capture_output=True, text=True, check=False, env=env,
+    )
+    assert injected.returncode != 0, injected.stdout
+    assert "injected failure" in injected.stderr, injected.stderr
+
+    quarantines = [
+        path for path in state.glob(".round_inflight.lockdir.*") if path.is_dir()
+    ]
+    assert len(quarantines) == 1, quarantines
+    transition = dict(
+        line.split("\t", 1)
+        for line in (quarantines[0] / "transition.tsv").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if "\t" in line
+    )
+    assert transition["action"] == "release", transition
+    assert quarantines[0].name.endswith(transition["operation_token"])
+    assert not (state / ".round_inflight.lockdir").exists()
