@@ -26,6 +26,7 @@ BEGIN {
 }
 
 my $SCHEMA = '1';
+my $OPERATOR_SCHEMA = '2';
 my $TOKEN_RE = qr/\A[0-9a-f]{64}\z/;
 
 sub usage {
@@ -46,6 +47,9 @@ Commands:
   operator-quarantine-invalid
                  preserve an explicitly identified invalid lock outside runtime
                  recovery after an operator has stopped all related tasks
+  operator-quarantine-unrecoverable
+                 preserve an exact valid generation whose subordinate state is
+                 structurally unrecoverable, after every writer is stopped
 
 Runtime options:
   --state-dir DIR --round-barcode NAME --scope full_round|dorado_only
@@ -63,6 +67,10 @@ Operator quarantine options:
   --expected-lock-dev N --expected-lock-ino N --operation-token HEX64
   --operator-label TEXT --reason TEXT --confirm-invalid-snapshot
   [--source-name BASENAME]
+
+Stopped-world valid-generation quarantine additionally requires:
+  --expected-generation-token HEX64 --confirm-stopped-world
+  --confirm-abandon-generation HEX64
 USAGE
 }
 
@@ -390,6 +398,32 @@ sub ensure_real_directory {
     return;
 }
 
+sub path_occupied_nofollow {
+    my ($path, $description) = @_;
+    my @st = lstat($path);
+    return 1 if @st;
+    return 0 if $!{ENOENT};
+    die "ERROR: cannot inspect $description '$path': $!\n";
+}
+
+sub assert_fenced_directory_move_ready {
+    my (%arg) = @_;
+    my @source = lstat($arg{source});
+    die "ERROR: cannot inspect fenced directory move source '$arg{source}': $!\n"
+        if !@source;
+    die "ERROR: fenced directory move source is not a real directory: $arg{source}\n"
+        if -l _ || !-d _;
+    die "ERROR: fenced directory move source identity changed: $arg{source}\n"
+        if $source[0] != $arg{expected_dev}
+        || $source[1] != $arg{expected_ino};
+    my @destination = lstat($arg{destination});
+    die "ERROR: fenced directory move destination already exists: $arg{destination}\n"
+        if @destination;
+    die "ERROR: cannot inspect fenced directory move destination "
+        . "'$arg{destination}': $!\n"
+        if !$!{ENOENT};
+}
+
 sub canonical_body {
     my ($values_ref, $order_ref) = @_;
     return join('', map { "$_\t$values_ref->{$_}\n" } @{$order_ref});
@@ -590,11 +624,15 @@ my @RELEASE_ORDER = qw(schema token round_barcode scope outcome reason effective
 my @REVOCATION_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds reclaim_transition_epoch lock_dev lock_ino operation_token);
 my @EVENT_ORDER = qw(schema event_id generation_token round_barcode scope event outcome effective_ttl_seconds event_epoch lock_dev lock_ino);
 my @INFLIGHT_ORDER = qw(round_barcode started_utc read_file generation_token scope lock_dev lock_ino);
-my @OPERATOR_EVENT_ORDER = qw(schema operation_token phase operator_label reason source_name destination_name lock_dev lock_ino generation_status generation_entry_kind generation_sha256 generation_entry_fingerprint transition_status transition_entry_kind transition_sha256 transition_entry_fingerprint event_epoch outcome);
+my @OPERATOR_EVENT_ORDER = qw(schema operation_token operation_kind expected_generation_token recovery_basis phase operator_label reason source_name destination_name lock_dev lock_ino tree_sha256 generation_status generation_entry_kind generation_sha256 generation_entry_fingerprint pins_status pins_entry_kind pins_sha256 pins_entry_fingerprint transition_status transition_entry_kind transition_sha256 transition_entry_fingerprint marker_status marker_entry_kind marker_sha256 marker_entry_fingerprint release_authority_status finalization_status finalization_sha256 event_epoch outcome);
 my @OPERATOR_EVIDENCE_FIELDS = qw(
+    recovery_basis tree_sha256
     generation_status generation_entry_kind generation_sha256
-    generation_entry_fingerprint transition_status transition_entry_kind
-    transition_sha256 transition_entry_fingerprint
+    generation_entry_fingerprint pins_status pins_entry_kind pins_sha256
+    pins_entry_fingerprint transition_status transition_entry_kind
+    transition_sha256 transition_entry_fingerprint marker_status
+    marker_entry_kind marker_sha256 marker_entry_fingerprint
+    release_authority_status finalization_status finalization_sha256
 );
 
 sub record_for {
@@ -612,7 +650,7 @@ sub transition_record {
     return record_for(transition_path($dir), \@TRANSITION_ORDER);
 }
 
-sub operator_evidence_entry {
+sub operator_evidence_entry_shallow {
     my ($path) = @_;
     my @before = lstat($path);
     return {
@@ -658,6 +696,47 @@ sub operator_evidence_entry {
     };
 }
 
+sub operator_directory_manifest_add {
+    my ($digest, $directory, $prefix) = @_;
+    # Adopt every visible descendant namespace before treating its names as
+    # durable operator evidence. A writer may have died after linking a child
+    # and before syncing this particular directory.
+    sync_directory($directory);
+    opendir(my $dh, $directory)
+        or die "ERROR: cannot inspect operator evidence directory '$directory': $!\n";
+    my @entries = sort grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+    closedir($dh)
+        or die "ERROR: cannot close operator evidence directory '$directory': $!\n";
+    for my $entry (@entries) {
+        my $path = File::Spec->catfile($directory, $entry);
+        my $relative = $prefix eq '' ? $entry : "$prefix/$entry";
+        my $evidence = operator_evidence_entry_shallow($path);
+        for my $value (
+            $relative, $evidence->{entry_kind}, $evidence->{sha256},
+            $evidence->{fingerprint},
+        ) {
+            $digest->add(pack('N', length($value)), $value);
+        }
+        operator_directory_manifest_add($digest, $path, $relative)
+            if $evidence->{entry_kind} eq 'directory';
+    }
+}
+
+sub operator_directory_manifest_sha256 {
+    my ($directory) = @_;
+    my $digest = Digest::SHA->new(256);
+    operator_directory_manifest_add($digest, $directory, '');
+    return $digest->hexdigest();
+}
+
+sub operator_evidence_entry {
+    my ($path) = @_;
+    my $evidence = operator_evidence_entry_shallow($path);
+    $evidence->{sha256} = operator_directory_manifest_sha256($path)
+        if $evidence->{entry_kind} eq 'directory';
+    return $evidence;
+}
+
 sub lock_snapshot {
     my ($dir) = @_;
     my @dir_st = lstat($dir);
@@ -676,7 +755,6 @@ sub lock_snapshot {
     my $generation;
     my $ok = eval { $generation = generation_record($dir); 1 };
     if (!$ok) {
-        $snapshot->{malformed_error} = $@;
         $snapshot->{generation_status} = 'parse-invalid';
         return $snapshot;
     }
@@ -722,13 +800,434 @@ sub invalid_snapshot_error {
 }
 
 sub operator_transition_status {
-    my ($dir, $entry) = @_;
+    my ($dir, $entry, $snapshot) = @_;
     my $path = transition_path($dir);
     return 'absent' if $entry->{entry_kind} eq 'absent';
     my $record;
     my $ok = eval { $record = transition_record($dir); 1 };
-    return $ok && defined($record)
-        ? 'present-nonauthoritative' : 'parse-invalid';
+    return 'parse-invalid' if !$ok || !defined($record);
+    return 'semantic-invalid'
+        if !defined($snapshot) || !$snapshot->{valid}
+        || !validate_transition_for_snapshot($record, $snapshot);
+    return $record->{action} eq 'reclaim'
+        ? 'valid-reclaim' : 'valid-release';
+}
+
+sub operator_pins_evidence {
+    my ($dir, $snapshot) = @_;
+    my $path = pins_dir($dir);
+    my $entry_evidence = operator_evidence_entry($path);
+    return {
+        status => 'missing', %{$entry_evidence},
+    } if $entry_evidence->{entry_kind} eq 'absent';
+    return {
+        status => 'unsafe', %{$entry_evidence},
+    } if $entry_evidence->{entry_kind} ne 'directory';
+    sync_directory($path);
+    opendir(my $dh, $path)
+        or die "ERROR: cannot inspect generation pins '$path': $!\n";
+    my @entries = sort grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+    closedir($dh)
+        or die "ERROR: cannot close generation pins '$path': $!\n";
+    my $status = 'healthy';
+    my @ready_tokens;
+    for my $entry (@entries) {
+        next if $entry !~ /\Aready\.([0-9a-f]{64})\.tsv\z/;
+        my $pin_token = $1;
+        my $pin;
+        my $ok = eval {
+            $pin = record_for(
+                pin_ready_path($dir, $pin_token), \@PIN_ORDER,
+            );
+            1;
+        };
+        $status = 'record-invalid'
+            if !$ok || !defined($pin)
+            || !validate_pin_for_snapshot($pin, $snapshot)
+            || $pin->{pin_token} ne $pin_token;
+        push(@ready_tokens, $pin_token)
+            if $ok && defined($pin)
+            && validate_pin_for_snapshot($pin, $snapshot)
+            && $pin->{pin_token} eq $pin_token;
+    }
+    return {
+        status => $status,
+        entry_kind => 'directory',
+        sha256 => operator_directory_manifest_sha256($path),
+        fingerprint => $entry_evidence->{fingerprint},
+        ready_tokens => \@ready_tokens,
+    };
+}
+
+sub operator_marker_evidence {
+    my ($state_dir, $snapshot) = @_;
+    return {
+        status => 'not-applicable', entry_kind => 'absent',
+        sha256 => 'none', fingerprint => 'none',
+    } if !$snapshot->{valid};
+    my $generation = $snapshot->{generation};
+    my $path = marker_path($state_dir, $generation->{token});
+    my $evidence = operator_evidence_entry($path);
+    return { status => 'absent', %{$evidence} }
+        if $evidence->{entry_kind} eq 'absent';
+    my $marker;
+    my $ok = eval { $marker = record_for($path, \@MARKER_ORDER); 1 };
+    my $valid = $ok && defined($marker)
+        && $marker->{schema} eq $SCHEMA
+        && $marker->{token} eq $generation->{token}
+        && $marker->{round_barcode} eq $generation->{round_barcode}
+        && $marker->{scope} eq $generation->{scope}
+        && $marker->{outcome} eq 'handoff'
+        && $marker->{created_epoch} =~ /\A[0-9]+\z/;
+    return { status => $valid ? 'valid' : 'invalid', %{$evidence} };
+}
+
+sub operator_release_authority_status {
+    my (%arg) = @_;
+    return 'not-applicable'
+        if $arg{transition_status} ne 'valid-release';
+    my $snapshot = $arg{snapshot};
+    my $generation = $snapshot->{generation};
+    my $transition = transition_record($arg{source_path});
+    my $reason = $transition->{reason};
+    my $reason_matches_scope = $generation->{scope} eq 'full_round'
+        ? ($reason eq 'full_round_released' || $reason eq 'pre_handoff_abort')
+        : ($reason eq 'dorado_only_early' || $reason eq 'pre_handoff_abort');
+    return 'reason-scope-invalid' if !$reason_matches_scope;
+    if ($reason eq 'pre_handoff_abort') {
+        return 'marker-conflict' if $arg{marker_status} ne 'absent';
+    } else {
+        return 'marker-missing' if $arg{marker_status} eq 'absent';
+        return 'marker-invalid' if $arg{marker_status} ne 'valid';
+    }
+    return 'pin-invalid'
+        if $arg{pins_status} eq 'missing' || $arg{pins_status} eq 'unsafe';
+    my $pin_path = pin_ready_path(
+        $arg{source_path}, $transition->{allowed_pin_token},
+    );
+    my $pin;
+    my $ok = eval { $pin = record_for($pin_path, \@PIN_ORDER); 1 };
+    return 'pin-missing' if $ok && !defined($pin);
+    return 'pin-invalid'
+        if !$ok || !validate_pin_for_snapshot($pin, $snapshot)
+        || $pin->{pin_token} ne $transition->{allowed_pin_token};
+    return 'pin-role-invalid'
+        if $pin->{role} ne release_pin_role($reason);
+    return 'valid';
+}
+
+sub operator_recovery_basis {
+    my (%arg) = @_;
+    my $snapshot = $arg{snapshot};
+    return 'generation-invalid' if !$snapshot->{valid};
+    my $transition_status = $arg{transition_status};
+    if ($arg{source_name}
+        =~ /\A\.round_inflight\.lockdir\.(reclaim|release)-([0-9a-f]{64})\z/) {
+        my ($name_action, $name_token) = ($1, $2);
+        return 'transition-orphan-invalid'
+            if $transition_status eq 'absent'
+            || $transition_status eq 'parse-invalid'
+            || $transition_status eq 'semantic-invalid';
+        my $transition = transition_record($arg{source_path});
+        return 'transition-orphan-invalid'
+            if !defined($transition)
+            || $transition->{action} ne $name_action
+            || $transition->{operation_token} ne $name_token;
+        return 'release-authority-invalid'
+            if $transition_status eq 'valid-release'
+            && $arg{release_authority_status} ne 'valid';
+        return 'healthy';
+    }
+    return 'release-authority-invalid'
+        if $transition_status eq 'valid-release'
+        && $arg{release_authority_status} ne 'valid';
+    return 'marker-invalid'
+        if $transition_status eq 'absent'
+        && $arg{marker_status} eq 'invalid';
+    my $pins_status = $arg{pins_status};
+    return 'pins-missing' if $pins_status eq 'missing';
+    return 'pins-unsafe' if $pins_status eq 'unsafe';
+    return 'pins-record-invalid' if $pins_status eq 'record-invalid';
+    return 'transition-parse-invalid'
+        if $transition_status eq 'parse-invalid';
+    return 'transition-semantic-invalid'
+        if $transition_status eq 'semantic-invalid';
+    return 'healthy';
+}
+
+sub operator_named_evidence_sha256 {
+    my (@items) = @_;
+    my $digest = Digest::SHA->new(256);
+    my $domain = 'RTBioScan-round-lock-operator-finalization-v1';
+    $digest->add(pack('N', length($domain)), $domain);
+    for my $item (@items) {
+        my ($label, $evidence) = @{$item};
+        for my $value (
+            $label, $evidence->{entry_kind}, $evidence->{sha256},
+            $evidence->{fingerprint},
+        ) {
+            $digest->add(pack('N', length($value)), $value);
+        }
+    }
+    return $digest->hexdigest();
+}
+
+sub operator_existing_record_matches {
+    my ($path, $order_ref, $expected_ref, $evidence) = @_;
+    return 1 if $evidence->{entry_kind} eq 'absent';
+    return 0 if $evidence->{entry_kind} ne 'regular';
+    my $record;
+    my $ok = eval { $record = record_for($path, $order_ref); 1 };
+    return 0 if !$ok || !defined($record);
+    return canonical_body($record, $order_ref)
+        eq canonical_body($expected_ref, $order_ref);
+}
+
+sub assert_operator_abandonment_global_paths_safe {
+    my ($state_dir) = @_;
+    my $compat_path = inflight_compat_path($state_dir);
+    my @compat_st = lstat($compat_path);
+    if (@compat_st) {
+        die "ERROR: operator quarantine cannot restore liveness while the "
+            . "compatibility inflight diagnostic is a directory: $compat_path\n"
+            if !-l _ && -d _;
+    } elsif (!$!{ENOENT}) {
+        die "ERROR: cannot inspect compatibility inflight diagnostic "
+            . "'$compat_path': $!\n";
+    }
+
+    my $event_dir = events_dir($state_dir);
+    my @event_dir_st = lstat($event_dir);
+    if (@event_dir_st) {
+        die "ERROR: operator quarantine cannot restore liveness with an "
+            . "unsafe round-lock event directory: $event_dir\n"
+            if -l _ || !-d _;
+        sync_directory($event_dir);
+    } elsif (!$!{ENOENT}) {
+        die "ERROR: cannot inspect round-lock event directory '$event_dir': $!\n";
+    }
+}
+
+sub operator_finalization_evidence {
+    my (%arg) = @_;
+    return { status => 'not-applicable', sha256 => 'none' }
+        if $arg{local_basis} ne 'healthy'
+        || $arg{transition_status}
+            !~ /\A(?:valid-reclaim|valid-release)\z/;
+    my $transition = transition_record($arg{source_path});
+    return { status => 'not-applicable', sha256 => 'none' }
+        if !defined($transition);
+    my $is_canonical = $arg{source_name} eq '.round_inflight.lockdir';
+    if (!$is_canonical) {
+        return { status => 'not-applicable', sha256 => 'none' }
+            if $arg{source_name}
+                !~ /\A\.round_inflight\.lockdir\.(reclaim|release)-([0-9a-f]{64})\z/
+            || $transition->{action} ne $1
+            || $transition->{operation_token} ne $2;
+    }
+    return { status => 'not-applicable', sha256 => 'none' }
+        if $transition->{action} eq 'release'
+        && $arg{release_authority_status} ne 'valid';
+    if ($is_canonical) {
+        return { status => 'not-applicable', sha256 => 'none' }
+            if $arg{pins_status} ne 'healthy';
+        my @ready = @{$arg{ready_tokens} // []};
+        if ($transition->{action} eq 'release') {
+            return { status => 'not-applicable', sha256 => 'none' }
+                if grep { $_ ne $transition->{allowed_pin_token} } @ready;
+        } else {
+            return { status => 'not-applicable', sha256 => 'none' }
+                if @ready;
+        }
+    }
+
+    my $snapshot = $arg{snapshot};
+    my $generation = $snapshot->{generation};
+    my @items;
+    my $status = 'ready';
+    if ($is_canonical) {
+        my $inflight_path = inflight_generation_path(
+            $arg{state_dir}, $generation->{token},
+        );
+        my $inflight_evidence = operator_evidence_entry($inflight_path);
+        push(@items, [
+            ".round_inflight.$generation->{token}.tsv", $inflight_evidence,
+        ]);
+        if ($inflight_evidence->{entry_kind} ne 'absent') {
+            my $inflight;
+            my $ok = eval {
+                $inflight = record_for($inflight_path, \@INFLIGHT_ORDER);
+                1;
+            };
+            my $valid = $ok && defined($inflight)
+                && $inflight->{generation_token} eq $generation->{token}
+                && $inflight->{round_barcode} eq $generation->{round_barcode}
+                && $inflight->{scope} eq $generation->{scope}
+                && $inflight->{lock_dev} eq "$snapshot->{dev}"
+                && $inflight->{lock_ino} eq "$snapshot->{ino}";
+            $status = 'inflight-invalid' if !$valid;
+            my $compat_path = inflight_compat_path($arg{state_dir});
+            my $compat_evidence = operator_evidence_entry($compat_path);
+            push(@items, ['round_inflight.txt', $compat_evidence]);
+            $status = 'unsupported'
+                if $compat_evidence->{entry_kind} eq 'directory';
+            if ($valid && $compat_evidence->{entry_kind} ne 'absent') {
+                my $compat_body = join(
+                    '',
+                    "round_barcode=$inflight->{round_barcode}\n",
+                    "started_utc=$inflight->{started_utc}\n",
+                    "read_file=$inflight->{read_file}\n",
+                    "generation_token=$inflight->{generation_token}\n",
+                    "scope=$inflight->{scope}\n",
+                    "lock_dev=$inflight->{lock_dev}\n",
+                    "lock_ino=$inflight->{lock_ino}\n",
+                );
+                my $expected_compat = $compat_body
+                    . 'record_sha256=' . sha256_hex($compat_body) . "\n";
+                $status = 'compat-invalid'
+                    if $status eq 'ready'
+                    && ($compat_evidence->{entry_kind} ne 'regular'
+                        || $compat_evidence->{sha256}
+                            ne sha256_hex($expected_compat));
+            }
+        }
+    }
+
+    my ($receipt_path, $receipt_order, %receipt);
+    if ($transition->{action} eq 'release') {
+        $receipt_path = release_path(
+            $arg{state_dir}, $generation->{token},
+        );
+        $receipt_order = \@RELEASE_ORDER;
+        %receipt = (
+            schema => $SCHEMA, token => $generation->{token},
+            round_barcode => $generation->{round_barcode},
+            scope => $generation->{scope}, outcome => 'released',
+            reason => $transition->{reason},
+            effective_ttl_seconds => $generation->{effective_ttl_seconds},
+            release_transition_epoch => $transition->{started_epoch},
+            lock_dev => $snapshot->{dev}, lock_ino => $snapshot->{ino},
+            operation_token => $transition->{operation_token},
+        );
+    } else {
+        $receipt_path = revocation_path(
+            $arg{state_dir}, $generation->{token},
+        );
+        $receipt_order = \@REVOCATION_ORDER;
+        %receipt = (
+            schema => $SCHEMA, token => $generation->{token},
+            round_barcode => $generation->{round_barcode},
+            scope => $generation->{scope}, outcome => 'revoked',
+            reason => $transition->{reason},
+            effective_ttl_seconds => $generation->{effective_ttl_seconds},
+            reclaim_transition_epoch => $transition->{started_epoch},
+            lock_dev => $snapshot->{dev}, lock_ino => $snapshot->{ino},
+            operation_token => $transition->{operation_token},
+        );
+    }
+    my $receipt_evidence = operator_evidence_entry($receipt_path);
+    my $receipt_relative = $transition->{action} eq 'release'
+        ? ".round_lock_release.$generation->{token}.tsv"
+        : ".round_lock_revocation.$generation->{token}.tsv";
+    push(@items, [$receipt_relative, $receipt_evidence]);
+
+    my $opposite_path = $transition->{action} eq 'release'
+        ? revocation_path($arg{state_dir}, $generation->{token})
+        : release_path($arg{state_dir}, $generation->{token});
+    my $opposite_relative = $transition->{action} eq 'release'
+        ? ".round_lock_revocation.$generation->{token}.tsv"
+        : ".round_lock_release.$generation->{token}.tsv";
+    my $opposite_evidence = operator_evidence_entry($opposite_path);
+    push(@items, [$opposite_relative, $opposite_evidence]);
+    $status = 'opposite-outcome-conflict'
+        if $status eq 'ready'
+        && $opposite_evidence->{entry_kind} ne 'absent';
+    $status = 'receipt-invalid'
+        if $status eq 'ready'
+        && !operator_existing_record_matches(
+            $receipt_path, $receipt_order, \%receipt, $receipt_evidence,
+        );
+
+    my $event_dir = events_dir($arg{state_dir});
+    my @event_dir_st = lstat($event_dir);
+    if (@event_dir_st) {
+        die "ERROR: round-lock event directory is not a real directory: $event_dir\n"
+            if -l _ || !-d _;
+        sync_directory($event_dir);
+    } elsif (!$!{ENOENT}) {
+        die "ERROR: cannot inspect round-lock event directory '$event_dir': $!\n";
+    }
+    my $event_action = $transition->{action};
+    my $event_path = File::Spec->catfile(
+        $event_dir,
+        join(
+            '.', $generation->{token}, $event_action,
+            $transition->{operation_token},
+        ) . '.tsv',
+    );
+    my %event = (
+        schema => $SCHEMA, event_id => $transition->{operation_token},
+        generation_token => $generation->{token},
+        round_barcode => $generation->{round_barcode},
+        scope => $generation->{scope}, event => $event_action,
+        outcome => $transition->{action} eq 'reclaim'
+            ? 'quarantined' : $transition->{reason},
+        effective_ttl_seconds => $generation->{effective_ttl_seconds},
+        event_epoch => $transition->{started_epoch},
+        lock_dev => $snapshot->{dev}, lock_ino => $snapshot->{ino},
+    );
+    my $event_evidence = operator_evidence_entry($event_path);
+    my $event_relative = join(
+        '/', '.round_lock_events',
+        join(
+            '.', $generation->{token}, $event_action,
+            $transition->{operation_token},
+        ) . '.tsv',
+    );
+    push(@items, [$event_relative, $event_evidence]);
+    $status = 'event-invalid'
+        if $status eq 'ready'
+        && !operator_existing_record_matches(
+            $event_path, \@EVENT_ORDER, \%event, $event_evidence,
+        );
+
+    my $archive_path = File::Spec->catdir(
+        terminal_archive_dir($arg{state_dir}),
+        "$transition->{action}-$transition->{operation_token}",
+    );
+    my $archive_evidence = operator_evidence_entry($archive_path);
+    push(@items, [
+        ".round_lock_archives/$transition->{action}-$transition->{operation_token}",
+        $archive_evidence,
+    ]);
+    $status = 'archive-collision'
+        if $status eq 'ready'
+        && $archive_evidence->{entry_kind} ne 'absent';
+    return {
+        status => $status,
+        sha256 => operator_named_evidence_sha256(@items),
+    };
+}
+
+sub operator_snapshot_matches_policy {
+    my ($snapshot, $basis, $arg_ref) = @_;
+    if ($arg_ref->{operation_kind} eq 'invalid_snapshot') {
+        return !$snapshot->{valid} && $basis eq 'generation-invalid';
+    }
+    return $snapshot->{valid}
+        && $snapshot->{generation}->{token}
+            eq $arg_ref->{expected_generation_token}
+        && $basis ne 'healthy'
+        && $basis ne 'generation-invalid';
+}
+
+sub operator_policy_error {
+    my ($arg_ref, $basis) = @_;
+    return "ERROR: operator quarantine refuses a valid generation\n"
+        if $arg_ref->{operation_kind} eq 'invalid_snapshot';
+    return "ERROR: operator quarantine generation token does not match confirmation\n"
+        if $basis eq 'generation-token-mismatch';
+    return "ERROR: operator quarantine refuses a structurally recoverable generation\n";
 }
 
 sub operator_event_path {
@@ -836,6 +1335,9 @@ sub operator_pending_tokens {
     my $path = operator_pending_dir($state_dir);
     my @st = lstat($path);
     return () if !@st && $!{ENOENT};
+    # Adopt a pending link (or removal) left visible by a process killed before
+    # its own parent-directory barrier, before enumeration makes it authority.
+    sync_directory($path);
     opendir(my $dh, $path)
         or die "ERROR: cannot inspect operator pending directory '$path': $!\n";
     my @tokens;
@@ -887,16 +1389,44 @@ sub valid_operator_entry_evidence {
         if $kind eq 'absent';
     return $sha =~ $TOKEN_RE && $fingerprint =~ $TOKEN_RE
         if $kind eq 'regular';
+    return $sha =~ $TOKEN_RE && $fingerprint =~ $TOKEN_RE
+        if $kind eq 'directory';
     return $sha eq 'none' && $fingerprint =~ $TOKEN_RE
-        if $kind =~ /\A(?:regular-unreadable|symlink|directory|fifo|other)\z/;
+        if $kind =~ /\A(?:regular-unreadable|symlink|fifo|other)\z/;
+    return 0;
+}
+
+sub valid_operator_pins_evidence {
+    my ($record) = @_;
+    my $status = $record->{pins_status} // '';
+    my $kind = $record->{pins_entry_kind} // '';
+    my $sha = $record->{pins_sha256} // '';
+    my $fingerprint = $record->{pins_entry_fingerprint} // '';
+    return $kind eq 'absent' && $sha eq 'none' && $fingerprint eq 'none'
+        if $status eq 'missing';
+    return $kind ne 'absent' && $kind ne 'directory'
+        && valid_operator_entry_evidence($record, 'pins')
+        if $status eq 'unsafe';
+    return $kind eq 'directory' && $sha =~ $TOKEN_RE
+        && $fingerprint =~ $TOKEN_RE
+        if $status eq 'healthy' || $status eq 'record-invalid';
     return 0;
 }
 
 sub validate_operator_event_shape {
     my ($record, $operation_token, $phase) = @_;
     return 0 if !defined($record);
-    return $record->{schema} eq $SCHEMA
+    return $record->{schema} eq $OPERATOR_SCHEMA
         && $record->{operation_token} eq $operation_token
+        && $record->{operation_kind}
+            =~ /\A(?:invalid_snapshot|abandon_unrecoverable_generation)\z/
+        && (($record->{operation_kind} eq 'invalid_snapshot'
+                && $record->{expected_generation_token} eq 'none'
+                && $record->{recovery_basis} eq 'generation-invalid')
+            || ($record->{operation_kind} eq 'abandon_unrecoverable_generation'
+                && $record->{expected_generation_token} =~ $TOKEN_RE
+                && $record->{recovery_basis}
+                    =~ /\A(?:pins-missing|pins-unsafe|pins-record-invalid|transition-parse-invalid|transition-semantic-invalid|transition-orphan-invalid|marker-invalid|release-authority-invalid|finalization-invalid)\z/))
         && $record->{phase} eq $phase
         && $record->{operator_label} ne ''
         && $record->{operator_label} !~ /[\t\r\n]/
@@ -908,20 +1438,63 @@ sub validate_operator_event_shape {
             eq ".round_inflight.lockdir.operator-$operation_token"
         && $record->{lock_dev} =~ /\A[0-9]+\z/
         && $record->{lock_ino} =~ /\A[0-9]+\z/
+        && $record->{tree_sha256} =~ $TOKEN_RE
         && $record->{generation_status}
-            =~ /\A(?:absent|parse-invalid|semantic-invalid)\z/
+            =~ /\A(?:absent|parse-invalid|semantic-invalid|valid)\z/
+        && (($record->{operation_kind} eq 'invalid_snapshot'
+                && $record->{generation_status} ne 'valid')
+            || ($record->{operation_kind}
+                    eq 'abandon_unrecoverable_generation'
+                && $record->{generation_status} eq 'valid'))
         && valid_operator_entry_evidence($record, 'generation')
         && (($record->{generation_status} eq 'absent')
             == ($record->{generation_entry_kind} eq 'absent'))
         && ($record->{generation_status} ne 'semantic-invalid'
             || $record->{generation_entry_kind} eq 'regular')
+        && ($record->{generation_status} ne 'valid'
+            || $record->{generation_entry_kind} eq 'regular')
+        && $record->{pins_status}
+            =~ /\A(?:missing|unsafe|healthy|record-invalid)\z/
+        && valid_operator_pins_evidence($record)
         && $record->{transition_status}
-            =~ /\A(?:absent|parse-invalid|present-nonauthoritative)\z/
+            =~ /\A(?:absent|parse-invalid|semantic-invalid|valid-reclaim|valid-release)\z/
         && valid_operator_entry_evidence($record, 'transition')
         && (($record->{transition_status} eq 'absent')
             == ($record->{transition_entry_kind} eq 'absent'))
-        && ($record->{transition_status} ne 'present-nonauthoritative'
+        && ($record->{transition_status}
+                !~ /\A(?:semantic-invalid|valid-reclaim|valid-release)\z/
             || $record->{transition_entry_kind} eq 'regular')
+        && $record->{marker_status}
+            =~ /\A(?:not-applicable|absent|valid|invalid)\z/
+        && valid_operator_entry_evidence($record, 'marker')
+        && (($record->{marker_status}
+                =~ /\A(?:not-applicable|absent)\z/)
+            == ($record->{marker_entry_kind} eq 'absent'))
+        && ($record->{marker_status} ne 'valid'
+            || $record->{marker_entry_kind} eq 'regular')
+        && $record->{release_authority_status}
+            =~ /\A(?:not-applicable|valid|reason-scope-invalid|marker-missing|marker-invalid|marker-conflict|pin-missing|pin-invalid|pin-role-invalid)\z/
+        && (($record->{transition_status} eq 'valid-release')
+            == ($record->{release_authority_status} ne 'not-applicable'))
+        && ($record->{recovery_basis} ne 'finalization-invalid'
+            || ($record->{transition_status}
+                    =~ /\A(?:valid-reclaim|valid-release)\z/
+                && ($record->{source_name} ne '.round_inflight.lockdir'
+                    || $record->{pins_status} eq 'healthy')
+                && $record->{release_authority_status}
+                    =~ /\A(?:not-applicable|valid)\z/))
+        && ($record->{recovery_basis} ne 'release-authority-invalid'
+            || $record->{release_authority_status}
+                =~ /\A(?:reason-scope-invalid|marker-missing|marker-invalid|marker-conflict|pin-missing|pin-invalid|pin-role-invalid)\z/)
+        && $record->{finalization_status}
+            =~ /\A(?:not-applicable|inflight-invalid|compat-invalid|receipt-invalid|opposite-outcome-conflict|event-invalid|archive-collision)\z/
+        && (($record->{finalization_status} eq 'not-applicable'
+                && $record->{finalization_sha256} eq 'none')
+            || ($record->{finalization_status} ne 'not-applicable'
+                && $record->{finalization_sha256} =~ $TOKEN_RE))
+        && (($record->{recovery_basis} eq 'finalization-invalid')
+            == ($record->{finalization_status}
+                =~ /\A(?:inflight-invalid|compat-invalid|receipt-invalid|opposite-outcome-conflict|event-invalid|archive-collision)\z/))
         && $record->{event_epoch} =~ /\A[0-9]+\z/
         && $record->{outcome} eq ($phase eq 'intent' ? 'prepared' : 'quarantined');
 }
@@ -943,6 +1516,9 @@ sub validate_operator_event_for_args {
         $record, $arg_ref->{operation_token}, $phase,
     );
     return $record->{operator_label} eq $arg_ref->{operator_label}
+        && $record->{operation_kind} eq $arg_ref->{operation_kind}
+        && $record->{expected_generation_token}
+            eq $arg_ref->{expected_generation_token}
         && $record->{reason} eq $arg_ref->{reason}
         && $record->{source_name} eq $arg_ref->{source_name}
         && $record->{destination_name} eq $arg_ref->{destination_name}
@@ -953,6 +1529,10 @@ sub validate_operator_event_for_args {
 sub operator_evidence_values {
     my (%arg) = @_;
     my $snapshot = $arg{snapshot};
+    assert_operator_abandonment_global_paths_safe($arg{state_dir});
+    my $tree = operator_evidence_entry($arg{source_path});
+    die "ERROR: operator quarantine source evidence is not a directory\n"
+        if $tree->{entry_kind} ne 'directory';
     my $generation = operator_evidence_entry(
         generation_path($arg{source_path}),
     );
@@ -960,17 +1540,55 @@ sub operator_evidence_values {
         transition_path($arg{source_path}),
     );
     my $transition_status = operator_transition_status(
-        $arg{source_path}, $transition,
+        $arg{source_path}, $transition, $snapshot,
     );
+    my $pins = operator_pins_evidence($arg{source_path}, $snapshot);
+    my $marker = operator_marker_evidence($arg{state_dir}, $snapshot);
+    my $release_authority_status = operator_release_authority_status(
+        %arg, snapshot => $snapshot,
+        transition_status => $transition_status,
+        pins_status => $pins->{status}, marker_status => $marker->{status},
+    );
+    my $local_basis = operator_recovery_basis(
+        %arg, snapshot => $snapshot, pins_status => $pins->{status},
+        transition_status => $transition_status,
+        marker_status => $marker->{status},
+        release_authority_status => $release_authority_status,
+    );
+    my $finalization = operator_finalization_evidence(
+        %arg, snapshot => $snapshot, local_basis => $local_basis,
+        transition_status => $transition_status,
+        pins_status => $pins->{status},
+        ready_tokens => $pins->{ready_tokens},
+        release_authority_status => $release_authority_status,
+    );
+    my $recovery_basis = $local_basis;
+    $recovery_basis = 'finalization-invalid'
+        if $local_basis eq 'healthy'
+        && $finalization->{status}
+            =~ /\A(?:inflight-invalid|compat-invalid|receipt-invalid|opposite-outcome-conflict|event-invalid|archive-collision)\z/;
     return (
+        recovery_basis => $recovery_basis,
+        tree_sha256 => $tree->{sha256},
         generation_status => $snapshot->{generation_status},
         generation_entry_kind => $generation->{entry_kind},
         generation_sha256 => $generation->{sha256},
         generation_entry_fingerprint => $generation->{fingerprint},
+        pins_status => $pins->{status},
+        pins_entry_kind => $pins->{entry_kind},
+        pins_sha256 => $pins->{sha256},
+        pins_entry_fingerprint => $pins->{fingerprint},
         transition_status => $transition_status,
         transition_entry_kind => $transition->{entry_kind},
         transition_sha256 => $transition->{sha256},
         transition_entry_fingerprint => $transition->{fingerprint},
+        marker_status => $marker->{status},
+        marker_entry_kind => $marker->{entry_kind},
+        marker_sha256 => $marker->{sha256},
+        marker_entry_fingerprint => $marker->{fingerprint},
+        release_authority_status => $release_authority_status,
+        finalization_status => $finalization->{status},
+        finalization_sha256 => $finalization->{sha256},
     );
 }
 
@@ -1004,8 +1622,11 @@ sub assert_operator_operations_complete {
             if !@pending_st || !@audit_st
             || $pending_st[0] != $audit_st[0]
             || $pending_st[1] != $audit_st[1];
+        my $replay_command = $intent->{operation_kind} eq 'invalid_snapshot'
+            ? 'operator-quarantine-invalid'
+            : 'operator-quarantine-unrecoverable';
         die "ERROR: incomplete operator quarantine $operation_token; rerun "
-            . "operator-quarantine-invalid with the original arguments\n"
+            . "$replay_command with the original arguments\n"
             if !defined($complete);
         die "ERROR: malformed operator quarantine completion: $operation_token\n"
             if !validate_operator_event_shape(
@@ -1030,12 +1651,17 @@ sub assert_operator_operations_complete {
             || $destination_st[0] != $intent->{lock_dev}
             || $destination_st[1] != $intent->{lock_ino};
         my $snapshot = lock_snapshot($destination);
-        die "ERROR: completed operator quarantine destination became valid\n"
-            if !defined($snapshot) || $snapshot->{valid};
+        die "ERROR: completed operator quarantine destination is absent\n"
+            if !defined($snapshot);
         my %evidence = operator_evidence_values(
             state_dir => $state_dir, source_path => $destination,
-            snapshot => $snapshot,
+            source_name => $intent->{source_name}, snapshot => $snapshot,
+            operation_kind => $intent->{operation_kind},
         );
+        die "ERROR: completed operator quarantine destination no longer matches policy\n"
+            if !operator_snapshot_matches_policy(
+                $snapshot, $evidence{recovery_basis}, $intent,
+            );
         for my $field (@OPERATOR_EVIDENCE_FIELDS) {
             die "ERROR: completed operator quarantine evidence changed\n"
                 if $intent->{$field} ne $evidence{$field}
@@ -1047,7 +1673,7 @@ sub assert_operator_operations_complete {
     }
 }
 
-sub operator_quarantine_invalid {
+sub operator_quarantine_snapshot {
     my (%arg) = @_;
     validate_operator_events_directory_if_present($arg{state_dir});
     my @other = grep {
@@ -1082,12 +1708,16 @@ sub operator_quarantine_invalid {
             || $destination_st[0] != $arg{expected_lock_dev}
             || $destination_st[1] != $arg{expected_lock_ino};
         my $destination_snapshot = lock_snapshot($destination);
-        die "ERROR: completed operator quarantine destination became valid\n"
-            if !defined($destination_snapshot) || $destination_snapshot->{valid};
+        die "ERROR: completed operator quarantine destination is absent\n"
+            if !defined($destination_snapshot);
         my %current_evidence = operator_evidence_values(
             %arg, source_path => $destination,
             snapshot => $destination_snapshot,
         );
+        die "ERROR: completed operator quarantine destination no longer matches policy\n"
+            if !operator_snapshot_matches_policy(
+                $destination_snapshot, $current_evidence{recovery_basis}, \%arg,
+            );
         for my $field (@OPERATOR_EVIDENCE_FIELDS) {
             die "ERROR: completed operator quarantine evidence changed\n"
                 if $complete->{$field} ne $current_evidence{$field}
@@ -1110,14 +1740,22 @@ sub operator_quarantine_invalid {
     my $evidence_source = @destination_before ? $destination : $source;
     my $snapshot = lock_snapshot($evidence_source);
     die "ERROR: operator quarantine source is absent\n" if !defined($snapshot);
-    die "ERROR: operator quarantine refuses a valid generation\n"
-        if $snapshot->{valid};
     die "ERROR: operator quarantine lock identity does not match confirmation\n"
         if $snapshot->{dev} != $arg{expected_lock_dev}
         || $snapshot->{ino} != $arg{expected_lock_ino};
     my %evidence = operator_evidence_values(
         %arg, source_path => $evidence_source, snapshot => $snapshot,
     );
+    my $policy_basis = $evidence{recovery_basis};
+    $policy_basis = 'generation-token-mismatch'
+        if $arg{operation_kind} eq 'abandon_unrecoverable_generation'
+        && (!$snapshot->{valid}
+            || $snapshot->{generation}->{token}
+                ne $arg{expected_generation_token});
+    die operator_policy_error(\%arg, $policy_basis)
+        if !operator_snapshot_matches_policy(
+            $snapshot, $evidence{recovery_basis}, \%arg,
+        );
 
     if (defined($intent)) {
         die "ERROR: operator quarantine intent does not match this request\n"
@@ -1128,8 +1766,10 @@ sub operator_quarantine_invalid {
         sync_directory(operator_events_dir($arg{state_dir}));
     } else {
         my %value = (
-            schema => $SCHEMA,
+            schema => $OPERATOR_SCHEMA,
             operation_token => $arg{operation_token},
+            operation_kind => $arg{operation_kind},
+            expected_generation_token => $arg{expected_generation_token},
             phase => 'intent',
             operator_label => $arg{operator_label},
             reason => $arg{reason},
@@ -1141,6 +1781,10 @@ sub operator_quarantine_invalid {
             event_epoch => int(time()),
             outcome => 'prepared',
         );
+        die "ERROR: internal: operator intent does not satisfy its wire contract\n"
+            if !validate_operator_event_shape(
+                \%value, $arg{operation_token}, 'intent',
+            );
         install_operator_event(%arg, %value);
         $intent = operator_event_record(
             $arg{state_dir}, $arg{operation_token}, 'intent',
@@ -1156,6 +1800,11 @@ sub operator_quarantine_invalid {
         die "ERROR: operator quarantine source identity changed\n"
             if $source_st[0] != $arg{expected_lock_dev}
             || $source_st[1] != $arg{expected_lock_ino};
+        assert_fenced_directory_move_ready(
+            source => $source, destination => $destination,
+            expected_dev => $arg{expected_lock_dev},
+            expected_ino => $arg{expected_lock_ino},
+        );
         rename($source, $destination)
             or die "ERROR: cannot preserve invalid lock for operator review: $!\n";
         test_pause('after-operator-rename-before-sync');
@@ -1171,11 +1820,15 @@ sub operator_quarantine_invalid {
         || $destination_st[0] != $arg{expected_lock_dev}
         || $destination_st[1] != $arg{expected_lock_ino};
     my $moved_snapshot = lock_snapshot($destination);
-    die "ERROR: operator quarantine destination became valid\n"
-        if !defined($moved_snapshot) || $moved_snapshot->{valid};
+    die "ERROR: operator quarantine destination is absent\n"
+        if !defined($moved_snapshot);
     my %moved_evidence = operator_evidence_values(
         %arg, source_path => $destination, snapshot => $moved_snapshot,
     );
+    die "ERROR: operator quarantine destination no longer matches policy\n"
+        if !operator_snapshot_matches_policy(
+            $moved_snapshot, $moved_evidence{recovery_basis}, \%arg,
+        );
     for my $field (@OPERATOR_EVIDENCE_FIELDS) {
         die "ERROR: operator quarantine evidence changed during preservation\n"
             if $moved_evidence{$field} ne $evidence{$field};
@@ -1190,6 +1843,10 @@ sub operator_quarantine_invalid {
         event_epoch => $complete_epoch,
         outcome => 'quarantined',
     );
+    die "ERROR: internal: operator completion does not satisfy its wire contract\n"
+        if !validate_operator_event_shape(
+            \%complete_value, $arg{operation_token}, 'complete',
+        );
     install_operator_event(%arg, %complete_value);
     remove_operator_pending($arg{state_dir}, $intent);
 }
@@ -1671,6 +2328,12 @@ sub record_transition_outcome {
     my $round = $generation->{round_barcode};
     my $scope = $generation->{scope};
     my $ttl = $generation->{effective_ttl_seconds};
+    my $opposite_path = $transition->{action} eq 'reclaim'
+        ? release_path($arg{state_dir}, $token)
+        : revocation_path($arg{state_dir}, $token);
+    die "ERROR: pending $transition->{action} conflicts with an opposite "
+        . "terminal outcome for generation $token\n"
+        if path_occupied_nofollow($opposite_path, 'opposite terminal outcome');
     if ($transition->{action} eq 'reclaim') {
         install_revocation(
             state_dir => $arg{state_dir}, token => $token, round_barcode => $round,
@@ -1733,7 +2396,10 @@ sub validate_release_transition_authority {
     );
     if ($reason eq 'full_round_released' || $reason eq 'dorado_only_early') {
         validate_marker(%generation_arg);
-    } elsif (-e marker_path($arg{state_dir}, $generation->{token})) {
+    } elsif (path_occupied_nofollow(
+        marker_path($arg{state_dir}, $generation->{token}),
+        'pre-handoff marker',
+    )) {
         die "ERROR: pre-handoff release conflicts with an existing handoff marker\n";
     }
     my $allowed_pin = read_ready_pin(
@@ -1755,6 +2421,11 @@ sub archive_release_quarantine {
     ensure_real_directory($archive_parent, 0700);
     my $archive = File::Spec->catdir(
         $archive_parent, "release-$operation_token",
+    );
+    assert_fenced_directory_move_ready(
+        source => $path, destination => $archive,
+        expected_dev => $arg{snapshot}->{dev},
+        expected_ino => $arg{snapshot}->{ino},
     );
     if (!rename($path, $archive)) {
         my $error = "$!";
@@ -1799,6 +2470,11 @@ sub archive_reclaim_quarantine {
     ensure_real_directory($archive_parent, 0700);
     my $archive = File::Spec->catdir(
         $archive_parent, "reclaim-$operation_token",
+    );
+    assert_fenced_directory_move_ready(
+        source => $path, destination => $archive,
+        expected_dev => $arg{snapshot}->{dev},
+        expected_ino => $arg{snapshot}->{ino},
     );
     if (!rename($path, $archive)) {
         my $error = "$!";
@@ -1859,6 +2535,10 @@ sub finalize_transition {
     }
     my $suffix = $transition->{action} eq 'reclaim' ? 'reclaim' : 'release';
     my $quarantine = "$dir.$suffix-$transition->{operation_token}";
+    assert_fenced_directory_move_ready(
+        source => $dir, destination => $quarantine,
+        expected_dev => $snapshot->{dev}, expected_ino => $snapshot->{ino},
+    );
     if (!rename($dir, $quarantine)) {
         my $rename_error = "$!";
         my $moved = transition_record($quarantine);
@@ -2134,7 +2814,13 @@ sub stale_reason {
     my @blocking = blocking_pins(lock_dir($state_dir), $snapshot, undef);
     return undef if @blocking;
     my $handoff = marker_path($state_dir, $generation->{token});
-    if (!-e $handoff && $generation->{host} eq $THIS_HOST) {
+    my $has_handoff = path_occupied_nofollow($handoff, 'handoff marker');
+    validate_marker(
+        state_dir => $state_dir, token => $generation->{token},
+        round_barcode => $generation->{round_barcode},
+        scope => $generation->{scope},
+    ) if $has_handoff;
+    if (!$has_handoff && $generation->{host} eq $THIS_HOST) {
         my $alive = kill(0, $generation->{pid}) || $!{EPERM};
         return "dead pid=$generation->{pid} host=$generation->{host}" if !$alive;
         my $relationship = process_start_relationship(
@@ -2261,8 +2947,18 @@ sub acquire_generation {
                 my $error = $@ || "ERROR: cannot initialize round lock\n";
                 my $failed = "$dir.failed-acquire-$token";
                 my $owned = { dev => $st[0], ino => $st[1] };
-                if (same_identity($owned, $dir) && !rename($dir, $failed)) {
-                    die "$error" . "ERROR: failed acquisition also could not be quarantined: $!\n";
+                if (same_identity($owned, $dir)) {
+                    my $move_ok = eval {
+                        assert_fenced_directory_move_ready(
+                            source => $dir, destination => $failed,
+                            expected_dev => $st[0], expected_ino => $st[1],
+                        );
+                        rename($dir, $failed)
+                            or die "ERROR: failed acquisition also could not be quarantined: $!\n";
+                        1;
+                    };
+                    die "$error" . ($@ || "ERROR: failed acquisition quarantine failed\n")
+                        if !$move_ok;
                 }
                 if (-e $dir || -l $dir) {
                     die "$error" . "ERROR: failed acquisition lost ownership of the canonical lock; replacement preserved\n";
@@ -2333,7 +3029,8 @@ sub release_generation {
     install_marker(%arg) if $arg{reason} eq 'dorado_only_early';
     if ($arg{unless_handoff}) {
         my $marker = marker_path($arg{state_dir}, $arg{token});
-        if (-e $marker) {
+        if (path_occupied_nofollow($marker, 'pre-handoff marker')) {
+            validate_marker(%arg);
             unpin_generation(%arg);
             return 1;
         }
@@ -2495,7 +3192,7 @@ sub remove_inflight_for_snapshot {
 sub remove_exact_marker {
     my (%arg) = @_;
     my $path = marker_path($arg{state_dir}, $arg{token});
-    return if !-e $path;
+    return if !path_occupied_nofollow($path, 'handoff marker');
     validate_marker(%arg);
     unlink($path) or die "ERROR: cannot remove exact handoff marker '$path': $!\n";
     sync_directory($arg{state_dir});
@@ -2505,7 +3202,7 @@ my $command = shift(@ARGV) // '';
 usage() if $command eq '' || $command eq '--help' || $command eq '-h';
 my %VALID_COMMAND = map { $_ => 1 } qw(
     acquire inflight handoff pin guard-pin unpin verify-release early-release
-    finish abort operator-quarantine-invalid
+    finish abort operator-quarantine-invalid operator-quarantine-unrecoverable
 );
 usage() if !$VALID_COMMAND{$command};
 Configure(qw(no_auto_abbrev no_getopt_compat no_bundling no_ignore_case));
@@ -2515,6 +3212,7 @@ my %opt = (
     stale_seconds => 0,
     best_effort => 0,
     confirm_invalid_snapshot => 0,
+    confirm_stopped_world => 0,
 );
 my @common_option_spec = (
     'state-dir=s' => \$opt{state_dir},
@@ -2529,6 +3227,18 @@ my @operator_option_spec = (
     'reason=s' => \$opt{reason},
     'source-name=s' => \$opt{source_name},
     'confirm-invalid-snapshot!' => \$opt{confirm_invalid_snapshot},
+);
+my @unrecoverable_operator_option_spec = (
+    @common_option_spec,
+    'expected-lock-dev=s' => \$opt{expected_lock_dev},
+    'expected-lock-ino=s' => \$opt{expected_lock_ino},
+    'expected-generation-token=s' => \$opt{expected_generation_token},
+    'operation-token=s' => \$opt{operation_token},
+    'operator-label=s' => \$opt{operator_label},
+    'reason=s' => \$opt{reason},
+    'source-name=s' => \$opt{source_name},
+    'confirm-stopped-world!' => \$opt{confirm_stopped_world},
+    'confirm-abandon-generation=s' => \$opt{confirm_abandon_generation},
 );
 my @runtime_option_spec = (
     @common_option_spec,
@@ -2546,6 +3256,8 @@ GetOptionsFromArray(
     \@ARGV,
     $command eq 'operator-quarantine-invalid'
         ? @operator_option_spec
+        : $command eq 'operator-quarantine-unrecoverable'
+        ? @unrecoverable_operator_option_spec
         : @runtime_option_spec,
 ) or usage();
 die "ERROR: unexpected arguments: @ARGV\n" if @ARGV;
@@ -2555,19 +3267,42 @@ die "ERROR: --best-effort is valid only for abort or unpin\n"
 validate_failpoint_configuration();
 $opt{state_dir} = validate_text('state-dir', $opt{state_dir});
 my @state_st = lstat($opt{state_dir});
-if (!@state_st && $!{ENOENT} && $command ne 'operator-quarantine-invalid') {
+my $operator_command = $command eq 'operator-quarantine-invalid'
+    || $command eq 'operator-quarantine-unrecoverable';
+if (!@state_st && $!{ENOENT} && !$operator_command) {
     make_path($opt{state_dir}, { mode => 0700 });
     @state_st = lstat($opt{state_dir});
 }
 die "ERROR: state-dir is not a real directory: $opt{state_dir}\n"
     if !@state_st || -l _ || !-d _;
 
-if ($command eq 'operator-quarantine-invalid') {
+if ($operator_command) {
     for my $required (qw(expected_lock_dev expected_lock_ino operation_token operator_label reason)) {
         die "ERROR: missing $required\n" if !defined($opt{$required});
     }
-    die "ERROR: operator quarantine requires --confirm-invalid-snapshot\n"
-        if !$opt{confirm_invalid_snapshot};
+    if ($command eq 'operator-quarantine-invalid') {
+        die "ERROR: operator quarantine requires --confirm-invalid-snapshot\n"
+            if !$opt{confirm_invalid_snapshot};
+        $opt{operation_kind} = 'invalid_snapshot';
+        $opt{expected_generation_token} = 'none';
+    } else {
+        die "ERROR: missing expected_generation_token\n"
+            if !defined($opt{expected_generation_token});
+        die "ERROR: missing confirm_abandon_generation\n"
+            if !defined($opt{confirm_abandon_generation});
+        die "ERROR: stopped-world quarantine requires --confirm-stopped-world\n"
+            if !$opt{confirm_stopped_world};
+        $opt{expected_generation_token} = validate_token(
+            $opt{expected_generation_token},
+        );
+        $opt{confirm_abandon_generation} = validate_token(
+            $opt{confirm_abandon_generation},
+        );
+        die "ERROR: abandonment confirmation does not match expected generation\n"
+            if $opt{confirm_abandon_generation}
+                ne $opt{expected_generation_token};
+        $opt{operation_kind} = 'abandon_unrecoverable_generation';
+    }
     $opt{expected_lock_dev} = validate_uint(
         'expected-lock-dev', $opt{expected_lock_dev},
     );
@@ -2587,7 +3322,7 @@ if ($command eq 'operator-quarantine-invalid') {
     my $operator_fence = acquire_state_fence_with_wait(
         $opt{state_dir}, $opt{wait_seconds},
     );
-    operator_quarantine_invalid(%opt);
+    operator_quarantine_snapshot(%opt);
     release_state_fence($operator_fence);
     exit 0;
 }
@@ -2632,7 +3367,7 @@ if ($command eq 'inflight') {
     die "ERROR: handoff is only valid for full_round\n" if $opt{scope} ne 'full_round';
     recover_quarantines($opt{state_dir});
     my $marker = marker_path($opt{state_dir}, $opt{token});
-    if (-e $marker) {
+    if (path_occupied_nofollow($marker, 'handoff marker')) {
         validate_marker(%opt);
         my $receipt = release_record(%opt);
         my $revoked = revocation_record(%opt);
