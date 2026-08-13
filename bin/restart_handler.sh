@@ -55,6 +55,112 @@ wipe_dir_contents() {
     rm -rf "$dir/.parser_state_txn" 2>/dev/null || true
 }
 
+is_round_lock_namespace() {
+    local name="$1"
+    case "$name" in
+        .round_inflight.*|round_inflight.txt|\
+        .round_lock_handoff|.round_lock_handoff.*|\
+        .round_lock_release|.round_lock_release.*|\
+        .round_lock_finish|.round_lock_finish.*|\
+        .round_lock_revocation|.round_lock_revocation.*|\
+        .round_lock_events|.round_lock_events.*|\
+        .round_lock_operator_events|.round_lock_operator_events.*|\
+        .round_lock_operator_pending|.round_lock_operator_pending.*|\
+        .round_lock_archives|.round_lock_archives.*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+restart_refuse_path() {
+    local path="$1"
+    local reason="$2"
+    printf "ERROR: restart_mode=%s refuses to mutate round-lock state: %s: %s\n" \
+        "$MODE" "$reason" "$path" 1>&2
+    return 1
+}
+
+# Reset and restore predate the fenced round-lock protocol.  They must never
+# erase, copy, or follow that protocol's live state or durable evidence.  Scan
+# with dotglob enabled only while collecting each directory's entries so that
+# hidden protocol names are inspected without changing wipe/copy semantics.
+scan_restart_tree() {
+    local root="$1"
+    local purpose="$2"
+    local reject_symlinks="$3"
+    local ignored_presentation_tree="${4:-}"
+    local dotglob_was_set=0
+    local entries=()
+    local entry
+    local name
+
+    if [ -L "$root" ]; then
+        restart_refuse_path "$root" "unsafe symlink at ${purpose} root"
+        return 1
+    fi
+    [ -e "$root" ] || return 0
+    [ -d "$root" ] || return 0
+
+    if shopt -q dotglob; then
+        dotglob_was_set=1
+    else
+        shopt -s dotglob
+    fi
+    entries=( "$root"/* )
+    if [ "$dotglob_was_set" -eq 0 ]; then
+        shopt -u dotglob
+    fi
+
+    for entry in "${entries[@]}"; do
+        name="${entry##*/}"
+        if is_round_lock_namespace "$name"; then
+            restart_refuse_path "$entry" "protected round-lock namespace in ${purpose}"
+            return 1
+        fi
+        if [ -L "$entry" ]; then
+            if [ "$reject_symlinks" -eq 1 ]; then
+                if [ -n "$ignored_presentation_tree" ]; then
+                    case "$entry" in
+                        "$ignored_presentation_tree"/*)
+                            # backup_update_and_clean creates this derived link tree.
+                            # Restore never copies it, so inspecting a target would
+                            # add authority without restoring any rolling state.
+                            continue
+                            ;;
+                    esac
+                fi
+                restart_refuse_path "$entry" "unsafe symlink in ${purpose}"
+                return 1
+            fi
+            continue
+        fi
+        if [ -d "$entry" ]; then
+            scan_restart_tree "$entry" "$purpose" "$reject_symlinks" \
+                "$ignored_presentation_tree" || return 1
+        fi
+    done
+}
+
+# Complete every destructive preflight before the first wipe.  The live state
+# tree may contain ordinary symlinks (rm removes the link itself), but restore
+# snapshots may not: their copy paths could otherwise traverse or reproduce an
+# entry whose contents were not inspected.  The `_state` pathname is also the
+# helper's flock fence, so a symlink there is never a valid mutation target.
+scan_restart_tree "$ONGOING" "live ongoing state" 0
+if [ -L "$ONGOING_STATE" ]; then
+    restart_refuse_path "$ONGOING_STATE" "round-lock state-fence path is a symlink"
+fi
+
+if [ "$MODE" = "reset" ]; then
+    scan_restart_tree "$LEGACY_CURRENT" "reset snapshot state" 0
+else
+    scan_restart_tree "$LEGACY_CURRENT" "restore snapshot state" 1 \
+        "$LEGACY_CURRENT/tables/to_figures"
+    scan_restart_tree "$CURRENT_ROOT" "restore snapshot state" 1 \
+        "$CURRENT_ROOT/tables/to_figures"
+fi
+
 if [ "$MODE" = "reset" ]; then
     wipe_dir_contents "$ONGOING"
     wipe_dir_contents "$LEGACY_CURRENT"
@@ -78,7 +184,11 @@ restore_from_root() {
 
     # Prefer the structured snapshot layout used by backup_update_and_clean.
     local restored=0
+    local structured_layout_seen=0
     local subs=()
+    local items=()
+    local copy_items=()
+    local item
     if [ "$scope" = "tables_plots" ]; then
         subs=( tables plots )
     elif [ "$scope" = "sequences" ]; then
@@ -89,9 +199,19 @@ restore_from_root() {
     for sub in "${subs[@]}"; do
         local src="${root}/${sub}"
         if [ -d "$src" ]; then
+            structured_layout_seen=1
             items=( "$src"/* )
-            if (( ${#items[@]} )); then
-                cp -R "${items[@]}" "$ONGOING_STATE/"
+            copy_items=()
+            for item in "${items[@]}"; do
+                # `tables/to_figures` contains derived absolute symlinks for
+                # rendering.  The real table files are restored separately.
+                if [ "$sub" = "tables" ] && [ "${item##*/}" = "to_figures" ]; then
+                    continue
+                fi
+                copy_items+=( "$item" )
+            done
+            if (( ${#copy_items[@]} )); then
+                cp -R "${copy_items[@]}" "$ONGOING_STATE/"
                 restored=1
             fi
         fi
@@ -99,7 +219,7 @@ restore_from_root() {
 
     # Backward-compatible: if the root doesn't have the structured layout,
     # treat it as a flat snapshot and copy its top-level contents.
-    if [ "$restored" -eq 0 ]; then
+    if [ "$structured_layout_seen" -eq 0 ]; then
         items=( "$root"/* )
         if (( ${#items[@]} )); then
             cp -R "${items[@]}" "$ONGOING_STATE/"
