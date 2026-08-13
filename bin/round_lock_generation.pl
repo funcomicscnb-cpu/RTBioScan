@@ -51,6 +51,10 @@ Runtime options:
   --state-dir DIR --round-barcode NAME --scope full_round|dorado_only
   --token HEX64 --pin-token HEX64 --owner-pid PID --role NAME
   --stale-seconds N --wait-seconds N
+  For response-loss recovery, callers must durably preallocate and retain an
+  exact distinct --token/--pin-token pair before acquire, or an exact
+  --pin-token before pin, then retry the identical request. Tokenless calls
+  preserve the legacy interface but cannot recover a response that was lost.
   --best-effort suppresses only an abort/unpin authority miss after the state
   fence is acquired; fence, recovery, and malformed-state errors remain fatal
 
@@ -114,6 +118,20 @@ sub validate_role {
     die "ERROR: invalid pin role\n"
         if !defined($role) || $role !~ /\A[A-Za-z0-9][A-Za-z0-9_.-]*\z/;
     return $role;
+}
+
+sub write_stdout {
+    my ($content) = @_;
+    local $SIG{PIPE} = 'IGNORE';
+    my $offset = 0;
+    while ($offset < length($content)) {
+        my $written = syswrite(
+            STDOUT, $content, length($content) - $offset, $offset,
+        );
+        die "ERROR: cannot write stdout: $!\n"
+            if !defined($written) || $written == 0;
+        $offset += $written;
+    }
 }
 
 sub new_token {
@@ -1252,6 +1270,21 @@ sub pin_values {
     };
 }
 
+sub pin_matches_request {
+    my ($pin, $snapshot, $arg_ref, $pin_token) = @_;
+    my $process_start = process_start_identity($arg_ref->{owner_pid})
+        || 'unavailable';
+    return validate_pin_for_snapshot($pin, $snapshot)
+        && $pin->{pin_token} eq $pin_token
+        && $pin->{token} eq $arg_ref->{token}
+        && $pin->{round_barcode} eq $arg_ref->{round_barcode}
+        && $pin->{scope} eq $arg_ref->{scope}
+        && $pin->{role} eq $arg_ref->{role}
+        && $pin->{pid} == $arg_ref->{owner_pid}
+        && $pin->{host} eq $THIS_HOST
+        && $pin->{process_start} eq $process_start;
+}
+
 sub validate_pin_for_snapshot {
     my ($pin, $snapshot) = @_;
     return 0 if !defined($pin) || !$snapshot->{valid};
@@ -1355,8 +1388,13 @@ sub install_pin {
     if (!$installed) {
         my $existing = record_for($candidate, \@PIN_ORDER);
         die "ERROR: immutable pin candidate conflicts: $pin_token\n"
-            if canonical_body($existing, \@PIN_ORDER)
-                ne canonical_body($values, \@PIN_ORDER);
+            if !pin_matches_request($existing, $snapshot, \%arg, $pin_token);
+        $values = $existing;
+        my @ready_st = lstat($ready);
+        die "ERROR: immutable pin candidate has no live ready pin: $pin_token\n"
+            if !@ready_st && $!{ENOENT};
+        die "ERROR: cannot inspect ready process pin '$pin_token': $!\n"
+            if !@ready_st;
     }
     assert_generation(%arg);
     if (!link($candidate, $ready)) {
@@ -1365,8 +1403,13 @@ sub install_pin {
         die "ERROR: cannot ready process pin '$pin_token': $error\n" if !$exists;
         my $existing = record_for($ready, \@PIN_ORDER);
         die "ERROR: ready process pin conflicts: $pin_token\n"
-            if canonical_body($existing, \@PIN_ORDER)
-                ne canonical_body($values, \@PIN_ORDER);
+            if !pin_matches_request($existing, $snapshot, \%arg, $pin_token);
+        my @candidate_st = lstat($candidate);
+        my @ready_st = lstat($ready);
+        die "ERROR: ready process pin is not the immutable candidate: $pin_token\n"
+            if !@candidate_st || !@ready_st
+            || $candidate_st[0] != $ready_st[0]
+            || $candidate_st[1] != $ready_st[1];
         sync_directory(pins_dir($dir));
     } else {
         sync_directory(pins_dir($dir));
@@ -1942,6 +1985,144 @@ sub recover_pending_release {
     return 1;
 }
 
+sub acquire_generation_matches_request {
+    my ($snapshot, $arg_ref) = @_;
+    return 0 if !$snapshot->{valid};
+    my $generation = $snapshot->{generation};
+    my $process_start = process_start_identity($arg_ref->{owner_pid})
+        || 'unavailable';
+    return $generation->{token} eq $arg_ref->{token}
+        && $generation->{round_barcode} eq $arg_ref->{round_barcode}
+        && $generation->{scope} eq $arg_ref->{scope}
+        && $generation->{pid} == $arg_ref->{owner_pid}
+        && $generation->{host} eq $THIS_HOST
+        && $generation->{process_start} eq $process_start
+        && $generation->{effective_ttl_seconds} eq "$arg_ref->{stale_seconds}";
+}
+
+sub assert_paths_absent_for_explicit_acquire {
+    my ($label, @paths) = @_;
+    for my $path (@paths) {
+        my @st = lstat($path);
+        die "ERROR: explicit acquire token has durable $label history: $path\n"
+            if @st;
+        die "ERROR: cannot inspect explicit acquire history '$path': $!\n"
+            if !$!{ENOENT};
+    }
+}
+
+sub assert_no_acquire_event_history {
+    my ($state_dir, $token) = @_;
+    my $dir = events_dir($state_dir);
+    my @dir_st = lstat($dir);
+    return if !@dir_st && $!{ENOENT};
+    die "ERROR: acquire event history directory is missing or unsafe\n"
+        if !@dir_st || -l _ || !-d _;
+    sync_directory($dir);
+    opendir(my $dh, $dir)
+        or die "ERROR: cannot inspect acquire event history '$dir': $!\n";
+    my @matches = sort grep {
+        /\A\Q$token\E\.acquire\.[0-9a-f]{64}\.tsv\z/
+    } readdir($dh);
+    closedir($dh)
+        or die "ERROR: cannot close acquire event history '$dir': $!\n";
+    die "ERROR: explicit acquire generation token has durable acquire history: "
+        . "$matches[0]\n" if @matches;
+}
+
+sub assert_explicit_acquire_token_unused {
+    my (%arg) = @_;
+    my $dir = lock_dir($arg{state_dir});
+    assert_paths_absent_for_explicit_acquire(
+        'conflicting',
+        marker_path($arg{state_dir}, $arg{token}),
+        release_path($arg{state_dir}, $arg{token}),
+        revocation_path($arg{state_dir}, $arg{token}),
+        inflight_generation_path($arg{state_dir}, $arg{token}),
+        "$dir.failed-acquire-$arg{token}",
+    );
+    assert_no_acquire_event_history($arg{state_dir}, $arg{token});
+}
+
+sub validate_explicit_acquire_replay_pin {
+    my (%arg) = @_;
+    my $dir = lock_dir($arg{state_dir});
+    my $snapshot = $arg{snapshot};
+    my %pin_arg = (%arg, role => 'fast_acquisition');
+    my $candidate_path = pin_candidate_path($dir, $arg{pin_token});
+    my $ready_path = pin_ready_path($dir, $arg{pin_token});
+    my $candidate = record_for($candidate_path, \@PIN_ORDER);
+    my $ready = read_ready_pin($dir, $arg{pin_token}, $snapshot);
+    die "ERROR: explicit acquire replay is missing its durable process pin\n"
+        if !defined($candidate) || !defined($ready);
+    die "ERROR: explicit acquire replay process pin conflicts\n"
+        if !pin_matches_request(
+            $candidate, $snapshot, \%pin_arg, $arg{pin_token},
+        )
+        || !pin_matches_request($ready, $snapshot, \%pin_arg, $arg{pin_token});
+    my @candidate_st = lstat($candidate_path);
+    my @ready_st = lstat($ready_path);
+    die "ERROR: explicit acquire replay pin is not the immutable candidate\n"
+        if !@candidate_st || !@ready_st
+        || $candidate_st[0] != $ready_st[0]
+        || $candidate_st[1] != $ready_st[1];
+}
+
+sub validate_explicit_acquire_replay_event {
+    my (%arg) = @_;
+    my $snapshot = $arg{snapshot};
+    my $generation = $snapshot->{generation};
+    my $event_dir = events_dir($arg{state_dir});
+    my @event_dir_st = lstat($event_dir);
+    die "ERROR: explicit acquire replay event directory is missing or unsafe\n"
+        if !@event_dir_st || -l _ || !-d _;
+    sync_directory($event_dir);
+    my $path = File::Spec->catfile(
+        $event_dir,
+        "$arg{token}.acquire.$arg{pin_token}.tsv",
+    );
+    my $event = record_for($path, \@EVENT_ORDER);
+    die "ERROR: explicit acquire replay is missing its durable acquire event\n"
+        if !defined($event);
+    my %expected = (
+        schema => $SCHEMA,
+        event_id => $arg{pin_token},
+        generation_token => $arg{token},
+        round_barcode => $arg{round_barcode},
+        scope => $arg{scope},
+        event => 'acquire',
+        outcome => 'acquired',
+        effective_ttl_seconds => $generation->{effective_ttl_seconds},
+        event_epoch => $generation->{started_epoch},
+        lock_dev => $snapshot->{dev},
+        lock_ino => $snapshot->{ino},
+    );
+    die "ERROR: explicit acquire replay event conflicts\n"
+        if canonical_body($event, \@EVENT_ORDER)
+            ne canonical_body(\%expected, \@EVENT_ORDER);
+}
+
+sub replay_explicit_acquire {
+    my (%arg) = @_;
+    my $dir = lock_dir($arg{state_dir});
+    my $snapshot = $arg{snapshot};
+    die "ERROR: explicit acquire request conflicts with generation $arg{token}\n"
+        if !acquire_generation_matches_request($snapshot, \%arg);
+    my $transition = transition_record($dir);
+    die "ERROR: explicit acquire request conflicts with a pending transition\n"
+        if defined($transition);
+    assert_paths_absent_for_explicit_acquire(
+        'progressed',
+        marker_path($arg{state_dir}, $arg{token}),
+        release_path($arg{state_dir}, $arg{token}),
+        revocation_path($arg{state_dir}, $arg{token}),
+        inflight_generation_path($arg{state_dir}, $arg{token}),
+    );
+    validate_explicit_acquire_replay_pin(%arg);
+    validate_explicit_acquire_replay_event(%arg);
+    return ($arg{token}, $arg{pin_token});
+}
+
 sub stale_reason {
     my ($state_dir, $snapshot, $fallback_ttl) = @_;
     die "ERROR: internal: stale_reason requires a valid generation snapshot\n"
@@ -2006,6 +2187,7 @@ sub reclaim_if_stale {
 sub acquire_generation {
     my (%arg) = @_;
     my $dir = lock_dir($arg{state_dir});
+    my $explicit_tokens = defined($arg{token});
     my $waited_ms = 0;
     my $limit_ms = $arg{wait_seconds} * 1000;
     while (1) {
@@ -2022,13 +2204,23 @@ sub acquire_generation {
         my $existing_snapshot = lock_snapshot($dir);
         die invalid_snapshot_error($dir, $existing_snapshot)
             if defined($existing_snapshot) && !$existing_snapshot->{valid};
+        if ($explicit_tokens && defined($existing_snapshot)
+            && $existing_snapshot->{generation}->{token} eq $arg{token}) {
+            my @replayed = replay_explicit_acquire(
+                %arg, snapshot => $existing_snapshot,
+            );
+            release_state_fence($state_fence);
+            return @replayed;
+        }
+        assert_explicit_acquire_token_unused(%arg) if $explicit_tokens;
         ensure_real_directory(events_dir($arg{state_dir}), 0700);
         if (mkdir($dir, 0700)) {
             sync_directory($arg{state_dir});
             test_pause('after-lock-mkdir-before-stat');
             my @st = lstat($dir);
             die "ERROR: cannot inspect newly-created round lock: $!\n" if !@st;
-            my $token = new_token(join(':', $dir, $arg{round_barcode}, $arg{scope}));
+            my $token = $arg{token}
+                // new_token(join(':', $dir, $arg{round_barcode}, $arg{scope}));
             my %generation = (
                 schema => $SCHEMA, token => $token, round_barcode => $arg{round_barcode},
                 scope => $arg{scope}, pid => $arg{owner_pid}, host => $THIS_HOST,
@@ -2047,16 +2239,22 @@ sub acquire_generation {
                 install_generation($dir, \%generation);
                 test_pause('after-generation-install');
                 $pin_token = install_pin(
-                    %arg, token => $token, pin_token => new_token("acquire:$token"),
+                    %arg, token => $token,
+                    pin_token => $arg{pin_token} // new_token("acquire:$token"),
                     role => 'fast_acquisition', snapshot => undef,
                 );
-                write_event(
+                my %event_arg = (
                     state_dir => $arg{state_dir}, generation_token => $token,
                     round_barcode => $arg{round_barcode}, scope => $arg{scope},
                     event => 'acquire', outcome => 'acquired',
                     effective_ttl_seconds => $arg{stale_seconds},
                     lock_dev => $st[0], lock_ino => $st[1],
                 );
+                if ($explicit_tokens) {
+                    $event_arg{event_id} = $pin_token;
+                    $event_arg{event_epoch} = $generation{started_epoch};
+                }
+                write_event(%event_arg);
                 1;
             };
             if (!$ok) {
@@ -2408,8 +2606,12 @@ if ($command eq 'acquire') {
     $opt{round_barcode} = validate_text('round-barcode', $opt{round_barcode});
     $opt{scope} = validate_scope($opt{scope});
     $opt{owner_pid} = validate_pid($opt{owner_pid});
+    die "ERROR: acquire requires --token and --pin-token together\n"
+        if defined($opt{token}) != defined($opt{pin_token});
+    die "ERROR: acquire generation and pin tokens must differ\n"
+        if defined($opt{token}) && $opt{token} eq $opt{pin_token};
     my ($token, $pin_token) = acquire_generation(%opt);
-    print "generation_token=$token\npin_token=$pin_token\n";
+    write_stdout("generation_token=$token\npin_token=$pin_token\n");
     exit 0;
 }
 
@@ -2481,9 +2683,13 @@ if ($command eq 'inflight') {
     $opt{owner_pid} = validate_pid($opt{owner_pid});
     $opt{role} = validate_role($opt{role});
     die "ERROR: pin is only valid for full_round\n" if $opt{scope} ne 'full_round';
+    die "ERROR: generation and pin tokens must differ\n"
+        if defined($opt{pin_token}) && $opt{pin_token} eq $opt{token};
     validate_marker(%opt);
     my $pin_token = install_pin(%opt);
-    print "$pin_token\n";
+    release_state_fence($state_fence);
+    write_stdout("$pin_token\n");
+    exit 0;
 } elsif ($command eq 'guard-pin') {
     die "ERROR: missing pin-token\n" if !defined($opt{pin_token});
     guard_pin(%opt);
