@@ -8,5 +8,6 @@ Internal documents currently kept in the repository:
 2. [Performance improvement backlog and testing targets](performance_pr_backlog.md)
 3. [Public release manifest and release-content rules](public_release_manifest.md)
 4. [Release packaging helper documentation](release_preparation.md)
+5. [Invalid round-lock operator recovery](round_lock_operator_recovery.md)
 
 Public end-user documentation remains in the main [docs index](../README.md).
