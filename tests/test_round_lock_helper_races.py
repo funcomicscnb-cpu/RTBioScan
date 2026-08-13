@@ -22,6 +22,13 @@ from pathlib import Path
 
 import pytest
 
+from tests.round_lock_test_utils import (
+    TRANSITION_ORDER,
+    assert_token,
+    parse_acquire_output,
+    read_record,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "bin" / "round_lock_generation.pl"
 EVENTS_DIR_NAME = ".round_lock_events"
@@ -444,15 +451,32 @@ def test_unmodified_control_release_still_succeeds(tmp_path: Path) -> None:
     assert not (state / ".round_inflight.lockdir").exists()
 
 
-def _interrupted_release(state: Path) -> tuple[list[str], dict[str, str], Path, dict[str, str]]:
+def _assert_absent(path: Path) -> None:
+    """Require ``path`` to be absent, accepting only ENOENT.
+
+    Path.exists() follows symlinks, so a dangling symlink at the canonical lock
+    path reports absent while a later mkdir on it returns EEXIST -- the fixture
+    would certify a clean slate for a state where acquisition contends.
+    """
+    try:
+        entry = os.lstat(path)
+    except FileNotFoundError:
+        return
+    raise AssertionError(f"expected {path} to be absent, found mode {entry.st_mode:o}")
+
+
+def _interrupted_release(state: Path) -> tuple[list[str], str, Path, dict[str, str]]:
     """Drive one release to the ``after-quarantine-rename`` failpoint.
 
     Shared by the concurrency regression and its setup gate so the two cannot
     drift apart -- the gate has to exercise the exact preparation the
-    regression runs, not a copy of it.
+    regression runs, not a copy of it. Every check below is a fail-closed
+    assertion on the intermediate state: the gate's whole job is to separate
+    "the known recovery defect" from "the setup silently stopped working", and
+    a check that cannot fail does neither.
 
-    Returns the CLI base arguments, the acquisition tokens, the single
-    quarantine left behind, and its parsed transition record.
+    Returns the CLI base arguments, the generation token, the single quarantine
+    left behind, and its validated transition record.
     """
     state.mkdir()
     base = [
@@ -465,49 +489,58 @@ def _interrupted_release(state: Path) -> tuple[list[str], dict[str, str], Path, 
         capture_output=True, text=True, check=False,
     )
     assert acquired.returncode == 0, acquired.stderr
-    tokens = dict(
-        line.split("=", 1)
-        for line in acquired.stdout.strip().splitlines()
-        if "=" in line
-    )
+    generation_token, pin_token = parse_acquire_output(acquired.stdout)
 
     env = dict(os.environ)
     env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-quarantine-rename"
     injected = subprocess.run(
         ["perl", str(SCRIPT), "early-release", *base,
-         "--token", tokens["generation_token"],
-         "--pin-token", tokens["pin_token"]],
+         "--token", generation_token, "--pin-token", pin_token],
         capture_output=True, text=True, check=False, env=env,
     )
-    # Prove the interleaving was actually established. A failpoint that
-    # silently stopped working would otherwise leave callers running against
-    # whatever state happened to exist.
+    # Prove this exact interleaving was established. The helper has three
+    # distinct "injected failure" messages -- after transition install (:998),
+    # after quarantine rename (:1055), and before compatibility inflight
+    # publish (:1385) -- which leave different intermediate states, so the
+    # substring alone cannot tell them apart.
     assert injected.returncode != 0, injected.stdout
-    assert "injected failure" in injected.stderr, injected.stderr
+    assert injected.stderr.strip() == (
+        "ERROR: injected failure after quarantine rename"
+    ), injected.stderr
 
-    # One lstat per candidate, not Path.is_dir(): is_dir() follows symlinks, so
-    # a symlink pointing at a directory would be accepted, and pairing it with
-    # a separate is_symlink() call leaves a window between the two checks. The
-    # helper holds itself to exactly this standard at
-    # bin/round_lock_generation.pl:963-969 before removing a quarantine.
-    quarantines = []
-    for path in state.glob(".round_inflight.lockdir.*"):
-        try:
-            entry = os.lstat(path)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISDIR(entry.st_mode):
-            quarantines.append(path)
-    assert len(quarantines) == 1, quarantines
-    quarantine = quarantines[0]
-    transition = dict(
-        line.split("\t", 1)
-        for line in (quarantine / "transition.tsv").read_text(
-            encoding="utf-8"
-        ).splitlines()
-        if "\t" in line
+    # Assert on every entry in the namespace, then validate the sole one.
+    # Filtering first and counting after cannot detect an unexpected entry: the
+    # filter discards the evidence before the assertion sees it.
+    candidates = sorted(state.glob(".round_inflight.lockdir.*"))
+    assert len(candidates) == 1, candidates
+    quarantine = candidates[0]
+    # One lstat, not Path.is_dir(): is_dir() follows symlinks, and pairing it
+    # with is_symlink() leaves a window between two checks. The helper holds
+    # itself to this standard at bin/round_lock_generation.pl:963-969. No
+    # FileNotFoundError guard either -- setup is single-process here, so a
+    # vanished candidate is an anomaly, not a race to skip.
+    entry = os.lstat(quarantine)
+    assert stat.S_ISDIR(entry.st_mode), (quarantine, entry.st_mode)
+
+    transition = read_record(
+        quarantine / "transition.tsv", required=TRANSITION_ORDER
     )
+    assert_token(transition["operation_token"])
+    assert transition["schema"] == "1", transition
     assert transition["action"] == "release", transition
+    assert transition["owner_token"] == generation_token, transition
+    assert transition["allowed_pin_token"] == pin_token, transition
+    assert transition["round_barcode"] == "r", transition
+    assert transition["scope"] == "dorado_only", transition
+    assert transition["reason"] == "dorado_only_early", transition
+    assert transition["effective_ttl_seconds"] == "30", transition
+    assert transition["started_epoch"].isdigit(), transition
+    # Bind the record to the directory it describes. The quarantine is the
+    # canonical lock renamed, and rename preserves the inode, so these must
+    # still match the tree on disk.
+    assert transition["lock_dev"] == str(entry.st_dev), (transition, entry.st_dev)
+    assert transition["lock_ino"] == str(entry.st_ino), (transition, entry.st_ino)
+
     # Exact equality, not endswith. recover_quarantines scans an anchored
     # namespace, /\A\.round_inflight\.lockdir\.(?:reclaim|release)-[0-9a-f]{64}\z/,
     # and re-derives this same name at bin/round_lock_generation.pl:1083, so the
@@ -521,8 +554,8 @@ def _interrupted_release(state: Path) -> tuple[list[str], dict[str, str], Path, 
         transition["operation_token"]
     )
     assert quarantine.name == expected_name, (quarantine.name, expected_name)
-    assert not (state / ".round_inflight.lockdir").exists()
-    return base, tokens, quarantine, transition
+    _assert_absent(state / ".round_inflight.lockdir")
+    return base, generation_token, quarantine, transition
 
 
 def test_concurrent_release_recovery_is_single_winner(tmp_path: Path) -> None:
@@ -553,14 +586,14 @@ def test_concurrent_release_recovery_is_single_winner(tmp_path: Path) -> None:
     failures: list[str] = []
     total = 0
     for trial in range(6):
-        base, tokens, _quarantine, _transition = _interrupted_release(
+        base, generation_token, _quarantine, _transition = _interrupted_release(
             tmp_path / f"state-{trial}"
         )
 
         procs = [
             subprocess.Popen(
                 ["perl", str(SCRIPT), "verify-release", *base,
-                 "--token", tokens["generation_token"]],
+                 "--token", generation_token],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             for _ in range(8)

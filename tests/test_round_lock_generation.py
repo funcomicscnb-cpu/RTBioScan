@@ -8,6 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.round_lock_test_utils import assert_token as _assert_token
+from tests.round_lock_test_utils import parse_acquire_output as _parse_acquire_output
+from tests.round_lock_test_utils import read_record as _read_record
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "bin" / "round_lock_generation.pl"
@@ -71,27 +75,6 @@ def _run(
     )
 
 
-def _assert_token(token: str) -> None:
-    assert len(token) == 64
-    assert set(token) <= set("0123456789abcdef")
-
-
-def _parse_acquire_output(stdout: str) -> tuple[str, str]:
-    fields: dict[str, str] = {}
-    for line in stdout.splitlines():
-        key, separator, value = line.partition("=")
-        assert separator == "=", stdout
-        assert key not in fields, stdout
-        fields[key] = value
-    assert set(fields) == {"generation_token", "pin_token"}, stdout
-    generation_token = fields["generation_token"]
-    pin_token = fields["pin_token"]
-    _assert_token(generation_token)
-    _assert_token(pin_token)
-    assert generation_token != pin_token
-    return generation_token, pin_token
-
-
 def _acquire(state: Path, **kwargs: object) -> tuple[str, str]:
     kwargs.setdefault("owner_pid", os.getpid())
     result = _run("acquire", state, **kwargs)
@@ -106,23 +89,6 @@ def _pin(state: Path, token: str, *, role: str, **kwargs: object) -> str:
     pin_token = result.stdout.strip()
     _assert_token(pin_token)
     return pin_token
-
-
-def _read_record(path: Path) -> dict[str, str]:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    values: dict[str, str] = {}
-    body: list[str] = []
-    checksum = ""
-    for line in lines:
-        key, value = line.split("\t", 1)
-        if key == "record_sha256":
-            checksum = value
-        else:
-            assert key not in values
-            values[key] = value
-            body.append(f"{key}\t{value}\n")
-    assert checksum == hashlib.sha256("".join(body).encode()).hexdigest()
-    return values
 
 
 def _read_compat_inflight(path: Path) -> dict[str, str]:
