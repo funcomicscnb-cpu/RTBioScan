@@ -66,7 +66,7 @@ def test_blast_cache_key_uses_variables() -> None:
 
 def test_consensus_cleanup_preserves_declared_join_output() -> None:
     consensus_block = _consensus_block()
-    assert 'file("${barcode}_preblastreport_join.txt"), file("consensus_blast_report_full.txt"), file("consensus_round_provenance.tsv") into report_consensus' in consensus_block
+    assert 'file("${barcode}_preblastreport_join.txt"), file("consensus_blast_report_full.txt"), file("consensus_round_provenance.tsv"), val(round_generation_token), val(round_lock_scope) into report_consensus' in consensus_block
     cleanup_block = consensus_block.split("# B1: clean up taxonomy and BLAST temp files from work directory", 1)[1]
     assert '${barcode}_preblastreport*.txt' not in cleanup_block
     assert '${barcode}_preblastreport[0-9]*.txt' in cleanup_block

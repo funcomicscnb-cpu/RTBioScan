@@ -822,6 +822,7 @@ def fastFilterShadowEnabled = parseBoolStrict(params.fast_filter_shadow, false, 
 // STAGE A — FAST PRE-FILTER (fast_on_target_detection)
 // ============================================================
 process fast_on_target_detection {
+	cache false
 	// Reserve only 1 CPU for scheduling so this task does not starve downstream processes.
 	// Actual tool threading is controlled via params.align_threads inside the script.
 	cpus 1
@@ -831,9 +832,11 @@ process fast_on_target_detection {
 	    val(read_path) from reads
 	
     output:
-    tuple env(barcode), env(round_barcode), file("*.pod5"), file("*reads_target.list") into hq_reads_get
-	tuple env(barcode), env(round_barcode), val(read_path) into close_round_ch, get_summary_ch, failed_round_source_ch
-	tuple  env(barcode), env(round_barcode), file("*fast.fasta"), file("*qced_reads_kingdom.txt"), file("*fast.sam"), file("*reads_target.list") into on_target_report
+	    tuple env(barcode), env(round_barcode), file("*.pod5"), file("*reads_target.list") into hq_reads_get
+		tuple env(barcode), env(round_barcode), val(read_path) into close_round_ch, get_summary_ch
+		tuple env(barcode), env(round_barcode), val(read_path), env(round_generation_token), env(round_lock_scope) into failed_round_source_ch
+		tuple env(barcode), env(round_barcode), file("*fast.fasta"), file("*qced_reads_kingdom.txt"), file("*fast.sam"), file("*reads_target.list"), env(round_generation_token), env(round_lock_scope) into on_target_report
+		tuple env(barcode), env(round_barcode), env(round_generation_token), env(round_lock_scope) into round_generation_ch
 	
     script:
     read_file = file(read_path)
@@ -880,80 +883,135 @@ process fast_on_target_detection {
 		# The lock is acquired here and released according to --round_lock_scope:
 		# - full_round: at the end of `backup_update_and_clean`
 		# - dorado_only: immediately after FAST Dorado basecalling completes
-				ROUND_LOCKDIR="${ongoingStateDir}/_state/.round_inflight.lockdir"
-				# Clear any stale handoff markers for this same round barcode (e.g. previous crash mid-round).
-				rm -f "${ongoingStateDir}/_state/.round_lock_handoff.\$round_barcode"* 2>/dev/null || true
-				ROUND_LOCK_HANDOFF_FILE="${ongoingStateDir}/_state/.round_lock_handoff.\$round_barcode"
-				ROUND_LOCK_WAIT_MIN=${params.round_lock_wait_minutes}
-				STALE_LOCK_TTL_MIN=${params.stale_lock_ttl_minutes}
-				LOCK_META="\$ROUND_LOCKDIR/meta.env"
-				THIS_HOST="\$(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
-				waited=0
-					ROUND_LOCK_EARLY_RELEASED=0
-					remove_round_lock_if_stale() {
-						rm -rf "\$ROUND_LOCKDIR" 2>/dev/null || true
-						rm -f "${ongoingStateDir}/_state/round_inflight.txt" 2>/dev/null || true
-						rm -f "${ongoingStateDir}/_state/.round_lock_handoff."* 2>/dev/null || true
-					}
-					release_round_lock_now() {
-						rm -f "\$ROUND_LOCKDIR/meta.env" 2>/dev/null || true
-						rmdir "\$ROUND_LOCKDIR" 2>/dev/null || true
-						rm -f "${ongoingStateDir}/_state/round_inflight.txt" 2>/dev/null || true
-						ROUND_LOCK_EARLY_RELEASED=1
-					}
-					release_round_lock() {
-						if [ "\$ROUND_LOCK_EARLY_RELEASED" -eq 1 ]; then
-							return 0
+					ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+					ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+					ROUND_LOCK_SCOPE="${roundLockScopeCanonical}"
+					ROUND_LOCK_WAIT_SECONDS="\$(( ${params.round_lock_wait_minutes} * 60 ))"
+					ROUND_LOCK_STALE_SECONDS="\$(( ${staleLockTtlMinutesStr} * 60 ))"
+					source "${baseDir}/bin/round_lock_process_guard.sh"
+					ROUND_LOCK_GENERATION_TOKEN_FILE=".rtbioscan-round-lock-acquire-generation.\$\$"
+					ROUND_LOCK_ACQUISITION_PIN_FILE=".rtbioscan-round-lock-acquire-pin.\$\$"
+					round_generation_token_retained="\$(rtbioscan_round_lock_prepare_token_file \
+						"\$ROUND_LOCK_GENERATION_TOKEN_FILE" \
+						"acquire-generation:\$round_barcode:\$ROUND_LOCK_SCOPE:\$\$")"
+					round_acquisition_pin_retained="\$(rtbioscan_round_lock_prepare_token_file \
+						"\$ROUND_LOCK_ACQUISITION_PIN_FILE" \
+						"acquire-pin:\$round_barcode:\$ROUND_LOCK_SCOPE:\$\$")"
+					if [ "\$round_generation_token_retained" = "\$round_acquisition_pin_retained" ]; then
+						echo "ERROR: round-lock acquire tokens are not distinct" >&2
+						exit 1
+					fi
+						round_lock_acquired=0
+						round_lock_cleanup=abort
+					round_lock_cleanup_on_exit() {
+						round_lock_status=\$?
+						trap - EXIT
+						round_lock_cleanup_status=0
+							case "\$round_lock_cleanup" in
+								abort)
+									if [ "\$round_lock_acquired" -eq 1 ]; then
+										perl "\$ROUND_LOCK_HELPER" abort \
+											--state-dir "\$ROUND_LOCK_STATE_DIR" \
+											--round-barcode "\$round_barcode" \
+											--scope "\$ROUND_LOCK_SCOPE" \
+											--token "\$round_generation_token_retained" \
+											--pin-token "\$round_acquisition_pin_retained" \
+											--best-effort || round_lock_cleanup_status=\$?
+									fi
+								;;
+							cancel-dorado-handoff)
+								perl "\$ROUND_LOCK_HELPER" cancel-handoff \
+									--state-dir "\$ROUND_LOCK_STATE_DIR" \
+									--round-barcode "\$round_barcode" \
+									--scope "\$ROUND_LOCK_SCOPE" \
+									--token "\$round_generation_token_retained" \
+									--pin-token "\$round_acquisition_pin_retained" \
+									|| round_lock_cleanup_status=\$?
+								;;
+						none) ;;
+							*)
+								echo "ERROR: invalid round-lock cleanup state: \$round_lock_cleanup" >&2
+								round_lock_cleanup_status=1
+								;;
+						esac
+						if [ "\$round_lock_cleanup_status" -ne 0 ]; then
+							echo "ERROR: round-lock cleanup failed (rc=\$round_lock_cleanup_status)" >&2
+							if [ "\$round_lock_status" -eq 0 ]; then
+								round_lock_status=\$round_lock_cleanup_status
+							fi
 						fi
-						# If this round never reached the "handoff" point, release the lock so the next POD5 can proceed.
-						if [ ! -f "\$ROUND_LOCK_HANDOFF_FILE" ]; then
-							rmdir "\$ROUND_LOCKDIR" 2>/dev/null || true
-					rm -f "${ongoingStateDir}/_state/round_inflight.txt" 2>/dev/null || true
-				fi
-			}
-				trap release_round_lock EXIT
-				lock_timeout=0
-				source "${baseDir}/bin/lib/stale_lock_utils.sh"
-				while ! mkdir "\$ROUND_LOCKDIR" 2>/dev/null; do
-				reclaimed_round_lock=0
-				set +e
-				stale_lock_maybe_reclaim \
-					"\$ROUND_LOCKDIR" \
-					"\$LOCK_META" \
-					"\$THIS_HOST" \
-					"\$(( ${staleLockTtlMinutesStr} * 60 ))" \
-					"round lock" \
-					remove_round_lock_if_stale \
-					1
-				reclaim_status=\$?
-				set -e
-				if [ "\$reclaim_status" -eq 2 ]; then
-					echo "ERROR: stale_lock_maybe_reclaim rejected round lock parameters" 1>&2
-					exit 1
-				fi
-				if [ "\$reclaim_status" -eq 10 ]; then
-					reclaimed_round_lock=1
-				fi
-				if [ "\$reclaimed_round_lock" -eq 1 ]; then
-					continue
-				fi
-
-				sleep 5
-				waited=\$((waited + 5))
-				# Periodic status so it doesn't look "stalled" in Nextflow.
-				if [ \$((waited % 60)) -eq 0 ]; then
-				echo "INFO: Waiting for previous round to finish (lock: \$ROUND_LOCKDIR)" 1>&2
-			fi
-				if [ "\$ROUND_LOCK_WAIT_MIN" -gt 0 ] && [ "\$waited" -ge \$((ROUND_LOCK_WAIT_MIN * 60)) ]; then
-					echo "ERROR: Timed out waiting for previous round to finish (lock: \$ROUND_LOCKDIR)" 1>&2
-					lock_timeout=1
-					break
-				fi
-				done
-				if [ "\$lock_timeout" -eq 1 ]; then
-					echo "ERROR: Round lock wait timed out for \${round_barcode}" 1>&2
-					exit 1
-				fi
+						exit "\$round_lock_status"
+					}
+					trap round_lock_cleanup_on_exit EXIT
+					round_lock_acquire_once() {
+						round_lock_acquire_command=\$1
+						perl "\$ROUND_LOCK_HELPER" "\$round_lock_acquire_command" \
+							--state-dir "\$ROUND_LOCK_STATE_DIR" \
+							--round-barcode "\$round_barcode" \
+							--scope "\$ROUND_LOCK_SCOPE" \
+							--token "\$round_generation_token_retained" \
+							--pin-token "\$round_acquisition_pin_retained" \
+							--owner-pid "\$\$" \
+							--wait-seconds "\$ROUND_LOCK_WAIT_SECONDS" \
+							--stale-seconds "\$ROUND_LOCK_STALE_SECONDS"
+					}
+					ROUND_LOCK_ACQUIRE_OUTPUT="\$(round_lock_acquire_once acquire)" || \
+						ROUND_LOCK_ACQUIRE_OUTPUT="\$(round_lock_acquire_once replay-acquire)"
+					round_generation_token=""
+					round_acquisition_pin=""
+					round_lock_field_count=0
+					while IFS='=' read -r round_lock_key round_lock_value; do
+						case "\$round_lock_key" in
+							generation_token)
+								[ -z "\$round_generation_token" ] || { echo "ERROR: duplicate round-lock generation token" >&2; exit 1; }
+								round_generation_token="\$round_lock_value"
+								;;
+							pin_token)
+								[ -z "\$round_acquisition_pin" ] || { echo "ERROR: duplicate round-lock acquisition pin" >&2; exit 1; }
+								round_acquisition_pin="\$round_lock_value"
+								;;
+							*)
+								echo "ERROR: unexpected round-lock acquisition field: \$round_lock_key" >&2
+								exit 1
+								;;
+						esac
+						round_lock_field_count="\$((round_lock_field_count + 1))"
+					done <<ROUND_LOCK_ACQUIRE_FIELDS
+\$ROUND_LOCK_ACQUIRE_OUTPUT
+ROUND_LOCK_ACQUIRE_FIELDS
+					if [ "\$round_lock_field_count" -ne 2 ]; then
+						echo "ERROR: round-lock helper returned an incomplete acquisition record" >&2
+						exit 1
+					fi
+					case "\$round_generation_token" in
+						''|*[!0-9a-f]*)
+							echo "ERROR: round-lock helper returned malformed acquisition tokens" >&2
+							exit 1
+							;;
+					esac
+					case "\$round_acquisition_pin" in
+						''|*[!0-9a-f]*)
+							echo "ERROR: round-lock helper returned malformed acquisition tokens" >&2
+							exit 1
+							;;
+					esac
+					if [ "\${#round_generation_token}" -ne 64 ] || [ "\${#round_acquisition_pin}" -ne 64 ]; then
+						echo "ERROR: round-lock helper returned invalid acquisition token lengths" >&2
+						exit 1
+					fi
+						if [ "\$round_generation_token" != "\$round_generation_token_retained" ] || \
+						[ "\$round_acquisition_pin" != "\$round_acquisition_pin_retained" ] || \
+						[ "\$round_generation_token_retained" != "\$(rtbioscan_round_lock_prepare_token_file \
+						"\$ROUND_LOCK_GENERATION_TOKEN_FILE" \
+						"acquire-generation:\$round_barcode:\$ROUND_LOCK_SCOPE:\$\$")" ] || \
+						[ "\$round_acquisition_pin_retained" != "\$(rtbioscan_round_lock_prepare_token_file \
+						"\$ROUND_LOCK_ACQUISITION_PIN_FILE" \
+						"acquire-pin:\$round_barcode:\$ROUND_LOCK_SCOPE:\$\$")" ]; then
+						echo "ERROR: round-lock helper response does not match retained acquire tokens" >&2
+							exit 1
+						fi
+						round_lock_acquired=1
+						round_lock_scope="\$ROUND_LOCK_SCOPE"
 	READ_FILE_ABS=\$(bash ${baseDir}/bin/round_barcode_source_guard.sh \
 		--state-dir "${ongoingStateDir}/_state" \
 		--round-barcode "\$round_barcode" \
@@ -966,11 +1024,13 @@ process fast_on_target_detection {
 	then
 		mkdir -p ${ongoingStateDir}/\$round_barcode/
 	fi
-	{
-		printf 'round_barcode=%s\n' "\$round_barcode"
-		printf 'started_utc=%s\n' "\$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
-		printf 'read_file=%s\n' "\$READ_FILE_ABS"
-	} > ${ongoingStateDir}/_state/round_inflight.txt || true
+		perl "\$ROUND_LOCK_HELPER" inflight \
+			--state-dir "\$ROUND_LOCK_STATE_DIR" \
+			--round-barcode "\$round_barcode" \
+			--scope "\$ROUND_LOCK_SCOPE" \
+			--token "\$round_generation_token" \
+			--pin-token "\$round_acquisition_pin" \
+			--read-file "\$READ_FILE_ABS"
 
 	# Assign a deterministic round index under the existing round lock.
 	ROUND_INDEX=\$(bash ${baseDir}/bin/round_index_assign.sh \
@@ -1059,9 +1119,14 @@ process fast_on_target_detection {
 			        echo "ERROR: Timed out waiting ${params.file_wait_minutes} minute(s) for ${read_file} to become readable" 1>&2
 					exit 1
 			    fi
-		if [ "\$ROUND_LOCK_SCOPE" = "dorado_only" ] && [ "\$ROUND_LOCK_EARLY_RELEASED" -ne 1 ]; then
-			: > "\$ROUND_LOCK_HANDOFF_FILE" 2>/dev/null || true
-			release_round_lock_now
+		if [ "\$ROUND_LOCK_SCOPE" = "dorado_only" ]; then
+			round_lock_cleanup=cancel-dorado-handoff
+			perl "\$ROUND_LOCK_HELPER" early-release \
+				--state-dir "\$ROUND_LOCK_STATE_DIR" \
+				--round-barcode "\$round_barcode" \
+				--scope "\$ROUND_LOCK_SCOPE" \
+				--token "\$round_generation_token" \
+				--pin-token "\$round_acquisition_pin"
 			echo "INFO: round lock released after FAST basecalling (round_lock_scope=dorado_only)" 1>&2
 		fi
 		if [ -s \${barcode}_fast.sam ];
@@ -1190,16 +1255,22 @@ process fast_on_target_detection {
 			# In full_round mode keep lock ownership until backup_update_and_clean.
 			# In dorado_only mode this handoff/release already happened after FAST basecalling.
 			if [ "\$ROUND_LOCK_SCOPE" = "full_round" ]; then
-				: > "\$ROUND_LOCK_HANDOFF_FILE" 2>/dev/null || true
+				perl "\$ROUND_LOCK_HELPER" handoff \
+					--state-dir "\$ROUND_LOCK_STATE_DIR" \
+					--round-barcode "\$round_barcode" \
+					--scope "\$ROUND_LOCK_SCOPE" \
+					--token "\$round_generation_token" \
+					--pin-token "\$round_acquisition_pin"
 			fi
+			round_lock_cleanup=none
 	
 		"""
 	}
 
 failed_round_ch = failed_round_source_ch
-	.map { barcode, round_barcode, read_path ->
-		def roundFailedFile = file("${ongoingStateDir}/${round_barcode}/ROUND_FAILED.txt")
-		roundFailedFile.exists() ? [barcode, round_barcode, roundFailedFile] : null
+		.map { barcode, round_barcode, read_path, round_generation_token, round_lock_scope ->
+			def roundFailedFile = file("${ongoingStateDir}/${round_barcode}/ROUND_FAILED.txt")
+			roundFailedFile.exists() ? [barcode, round_barcode, roundFailedFile, round_generation_token, round_lock_scope] : null
 	}
 	.filter { it != null }
 failed_round_ch.into {
@@ -1214,41 +1285,41 @@ failed_round_ch.into {
 	failed_cons_agg_src_ch
 }
 failed_blst_rpt_summary = failed_blst_rpt_summary_src_ch
-	.map { barcode, round_barcode, round_failed_file ->
-		[barcode, round_barcode, failedRoundPlaceholderAssets.blastOtuPretaxRpt, failedRoundPlaceholderAssets.readInfoRpt, failedRoundPlaceholderAssets.blastOtuNoadapterRpt, failedRoundPlaceholderAssets.blastFilterStats]
-	}
+		.map { barcode, round_barcode, round_failed_file, round_generation_token, round_lock_scope ->
+			[barcode, round_barcode, failedRoundPlaceholderAssets.blastOtuPretaxRpt, failedRoundPlaceholderAssets.readInfoRpt, failedRoundPlaceholderAssets.blastOtuNoadapterRpt, failedRoundPlaceholderAssets.blastFilterStats, round_generation_token, round_lock_scope]
+		}
 failed_cons_rpt_summary = failed_cons_rpt_summary_src_ch
-	.map { barcode, round_barcode, round_failed_file ->
-		[barcode, round_barcode, failedRoundPlaceholderAssets.blastConsensusTaxRpt, failedRoundPlaceholderAssets.consensusRoundProv]
-	}
+		.map { barcode, round_barcode, round_failed_file, round_generation_token, round_lock_scope ->
+			[barcode, round_barcode, failedRoundPlaceholderAssets.blastConsensusTaxRpt, failedRoundPlaceholderAssets.consensusRoundProv]
+		}
 failed_otu_def_rpt_summary = failed_otu_def_rpt_summary_src_ch
-	.map { barcode, round_barcode, round_failed_file ->
-		[barcode, round_barcode, failedRoundPlaceholderAssets.otuDefRpt, failedRoundPlaceholderAssets.otuMembersRound, failedRoundPlaceholderAssets.otuSizesRound]
-	}
+		.map { barcode, round_barcode, round_failed_file, round_generation_token, round_lock_scope ->
+			[barcode, round_barcode, failedRoundPlaceholderAssets.otuDefRpt, failedRoundPlaceholderAssets.otuMembersRound, failedRoundPlaceholderAssets.otuSizesRound]
+		}
 failed_otu_def_rpt_sidecar_summary = failed_otu_def_rpt_sidecar_summary_src_ch
-	.map { barcode, round_barcode, round_failed_file ->
-		[barcode, round_barcode, failedRoundPlaceholderAssets.otuDefSidecar]
-	}
+		.map { barcode, round_barcode, round_failed_file, round_generation_token, round_lock_scope ->
+			[barcode, round_barcode, failedRoundPlaceholderAssets.otuDefSidecar]
+		}
 failed_demult_rpt_summary = failed_demult_rpt_summary_src_ch
-	.map { barcode, round_barcode, round_failed_file ->
-		[barcode, round_barcode, failedRoundPlaceholderAssets.demultRpt]
-	}
+		.map { barcode, round_barcode, round_failed_file, round_generation_token, round_lock_scope ->
+			[barcode, round_barcode, failedRoundPlaceholderAssets.demultRpt]
+		}
 failed_demult_rpt_sidecar_summary = failed_demult_rpt_sidecar_summary_src_ch
-	.map { barcode, round_barcode, round_failed_file ->
-		[barcode, round_barcode, failedRoundPlaceholderAssets.demultSidecar]
-	}
+		.map { barcode, round_barcode, round_failed_file, round_generation_token, round_lock_scope ->
+			[barcode, round_barcode, failedRoundPlaceholderAssets.demultSidecar]
+		}
 failed_target_rpt_summary = failed_target_rpt_summary_src_ch
-	.map { barcode, round_barcode, round_failed_file ->
-		[barcode, round_barcode, failedRoundPlaceholderAssets.onTargetRpt]
-	}
+		.map { barcode, round_barcode, round_failed_file, round_generation_token, round_lock_scope ->
+			[barcode, round_barcode, failedRoundPlaceholderAssets.onTargetRpt]
+		}
 failed_blast_agg_ch = failed_blast_agg_src_ch
-	.map { barcode, round_barcode, round_failed_file ->
-		[barcode, round_barcode, failedRoundPlaceholderAssets.blastReportAnnotated]
-	}
+		.map { barcode, round_barcode, round_failed_file, round_generation_token, round_lock_scope ->
+			[barcode, round_barcode, failedRoundPlaceholderAssets.blastReportAnnotated]
+		}
 failed_cons_agg_ch = failed_cons_agg_src_ch
-	.map { barcode, round_barcode, round_failed_file ->
-		[barcode, round_barcode, failedRoundPlaceholderAssets.consensusBlastFull]
-	}
+		.map { barcode, round_barcode, round_failed_file, round_generation_token, round_lock_scope ->
+			[barcode, round_barcode, failedRoundPlaceholderAssets.consensusBlastFull]
+		}
 
 // ============================================================
 // STAGE B — REPORTING (_reporting_fast_on_target)
@@ -1258,10 +1329,11 @@ process _reporting_fast_on_target {
 	maxForks maxForksReportingVal
 
     input:
-	tuple val(barcode), val(round_barcode), file(round_fast_fasta), file(round_blast_kingdom), file(round_fast_sam), file(round_reads_target_list) from on_target_report
+		tuple val(barcode), val(round_barcode), file(round_fast_fasta), file(round_blast_kingdom), file(round_fast_sam), file(round_reads_target_list), val(round_generation_token), val(round_lock_scope) from on_target_report
 	
     output:
-    tuple val(barcode), val(round_barcode) into fast_control
+	    tuple val(barcode), val(round_barcode), val(round_generation_token), val(round_lock_scope) into fast_control
+		tuple val(barcode), val(round_barcode) into round_lock_done_reporting_fast_on_target_ch
 	tuple val(barcode), val(round_barcode), file("${barcode}_on_target_rpt.txt") into target_rpt_summary
     file("${barcode}_read_info_rpt.txt")
 	
@@ -1269,8 +1341,16 @@ process _reporting_fast_on_target {
 	"""
 	set -euo pipefail
 	shopt -s nullglob
-	export LC_ALL=C
-	RESTART_TOKEN="${restartTokenForCache}"
+		export LC_ALL=C
+		RESTART_TOKEN="${restartTokenForCache}"
+		export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+		export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+		export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+		export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+		export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+		export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.reporting_fast_on_target.\$\$"
+		source "${baseDir}/bin/round_lock_process_guard.sh"
+		rtbioscan_round_lock_pin reporting_fast_on_target
 
 	DORADO_SUMMARY_HEADER='input_filename\tbatch_id\tparent_read_id\tread_id\trun_id\tchannel\tmux\tminknow_events\tstart_time\tduration\tpasses_filtering\ttemplate_start\tnum_events_template\ttemplate_duration\tsequence_length_template\tmean_qscore_template\tpore_type\texperiment_id\tsample_id\tend_reason\n'
 
@@ -1303,7 +1383,8 @@ process _reporting_fast_on_target {
 	cp -f ${round_blast_kingdom} ${ongoingStateDir}/${round_barcode}/${round_blast_kingdom} 2>/dev/null || true
 	cp -f ${barcode}_round_fast.tsv ${ongoingStateDir}/${round_barcode}/${barcode}_round_fast.tsv 2>/dev/null || true
 	cp -f ${barcode}_read_info_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt 2>/dev/null || true
-	cp -f ${barcode}_on_target_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_on_target_rpt.txt 2>/dev/null || true
+		cp -f ${barcode}_on_target_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_on_target_rpt.txt 2>/dev/null || true
+		rtbioscan_round_lock_unpin
 	
 	
 	"""	
@@ -1434,6 +1515,7 @@ process hac_basecalling {
 	"""
 }
 
+hac_reads_with_generation = ChannelUtils.strictRoundJoin(barcode_annotate, round_generation_ch, 'hac_reads_with_generation')
 hq_reads_report_with_fast_control = ChannelUtils.strictRoundJoin(hq_reads_report, fast_control)
 
 // ============================================================
@@ -1444,18 +1526,27 @@ process _reporting_hac_basecalling {
 	maxForks maxForksReportingVal
 
     input:
-	tuple val(barcode), val(round_barcode), file(round_hac_sam), file(round_hac_fastq) from hq_reads_report_with_fast_control
+		tuple val(barcode), val(round_barcode), file(round_hac_sam), file(round_hac_fastq), val(round_generation_token), val(round_lock_scope) from hq_reads_report_with_fast_control
 	
     output:
 	tuple val(barcode), val(round_barcode) into hac_read_control
+	tuple val(barcode), val(round_barcode) into round_lock_done_reporting_hac_basecalling_ch
 	
     script:
 
 	"""
 	set -euo pipefail
 	shopt -s nullglob
-	export LC_ALL=C
-	RESTART_TOKEN="${restartTokenForCache}"
+		export LC_ALL=C
+		RESTART_TOKEN="${restartTokenForCache}"
+		export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+		export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+		export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+		export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+		export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+		export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.reporting_hac_basecalling.\$\$"
+		source "${baseDir}/bin/round_lock_process_guard.sh"
+		rtbioscan_round_lock_pin reporting_hac_basecalling
 
 	DORADO_SUMMARY_HEADER='input_filename\tbatch_id\tparent_read_id\tread_id\trun_id\tchannel\tmux\tminknow_events\tstart_time\tduration\tpasses_filtering\ttemplate_start\tnum_events_template\ttemplate_duration\tsequence_length_template\tmean_qscore_template\tpore_type\texperiment_id\tsample_id\tend_reason\n'
 
@@ -1478,8 +1569,9 @@ process _reporting_hac_basecalling {
 	fi
 	cp -f ${barcode}_round_hac.tsv ${ongoingStateDir}/${round_barcode}/${barcode}_hac.tsv 2>/dev/null || true
 
-	perl ${baseDir}/bin/reporting_getting_hq.pl ${barcode}_round_hac.tsv ${round_hac_sam} ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt ${params.min_read_length} ${params.max_read_length} ${params.min_quality_score} ${barcode}
-	cp -f ${barcode}_read_info_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt 2>/dev/null || true
+		perl ${baseDir}/bin/reporting_getting_hq.pl ${barcode}_round_hac.tsv ${round_hac_sam} ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt ${params.min_read_length} ${params.max_read_length} ${params.min_quality_score} ${barcode}
+		cp -f ${barcode}_read_info_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt 2>/dev/null || true
+		rtbioscan_round_lock_unpin
 	
 	"""
 }
@@ -1492,18 +1584,27 @@ process demultiplexing_hq_reads {
     maxForks 1
 
     input:
-    tuple val(barcode), val(round_barcode), file(hac_reads_fastq) from barcode_annotate
+	    tuple val(barcode), val(round_barcode), file(hac_reads_fastq), val(round_generation_token), val(round_lock_scope) from hac_reads_with_generation
 	
 	
     output:
-	tuple val(barcode), val(round_barcode), file("${barcode}_hac_sup_annotated_clean.fasta") into otu_analysis
-	tuple val(barcode), val(round_barcode), file("${barcode}_hac_sup_annotated_clean.fastq") into annotate_reads_report	
+		tuple val(barcode), val(round_barcode), file("${barcode}_hac_sup_annotated_clean.fasta"), val(round_generation_token), val(round_lock_scope) into otu_analysis
+		tuple val(barcode), val(round_barcode), file("${barcode}_hac_sup_annotated_clean.fastq"), val(round_generation_token), val(round_lock_scope) into annotate_reads_report
+		tuple val(barcode), val(round_barcode) into round_lock_done_demultiplexing_hq_reads_ch
     script:
 	"""
 	set -euo pipefail
 	shopt -s nullglob
-	export LC_ALL=C
-	RESTART_TOKEN="${restartTokenForCache}"
+		export LC_ALL=C
+		RESTART_TOKEN="${restartTokenForCache}"
+		export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+		export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+		export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+		export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+		export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+		export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.demultiplexing_hq_reads.\$\$"
+		source "${baseDir}/bin/round_lock_process_guard.sh"
+		rtbioscan_round_lock_pin demultiplexing_hq_reads
 
 	# Ensure expected outputs exist even if no reads are present or demux is disabled.
 	: > ${barcode}_hac_sup_annotated_clean.fastq
@@ -1879,12 +1980,13 @@ PY
 	fi
 	_p_targets="${params.targets}"
 	IFS='|' read -ra _TARGETS <<< "\$_p_targets"
-	for _t in "\${_TARGETS[@]}"; do
-		if [ -f ${barcode}_sup_annotated_\${_t}.fastq ]; then
-			rm ${barcode}_sup_annotated_\${_t}.fastq
-			echo "Removing ${barcode}_sup_annotated_\${_t}.fastq" 1>&2
-		fi
-	done
+		for _t in "\${_TARGETS[@]}"; do
+			if [ -f ${barcode}_sup_annotated_\${_t}.fastq ]; then
+				rm ${barcode}_sup_annotated_\${_t}.fastq
+				echo "Removing ${barcode}_sup_annotated_\${_t}.fastq" 1>&2
+			fi
+		done
+		rtbioscan_round_lock_unpin
 	
 	"""
 }
@@ -1897,20 +1999,29 @@ process _reporting_hq_demultiplexing {
 	maxForks maxForksReportingVal
 
     input:
-	tuple val(barcode), val(round_barcode), file(hac_sup_annotated_clean_fastq) from annotate_reads_report
+		tuple val(barcode), val(round_barcode), file(hac_sup_annotated_clean_fastq), val(round_generation_token), val(round_lock_scope) from annotate_reads_report
 	
     output:
 	tuple val(barcode), val(round_barcode), file("${barcode}_demult_rpt.txt") into demult_control
     tuple val(barcode), val(round_barcode), file("${barcode}_demult_rpt.txt") into demult_rpt_summary
     tuple val(barcode), val(round_barcode), file("${barcode}_demult_rpt.contract.tsv") into demult_rpt_sidecar_summary
+	tuple val(barcode), val(round_barcode) into round_lock_done_reporting_hq_demultiplexing_ch
     
 	script:
 
 	"""
 	set -euo pipefail
 	shopt -s nullglob
-	export LC_ALL=C
-	RESTART_TOKEN="${restartTokenForCache}"
+		export LC_ALL=C
+		RESTART_TOKEN="${restartTokenForCache}"
+		export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+		export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+		export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+		export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+		export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+		export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.reporting_hq_demultiplexing.\$\$"
+		source "${baseDir}/bin/round_lock_process_guard.sh"
+		rtbioscan_round_lock_pin reporting_hq_demultiplexing
 	ROUND_FAILED_FILE="${ongoingStateDir}/${round_barcode}/ROUND_FAILED.txt"
 	ROUND_FAILED=0
 	if [ -f "\$ROUND_FAILED_FILE" ]; then
@@ -1939,7 +2050,8 @@ process _reporting_hq_demultiplexing {
 	fi
 	mkdir -p ${ongoingStateDir}/${round_barcode}/
 	cp -f ${barcode}_demult_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_demult_rpt.txt 2>/dev/null || true
-	cp -f ${barcode}_demult_rpt.contract.tsv ${ongoingStateDir}/${round_barcode}/${barcode}_demult_rpt.contract.tsv 2>/dev/null || true
+		cp -f ${barcode}_demult_rpt.contract.tsv ${ongoingStateDir}/${round_barcode}/${barcode}_demult_rpt.contract.tsv 2>/dev/null || true
+		rtbioscan_round_lock_unpin
 	
 	
 	"""	
@@ -1957,20 +2069,29 @@ process OTU_definition {
 	    maxForks maxForksStatefulCoreVal
 	    label 'cluster'
     input:
-	tuple val(barcode), val(round_barcode), file(fasta_hq_qced) from otu_analysis
+		tuple val(barcode), val(round_barcode), file(fasta_hq_qced), val(round_generation_token), val(round_lock_scope) from otu_analysis
 	
 	output:
-	tuple val(barcode), val(round_barcode), file(fasta_hq_qced), file("${barcode}_qced_reads_nr.fasta.clstr") into fastq_qced_blast
-	tuple val(barcode), val(round_barcode), file(fasta_hq_qced) into fastq_qced_consensus
-	tuple val(barcode), val(round_barcode), file("${barcode}_qced_reads_nr.fasta.clstr") into report_otu
+		tuple val(barcode), val(round_barcode), file(fasta_hq_qced), file("${barcode}_qced_reads_nr.fasta.clstr"), val(round_generation_token), val(round_lock_scope) into fastq_qced_blast
+		tuple val(barcode), val(round_barcode), file(fasta_hq_qced), val(round_generation_token), val(round_lock_scope) into fastq_qced_consensus
+		tuple val(barcode), val(round_barcode), file("${barcode}_qced_reads_nr.fasta.clstr"), val(round_generation_token), val(round_lock_scope) into report_otu
+		tuple val(barcode), val(round_barcode) into round_lock_done_OTU_definition_ch
 	
     script:
 	"""
 	set -euo pipefail
 	shopt -s nullglob
 	export LC_ALL=C
-	trap 'echo "ERROR: OTU_definition failed at line \$LINENO: \$BASH_COMMAND" >&2' ERR
-	RESTART_TOKEN="${restartTokenForCache}"
+		trap 'echo "ERROR: OTU_definition failed at line \$LINENO: \$BASH_COMMAND" >&2' ERR
+		RESTART_TOKEN="${restartTokenForCache}"
+		export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+		export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+		export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+		export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+		export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+		export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.OTU_definition.\$\$"
+		source "${baseDir}/bin/round_lock_process_guard.sh"
+		rtbioscan_round_lock_pin OTU_definition
 	# Align cd-hit threads with CPUs reserved for this task (see `cpus { params.cluster_threads }`).
 	THREADS=${task.cpus}
 	if [ -z "\$THREADS" ]; then THREADS=1; fi
@@ -2590,8 +2711,9 @@ process OTU_definition {
 	[ -f "\${1:-}" ] && rm ${barcode}_qced_reads_nr[0-9]* || true
 
 		set -- ${barcode}_qced_reads_*normal*
-	[ -f "\${1:-}" ] && rm ${barcode}_qced_reads_*normal* || true
-		fi  # HQ reads non-empty
+		[ -f "\${1:-}" ] && rm ${barcode}_qced_reads_*normal* || true
+			fi  # HQ reads non-empty
+		rtbioscan_round_lock_unpin
 		
 		"""
 }
@@ -2604,17 +2726,26 @@ otu_def_reporting_inputs = ChannelUtils.strictRoundJoin(report_otu, demult_contr
 process _reporting_OTU_definition {
   maxForks maxForksReportingVal
   input:
-    tuple val(barcode), val(round_barcode), file(otu_clstr), file(demult) from otu_def_reporting_inputs
+	    tuple val(barcode), val(round_barcode), file(otu_clstr), val(round_generation_token), val(round_lock_scope), file(demult) from otu_def_reporting_inputs
   output:
     tuple val(barcode), val(round_barcode), file("${barcode}_otu_def_rpt.txt"), file("${barcode}_otu_members_round.tsv"), file("${barcode}_otu_sizes_round.tsv") into otu_def_rpt_summary, otu_def_rpt_summary_for_blast
     tuple val(barcode), val(round_barcode), file("${barcode}_otu_def_rpt.contract.tsv") into otu_def_rpt_sidecar_summary
+    tuple val(barcode), val(round_barcode) into round_lock_done_reporting_OTU_definition_ch
     script:
 
 	"""
 	set -euo pipefail
 	shopt -s nullglob
-	export LC_ALL=C
-	RESTART_TOKEN="${restartTokenForCache}"
+		export LC_ALL=C
+		RESTART_TOKEN="${restartTokenForCache}"
+		export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+		export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+		export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+		export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+		export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+		export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.reporting_OTU_definition.\$\$"
+		source "${baseDir}/bin/round_lock_process_guard.sh"
+		rtbioscan_round_lock_pin reporting_OTU_definition
 	OTU_SIZE_STREAK_MODE="${otuSizeStreakModeCanonical}"
 	OTU_SIZE_STREAK_MIN_ROUNDS="${otuSizeStreakMinRoundsStr}"
 	ROUND_FAILED_FILE="${ongoingStateDir}/${round_barcode}/ROUND_FAILED.txt"
@@ -2755,9 +2886,10 @@ fi
 				echo "WARN: otu_size_streak_missing_hash_rows=\${_missing_hash} (size-streak skipped for missing hash)" 1>&2
 			fi
 		fi
-		cp "\$OTU_SIZE_STREAK_IDS" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_size_streak_prune_ids.txt 2>/dev/null || true
-		cp "\$OTU_SIZE_STREAK_STATS" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_size_streak_stats.tsv 2>/dev/null || true
-		cp "\$OTU_SIZE_STREAK_STATE_NEXT" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_size_streak.tsv 2>/dev/null || true
+			cp "\$OTU_SIZE_STREAK_IDS" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_size_streak_prune_ids.txt 2>/dev/null || true
+			cp "\$OTU_SIZE_STREAK_STATS" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_size_streak_stats.tsv 2>/dev/null || true
+			cp "\$OTU_SIZE_STREAK_STATE_NEXT" ${ongoingStateDir}/${round_barcode}/${barcode}_otu_size_streak.tsv 2>/dev/null || true
+			rtbioscan_round_lock_unpin
 
 		"""
 }
@@ -2778,11 +2910,12 @@ process blast_OTU_pretax {
 		time '20h'
 
     input:
-      tuple val(barcode), val(round_barcode), file(fasta_hq_qced), file(qced_reads_nr), file(read_file), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round) from blast_pretax_inputs
+	      tuple val(barcode), val(round_barcode), file(fasta_hq_qced), file(qced_reads_nr), val(round_generation_token), val(round_lock_scope), file(read_file), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round) from blast_pretax_inputs
     output:
       tuple val(barcode), val(round_barcode), file('blast_report_annotated.txt') into blast_agg_ch
-      tuple val(barcode), val(round_barcode), file("${barcode}_blastreport_sup.sam"), file("${barcode}_round_sup.tsv"), file("${barcode}_blastreport_sup_pre.fastq"), file("${barcode}_preblastreport_join.txt"), file("blast_report_annotated_preferred.txt"), file("blast_report_annotated_noadapter.txt"), file("${barcode}_blast_filter_stats.tsv") into report_blast
+	      tuple val(barcode), val(round_barcode), file("${barcode}_blastreport_sup.sam"), file("${barcode}_round_sup.tsv"), file("${barcode}_blastreport_sup_pre.fastq"), file("${barcode}_preblastreport_join.txt"), file("blast_report_annotated_preferred.txt"), file("blast_report_annotated_noadapter.txt"), file("${barcode}_blast_filter_stats.tsv"), val(round_generation_token), val(round_lock_scope) into report_blast
       tuple val(barcode), val(round_barcode), file("blast_report_annotated.txt"), file("${barcode}_assigned_read_ids.list") into blast2consensus
+      tuple val(barcode), val(round_barcode) into round_lock_done_blast_OTU_pretax_ch
 
 	script:
 	if(!usingDockerProfile){
@@ -2806,7 +2939,15 @@ process blast_OTU_pretax {
 			exit 1
 		fi
 	done
-	RESTART_TOKEN="${restartTokenForCache}"
+		RESTART_TOKEN="${restartTokenForCache}"
+		export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+		export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+		export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+		export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+		export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+		export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.blast_OTU_pretax.\$\$"
+		source "${baseDir}/bin/round_lock_process_guard.sh"
+		rtbioscan_round_lock_pin blast_OTU_pretax
 	THREADS=${task.cpus}
 	OTU_BLAST_MIN_MEMBERS="${otuBlastMinMembersStr}"
 	OTU_BLAST_FILTER_MODE="${otuBlastFilterModeCanonical}"
@@ -4019,6 +4160,7 @@ process blast_OTU_pretax {
 		copy_soft "\$OTU_MEMBERS_BLASTDIAG" "\${STATE_DIR}/${barcode}_otu_members_blastdiag.tsv"
 		copy_soft "\$OTU_SIZES_BLASTDIAG" "\${STATE_DIR}/${barcode}_otu_sizes_blastdiag.tsv"
 		copy_soft "\$OTU_MEMBERS_BLASTDIAG_STATS" "\${STATE_DIR}/${barcode}_otu_members_blastdiag_stats_last.tsv"
+		rtbioscan_round_lock_unpin
 		"""
   }
 
@@ -4030,9 +4172,10 @@ report_blast_inputs = ChannelUtils.strictRoundJoin(report_blast, hac_read_contro
 process _reporting_blast_pretax {
   maxForks maxForksReportingVal
   input:
-    tuple val(barcode), val(round_barcode), file(round_sup_sam), file(round_sup_tsv), file(blast_sup_fastq), file(blast_read), file(blast_report_otu), file(blast_report_noadapter), file(blast_filter_stats) from report_blast_inputs
+	    tuple val(barcode), val(round_barcode), file(round_sup_sam), file(round_sup_tsv), file(blast_sup_fastq), file(blast_read), file(blast_report_otu), file(blast_report_noadapter), file(blast_filter_stats), val(round_generation_token), val(round_lock_scope) from report_blast_inputs
   output:
-    tuple val(barcode), val(round_barcode), file("${barcode}_blast_otu_pretax_rpt.txt"), file("${barcode}_read_info_rpt.txt"), file("${barcode}_blast_otu_noadapter_rpt.txt"), file(blast_filter_stats) into blst_rpt_summary
+	    tuple val(barcode), val(round_barcode), file("${barcode}_blast_otu_pretax_rpt.txt"), file("${barcode}_read_info_rpt.txt"), file("${barcode}_blast_otu_noadapter_rpt.txt"), file(blast_filter_stats), val(round_generation_token), val(round_lock_scope) into blst_rpt_summary
+    tuple val(barcode), val(round_barcode) into round_lock_done_reporting_blast_pretax_ch
     file("${barcode}_blast_otu_pretax_rpt.txt")
     file("${barcode}_blast_otu_noadapter_rpt.txt")
 	
@@ -4041,8 +4184,16 @@ process _reporting_blast_pretax {
 		"""
 			set -euo pipefail
 			shopt -s nullglob
-			export LC_ALL=C
-			RESTART_TOKEN="${restartTokenForCache}"
+				export LC_ALL=C
+				RESTART_TOKEN="${restartTokenForCache}"
+				export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+				export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+				export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+				export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+				export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+				export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.reporting_blast_pretax.\$\$"
+				source "${baseDir}/bin/round_lock_process_guard.sh"
+				rtbioscan_round_lock_pin reporting_blast_pretax
 			ROUND_FAILED_FILE="${ongoingStateDir}/${round_barcode}/ROUND_FAILED.txt"
 			ROUND_FAILED=0
 			if [ -f "\$ROUND_FAILED_FILE" ]; then
@@ -4183,7 +4334,7 @@ process _reporting_blast_pretax {
 			fi
 		fi
 
-		if cp ${barcode}_blast_otu_noadapter_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_blast_otu_noadapter_rpt.txt;
+				if cp ${barcode}_blast_otu_noadapter_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_blast_otu_noadapter_rpt.txt;
 		then
 			mkdir -p ${ongoingStateDir}/_state
 			if [ ! -f ${ongoingStateDir}/_state/${barcode}_blast_otu_noadapter_rpt.txt ];
@@ -4195,9 +4346,10 @@ process _reporting_blast_pretax {
 					tail -n +2 ${barcode}_blast_otu_noadapter_rpt.txt >> ${ongoingStateDir}/_state/${barcode}_blast_otu_noadapter_rpt.txt
 				fi
 			fi
-		fi
+				fi
+				rtbioscan_round_lock_unpin
 
-	"""
+		"""
 }
 
 consensus_inputs = ChannelUtils.strictRoundJoin(fastq_qced_consensus, blast2consensus)
@@ -4213,11 +4365,12 @@ process consensus {
 	    label 'blast'
 
     input: 
-    tuple val(barcode), val(round_barcode), file(fasta_hq_qced), file(blast_report), file(assigned_read_ids) from consensus_inputs
+	    tuple val(barcode), val(round_barcode), file(fasta_hq_qced), val(round_generation_token), val(round_lock_scope), file(blast_report), file(assigned_read_ids) from consensus_inputs
 
 	output:
-	tuple val(barcode), val(round_barcode), file("${barcode}_preblastreport_join.txt"), file("consensus_blast_report_full.txt"), file("consensus_round_provenance.tsv") into report_consensus
+		tuple val(barcode), val(round_barcode), file("${barcode}_preblastreport_join.txt"), file("consensus_blast_report_full.txt"), file("consensus_round_provenance.tsv"), val(round_generation_token), val(round_lock_scope) into report_consensus
 	tuple val(barcode), val(round_barcode), file('consensus_blast_report_full.txt') into cons_agg_ch
+	tuple val(barcode), val(round_barcode) into round_lock_done_consensus_ch
 
 	script:
 
@@ -4247,6 +4400,14 @@ process consensus {
 		fi
 	done
 	RESTART_TOKEN="${restartTokenForCache}"
+	export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+	export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+	export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+	export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+	export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+	export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.consensus.\$\$"
+	source "${baseDir}/bin/round_lock_process_guard.sh"
+	rtbioscan_round_lock_pin consensus
 	THREADS=${task.cpus}
 		export RTBIOSCAN_RSCRIPT="${consensusRscriptBin ?: 'Rscript'}"
 		export BLASTDB=${taxdb_dir}
@@ -5328,10 +5489,11 @@ process consensus {
 		rm -f tmp_idx.tsv tmp_tax.tsv tmp_tax_cols.tsv tmp_taxids_numeric.tsv tmp_taxids_unique.txt \
 			tmp_tax_map.tsv tmp_taxids_cached.txt tmp_taxids_missing.txt tmp_tax_map_missing.tsv \
 			tmp_assign_levels.tsv tmp_assign_levels_uniq.tsv tmp_tax_join.tsv consensus_sample_mode.tsv
-		rm -f ${barcode}_preblast_cached*.txt ${barcode}_preblast_new*.fasta \
-			${barcode}_preblast_new*.txt ${barcode}_preblast_hash_new*.tsv \
-			${barcode}_preblastreport[0-9]*.txt ${barcode}_COI.fasta ${barcode}_ITS2.fasta
-		"""
+			rm -f ${barcode}_preblast_cached*.txt ${barcode}_preblast_new*.fasta \
+				${barcode}_preblast_new*.txt ${barcode}_preblast_hash_new*.tsv \
+				${barcode}_preblastreport[0-9]*.txt ${barcode}_COI.fasta ${barcode}_ITS2.fasta
+			rtbioscan_round_lock_unpin
+			"""
 }
 
 // ============================================================
@@ -5340,9 +5502,10 @@ process consensus {
 process _reporting_consensus_tax {
   maxForks maxForksReportingVal
   input:
-    tuple val(barcode), val(round_barcode), file(blast_read), file(blast_report_consensus), file(consensus_round_provenance) from report_consensus
+	    tuple val(barcode), val(round_barcode), file(blast_read), file(blast_report_consensus), file(consensus_round_provenance), val(round_generation_token), val(round_lock_scope) from report_consensus
   output:
 	tuple val(barcode), val(round_barcode), file("${barcode}_blast_consensus_tax_rpt.txt"), file("consensus_round_provenance.tsv") into cons_rpt_summary
+	tuple val(barcode), val(round_barcode) into round_lock_done_reporting_consensus_tax_ch
     file("${barcode}_blast_consensus_tax_rpt.txt")
 	
     script:
@@ -5352,6 +5515,14 @@ process _reporting_consensus_tax {
 			shopt -s nullglob
 			export LC_ALL=C
 			RESTART_TOKEN="${restartTokenForCache}"
+			export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+			export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+			export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+			export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+			export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+			export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.reporting_consensus_tax.\$\$"
+			source "${baseDir}/bin/round_lock_process_guard.sh"
+			rtbioscan_round_lock_pin reporting_consensus_tax
 			ROUND_FAILED_FILE="${ongoingStateDir}/${round_barcode}/ROUND_FAILED.txt"
 			ROUND_FAILED=0
 			if [ -f "\$ROUND_FAILED_FILE" ]; then
@@ -5424,7 +5595,8 @@ process _reporting_consensus_tax {
 		|| { echo "ERROR: failed to persist consolidated consensus-tax report to round dir" 1>&2; exit 1; }
 	cp ${barcode}_blast_consensus_tax_consolidated_rpt.txt ${ongoingStateDir}/_state/${barcode}_blast_consensus_tax_consolidated_rpt.txt \
 		|| { echo "ERROR: failed to persist consolidated consensus-tax report to _state" 1>&2; exit 1; }
-		"""	
+			rtbioscan_round_lock_unpin
+			"""
 }
 
 blst_rpt_summary = preferRealRoundRows(blst_rpt_summary, failed_blst_rpt_summary, 'blst_rpt_summary')
@@ -5449,7 +5621,28 @@ getting_run_summary_inputs = ChannelUtils.strictRoundJoinAll([
 	target_rpt_summary,
 	reports_blast,
 ], 'getting_run_summary_inputs')
-getting_run_summary_with_path = ChannelUtils.strictRoundJoin(getting_run_summary_inputs, get_summary_ch)
+
+// Failed-round placeholder rows can arrive before the normal branches finish.
+// Drain every earlier generation-bound writer before the summary mutates
+// cumulative state or backup begins terminal finalization.
+round_lock_writers_drained_ch = ChannelUtils.strictRoundJoinAll([
+	round_lock_done_reporting_fast_on_target_ch,
+	round_lock_done_reporting_hac_basecalling_ch,
+	round_lock_done_demultiplexing_hq_reads_ch,
+	round_lock_done_reporting_hq_demultiplexing_ch,
+	round_lock_done_OTU_definition_ch,
+	round_lock_done_reporting_OTU_definition_ch,
+	round_lock_done_blast_OTU_pretax_ch,
+	round_lock_done_reporting_blast_pretax_ch,
+	round_lock_done_consensus_ch,
+	round_lock_done_reporting_consensus_tax_ch,
+], 'round_lock_writers_drained')
+getting_run_summary_inputs_drained = ChannelUtils.strictRoundJoin(
+	getting_run_summary_inputs,
+	round_lock_writers_drained_ch,
+	'getting_run_summary_inputs_drained'
+)
+getting_run_summary_with_path = ChannelUtils.strictRoundJoin(getting_run_summary_inputs_drained, get_summary_ch)
 
 
 // ============================================================
@@ -5459,9 +5652,9 @@ process getting_run_summary {
     maxForks maxForksReportingVal
     publishDir "${ongoingResultsStateDir}/", mode: 'copy', overwrite: true
 	input:
-	tuple val(barcode), val(round_barcode), file(blast_otu_pretax_rpt), file(read_info_rpt), file(blast_otu_noadapter_rpt), file(blast_filter_stats), file(blast_consensus_tax), file(consensus_round_provenance), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round), file(otu_def_rpt_sidecar), file(demult_rpt), file(demult_rpt_sidecar), file(on_target_rpt), file(summary), file(summary_otu), val(read_path) from getting_run_summary_with_path
+		tuple val(barcode), val(round_barcode), file(blast_otu_pretax_rpt), file(read_info_rpt), file(blast_otu_noadapter_rpt), file(blast_filter_stats), val(round_generation_token), val(round_lock_scope), file(blast_consensus_tax), file(consensus_round_provenance), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round), file(otu_def_rpt_sidecar), file(demult_rpt), file(demult_rpt_sidecar), file(on_target_rpt), file(summary), file(summary_otu), val(read_path) from getting_run_summary_with_path
     output:
-		tuple val(barcode), val(round_barcode) into complete_round_ch
+			tuple val(barcode), val(round_barcode), val(round_generation_token), val(round_lock_scope) into complete_round_ch
 
 		    def demuxModeValue = params.demultiplex_mode?.toString()?.toLowerCase()
 		    def generateDemuxReports = demuxEnabledInt
@@ -5492,6 +5685,14 @@ process getting_run_summary {
 	shopt -s nullglob
 	export LC_ALL=C
 	RESTART_TOKEN="${restartTokenForCache}"
+	export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+	export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+	export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+	export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+	export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+	export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.getting_run_summary.\$\$"
+	source "${baseDir}/bin/round_lock_process_guard.sh"
+	rtbioscan_round_lock_pin getting_run_summary
 		DEMUX_MODE="${demuxModeValue ?: ''}"
 		GENERATE_DEMUX_REPORTS=${generateDemuxReports}
 	HTML_REPORT_ENABLED=${htmlReportEnabled ? 1 : 0}
@@ -6360,10 +6561,11 @@ process getting_run_summary {
 			if [ ! -s "\$ROUND_REPORT_JSON" ]; then
 				echo "ERROR: final report_round_json.pl did not produce output: \$ROUND_REPORT_JSON" 1>&2
 				exit 1
-			fi
-			set -e
+				fi
+				set -e
+				rtbioscan_round_lock_unpin
 
-		"""
+			"""
 }
 
 complete_round_with_path = ChannelUtils.strictRoundJoin(complete_round_ch, close_round_ch)
@@ -6376,7 +6578,7 @@ complete_round_with_path = ChannelUtils.strictRoundJoin(complete_round_ch, close
 process backup_update_and_clean {
 	cache false
 	input:
-		tuple val(barcode), val(round_barcode), val(read_path) from complete_round_with_path
+			tuple val(barcode), val(round_barcode), val(round_generation_token), val(round_lock_scope), val(read_path) from complete_round_with_path
 	output:
 		file("done_pod5.txt")
 		tuple val(barcode), val(round_barcode), file("report_render.request") into report_render_request_ch
@@ -6393,8 +6595,16 @@ process backup_update_and_clean {
 		"""
 			set -euo pipefail
 			shopt -s nullglob
-			export LC_ALL=C
-			RESTART_TOKEN="${restartTokenForCache}"
+				export LC_ALL=C
+				RESTART_TOKEN="${restartTokenForCache}"
+				export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+				export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+				export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+				export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+				export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+				export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.backup_update_and_clean.\$\$"
+				source "${baseDir}/bin/round_lock_process_guard.sh"
+				rtbioscan_round_lock_pin backup_update_and_clean
 
 		READ_PATH="${read_path ?: ''}"
 
@@ -6402,20 +6612,13 @@ process backup_update_and_clean {
 		
 			ROUND_TMP="${ongoingStateDir}/${round_barcode}"
 			
-			STATE_TMP="${ongoingStateDir}/_state"
-			ONGOING_FINAL="${ongoingResultsStateDir}"
-				ROUND_LOCKDIR="\${STATE_TMP}/.round_inflight.lockdir"
-						DONE_LOCK="\${STATE_TMP}/.done_pod5.lock"
-						ROUND_LOCK_SCOPE="${roundLockScopeCanonical}"
-						LOCK_WAIT=${params.lock_wait_seconds}
+				STATE_TMP="${ongoingStateDir}/_state"
+				ONGOING_FINAL="${ongoingResultsStateDir}"
+							DONE_LOCK="\${STATE_TMP}/.done_pod5.lock"
+							LOCK_WAIT=${params.lock_wait_seconds}
 				source "${baseDir}/bin/lib/lock_utils.sh"
 				source "${baseDir}/bin/lib/backup_sync.sh"
 				init_lock_helpers
-			# Register the round lock (acquired by a prior process) so the EXIT trap
-			# releases it if this process crashes before the explicit rmdir below.
-			if [ "\$ROUND_LOCK_SCOPE" = "full_round" ] && [ -d "\$ROUND_LOCKDIR" ]; then
-				acquired_locks+=( "\$STATE_TMP/.round_inflight" )
-			fi
 		
 			CURRENT_TEMP_ROOT="${currentStateDir}"
 			CURRENT_ROOT="${currentResultsStateDir}"
@@ -6444,6 +6647,7 @@ process backup_update_and_clean {
 			FEEDER_SLICE_SIDECAR="\$FEEDER_METADATA_DIR/${round_barcode}_slice.tsv"
 			FEEDER_GLOBAL_LEDGER_DIR="${feederGlobalLedgerDir}"
 
+					if [ "\${RTBIOSCAN_ROUND_LOCK_ALREADY_COMPLETED:-0}" -ne 1 ]; then
 					# -- §2: Rolling state publish (copy _rpt.txt + PNGs to ongoing results) --
 					# Copy rolling tables/plots to the "ongoing" results area.
 					mkdir -p "\$ONGOING_FINAL"
@@ -6679,9 +6883,10 @@ process backup_update_and_clean {
 
 
 		# -- §6: State-tables snapshot + round-lock release --
-		# ---- Snapshot rolling state tables while lock is still held ----
-		# Done here (inside the round lock) to avoid a race with OTU_definition N+1,
-		# which writes to these same \$STATE_TMP files without holding the round lock.
+		# ---- Snapshot rolling state tables before the release boundary ----
+		# In full_round, the generation remains active under the backup pin here, so
+		# OTU_definition N+1 cannot mutate these same \$STATE_TMP files concurrently.
+		# dorado_only retains its documented early-release overlap semantics.
 		# These are small TSV/FASTA files so the cost is negligible.
 
 			mkdir -p "\$CURRENT_TEMP_ROOT/tables" "\$CURRENT_ROOT/tables"
@@ -6695,17 +6900,41 @@ process backup_update_and_clean {
 				sync_changed_files "\$CURRENT_TEMP_ROOT/tables" "\${state_tables[@]}" 2>/dev/null || true
 				sync_changed_files "\$CURRENT_ROOT/tables" "\${state_tables[@]}" 2>/dev/null || true
 			fi
+					fi
 
 
 		# ---- Release round lock (before heavy I/O) ----
 		# POD5 staging complete; release now so round N+1 can start
 		# while this process copies Consensus/plots/tables (outside lock).
-		if [ "\$ROUND_LOCK_SCOPE" = "full_round" ]; then
-			rm -f "\$ROUND_LOCKDIR/meta.env" 2>/dev/null || true
-			rmdir "\$ROUND_LOCKDIR" 2>/dev/null || true
-			rm -f "\$STATE_TMP/round_inflight.txt" 2>/dev/null || true
-		fi
-		rm -f "\$STATE_TMP/.round_lock_handoff.${round_barcode}"* 2>/dev/null || true
+			if [ "\$RTBIOSCAN_ROUND_LOCK_SCOPE" = "full_round" ]; then
+				if [ "\${RTBIOSCAN_ROUND_LOCK_ALREADY_COMPLETED:-0}" -eq 1 ]; then
+					perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" finish \
+						--state-dir "\$RTBIOSCAN_ROUND_LOCK_STATE_DIR" \
+						--round-barcode "\$RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE" \
+						--scope "\$RTBIOSCAN_ROUND_LOCK_SCOPE" \
+						--token "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN"
+				else
+					perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" finish \
+						--state-dir "\$RTBIOSCAN_ROUND_LOCK_STATE_DIR" \
+						--round-barcode "\$RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE" \
+						--scope "\$RTBIOSCAN_ROUND_LOCK_SCOPE" \
+						--token "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" \
+						--pin-token "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN"
+				fi
+			else
+				perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" finish \
+					--state-dir "\$RTBIOSCAN_ROUND_LOCK_STATE_DIR" \
+					--round-barcode "\$RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE" \
+					--scope "\$RTBIOSCAN_ROUND_LOCK_SCOPE" \
+					--token "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN"
+			fi
+			if [ ! -f done_pod5.txt ]; then
+				if [ ! -f "\$STATE_TMP/done_pod5.txt" ]; then
+					echo "ERROR: authenticated completed round lacks done_pod5.txt state" >&2
+					exit 1
+				fi
+				cp "\$STATE_TMP/done_pod5.txt" done_pod5.txt
+			fi
 
 
 		# -- §7: Post-lock heavy copies + disk-pressure cleanup --
