@@ -225,9 +225,6 @@ sub acquire_state_fence {
     die "ERROR: round-lock state directory changed while waiting for its fence\n"
         if !@current || -l _ || !-d _
         || $current[0] != $opened[0] || $current[1] != $opened[1];
-    # Re-establish parent-directory durability for a visible state transition
-    # whose previous owner may have died between rename/link and its fsync.
-    sync_directory($state_dir);
     my $archive_dir = terminal_archive_dir($state_dir);
     my @archive_st = lstat($archive_dir);
     if (@archive_st) {
@@ -240,6 +237,11 @@ sub acquire_state_fence {
     } elsif (!$!{ENOENT}) {
         die "ERROR: cannot inspect terminal round-lock archive '$archive_dir': $!\n";
     }
+    # Re-establish parent-directory durability for a visible state transition
+    # whose previous owner may have died between rename/link and its fsync.  A
+    # terminal rename is adopted destination-first so a second crash cannot
+    # persist source removal without the archived destination name.
+    sync_directory($state_dir);
     return $fh;
 }
 
@@ -1314,6 +1316,10 @@ sub blocking_pins {
     my @st = lstat($pin_dir);
     die "ERROR: generation pin directory is missing or unsafe: $pin_dir\n"
         if !@st || -l _ || !-d _;
+    # A previous helper may have died after adding or removing the last ready
+    # name but before syncing pins/.  Adopt that visible namespace before an
+    # empty enumeration is allowed to authorize release or reclaim.
+    sync_directory($pin_dir);
     opendir(my $dh, $pin_dir)
         or die "ERROR: cannot inspect generation pins '$pin_dir': $!\n";
     my @entries = sort grep { /\Aready\.([0-9a-f]{64})\.tsv\z/ } readdir($dh);

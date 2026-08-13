@@ -295,6 +295,33 @@ def test_both_directory_creation_outcomes_sync_the_parent() -> None:
     )
 
 
+def test_state_fence_adopts_terminal_archive_before_source_removal() -> None:
+    """A recovered rename must make its destination durable before its source."""
+    body = _sub_body("acquire_state_fence")
+    archive_sync = "sync_directory($archive_dir);"
+    state_sync = "sync_directory($state_dir);"
+
+    assert body.count(archive_sync) == 1, body
+    assert body.count(state_sync) == 1, body
+    assert body.index(archive_sync) < body.index(state_sync), (
+        "terminal archive adoption synced the source parent before the "
+        "destination parent"
+    )
+
+
+def test_blocking_pins_adopts_pin_directory_before_enumeration() -> None:
+    """An empty ready-pin namespace is authority only after its parent fsync."""
+    body = _sub_body("blocking_pins")
+    validation = "if !@st || -l _ || !-d _;"
+    pin_sync = "sync_directory($pin_dir);"
+    enumeration = "opendir(my $dh, $pin_dir)"
+
+    assert body.count(pin_sync) == 1, body
+    assert body.index(validation) < body.index(pin_sync) < body.index(enumeration), (
+        "blocking_pins did not validate and sync pins/ before enumerating it"
+    )
+
+
 def _helper(action: str, state: Path, **opts: str) -> subprocess.CompletedProcess[str]:
     argv = ["perl", str(SCRIPT), action, "--state-dir", str(state)]
     for key, value in opts.items():
