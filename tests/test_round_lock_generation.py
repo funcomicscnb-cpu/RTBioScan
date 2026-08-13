@@ -493,7 +493,7 @@ def test_existing_handoff_marker_rejects_a_displaced_generation(
 
 
 @pytest.mark.parametrize("malformed", [False, True])
-def test_legacy_or_malformed_lock_is_ttl_quarantined_without_marker_glob(
+def test_legacy_or_malformed_lock_requires_explicit_operator_quarantine(
     tmp_path: Path,
     malformed: bool,
 ) -> None:
@@ -508,19 +508,77 @@ def test_legacy_or_malformed_lock_is_ttl_quarantined_without_marker_glob(
     legacy_marker.write_bytes(b"legacy-marker\n")
     _backdate_lock(state)
 
-    token, _pin = _acquire(state, round_barcode="run_10", stale_seconds=1)
-    assert _generation(state)["token"] == token
+    before = {
+        path.relative_to(state).as_posix(): (
+            os.lstat(path).st_dev,
+            os.lstat(path).st_ino,
+            _read_nofollow_bytes(path) if path.is_file() else None,
+        )
+        for path in [state, *sorted(state.rglob("*"))]
+    }
+    blocked = subprocess.run(
+        _command(
+            "acquire", state, round_barcode="run_10", owner_pid=os.getpid(),
+            stale_seconds=1,
+        ),
+        capture_output=True,
+        check=False,
+        env=_perl_test_env(),
+    )
+    assert blocked.returncode != 0
+    expected_status = "parse-invalid" if malformed else "absent"
+    _assert_exact_error_line(
+        blocked.stderr,
+        f"ERROR: round lock has {expected_status} generation state and "
+        f"requires operator quarantine: {lock_dir}",
+    )
+    after = {
+        path.relative_to(state).as_posix(): (
+            os.lstat(path).st_dev,
+            os.lstat(path).st_ino,
+            _read_nofollow_bytes(path) if path.is_file() else None,
+        )
+        for path in [state, *sorted(state.rglob("*"))]
+    }
+    assert after == before
     assert _read_nofollow_bytes(legacy_marker) == b"legacy-marker\n"
-    quarantines = list(state.glob(".round_inflight.lockdir.reclaim-*"))
-    assert len(quarantines) == 1
-    legacy_events = [
-        event
-        for event in _event_records(state)
-        if event["generation_token"] == "legacy" and event["event"] == "reclaim"
-    ]
-    assert len(legacy_events) == 1
-    assert legacy_events[0]["outcome"] == "quarantined"
-    assert legacy_events[0]["effective_ttl_seconds"] == "1"
+
+
+def test_unknown_generation_host_is_unverifiable_and_never_reclaimed(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    token, pin_token = _acquire(state, stale_seconds=1)
+    generation_path = state / ".round_inflight.lockdir" / "generation.tsv"
+    generation = _read_record(generation_path, schema=GENERATION_SCHEMA)
+    generation["host"] = "unknown"
+    _rewrite_record(generation_path, generation, schema=GENERATION_SCHEMA)
+    before_generation = _read_nofollow_bytes(generation_path)
+    ready_pin = (
+        state / ".round_inflight.lockdir" / "pins" / f"ready.{pin_token}.tsv"
+    )
+    before_pin = _read_nofollow_bytes(ready_pin)
+
+    contender = subprocess.run(
+        _command(
+            "acquire", state, round_barcode="unknown_host_contender",
+            scope="full_round", owner_pid=os.getpid(), stale_seconds=1,
+            wait_seconds=1,
+        ),
+        capture_output=True, check=False, env=_perl_test_env(), timeout=5,
+    )
+    assert contender.returncode != 0
+    assert contender.stdout == b""
+    _assert_exact_error_line(
+        contender.stderr,
+        "ERROR: round lock host identity is unverifiable; refusing automatic reclaim",
+    )
+    assert _read_nofollow_bytes(generation_path) == before_generation
+    assert _read_nofollow_bytes(ready_pin) == before_pin
+    assert _generation(state)["token"] == token
+    assert not (state / ".round_inflight.lockdir" / "transition.tsv").exists()
+    assert not list(state.glob(".round_lock_release.*.tsv"))
+    assert not list(state.glob(".round_lock_revocation.*.tsv"))
 
 
 @pytest.mark.parametrize(
@@ -608,8 +666,8 @@ def test_concurrent_reclaimers_install_one_replacement_generation(
     assert len(winners) == 1
     assert _generation(state)["token"] == winners[0]
     assert _revocation(state, token_a).is_file()
-    quarantines = list(state.glob(".round_inflight.lockdir.reclaim-*"))
-    assert len(quarantines) == 1
+    archives = list((state / ".round_lock_archives").glob("reclaim-*"))
+    assert len(archives) == 1
     reclaim_events = [
         event
         for event in _event_records(state)
@@ -687,25 +745,30 @@ def test_delayed_reclaimer_cannot_rename_new_generation(tmp_path: Path) -> None:
         time.sleep(0.01)
     assert ready.exists(), delayed.communicate(timeout=1)[1]
 
-    token_b, _pin_b = _acquire(
-        state, round_barcode="run_3", stale_seconds=300, wait_seconds=1
+    contender = subprocess.Popen(
+        _command(
+            "acquire", state, round_barcode="run_3", owner_pid=os.getpid(),
+            stale_seconds=300, wait_seconds=1,
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_perl_test_env(),
     )
-    generation_b_path = state / ".round_inflight.lockdir" / "generation.tsv"
-    generation_b = _read_nofollow_bytes(generation_b_path)
-    replacement_paths = [
-        state / ".round_inflight.lockdir",
-        *(state / ".round_inflight.lockdir").iterdir(),
-    ]
-    future = time.time() + 3600
-    for path in replacement_paths:
-        os.utime(path, (future, future), follow_symlinks=False)
+    with pytest.raises(subprocess.TimeoutExpired):
+        contender.communicate(timeout=0.25)
     release.write_text("continue\n", encoding="utf-8")
     delayed_stdout, delayed_stderr = delayed.communicate(timeout=5)
-    assert delayed.returncode != 0, delayed_stdout
-    assert "timed out" in delayed_stderr
-    assert _read_nofollow_bytes(generation_b_path) == generation_b
+    assert delayed.returncode == 0, delayed_stderr
+    token_b, _pin_b = _parse_acquire_output(delayed_stdout.encode("ascii"))
+    contender_stdout, contender_stderr = contender.communicate(timeout=5)
+    assert contender.returncode != 0, contender_stdout
+    _assert_exact_error_line(
+        contender_stderr,
+        f"ERROR: timed out waiting for round lock "
+        f"'{state / '.round_inflight.lockdir'}'",
+    )
     assert _generation(state)["token"] == token_b
-    assert len(list(state.glob(".round_inflight.lockdir.reclaim-*"))) == 1
+    assert len(list((state / ".round_lock_archives").glob("reclaim-*"))) == 1
 
 
 def test_release_crash_recovers_authenticated_receipt_and_late_exit_is_safe(
@@ -799,6 +862,94 @@ def test_full_release_crash_is_recovered_without_minting_a_new_pin(
     assert not _marker(state, token).exists()
     assert not (state / ".round_inflight.lockdir").exists()
     assert list(state.glob(".round_inflight.lockdir.release-*")) == []
+
+
+def test_unpin_cannot_remove_the_pin_authorizing_a_pending_release(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    token, pin_token = _acquire(state, scope="dorado_only")
+    failpoint = "after-transition-install"
+    interrupted = subprocess.run(
+        _command(
+            "early-release", state, token=token, pin_token=pin_token,
+            scope="dorado_only", owner_pid=os.getpid(),
+        ),
+        capture_output=True, check=False,
+        env=_perl_test_env(RTBIOSCAN_ROUND_LOCK_FAILPOINT=failpoint),
+    )
+    assert interrupted.returncode != 0
+    _assert_exact_error_line(interrupted.stderr, FAILPOINT_ERRORS[failpoint])
+
+    lock = state / ".round_inflight.lockdir"
+    ready = lock / "pins" / f"ready.{pin_token}.tsv"
+    transition = lock / "transition.tsv"
+    ready_entry = os.lstat(ready)
+    ready_bytes = _read_nofollow_bytes(ready)
+    transition_entry = os.lstat(transition)
+    transition_bytes = _read_nofollow_bytes(transition)
+
+    rejected = _run(
+        "unpin", state, token=token, pin_token=pin_token,
+        scope="dorado_only", best_effort=True,
+    )
+    assert rejected.returncode != 0
+    _assert_exact_error_line(
+        rejected.stderr.encode(),
+        "ERROR: cannot remove the process pin authorizing a pending release",
+    )
+    assert (os.lstat(ready).st_dev, os.lstat(ready).st_ino) == (
+        ready_entry.st_dev, ready_entry.st_ino,
+    )
+    assert _read_nofollow_bytes(ready) == ready_bytes
+    assert (os.lstat(transition).st_dev, os.lstat(transition).st_ino) == (
+        transition_entry.st_dev, transition_entry.st_ino,
+    )
+    assert _read_nofollow_bytes(transition) == transition_bytes
+
+    recovered = _run("verify-release", state, token=token, scope="dorado_only")
+    assert recovered.returncode == 0, recovered.stderr
+    assert recovered.stdout == "dorado_only_early\n"
+
+
+def test_pending_release_still_allows_a_non_authorizing_worker_to_unpin(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    token, acquisition_pin = _acquire(state)
+    handoff = _run(
+        "handoff", state, token=token, pin_token=acquisition_pin,
+    )
+    assert handoff.returncode == 0, handoff.stderr
+    finisher_pin = _pin(state, token, role="backup_update_and_clean")
+    worker_pin = _pin(state, token, role="state_writer")
+
+    blocked = _run("finish", state, token=token, pin_token=finisher_pin)
+    assert blocked.returncode != 0
+    _assert_exact_error_line(
+        blocked.stderr.encode(),
+        "ERROR: release is blocked by another live generation pin",
+    )
+    transition = _read_record(
+        state / ".round_inflight.lockdir" / "transition.tsv",
+        schema=TRANSITION_SCHEMA,
+    )
+    assert transition["allowed_pin_token"] == finisher_pin
+
+    removed = _run(
+        "unpin", state, token=token, pin_token=worker_pin,
+        best_effort=True,
+    )
+    assert removed.returncode == 0, removed.stderr
+    assert not os.path.lexists(
+        state / ".round_inflight.lockdir" / "pins"
+        / f"ready.{worker_pin}.tsv"
+    )
+
+    finished = _run("finish", state, token=token, pin_token=finisher_pin)
+    assert finished.returncode == 0, finished.stderr
+    receipt = _read_record(_release_receipt(state, token), schema=RELEASE_SCHEMA)
+    assert receipt["operation_token"] == transition["operation_token"]
 
 
 def test_pending_release_recovery_revalidates_the_transition_pin_role(
@@ -1150,7 +1301,8 @@ def test_malformed_identity_and_path_tokens_fail_closed(tmp_path: Path) -> None:
     generation_path.write_text("schema\t1\nrecord_sha256\t0\n", encoding="utf-8")
     guarded = _run("guard-pin", state, token=token, pin_token=pin_token)
     assert guarded.returncode != 0
-    assert "malformed record" in guarded.stderr or "generation was lost" in guarded.stderr
+    assert "parse-invalid generation state" in guarded.stderr
+    assert "requires operator quarantine" in guarded.stderr
 
     bad_token = _run(
         "guard-pin", state, token="../../replacement", pin_token=pin_token

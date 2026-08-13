@@ -112,6 +112,17 @@ INFLIGHT_SCHEMA = RecordSchema(
         "scope", "lock_dev", "lock_ino",
     ),
 )
+OPERATOR_EVENT_SCHEMA = RecordSchema(
+    "OPERATOR_EVENT_ORDER",
+    (
+        "schema", "operation_token", "phase", "operator_label", "reason",
+        "source_name", "destination_name", "lock_dev", "lock_ino",
+        "generation_status", "generation_entry_kind", "generation_sha256",
+        "generation_entry_fingerprint", "transition_status",
+        "transition_entry_kind", "transition_sha256",
+        "transition_entry_fingerprint", "event_epoch", "outcome",
+    ),
+)
 
 HELPER_RECORD_SCHEMAS = (
     GENERATION_SCHEMA,
@@ -122,6 +133,7 @@ HELPER_RECORD_SCHEMAS = (
     REVOCATION_SCHEMA,
     EVENT_SCHEMA,
     INFLIGHT_SCHEMA,
+    OPERATOR_EVENT_SCHEMA,
 )
 
 CHECKSUM_KEY = b"record_sha256"

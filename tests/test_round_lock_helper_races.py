@@ -24,8 +24,10 @@ import pytest
 
 from tests.round_lock_test_utils import (
     GENERATION_SCHEMA,
+    EVENT_SCHEMA,
     MARKER_SCHEMA,
     PIN_SCHEMA,
+    RELEASE_SCHEMA,
     TRANSITION_SCHEMA,
     assert_exact_error_line,
     assert_token,
@@ -107,12 +109,36 @@ def test_concurrent_first_acquisition_never_fails_on_the_events_directory(
             )
             for _ in range(4)
         ]
+        results = []
         for proc in procs:
-            _, stderr = proc.communicate()
+            stdout, stderr = proc.communicate()
+            results.append((proc.returncode, stdout, stderr))
             attempts += 1
             assert "cannot create directory" not in stderr, stderr
             assert f"{EVENTS_DIR_NAME}: File exists" not in stderr, stderr
+        winners = [result for result in results if result[0] == 0]
+        assert len(winners) == 1, results
+        winner_token, _winner_pin = parse_acquire_output(
+            winners[0][1].encode("ascii")
+        )
+        failures = [result for result in results if result[0] != 0]
+        assert len(failures) == 3, results
+        expected = {
+            f"ERROR: timed out waiting for round lock '{state / '.round_inflight.lockdir'}'",
+            "ERROR: timed out waiting for round-lock state fence",
+        }
+        for _rc, stdout, stderr in failures:
+            assert stdout == ""
+            error_lines = {
+                line for line in stderr.splitlines() if line.startswith("ERROR:")
+            }
+            assert len(error_lines) == 1 and error_lines <= expected, failures
         assert (state / EVENTS_DIR_NAME).is_dir()
+        generation = read_record(
+            state / ".round_inflight.lockdir" / "generation.tsv",
+            schema=GENERATION_SCHEMA,
+        )
+        assert generation["token"] == winner_token
     assert attempts == 32
 
 
@@ -127,6 +153,8 @@ def test_events_directory_rejects_a_symlink(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "expected a real directory, not a symlink" in result.stderr
+    assert not os.path.lexists(state / ".round_inflight.lockdir")
+    assert not list(state.glob(".round_inflight.lockdir.failed-acquire-*"))
 
 
 def test_events_directory_rejects_a_regular_file(tmp_path: Path) -> None:
@@ -138,6 +166,8 @@ def test_events_directory_rejects_a_regular_file(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "expected a real directory, not a symlink" in result.stderr
+    assert not os.path.lexists(state / ".round_inflight.lockdir")
+    assert not list(state.glob(".round_inflight.lockdir.failed-acquire-*"))
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
@@ -217,7 +247,7 @@ def test_abort_with_a_valid_pin_releases_the_lock(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "Use of uninitialized value" not in result.stderr, result.stderr
-    assert not lock_dir.exists(), "abort returned 0 but left the round lock in place"
+    _assert_absent(lock_dir)
 
     # The generation is genuinely released, not merely reported as released.
     again = _acquire(state, "run_release_2")
@@ -457,7 +487,7 @@ def test_unmodified_control_release_still_succeeds(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert len(_release_receipts(state)) == 1
-    assert not (state / ".round_inflight.lockdir").exists()
+    _assert_absent(state / ".round_inflight.lockdir")
 
 
 def _assert_absent(path: Path) -> None:
@@ -480,9 +510,8 @@ def _interrupted_release(state: Path) -> tuple[list[str], str, Path, dict[str, s
     Shared by the concurrency regression and its setup gate so the two cannot
     drift apart -- the gate has to exercise the exact preparation the
     regression runs, not a copy of it. Every check below is a fail-closed
-    assertion on the intermediate state: the gate's whole job is to separate
-    "the known recovery defect" from "the setup silently stopped working", and
-    a check that cannot fail does neither.
+    assertion on the intermediate state: the gate distinguishes a recovery
+    regression from setup that silently stopped reaching the intended boundary.
 
     Returns the CLI base arguments, the generation token, the single quarantine
     left behind, and its validated transition record.
@@ -617,34 +646,26 @@ def _interrupted_release(state: Path) -> tuple[list[str], str, Path, dict[str, s
 def test_concurrent_release_recovery_is_single_winner(tmp_path: Path) -> None:
     """Many concurrent recoverers of one interrupted release must all succeed.
 
-    KNOWN DEFECT: this test currently FAILS, and is deliberately left unmarked
-    so the branch stays visibly red until the recovery protocol lands. It was
-    previously ``xfail(strict=False)``, which exits 0 on both XFAIL and XPASS
-    and so gated nothing; ``strict=True`` would not have helped either, since
-    it only fails on XPASS and still accepts the known failure.
-
-    Concurrent recovery of one interrupted release is not idempotent. Every
-    read in ``recover_quarantines`` can observe the quarantine vanish under it,
-    producing three failure classes: concurrent ``remove_tree``, ``pending
-    release lost its authenticated process pin``, and ``quarantine lacks a
-    valid transition``. Measured 13 failures in 96 concurrent recoveries; the
-    rate is nondeterministic, so individual runs can pass outright.
-
-    A cleanup-claim protocol was attempted and withdrawn in 371c1f3: claiming
-    by rename moved the tree outside the recovery scan namespace, orphaning it
-    on crash, and making claims enumerable to fix that made live claims
-    stealable. The fix needs an owner-identity and liveness contract, not
-    another rename.
-
-    Uses ``Popen`` rather than shell jobs, which spawn too slowly to hit the
-    window.
+    The helper-wide state-directory flock now serializes every cooperating
+    recovery command through validation, outcome publication, and the atomic
+    move to the terminal release archive. This test retains the high-contention
+    ``Popen`` shape that reproduced the old three-way read/remove race and
+    requires every waiter to observe the same idempotent receipt.
     """
     failures: list[str] = []
     total = 0
     for trial in range(6):
-        base, generation_token, _quarantine, _transition = _interrupted_release(
+        base, generation_token, quarantine, transition = _interrupted_release(
             tmp_path / f"state-{trial}"
         )
+        quarantine_manifest = {
+            path.relative_to(quarantine).as_posix(): (
+                os.lstat(path).st_dev, os.lstat(path).st_ino,
+                read_nofollow_bytes(path) if stat.S_ISREG(os.lstat(path).st_mode)
+                else None,
+            )
+            for path in [quarantine, *sorted(quarantine.rglob("*"))]
+        }
 
         procs = [
             subprocess.Popen(
@@ -655,10 +676,39 @@ def test_concurrent_release_recovery_is_single_winner(tmp_path: Path) -> None:
             for _ in range(8)
         ]
         for proc in procs:
-            _, stderr = proc.communicate()
+            stdout, stderr = proc.communicate()
             total += 1
             if proc.returncode != 0:
                 failures.append(stderr.strip().splitlines()[0] if stderr.strip() else "?")
+            else:
+                assert stdout == "dorado_only_early\n", stdout
+
+        state = quarantine.parent
+        receipt = read_record(
+            state / f".round_lock_release.{generation_token}.tsv",
+            schema=RELEASE_SCHEMA,
+        )
+        assert receipt["operation_token"] == transition["operation_token"]
+        archive = state / ".round_lock_archives" / (
+            f"release-{transition['operation_token']}"
+        )
+        archive_manifest = {
+            path.relative_to(archive).as_posix(): (
+                os.lstat(path).st_dev, os.lstat(path).st_ino,
+                read_nofollow_bytes(path) if stat.S_ISREG(os.lstat(path).st_mode)
+                else None,
+            )
+            for path in [archive, *sorted(archive.rglob("*"))]
+        }
+        assert archive_manifest == quarantine_manifest
+        events = [
+            read_record(path, schema=EVENT_SCHEMA)
+            for path in (state / ".round_lock_events").glob("*.tsv")
+        ]
+        releases = [event for event in events if event["event"] == "release"]
+        assert len(releases) == 1
+        assert releases[0]["event_id"] == transition["operation_token"]
+        assert not list(state.glob(".round_inflight.lockdir.release-*"))
 
     assert total == 48
     assert not failures, f"{len(failures)}/{total} recoveries failed: {failures[:3]}"
@@ -669,10 +719,8 @@ def test_after_quarantine_rename_failpoint_establishes_the_interleaving(
 ) -> None:
     """Gate the shared preparation the concurrency regression depends on.
 
-    That regression is expected to fail on the known recovery defect for as
-    long as the protocol is unfinished, so its own failure carries no
-    information about whether the failpoint still works. This test runs the
-    same ``_interrupted_release`` helper and nothing else, separating "red
-    because of the known defect" from "red because the setup broke".
+    The concurrent regression and this setup gate exercise the same
+    ``_interrupted_release`` helper. Keeping a separate gate makes a broken
+    failpoint distinguishable from a regression in serialized recovery.
     """
     _interrupted_release(tmp_path / "state")

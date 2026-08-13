@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -174,6 +175,13 @@ def test_assert_token_requires_lowercase_64_hex() -> None:
 def test_transition_order_matches_the_helper() -> None:
     """Pin every typed schema against the helper's own order declarations."""
     source = (SCRIPT).read_text(encoding="utf-8")
+    declared_names = set(
+        re.findall(r"^my @([A-Z][A-Z0-9_]*_ORDER)\s*=", source, re.MULTILINE)
+    )
+    expected_names = {
+        schema.helper_order_name for schema in HELPER_RECORD_SCHEMAS
+    }
+    assert declared_names == expected_names
     for schema in HELPER_RECORD_SCHEMAS:
         line = next(
             one
@@ -245,14 +253,8 @@ def test_the_helper_rejects_what_the_oracle_rejects(tmp_path: Path) -> None:
 
     Without this, the oracle could be arbitrarily strict rather than faithful.
 
-    The helper rejects the record but reports it as a *lost* generation, not a
-    malformed one: lock_snapshot captures parse_record's error into
-    ``$snapshot->{malformed_error}`` at bin/round_lock_generation.pl:433, and
-    that field is never read anywhere in the helper. Corruption and absence
-    therefore reach the operator as the same message, though they call for
-    different responses -- absence can be a benign cleanup race, corruption
-    cannot. The assertion below pins today's behavior deliberately: when the
-    diagnostic is surfaced, this test must fail and be updated consciously.
+    The helper must classify parse corruption separately from absence and
+    direct the operator to the explicit quarantine remedy.
     """
     state = tmp_path / "state"
     state.mkdir()
@@ -292,5 +294,6 @@ def test_the_helper_rejects_what_the_oracle_rejects(tmp_path: Path) -> None:
     assert result.returncode != 0, result.stdout
     assert_exact_error_line(
         result.stderr,
-        f"ERROR: round lock generation was lost: {generation_token}",
+        "ERROR: round lock has parse-invalid generation state and requires "
+        f"operator quarantine: {state / '.round_inflight.lockdir'}",
     )
