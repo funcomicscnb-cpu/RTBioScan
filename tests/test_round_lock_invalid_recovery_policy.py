@@ -503,6 +503,50 @@ def _assert_absent(path: Path) -> None:
     raise AssertionError(f"expected {path} absent, found mode {entry.st_mode:o}")
 
 
+def _operator_entry_fingerprint(path: Path) -> str:
+    """Reimplement the operator evidence metadata digest independently."""
+    entry = os.lstat(path)
+    assert stat.S_ISREG(entry.st_mode) and not stat.S_ISLNK(entry.st_mode)
+    metadata = "\0".join(
+        (
+            "regular",
+            str(entry.st_dev),
+            str(entry.st_ino),
+            str(entry.st_mode),
+            str(entry.st_nlink),
+            str(entry.st_uid),
+            str(entry.st_gid),
+            str(entry.st_rdev),
+            str(entry.st_size),
+            str(entry.st_mtime_ns // 1_000_000_000),
+            str(entry.st_ctime_ns // 1_000_000_000),
+            "",
+        )
+    ).encode("ascii")
+    return hashlib.sha256(metadata).hexdigest()
+
+
+def _assert_operator_event(
+    path: Path,
+    *,
+    expected_fields: dict[str, str],
+    phase: str,
+    outcome: str,
+    event_epoch_floor: int,
+    event_epoch_ceiling: int,
+) -> dict[str, str]:
+    """Validate one audit event against independently captured expectations."""
+    expected = {**expected_fields, "phase": phase, "outcome": outcome}
+    assert set(expected) == set(OPERATOR_EVENT_SCHEMA.fields) - {"event_epoch"}
+    event = read_record(path, schema=OPERATOR_EVENT_SCHEMA)
+    for field, value in expected.items():
+        assert event[field] == value, field
+    assert event["event_epoch"].isascii()
+    assert event["event_epoch"].isdigit()
+    assert event_epoch_floor <= int(event["event_epoch"]) <= event_epoch_ceiling
+    return event
+
+
 def _assert_operator_crash_boundary(
     state: Path,
     *,
@@ -514,6 +558,9 @@ def _assert_operator_crash_boundary(
     destination_visible: bool,
     pending_visible: bool,
     complete_visible: bool,
+    expected_event_fields: dict[str, str],
+    event_epoch_floor: int,
+    event_epoch_ceiling: int,
 ) -> tuple[Path, Path]:
     """Pin the exact visible namespace at one operator crash boundary."""
     audit = state / ".round_lock_operator_events"
@@ -522,33 +569,40 @@ def _assert_operator_crash_boundary(
     complete_path = audit / f"{operation_token}.complete.tsv"
     pending_path = pending_dir / f"{operation_token}.tsv"
 
+    assert source_visible != destination_visible
     expected_top = {EVENTS_NAME, ".round_lock_operator_events"}
-    expected_top.add(source.name if source_visible else destination.name)
+    if source_visible:
+        expected_top.add(source.name)
+    if destination_visible:
+        expected_top.add(destination.name)
     if pending_visible:
         expected_top.add(".round_lock_operator_pending")
     assert {path.name for path in state.iterdir()} == expected_top
-    assert sorted(path.name for path in audit.iterdir()) == [
-        f"{operation_token}.intent.tsv",
-        *([f"{operation_token}.complete.tsv"] if complete_visible else []),
-    ]
+    expected_audit = {f"{operation_token}.intent.tsv"}
+    if complete_visible:
+        expected_audit.add(f"{operation_token}.complete.tsv")
+    assert {path.name for path in audit.iterdir()} == expected_audit
 
     holder = source if source_visible else destination
     absent_holder = destination if source_visible else source
     assert _namespace(holder) == source_manifest
     _assert_absent(absent_holder)
 
-    intent = read_record(intent_path, schema=OPERATOR_EVENT_SCHEMA)
-    assert intent["operation_token"] == operation_token
-    assert intent["phase"] == "intent"
-    assert intent["outcome"] == "prepared"
-    assert intent["source_name"] == source.name
-    assert intent["destination_name"] == destination.name
+    intent = _assert_operator_event(
+        intent_path,
+        expected_fields=expected_event_fields,
+        phase="intent",
+        outcome="prepared",
+        event_epoch_floor=event_epoch_floor,
+        event_epoch_ceiling=event_epoch_ceiling,
+    )
     holder_entry = os.lstat(holder)
     assert intent["lock_dev"] == str(holder_entry.st_dev)
     assert intent["lock_ino"] == str(holder_entry.st_ino)
 
     intent_entry = os.lstat(intent_path)
     assert stat.S_ISREG(intent_entry.st_mode)
+    assert intent_entry.st_nlink == (2 if pending_visible else 1)
     if pending_visible:
         assert sorted(path.name for path in pending_dir.iterdir()) == [
             f"{operation_token}.tsv"
@@ -559,17 +613,30 @@ def _assert_operator_crash_boundary(
             intent_entry.st_dev,
             intent_entry.st_ino,
         )
-        assert read_record(
-            pending_path, schema=OPERATOR_EVENT_SCHEMA,
-        ) == intent
+        _assert_operator_event(
+            pending_path,
+            expected_fields=expected_event_fields,
+            phase="intent",
+            outcome="prepared",
+            event_epoch_floor=event_epoch_floor,
+            event_epoch_ceiling=event_epoch_ceiling,
+        )
     else:
         _assert_absent(pending_dir)
 
     if complete_visible:
-        complete = read_record(complete_path, schema=OPERATOR_EVENT_SCHEMA)
-        assert complete["operation_token"] == operation_token
-        assert complete["phase"] == "complete"
-        assert complete["outcome"] == "quarantined"
+        complete = _assert_operator_event(
+            complete_path,
+            expected_fields=expected_event_fields,
+            phase="complete",
+            outcome="quarantined",
+            event_epoch_floor=event_epoch_floor,
+            event_epoch_ceiling=event_epoch_ceiling,
+        )
+        complete_entry = os.lstat(complete_path)
+        assert stat.S_ISREG(complete_entry.st_mode)
+        assert complete_entry.st_nlink == 1
+        assert int(complete["event_epoch"]) >= int(intent["event_epoch"])
     else:
         _assert_absent(complete_path)
     return intent_path, complete_path
@@ -1031,30 +1098,65 @@ def test_operator_quarantine_handles_every_advertised_invalid_source_class(
 
 
 @pytest.mark.parametrize(
-    "failpoint,complete_visible",
+    (
+        "failpoint,source_visible,destination_visible,pending_visible,"
+        "complete_visible"
+    ),
     [
-        ("after-operator-intent-link-before-sync", False),
-        ("after-operator-intent", False),
-        ("after-operator-rename-before-sync", False),
-        ("after-operator-sync-before-complete", False),
-        ("after-operator-complete-link-before-sync", True),
+        ("after-operator-intent-link-before-sync", True, False, False, False),
+        ("after-operator-intent", True, False, True, False),
+        ("after-operator-rename-before-sync", False, True, True, False),
+        ("after-operator-sync-before-complete", False, True, True, False),
+        ("after-operator-complete-link-before-sync", False, True, True, True),
     ],
 )
 def test_operator_quarantine_replays_every_crash_boundary(
     tmp_path: Path,
     failpoint: str,
+    source_visible: bool,
+    destination_visible: bool,
+    pending_visible: bool,
     complete_visible: bool,
 ) -> None:
     state = _invalid_state(tmp_path, "semantic-invalid-canonical")
     source = state / LOCK_NAME
     source_entry = os.lstat(source)
+    source_manifest = _namespace(source)
     operation_token = _token(f"operator crash {failpoint}")
+    destination = state / f"{LOCK_NAME}.operator-{operation_token}"
+    generation_path = source / "generation.tsv"
+    generation = read_record(generation_path, schema=GENERATION_SCHEMA)
+    assert generation["lock_dev"] == str(source_entry.st_dev)
+    assert generation["lock_ino"] != str(source_entry.st_ino)
+    generation_bytes = read_nofollow_bytes(generation_path)
+    _assert_absent(source / "transition.tsv")
+    expected_event_fields = {
+        "schema": "1",
+        "operation_token": operation_token,
+        "operator_label": "pytest operator",
+        "reason": "invalid snapshot reviewed for recovery",
+        "source_name": source.name,
+        "destination_name": destination.name,
+        "lock_dev": str(source_entry.st_dev),
+        "lock_ino": str(source_entry.st_ino),
+        "generation_status": "semantic-invalid",
+        "generation_entry_kind": "regular",
+        "generation_sha256": hashlib.sha256(generation_bytes).hexdigest(),
+        "generation_entry_fingerprint": _operator_entry_fingerprint(
+            generation_path
+        ),
+        "transition_status": "absent",
+        "transition_entry_kind": "absent",
+        "transition_sha256": "none",
+        "transition_entry_fingerprint": "none",
+    }
     command = _operator_command(
         state,
         expected_dev=source_entry.st_dev,
         expected_ino=source_entry.st_ino,
         operation_token=operation_token,
     )
+    event_epoch_floor = int(time.time())
     ready = tmp_path / f"{failpoint}.ready"
     release = tmp_path / f"{failpoint}.release"
     process = subprocess.Popen(
@@ -1072,11 +1174,20 @@ def test_operator_quarantine_replays_every_crash_boundary(
     stdout, stderr = process.communicate(timeout=5)
     assert process.returncode == -signal.SIGKILL, (stdout, stderr)
 
-    audit = state / ".round_lock_operator_events"
-    intent_path = audit / f"{operation_token}.intent.tsv"
-    complete_path = audit / f"{operation_token}.complete.tsv"
-    assert os.path.lexists(intent_path)
-    assert os.path.lexists(complete_path) is complete_visible
+    intent_path, complete_path = _assert_operator_crash_boundary(
+        state,
+        source=source,
+        destination=destination,
+        operation_token=operation_token,
+        source_manifest=source_manifest,
+        source_visible=source_visible,
+        destination_visible=destination_visible,
+        pending_visible=pending_visible,
+        complete_visible=complete_visible,
+        expected_event_fields=expected_event_fields,
+        event_epoch_floor=event_epoch_floor,
+        event_epoch_ceiling=int(time.time()),
+    )
 
     if not complete_visible:
         before_runtime = _namespace(state)
@@ -1112,11 +1223,12 @@ def test_operator_quarantine_replays_every_crash_boundary(
         command, capture_output=True, check=False, env=perl_test_env(), timeout=5,
     )
     assert replay.returncode == 0, replay.stderr
-    destination = state / f"{LOCK_NAME}.operator-{operation_token}"
+    replay_epoch_ceiling = int(time.time())
     destination_entry = os.lstat(destination)
     assert (destination_entry.st_dev, destination_entry.st_ino) == (
         source_entry.st_dev, source_entry.st_ino,
     )
+    assert _namespace(destination) == source_manifest
     if complete_visible:
         assert read_record(
             source / "generation.tsv", schema=GENERATION_SCHEMA,
@@ -1124,10 +1236,23 @@ def test_operator_quarantine_replays_every_crash_boundary(
     else:
         assert not os.path.lexists(source)
     assert not list((state / ".round_lock_operator_pending").glob("*.tsv"))
-    intent = read_record(intent_path, schema=OPERATOR_EVENT_SCHEMA)
-    complete = read_record(complete_path, schema=OPERATOR_EVENT_SCHEMA)
-    assert intent["operation_token"] == operation_token
-    assert complete["operation_token"] == operation_token
+    intent = _assert_operator_event(
+        intent_path,
+        expected_fields=expected_event_fields,
+        phase="intent",
+        outcome="prepared",
+        event_epoch_floor=event_epoch_floor,
+        event_epoch_ceiling=replay_epoch_ceiling,
+    )
+    complete = _assert_operator_event(
+        complete_path,
+        expected_fields=expected_event_fields,
+        phase="complete",
+        outcome="quarantined",
+        event_epoch_floor=event_epoch_floor,
+        event_epoch_ceiling=replay_epoch_ceiling,
+    )
+    assert int(complete["event_epoch"]) >= int(intent["event_epoch"])
     if not complete_visible:
         replacement = _run_acquire(
             state, round_barcode=f"after_{failpoint}", stale_seconds=30,
