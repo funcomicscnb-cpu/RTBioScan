@@ -4,12 +4,12 @@ use strict;
 use warnings;
 
 use Digest::SHA qw(sha256_hex);
-use Errno qw(EEXIST ELOOP ENOENT EPERM);
-use Fcntl qw(:DEFAULT O_NOFOLLOW O_RDONLY);
+use Errno qw(EACCES EAGAIN EEXIST ELOOP ENOENT EPERM EWOULDBLOCK);
+use Fcntl qw(:DEFAULT :flock O_NOFOLLOW O_RDONLY);
 use File::Basename qw(dirname);
-use File::Path qw(make_path remove_tree);
+use File::Path qw(make_path);
 use File::Spec;
-use Getopt::Long qw(GetOptionsFromArray);
+use Getopt::Long qw(GetOptionsFromArray Configure);
 use IO::Handle;
 use POSIX qw(strftime);
 use Sys::Hostname qw(hostname);
@@ -43,11 +43,22 @@ Commands:
   early-release  create a dorado_only marker and release with the acquisition pin
   finish         release full_round, or clean the exact dorado_only marker
   abort          best-effort pre-handoff release with the acquisition pin
+  operator-quarantine-invalid
+                 preserve an explicitly identified invalid lock outside runtime
+                 recovery after an operator has stopped all related tasks
 
-Common options:
+Runtime options:
   --state-dir DIR --round-barcode NAME --scope full_round|dorado_only
   --token HEX64 --pin-token HEX64 --owner-pid PID --role NAME
   --stale-seconds N --wait-seconds N
+  --best-effort suppresses only an abort/unpin authority miss after the state
+  fence is acquired; fence, recovery, and malformed-state errors remain fatal
+
+Operator quarantine options:
+  --state-dir DIR [--wait-seconds N]
+  --expected-lock-dev N --expected-lock-ino N --operation-token HEX64
+  --operator-label TEXT --reason TEXT --confirm-invalid-snapshot
+  [--source-name BASENAME]
 USAGE
 }
 
@@ -176,6 +187,9 @@ sub revocation_path { return File::Spec->catfile($_[0], ".round_lock_revocation.
 sub inflight_generation_path { return File::Spec->catfile($_[0], ".round_inflight.$_[1].tsv"); }
 sub inflight_compat_path { return File::Spec->catfile($_[0], 'round_inflight.txt'); }
 sub events_dir { return File::Spec->catdir($_[0], '.round_lock_events'); }
+sub operator_events_dir { return File::Spec->catdir($_[0], '.round_lock_operator_events'); }
+sub operator_pending_dir { return File::Spec->catdir($_[0], '.round_lock_operator_pending'); }
+sub terminal_archive_dir { return File::Spec->catdir($_[0], '.round_lock_archives'); }
 
 sub sync_directory {
     my ($path) = @_;
@@ -184,6 +198,143 @@ sub sync_directory {
     $fh->sync()
         or die "ERROR: cannot sync directory '$path': $!\n";
     close($fh) or die "ERROR: cannot close directory '$path': $!\n";
+}
+
+sub acquire_state_fence {
+    my ($state_dir, $nonblocking) = @_;
+    my @before = lstat($state_dir);
+    die "ERROR: cannot inspect round-lock state directory '$state_dir': $!\n"
+        if !@before;
+    die "ERROR: round-lock state directory is not a real directory: $state_dir\n"
+        if -l _ || !-d _;
+    sysopen(my $fh, $state_dir, O_RDONLY)
+        or die "ERROR: cannot open round-lock state fence '$state_dir': $!\n";
+    my @opened = stat($fh);
+    die "ERROR: cannot inspect round-lock state fence '$state_dir': $!\n"
+        if !@opened;
+    die "ERROR: round-lock state directory changed while opening its fence\n"
+        if $opened[0] != $before[0] || $opened[1] != $before[1] || !-d _;
+    if (!flock($fh, LOCK_EX | ($nonblocking ? LOCK_NB : 0))) {
+        my $contended = $nonblocking && ($!{EAGAIN} || $!{EWOULDBLOCK});
+        my $error = "$!";
+        close($fh);
+        return undef if $contended;
+        die "ERROR: cannot acquire round-lock state fence '$state_dir': $error\n";
+    }
+    my @current = lstat($state_dir);
+    die "ERROR: round-lock state directory changed while waiting for its fence\n"
+        if !@current || -l _ || !-d _
+        || $current[0] != $opened[0] || $current[1] != $opened[1];
+    # Re-establish parent-directory durability for a visible state transition
+    # whose previous owner may have died between rename/link and its fsync.
+    sync_directory($state_dir);
+    my $archive_dir = terminal_archive_dir($state_dir);
+    my @archive_st = lstat($archive_dir);
+    if (@archive_st) {
+        die "ERROR: terminal round-lock archive is not a real directory: $archive_dir\n"
+            if -l _ || !-d _;
+        # A terminal archive rename can be visible before the archive-parent
+        # fsync.  Every later cooperating command adopts that visible state by
+        # repeating the missing durability barrier while it owns the fence.
+        sync_directory($archive_dir);
+    } elsif (!$!{ENOENT}) {
+        die "ERROR: cannot inspect terminal round-lock archive '$archive_dir': $!\n";
+    }
+    return $fh;
+}
+
+sub release_state_fence {
+    my ($fh) = @_;
+    return if !defined($fh);
+    flock($fh, LOCK_UN)
+        or die "ERROR: cannot release round-lock state fence: $!\n";
+    close($fh) or die "ERROR: cannot close round-lock state fence: $!\n";
+}
+
+sub acquire_state_fence_with_wait {
+    my ($state_dir, $wait_seconds) = @_;
+    my $waited_ms = 0;
+    my $limit_ms = $wait_seconds * 1000;
+    while (1) {
+        my $fh = acquire_state_fence($state_dir, 1);
+        return $fh if defined($fh);
+        die "ERROR: timed out waiting for round-lock state fence\n"
+            if $limit_ms > 0 && $waited_ms >= $limit_ms;
+        usleep(100_000);
+        $waited_ms += 100;
+    }
+}
+
+sub configured_failpoint {
+    return $ENV{RTBIOSCAN_ROUND_LOCK_FAILPOINT} // '';
+}
+
+sub validate_failpoint_configuration {
+    my $name = configured_failpoint();
+    return if $name eq '';
+    return if $name =~ /\A(?:unlink-ready-pin-before-open|replace-ready-pin-with-file|replace-ready-pin-with-symlink):[0-9a-f]{64}\z/;
+    my %known = map { $_ => 1 } qw(
+        after-lock-mkdir-before-stat
+        after-lock-stat-before-pins
+        after-pins-sync-before-generation
+        after-generation-install
+        after-transition-temp-partial-write
+        after-transition-temp-write-before-link
+        after-transition-link-before-temp-unlink
+        after-transition-temp-unlink-before-sync
+        after-operator-intent
+        after-operator-intent-link-before-sync
+        after-operator-rename-before-sync
+        after-operator-sync-before-complete
+        after-operator-complete-link-before-sync
+        after-transition-install
+        after-quarantine-rename
+        before-quarantine-recovery-outcome
+        after-transition-receipt-before-event
+        after-transition-outcome-before-archive
+        after-terminal-archive-rename-before-sync
+        before-compat-publish
+    );
+    die "ERROR: unknown round-lock failpoint: $name\n" if !$known{$name};
+}
+
+sub test_pause {
+    my ($name) = @_;
+    return if configured_failpoint() ne $name;
+    my $ready = validate_text(
+        'RTBIOSCAN_ROUND_LOCK_TEST_READY',
+        $ENV{RTBIOSCAN_ROUND_LOCK_TEST_READY},
+    );
+    my $release = validate_text(
+        'RTBIOSCAN_ROUND_LOCK_TEST_RELEASE',
+        $ENV{RTBIOSCAN_ROUND_LOCK_TEST_RELEASE},
+    );
+    my $timeout = $ENV{RTBIOSCAN_ROUND_LOCK_TEST_TIMEOUT_SECONDS} // '30';
+    $timeout = validate_uint('RTBIOSCAN_ROUND_LOCK_TEST_TIMEOUT_SECONDS', $timeout);
+    sysopen(my $ready_fh, $ready, O_WRONLY | O_CREAT | O_EXCL, 0600)
+        or die "ERROR: cannot publish failpoint readiness '$ready': $!\n";
+    print {$ready_fh} "$name\n"
+        or die "ERROR: cannot write failpoint readiness '$ready': $!\n";
+    $ready_fh->flush()
+        or die "ERROR: cannot flush failpoint readiness '$ready': $!\n";
+    $ready_fh->sync()
+        or die "ERROR: cannot sync failpoint readiness '$ready': $!\n";
+    close($ready_fh)
+        or die "ERROR: cannot close failpoint readiness '$ready': $!\n";
+    my $deadline = time() + $timeout;
+    while (1) {
+        my @st = lstat($release);
+        if (@st) {
+            die "ERROR: failpoint release is not a regular non-symlink file: $release\n"
+                if -l _ || !-f _;
+            last;
+        }
+        die "ERROR: cannot inspect failpoint release '$release': $!\n"
+            if !$!{ENOENT};
+        die "ERROR: timed out waiting for failpoint release: $name\n"
+            if time() >= $deadline;
+        usleep(10_000);
+    }
 }
 
 sub ensure_real_directory {
@@ -234,7 +385,22 @@ sub write_temp_file {
     my ($path, $content) = @_;
     sysopen(my $fh, $path, O_WRONLY | O_CREAT | O_EXCL, 0600)
         or die "ERROR: cannot create '$path': $!\n";
-    if (!print {$fh} $content) {
+    my $is_transition_temp = $path =~ m{/\.transition-[0-9a-f]{64}\.tmp\z};
+    my $written = 1;
+    if ($is_transition_temp
+        && configured_failpoint() eq 'after-transition-temp-partial-write') {
+        my $length = int(length($content) / 2) || 1;
+        $written = print {$fh} substr($content, 0, $length);
+        if ($written) {
+            $fh->flush()
+                or die "ERROR: cannot flush partial transition '$path': $!\n";
+            test_pause('after-transition-temp-partial-write');
+            $written = print {$fh} substr($content, $length);
+        }
+    } else {
+        $written = print {$fh} $content;
+    }
+    if (!$written) {
         my $error = $!;
         close($fh);
         unlink($path);
@@ -260,14 +426,18 @@ sub write_temp_file {
 }
 
 sub install_immutable {
-    my ($path, $content) = @_;
+    my ($path, $content, $after_link_failpoint) = @_;
     my $tmp = "$path.tmp-" . new_token($path);
     write_temp_file($tmp, $content);
     my $linked = link($tmp, $path);
     my $exists = !$linked && $!{EEXIST};
     my $error = $linked ? '' : "$!";
     unlink($tmp);
-    sync_directory(dirname($path)) if $linked;
+    test_pause($after_link_failpoint)
+        if $linked && defined($after_link_failpoint);
+    # An existing immutable name may have been linked by a process that died
+    # before syncing its parent. Adoption repeats the same durability barrier.
+    sync_directory(dirname($path)) if $linked || $exists;
     die "ERROR: cannot install immutable record '$path': $error\n"
         if !$linked && !$exists;
     return $linked ? 1 : 0;
@@ -400,6 +570,12 @@ my @RELEASE_ORDER = qw(schema token round_barcode scope outcome reason effective
 my @REVOCATION_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds reclaim_transition_epoch lock_dev lock_ino operation_token);
 my @EVENT_ORDER = qw(schema event_id generation_token round_barcode scope event outcome effective_ttl_seconds event_epoch lock_dev lock_ino);
 my @INFLIGHT_ORDER = qw(round_barcode started_utc read_file generation_token scope lock_dev lock_ino);
+my @OPERATOR_EVENT_ORDER = qw(schema operation_token phase operator_label reason source_name destination_name lock_dev lock_ino generation_status generation_entry_kind generation_sha256 generation_entry_fingerprint transition_status transition_entry_kind transition_sha256 transition_entry_fingerprint event_epoch outcome);
+my @OPERATOR_EVIDENCE_FIELDS = qw(
+    generation_status generation_entry_kind generation_sha256
+    generation_entry_fingerprint transition_status transition_entry_kind
+    transition_sha256 transition_entry_fingerprint
+);
 
 sub record_for {
     my ($path, $required_ref) = @_;
@@ -416,6 +592,52 @@ sub transition_record {
     return record_for(transition_path($dir), \@TRANSITION_ORDER);
 }
 
+sub operator_evidence_entry {
+    my ($path) = @_;
+    my @before = lstat($path);
+    return {
+        entry_kind => 'absent', sha256 => 'none', fingerprint => 'none',
+    } if !@before && $!{ENOENT};
+    die "ERROR: cannot inspect operator evidence '$path': $!\n" if !@before;
+    my $kind = -l _ ? 'symlink'
+        : -f _ ? 'regular'
+        : -d _ ? 'directory'
+        : -p _ ? 'fifo'
+        : 'other';
+    my $link_target = $kind eq 'symlink' ? readlink($path) : '';
+    die "ERROR: cannot read operator evidence link '$path': $!\n"
+        if $kind eq 'symlink' && !defined($link_target);
+    my $metadata = join(
+        "\0", $kind, @before[0 .. 7], @before[9 .. 10], $link_target,
+    );
+    my $fingerprint = sha256_hex($metadata);
+    return {
+        entry_kind => $kind, sha256 => 'none', fingerprint => $fingerprint,
+    } if $kind ne 'regular';
+    my $fh;
+    if (!sysopen($fh, $path, O_RDONLY | O_NOFOLLOW)) {
+        return {
+            entry_kind => 'regular-unreadable', sha256 => 'none',
+            fingerprint => $fingerprint,
+        } if $!{EACCES} || $!{EPERM};
+        die "ERROR: cannot read operator evidence '$path': $!\n";
+    }
+    binmode($fh, ':raw')
+        or die "ERROR: cannot set raw mode on operator evidence '$path': $!\n";
+    my @opened = stat($fh);
+    die "ERROR: cannot inspect open operator evidence '$path': $!\n"
+        if !@opened;
+    die "ERROR: operator evidence changed while opening: $path\n"
+        if $opened[0] != $before[0] || $opened[1] != $before[1] || !-f _;
+    my $digest = Digest::SHA->new(256);
+    $digest->addfile($fh);
+    close($fh) or die "ERROR: cannot close operator evidence '$path': $!\n";
+    return {
+        entry_kind => 'regular', sha256 => $digest->hexdigest(),
+        fingerprint => $fingerprint,
+    };
+}
+
 sub lock_snapshot {
     my ($dir) = @_;
     my @dir_st = lstat($dir);
@@ -423,17 +645,23 @@ sub lock_snapshot {
     die "ERROR: cannot inspect round lock '$dir': $!\n" if !@dir_st;
     die "ERROR: round lock is not a regular directory: $dir\n"
         if !-d _ || -l _;
+    # A visible nested generation/transition entry may have been linked by a
+    # process that died before syncing this directory. Snapshot adoption
+    # repeats that durability barrier before trusting either name.
+    sync_directory($dir);
     my $snapshot = {
         dev => $dir_st[0], ino => $dir_st[1], newest_epoch => $dir_st[9],
-        valid => 0,
+        valid => 0, generation_status => 'absent',
     };
     my $generation;
     my $ok = eval { $generation = generation_record($dir); 1 };
     if (!$ok) {
         $snapshot->{malformed_error} = $@;
+        $snapshot->{generation_status} = 'parse-invalid';
         return $snapshot;
     }
     return $snapshot if !defined($generation);
+    $snapshot->{generation_status} = 'semantic-invalid';
     my @generation_st = lstat(generation_path($dir));
     $snapshot->{newest_epoch} = $generation_st[9]
         if @generation_st && $generation_st[9] > $snapshot->{newest_epoch};
@@ -454,6 +682,7 @@ sub lock_snapshot {
         && $generation->{lock_ino} == $dir_st[1];
     if ($valid) {
         $snapshot->{valid} = 1;
+        $snapshot->{generation_status} = 'valid';
         $snapshot->{generation} = $generation;
         my @pins_st = lstat(pins_dir($dir));
         $snapshot->{newest_epoch} = $pins_st[9]
@@ -463,6 +692,486 @@ sub lock_snapshot {
             if @marker_st && $marker_st[9] > $snapshot->{newest_epoch};
     }
     return $snapshot;
+}
+
+sub invalid_snapshot_error {
+    my ($path, $snapshot) = @_;
+    my $status = $snapshot->{generation_status} // 'invalid';
+    return "ERROR: round lock has $status generation state and requires "
+        . "operator quarantine: $path\n";
+}
+
+sub operator_transition_status {
+    my ($dir, $entry) = @_;
+    my $path = transition_path($dir);
+    return 'absent' if $entry->{entry_kind} eq 'absent';
+    my $record;
+    my $ok = eval { $record = transition_record($dir); 1 };
+    return $ok && defined($record)
+        ? 'present-nonauthoritative' : 'parse-invalid';
+}
+
+sub operator_event_path {
+    my ($state_dir, $operation_token, $phase) = @_;
+    return File::Spec->catfile(
+        operator_events_dir($state_dir), "$operation_token.$phase.tsv",
+    );
+}
+
+sub operator_pending_path {
+    my ($state_dir, $operation_token) = @_;
+    return File::Spec->catfile(
+        operator_pending_dir($state_dir), "$operation_token.tsv",
+    );
+}
+
+sub validate_operator_events_directory_if_present {
+    my ($state_dir) = @_;
+    my $path = operator_events_dir($state_dir);
+    my @st = lstat($path);
+    return if !@st && $!{ENOENT};
+    die "ERROR: cannot inspect operator event directory '$path': $!\n"
+        if !@st;
+    die "ERROR: operator event directory is not a real directory: $path\n"
+        if -l _ || !-d _;
+}
+
+sub validate_operator_pending_directory_if_present {
+    my ($state_dir) = @_;
+    my $path = operator_pending_dir($state_dir);
+    my @st = lstat($path);
+    return if !@st && $!{ENOENT};
+    die "ERROR: cannot inspect operator pending directory '$path': $!\n"
+        if !@st;
+    die "ERROR: operator pending directory is not a real directory: $path\n"
+        if -l _ || !-d _;
+}
+
+sub operator_event_record {
+    my ($state_dir, $operation_token, $phase) = @_;
+    return record_for(
+        operator_event_path($state_dir, $operation_token, $phase),
+        \@OPERATOR_EVENT_ORDER,
+    );
+}
+
+sub operator_pending_record {
+    my ($state_dir, $operation_token) = @_;
+    return record_for(
+        operator_pending_path($state_dir, $operation_token),
+        \@OPERATOR_EVENT_ORDER,
+    );
+}
+
+sub install_operator_pending {
+    my ($state_dir, $intent) = @_;
+    ensure_real_directory(operator_pending_dir($state_dir), 0700);
+    my $path = operator_pending_path(
+        $state_dir, $intent->{operation_token},
+    );
+    my $audit_path = operator_event_path(
+        $state_dir, $intent->{operation_token}, 'intent',
+    );
+    my @audit_st = lstat($audit_path);
+    die "ERROR: operator intent is not a regular non-symlink file\n"
+        if !@audit_st || -l _ || !-f _;
+    my $linked = link($audit_path, $path);
+    my $exists = !$linked && $!{EEXIST};
+    my $error = $linked ? '' : "$!";
+    die "ERROR: cannot install operator pending intent: $error\n"
+        if !$linked && !$exists;
+    # Repeat the pending-directory barrier when adopting an existing link.
+    sync_directory(operator_pending_dir($state_dir));
+    my $existing = operator_pending_record(
+        $state_dir, $intent->{operation_token},
+    );
+    my @pending_st = lstat($path);
+    die "ERROR: operator pending intent conflicts: $intent->{operation_token}\n"
+        if !defined($existing) || !@pending_st || -l _ || !-f _
+        || $pending_st[0] != $audit_st[0] || $pending_st[1] != $audit_st[1]
+        || canonical_body($existing, \@OPERATOR_EVENT_ORDER)
+            ne canonical_body($intent, \@OPERATOR_EVENT_ORDER);
+}
+
+sub remove_operator_pending {
+    my ($state_dir, $intent) = @_;
+    my $path = operator_pending_path(
+        $state_dir, $intent->{operation_token},
+    );
+    my $existing = operator_pending_record(
+        $state_dir, $intent->{operation_token},
+    );
+    return if !defined($existing);
+    die "ERROR: operator pending intent conflicts: $intent->{operation_token}\n"
+        if canonical_body($existing, \@OPERATOR_EVENT_ORDER)
+        ne canonical_body($intent, \@OPERATOR_EVENT_ORDER);
+    unlink($path)
+        or die "ERROR: cannot retire completed operator pending intent '$path': $!\n";
+    sync_directory(operator_pending_dir($state_dir));
+}
+
+sub operator_pending_tokens {
+    my ($state_dir) = @_;
+    validate_operator_pending_directory_if_present($state_dir);
+    my $path = operator_pending_dir($state_dir);
+    my @st = lstat($path);
+    return () if !@st && $!{ENOENT};
+    opendir(my $dh, $path)
+        or die "ERROR: cannot inspect operator pending directory '$path': $!\n";
+    my @tokens;
+    for my $entry (readdir($dh)) {
+        next if $entry eq '.' || $entry eq '..';
+        if ($entry =~ /\A([0-9a-f]{64})\.tsv\z/) {
+            push(@tokens, $1);
+            next;
+        }
+        die "ERROR: unexpected entry in operator pending directory: $entry\n";
+    }
+    closedir($dh)
+        or die "ERROR: cannot close operator pending directory '$path': $!\n";
+    return sort @tokens;
+}
+
+sub install_operator_event {
+    my (%arg) = @_;
+    ensure_real_directory(operator_events_dir($arg{state_dir}), 0700);
+    my $path = operator_event_path(
+        $arg{state_dir}, $arg{operation_token}, $arg{phase},
+    );
+    my $after_link_failpoint = $arg{phase} eq 'intent'
+        ? 'after-operator-intent-link-before-sync'
+        : 'after-operator-complete-link-before-sync';
+    my $installed = install_immutable(
+        $path, checksummed_content(\%arg, \@OPERATOR_EVENT_ORDER),
+        $after_link_failpoint,
+    );
+    if (!$installed) {
+        my $existing = operator_event_record(
+            $arg{state_dir}, $arg{operation_token}, $arg{phase},
+        );
+        die "ERROR: immutable operator event conflicts: $arg{operation_token}\n"
+            if canonical_body($existing, \@OPERATOR_EVENT_ORDER)
+            ne canonical_body(\%arg, \@OPERATOR_EVENT_ORDER);
+        # Observing a matching immutable name does not prove the process that
+        # linked it reached its parent-directory durability barrier.
+        sync_directory(operator_events_dir($arg{state_dir}));
+    }
+}
+
+sub valid_operator_entry_evidence {
+    my ($record, $prefix) = @_;
+    my $kind = $record->{"${prefix}_entry_kind"} // '';
+    my $sha = $record->{"${prefix}_sha256"} // '';
+    my $fingerprint = $record->{"${prefix}_entry_fingerprint"} // '';
+    return $sha eq 'none' && $fingerprint eq 'none'
+        if $kind eq 'absent';
+    return $sha =~ $TOKEN_RE && $fingerprint =~ $TOKEN_RE
+        if $kind eq 'regular';
+    return $sha eq 'none' && $fingerprint =~ $TOKEN_RE
+        if $kind =~ /\A(?:regular-unreadable|symlink|directory|fifo|other)\z/;
+    return 0;
+}
+
+sub validate_operator_event_shape {
+    my ($record, $operation_token, $phase) = @_;
+    return 0 if !defined($record);
+    return $record->{schema} eq $SCHEMA
+        && $record->{operation_token} eq $operation_token
+        && $record->{phase} eq $phase
+        && $record->{operator_label} ne ''
+        && $record->{operator_label} !~ /[\t\r\n]/
+        && $record->{reason} ne ''
+        && $record->{reason} !~ /[\t\r\n]/
+        && $record->{source_name}
+            =~ /\A\.round_inflight\.lockdir(?:\.(?:reclaim|release)-[0-9a-f]{64})?\z/
+        && $record->{destination_name}
+            eq ".round_inflight.lockdir.operator-$operation_token"
+        && $record->{lock_dev} =~ /\A[0-9]+\z/
+        && $record->{lock_ino} =~ /\A[0-9]+\z/
+        && $record->{generation_status}
+            =~ /\A(?:absent|parse-invalid|semantic-invalid)\z/
+        && valid_operator_entry_evidence($record, 'generation')
+        && (($record->{generation_status} eq 'absent')
+            == ($record->{generation_entry_kind} eq 'absent'))
+        && ($record->{generation_status} ne 'semantic-invalid'
+            || $record->{generation_entry_kind} eq 'regular')
+        && $record->{transition_status}
+            =~ /\A(?:absent|parse-invalid|present-nonauthoritative)\z/
+        && valid_operator_entry_evidence($record, 'transition')
+        && (($record->{transition_status} eq 'absent')
+            == ($record->{transition_entry_kind} eq 'absent'))
+        && ($record->{transition_status} ne 'present-nonauthoritative'
+            || $record->{transition_entry_kind} eq 'regular')
+        && $record->{event_epoch} =~ /\A[0-9]+\z/
+        && $record->{outcome} eq ($phase eq 'intent' ? 'prepared' : 'quarantined');
+}
+
+sub operator_events_match {
+    my ($intent, $complete) = @_;
+    return 0 if !defined($intent) || !defined($complete);
+    for my $field (@OPERATOR_EVENT_ORDER) {
+        next if $field eq 'phase' || $field eq 'event_epoch'
+            || $field eq 'outcome';
+        return 0 if $intent->{$field} ne $complete->{$field};
+    }
+    return $complete->{event_epoch} >= $intent->{event_epoch};
+}
+
+sub validate_operator_event_for_args {
+    my ($record, $arg_ref, $phase) = @_;
+    return 0 if !validate_operator_event_shape(
+        $record, $arg_ref->{operation_token}, $phase,
+    );
+    return $record->{operator_label} eq $arg_ref->{operator_label}
+        && $record->{reason} eq $arg_ref->{reason}
+        && $record->{source_name} eq $arg_ref->{source_name}
+        && $record->{destination_name} eq $arg_ref->{destination_name}
+        && $record->{lock_dev} eq "$arg_ref->{expected_lock_dev}"
+        && $record->{lock_ino} eq "$arg_ref->{expected_lock_ino}";
+}
+
+sub operator_evidence_values {
+    my (%arg) = @_;
+    my $snapshot = $arg{snapshot};
+    my $generation = operator_evidence_entry(
+        generation_path($arg{source_path}),
+    );
+    my $transition = operator_evidence_entry(
+        transition_path($arg{source_path}),
+    );
+    my $transition_status = operator_transition_status(
+        $arg{source_path}, $transition,
+    );
+    return (
+        generation_status => $snapshot->{generation_status},
+        generation_entry_kind => $generation->{entry_kind},
+        generation_sha256 => $generation->{sha256},
+        generation_entry_fingerprint => $generation->{fingerprint},
+        transition_status => $transition_status,
+        transition_entry_kind => $transition->{entry_kind},
+        transition_sha256 => $transition->{sha256},
+        transition_entry_fingerprint => $transition->{fingerprint},
+    );
+}
+
+sub assert_operator_operations_complete {
+    my ($state_dir) = @_;
+    my $pending_dir = operator_pending_dir($state_dir);
+    for my $operation_token (operator_pending_tokens($state_dir)) {
+        validate_operator_events_directory_if_present($state_dir);
+        my $intent = operator_pending_record(
+            $state_dir, $operation_token,
+        );
+        my $audit_intent = operator_event_record(
+            $state_dir, $operation_token, 'intent',
+        );
+        my $complete = operator_event_record(
+            $state_dir, $operation_token, 'complete',
+        );
+        die "ERROR: malformed operator quarantine intent: $operation_token\n"
+            if !validate_operator_event_shape(
+                $intent, $operation_token, 'intent',
+            ) || !defined($audit_intent)
+            || canonical_body($intent, \@OPERATOR_EVENT_ORDER)
+                ne canonical_body($audit_intent, \@OPERATOR_EVENT_ORDER);
+        my @pending_st = lstat(operator_pending_path(
+            $state_dir, $operation_token,
+        ));
+        my @audit_st = lstat(operator_event_path(
+            $state_dir, $operation_token, 'intent',
+        ));
+        die "ERROR: operator pending intent is not the immutable audit intent\n"
+            if !@pending_st || !@audit_st
+            || $pending_st[0] != $audit_st[0]
+            || $pending_st[1] != $audit_st[1];
+        die "ERROR: incomplete operator quarantine $operation_token; rerun "
+            . "operator-quarantine-invalid with the original arguments\n"
+            if !defined($complete);
+        die "ERROR: malformed operator quarantine completion: $operation_token\n"
+            if !validate_operator_event_shape(
+                $complete, $operation_token, 'complete',
+            ) || !operator_events_match($intent, $complete);
+        my $source = File::Spec->catdir(
+            $state_dir, $intent->{source_name},
+        );
+        my $destination = File::Spec->catdir(
+            $state_dir, $intent->{destination_name},
+        );
+        my @source_st = lstat($source);
+        die "ERROR: completed operator quarantine source reused the preserved identity: $source\n"
+            if @source_st
+            && $source_st[0] == $intent->{lock_dev}
+            && $source_st[1] == $intent->{lock_ino};
+        die "ERROR: cannot inspect completed operator quarantine source '$source': $!\n"
+            if !@source_st && !$!{ENOENT};
+        my @destination_st = lstat($destination);
+        die "ERROR: completed operator quarantine destination is missing or changed\n"
+            if !@destination_st || -l _ || !-d _
+            || $destination_st[0] != $intent->{lock_dev}
+            || $destination_st[1] != $intent->{lock_ino};
+        my $snapshot = lock_snapshot($destination);
+        die "ERROR: completed operator quarantine destination became valid\n"
+            if !defined($snapshot) || $snapshot->{valid};
+        my %evidence = operator_evidence_values(
+            state_dir => $state_dir, source_path => $destination,
+            snapshot => $snapshot,
+        );
+        for my $field (@OPERATOR_EVIDENCE_FIELDS) {
+            die "ERROR: completed operator quarantine evidence changed\n"
+                if $intent->{$field} ne $evidence{$field}
+                || $complete->{$field} ne $evidence{$field};
+        }
+        sync_directory(operator_events_dir($state_dir));
+        sync_directory($state_dir);
+        remove_operator_pending($state_dir, $intent);
+    }
+}
+
+sub operator_quarantine_invalid {
+    my (%arg) = @_;
+    validate_operator_events_directory_if_present($arg{state_dir});
+    my @other = grep {
+        $_ ne $arg{operation_token}
+    } operator_pending_tokens($arg{state_dir});
+    die "ERROR: another operator quarantine is incomplete; replay it first\n"
+        if @other;
+    my $source = File::Spec->catdir($arg{state_dir}, $arg{source_name});
+    my $destination = File::Spec->catdir(
+        $arg{state_dir}, $arg{destination_name},
+    );
+    my $intent = operator_event_record(
+        $arg{state_dir}, $arg{operation_token}, 'intent',
+    );
+    my $complete = operator_event_record(
+        $arg{state_dir}, $arg{operation_token}, 'complete',
+    );
+
+    if (defined($complete)) {
+        die "ERROR: completed operator quarantine does not match this request\n"
+            if !validate_operator_event_for_args($complete, \%arg, 'complete');
+        die "ERROR: completed operator quarantine lacks a matching intent\n"
+            if !defined($intent)
+            || !validate_operator_event_for_args($intent, \%arg, 'intent');
+        die "ERROR: completed operator quarantine lacks exact intent binding\n"
+            if !operator_events_match($intent, $complete);
+        sync_directory(operator_events_dir($arg{state_dir}));
+        sync_directory($arg{state_dir});
+        my @destination_st = lstat($destination);
+        die "ERROR: completed operator quarantine destination is missing or changed\n"
+            if !@destination_st || -l _ || !-d _
+            || $destination_st[0] != $arg{expected_lock_dev}
+            || $destination_st[1] != $arg{expected_lock_ino};
+        my $destination_snapshot = lock_snapshot($destination);
+        die "ERROR: completed operator quarantine destination became valid\n"
+            if !defined($destination_snapshot) || $destination_snapshot->{valid};
+        my %current_evidence = operator_evidence_values(
+            %arg, source_path => $destination,
+            snapshot => $destination_snapshot,
+        );
+        for my $field (@OPERATOR_EVIDENCE_FIELDS) {
+            die "ERROR: completed operator quarantine evidence changed\n"
+                if $complete->{$field} ne $current_evidence{$field}
+                || $intent->{$field} ne $current_evidence{$field};
+        }
+        remove_operator_pending($arg{state_dir}, $intent);
+        return;
+    }
+
+    my @destination_before = lstat($destination);
+    die "ERROR: cannot inspect operator quarantine destination '$destination': $!\n"
+        if !@destination_before && !$!{ENOENT};
+    my @source_before = lstat($source);
+    die "ERROR: cannot inspect operator quarantine source '$source': $!\n"
+        if !@source_before && !$!{ENOENT};
+    die "ERROR: operator quarantine source and destination both exist\n"
+        if @source_before && @destination_before;
+    die "ERROR: operator quarantine destination lacks a durable matching intent\n"
+        if @destination_before && !defined($intent);
+    my $evidence_source = @destination_before ? $destination : $source;
+    my $snapshot = lock_snapshot($evidence_source);
+    die "ERROR: operator quarantine source is absent\n" if !defined($snapshot);
+    die "ERROR: operator quarantine refuses a valid generation\n"
+        if $snapshot->{valid};
+    die "ERROR: operator quarantine lock identity does not match confirmation\n"
+        if $snapshot->{dev} != $arg{expected_lock_dev}
+        || $snapshot->{ino} != $arg{expected_lock_ino};
+    my %evidence = operator_evidence_values(
+        %arg, source_path => $evidence_source, snapshot => $snapshot,
+    );
+
+    if (defined($intent)) {
+        die "ERROR: operator quarantine intent does not match this request\n"
+            if !validate_operator_event_for_args($intent, \%arg, 'intent')
+            || grep {
+                $intent->{$_} ne $evidence{$_}
+            } @OPERATOR_EVIDENCE_FIELDS;
+        sync_directory(operator_events_dir($arg{state_dir}));
+    } else {
+        my %value = (
+            schema => $SCHEMA,
+            operation_token => $arg{operation_token},
+            phase => 'intent',
+            operator_label => $arg{operator_label},
+            reason => $arg{reason},
+            source_name => $arg{source_name},
+            destination_name => $arg{destination_name},
+            lock_dev => $arg{expected_lock_dev},
+            lock_ino => $arg{expected_lock_ino},
+            %evidence,
+            event_epoch => int(time()),
+            outcome => 'prepared',
+        );
+        install_operator_event(%arg, %value);
+        $intent = operator_event_record(
+            $arg{state_dir}, $arg{operation_token}, 'intent',
+        );
+    }
+    install_operator_pending($arg{state_dir}, $intent);
+    test_pause('after-operator-intent');
+
+    my @source_st = lstat($source);
+    if (@source_st) {
+        die "ERROR: operator quarantine source is not a real directory\n"
+            if -l _ || !-d _;
+        die "ERROR: operator quarantine source identity changed\n"
+            if $source_st[0] != $arg{expected_lock_dev}
+            || $source_st[1] != $arg{expected_lock_ino};
+        rename($source, $destination)
+            or die "ERROR: cannot preserve invalid lock for operator review: $!\n";
+        test_pause('after-operator-rename-before-sync');
+    } elsif (!$!{ENOENT}) {
+        die "ERROR: cannot inspect operator quarantine source '$source': $!\n";
+    }
+    # Repeat this barrier on replay even when the source is already absent. A
+    # previous process may have died after rename and before syncing the parent.
+    sync_directory($arg{state_dir});
+    my @destination_st = lstat($destination);
+    die "ERROR: operator quarantine destination is missing or changed\n"
+        if !@destination_st || -l _ || !-d _
+        || $destination_st[0] != $arg{expected_lock_dev}
+        || $destination_st[1] != $arg{expected_lock_ino};
+    my $moved_snapshot = lock_snapshot($destination);
+    die "ERROR: operator quarantine destination became valid\n"
+        if !defined($moved_snapshot) || $moved_snapshot->{valid};
+    my %moved_evidence = operator_evidence_values(
+        %arg, source_path => $destination, snapshot => $moved_snapshot,
+    );
+    for my $field (@OPERATOR_EVIDENCE_FIELDS) {
+        die "ERROR: operator quarantine evidence changed during preservation\n"
+            if $moved_evidence{$field} ne $evidence{$field};
+    }
+    test_pause('after-operator-sync-before-complete');
+
+    my $complete_epoch = int(time());
+    $complete_epoch = $intent->{event_epoch}
+        if $complete_epoch < $intent->{event_epoch};
+    my %complete_value = (
+        %{$intent}, phase => 'complete',
+        event_epoch => $complete_epoch,
+        outcome => 'quarantined',
+    );
+    install_operator_event(%arg, %complete_value);
+    remove_operator_pending($arg{state_dir}, $intent);
 }
 
 sub same_identity {
@@ -516,7 +1225,8 @@ sub assert_generation {
     my $dir = lock_dir($arg{state_dir});
     my $snapshot = lock_snapshot($dir);
     die "ERROR: round lock generation was lost: $arg{token}\n"
-        if !defined($snapshot) || !$snapshot->{valid};
+        if !defined($snapshot);
+    die invalid_snapshot_error($dir, $snapshot) if !$snapshot->{valid};
     my $generation = $snapshot->{generation};
     die "ERROR: round lock generation was displaced: $arg{token}\n"
         if $generation->{token} ne $arg{token}
@@ -562,6 +1272,13 @@ sub validate_pin_for_snapshot {
 
 sub read_ready_pin {
     my ($dir, $pin_token, $snapshot) = @_;
+    my $pin_dir = pins_dir($dir);
+    my @pin_dir_st = lstat($pin_dir);
+    die "ERROR: process pin directory is not a real directory\n"
+        if !@pin_dir_st || -l _ || !-d _;
+    # Likewise adopt a ready hard link only after re-establishing its parent
+    # directory durability.
+    sync_directory($pin_dir);
     my $path = pin_ready_path($dir, $pin_token);
     my $pin = record_for($path, \@PIN_ORDER);
     return undef if !defined($pin);
@@ -578,6 +1295,9 @@ sub pin_is_blocking {
     # host and be misread as a foreign-host pin.
     die "ERROR: internal: pin_is_blocking requires a pin record\n"
         if !defined($pin);
+    # A failed hostname lookup must never make two unrelated hosts compare as
+    # the same literal "unknown" host and authorize local PID reasoning.
+    return 1 if $THIS_HOST eq 'unknown' || $pin->{host} eq 'unknown';
     return 1 if $pin->{host} ne $THIS_HOST;
     my $alive = kill(0, $pin->{pid}) || $!{EPERM};
     return 0 if !$alive;
@@ -641,6 +1361,7 @@ sub install_pin {
         die "ERROR: ready process pin conflicts: $pin_token\n"
             if canonical_body($existing, \@PIN_ORDER)
                 ne canonical_body($values, \@PIN_ORDER);
+        sync_directory(pins_dir($dir));
     } else {
         sync_directory(pins_dir($dir));
     }
@@ -669,8 +1390,17 @@ sub unpin_generation {
     my (%arg) = @_;
     my $dir = lock_dir($arg{state_dir});
     my $snapshot = lock_snapshot($dir);
-    return 0 if !defined($snapshot) || !$snapshot->{valid};
+    return 0 if !defined($snapshot);
+    die invalid_snapshot_error($dir, $snapshot) if !$snapshot->{valid};
     return 0 if $snapshot->{generation}->{token} ne $arg{token};
+    my $transition = transition_record($dir);
+    if (defined($transition)) {
+        die "ERROR: malformed transition identity in '$dir'\n"
+            if !validate_transition_for_snapshot($transition, $snapshot);
+        die "ERROR: cannot remove the process pin authorizing a pending release\n"
+            if $transition->{action} eq 'release'
+            && $transition->{allowed_pin_token} eq $arg{pin_token};
+    }
     my $pin = read_ready_pin($dir, $arg{pin_token}, $snapshot);
     return 0 if !defined($pin);
     my $path = pin_ready_path($dir, $arg{pin_token});
@@ -771,6 +1501,7 @@ sub install_transition {
     );
     my $tmp = File::Spec->catfile($dir, ".transition-$operation_token.tmp");
     write_temp_file($tmp, checksummed_content(\%value, \@TRANSITION_ORDER));
+    test_pause('after-transition-temp-write-before-link');
     if (!same_identity($arg{snapshot}, $dir)) {
         unlink($tmp);
         return undef;
@@ -779,8 +1510,10 @@ sub install_transition {
     my $exists = !$linked && $!{EEXIST};
     my $missing = !$linked && $!{ENOENT};
     my $error = $linked ? '' : "$!";
+    test_pause('after-transition-link-before-temp-unlink') if $linked;
     unlink($tmp);
-    sync_directory($dir) if $linked;
+    test_pause('after-transition-temp-unlink-before-sync') if $linked;
+    sync_directory($dir) if $linked || $exists;
     die "ERROR: cannot install round-lock transition: $error\n"
         if !$linked && !$exists && !$missing;
     return undef if $missing;
@@ -809,26 +1542,20 @@ sub validate_transition_for_snapshot {
         && $transition->{lock_dev} == $snapshot->{dev}
         && $transition->{lock_ino} == $snapshot->{ino};
     return 0 if !$shape_ok;
-    if ($snapshot->{valid}) {
-        my $generation = $snapshot->{generation};
-        return 0 if $transition->{owner_token} ne $generation->{token}
-            || $transition->{round_barcode} ne $generation->{round_barcode}
-            || $transition->{scope} ne $generation->{scope}
-            || $transition->{effective_ttl_seconds}
-                ne $generation->{effective_ttl_seconds};
-        return 0 if $transition->{action} eq 'reclaim'
-            && $transition->{allowed_pin_token} ne 'none';
-        return 0 if $transition->{action} eq 'release'
-            && ($transition->{allowed_pin_token} !~ $TOKEN_RE
-                || $transition->{reason}
-                    !~ /\A(?:full_round_released|dorado_only_early|pre_handoff_abort)\z/);
-        return 1;
-    }
-    return $transition->{action} eq 'reclaim'
-        && $transition->{owner_token} eq 'legacy'
-        && $transition->{round_barcode} eq 'legacy'
-        && $transition->{scope} eq 'legacy'
-        && $transition->{allowed_pin_token} eq 'none';
+    return 0 if !$snapshot->{valid};
+    my $generation = $snapshot->{generation};
+    return 0 if $transition->{owner_token} ne $generation->{token}
+        || $transition->{round_barcode} ne $generation->{round_barcode}
+        || $transition->{scope} ne $generation->{scope}
+        || $transition->{effective_ttl_seconds}
+            ne $generation->{effective_ttl_seconds};
+    return 0 if $transition->{action} eq 'reclaim'
+        && $transition->{allowed_pin_token} ne 'none';
+    return 0 if $transition->{action} eq 'release'
+        && ($transition->{allowed_pin_token} !~ $TOKEN_RE
+            || $transition->{reason}
+                !~ /\A(?:full_round_released|dorado_only_early|pre_handoff_abort)\z/);
+    return 1;
 }
 
 sub install_release {
@@ -853,7 +1580,7 @@ sub install_release {
 
 sub install_revocation {
     my (%arg) = @_;
-    return if $arg{token} !~ $TOKEN_RE;
+    validate_token($arg{token});
     my %value = (
         schema => $SCHEMA, token => $arg{token}, round_barcode => $arg{round_barcode},
         scope => $arg{scope}, outcome => 'revoked', reason => $arg{reason},
@@ -878,11 +1605,13 @@ sub record_transition_outcome {
     my (%arg) = @_;
     my $snapshot = $arg{snapshot};
     my $transition = $arg{transition};
-    my $generation = $snapshot->{valid} ? $snapshot->{generation} : undef;
-    my $token = $generation ? $generation->{token} : 'legacy';
-    my $round = $generation ? $generation->{round_barcode} : 'legacy';
-    my $scope = $generation ? $generation->{scope} : 'legacy';
-    my $ttl = $generation ? $generation->{effective_ttl_seconds} : $transition->{effective_ttl_seconds};
+    die "ERROR: internal: transition outcome requires a valid generation snapshot\n"
+        if !$snapshot->{valid};
+    my $generation = $snapshot->{generation};
+    my $token = $generation->{token};
+    my $round = $generation->{round_barcode};
+    my $scope = $generation->{scope};
+    my $ttl = $generation->{effective_ttl_seconds};
     if ($transition->{action} eq 'reclaim') {
         install_revocation(
             state_dir => $arg{state_dir}, token => $token, round_barcode => $round,
@@ -891,6 +1620,7 @@ sub record_transition_outcome {
             operation_token => $transition->{operation_token},
             event_epoch => $transition->{started_epoch},
         );
+        test_pause('after-transition-receipt-before-event');
         write_event(
             state_dir => $arg{state_dir}, generation_token => $token,
             round_barcode => $round, scope => $scope, event => 'reclaim',
@@ -907,6 +1637,7 @@ sub record_transition_outcome {
             event_epoch => $transition->{started_epoch},
             operation_token => $transition->{operation_token},
         );
+        test_pause('after-transition-receipt-before-event');
         write_event(
             state_dir => $arg{state_dir}, generation_token => $token,
             round_barcode => $round, scope => $scope, event => 'release',
@@ -956,36 +1687,90 @@ sub validate_release_transition_authority {
         if $allowed_pin->{role} ne $required_role;
 }
 
-sub remove_release_quarantine {
+sub archive_release_quarantine {
     my (%arg) = @_;
     return if $arg{transition}->{action} ne 'release';
     my $path = $arg{path};
-    my @st = lstat($path);
-    return if !@st && $!{ENOENT};
-    die "ERROR: cannot inspect completed release quarantine '$path': $!\n"
-        if !@st;
-    die "ERROR: completed release quarantine is not a real directory: $path\n"
-        if -l _ || !-d _;
-    die "ERROR: completed release quarantine identity changed: $path\n"
-        if $st[0] != $arg{snapshot}->{dev} || $st[1] != $arg{snapshot}->{ino};
-
-    my $errors;
-    remove_tree($path, { error => \$errors });
-    if (defined($errors) && @{$errors}) {
-        my @messages;
-        for my $item (@{$errors}) {
-            for my $failed_path (sort keys(%{$item})) {
-                push(@messages, "$failed_path: $item->{$failed_path}");
-            }
-        }
-        die "ERROR: cannot remove completed release quarantine '$path': "
-            . join('; ', @messages) . "\n";
+    my $operation_token = $arg{transition}->{operation_token};
+    my $archive_parent = terminal_archive_dir($arg{state_dir});
+    ensure_real_directory($archive_parent, 0700);
+    my $archive = File::Spec->catdir(
+        $archive_parent, "release-$operation_token",
+    );
+    if (!rename($path, $archive)) {
+        my $error = "$!";
+        my $existing = transition_record($archive);
+        die "ERROR: cannot archive completed release quarantine '$path': $error\n"
+            if !defined($existing)
+            || $existing->{operation_token} ne $operation_token;
+        my $archived_snapshot = lock_snapshot($archive);
+        die "ERROR: completed release archive identity changed: $archive\n"
+            if !defined($archived_snapshot)
+            || $archived_snapshot->{dev} != $arg{snapshot}->{dev}
+            || $archived_snapshot->{ino} != $arg{snapshot}->{ino};
+        my @source = lstat($path);
+        die "ERROR: release quarantine and archive both exist: $path\n"
+            if @source;
+        die "ERROR: cannot inspect release quarantine after archive race '$path': $!\n"
+            if !$!{ENOENT};
+        # A prior process may have died after the rename and before either
+        # parent-directory barrier.  Adopting the exact archive repeats both
+        # barriers before treating the move as durable.
+        sync_directory($archive_parent);
+        sync_directory($arg{state_dir});
+        return;
     }
-    my @remaining = lstat($path);
-    die "ERROR: completed release quarantine remains after cleanup: $path\n"
-        if @remaining;
-    die "ERROR: cannot verify completed release quarantine cleanup '$path': $!\n"
-        if !$!{ENOENT};
+    test_pause('after-terminal-archive-rename-before-sync');
+    my @archived = lstat($archive);
+    die "ERROR: cannot inspect completed release archive '$archive': $!\n"
+        if !@archived;
+    die "ERROR: wrong release quarantine was archived\n"
+        if $archived[0] != $arg{snapshot}->{dev}
+        || $archived[1] != $arg{snapshot}->{ino};
+    sync_directory($archive_parent);
+    sync_directory($arg{state_dir});
+}
+
+sub archive_reclaim_quarantine {
+    my (%arg) = @_;
+    return if $arg{transition}->{action} ne 'reclaim';
+    my $path = $arg{path};
+    my $operation_token = $arg{transition}->{operation_token};
+    my $archive_parent = terminal_archive_dir($arg{state_dir});
+    ensure_real_directory($archive_parent, 0700);
+    my $archive = File::Spec->catdir(
+        $archive_parent, "reclaim-$operation_token",
+    );
+    if (!rename($path, $archive)) {
+        my $error = "$!";
+        my $existing = transition_record($archive);
+        die "ERROR: cannot archive completed reclaim quarantine '$path': $error\n"
+            if !defined($existing)
+            || $existing->{operation_token} ne $operation_token;
+        my $archived_snapshot = lock_snapshot($archive);
+        die "ERROR: completed reclaim archive identity changed: $archive\n"
+            if !defined($archived_snapshot)
+            || $archived_snapshot->{dev} != $arg{snapshot}->{dev}
+            || $archived_snapshot->{ino} != $arg{snapshot}->{ino};
+        my @source = lstat($path);
+        die "ERROR: reclaim quarantine and archive both exist: $path\n"
+            if @source;
+        die "ERROR: cannot inspect reclaim quarantine after archive race '$path': $!\n"
+            if !$!{ENOENT};
+        # See archive_release_quarantine: replay must establish durability for
+        # an archive name that another process may only have linked visibly.
+        sync_directory($archive_parent);
+        sync_directory($arg{state_dir});
+        return;
+    }
+    test_pause('after-terminal-archive-rename-before-sync');
+    my @archived = lstat($archive);
+    die "ERROR: cannot inspect completed reclaim archive '$archive': $!\n"
+        if !@archived;
+    die "ERROR: wrong reclaim quarantine was archived\n"
+        if $archived[0] != $arg{snapshot}->{dev}
+        || $archived[1] != $arg{snapshot}->{ino};
+    sync_directory($archive_parent);
     sync_directory($arg{state_dir});
 }
 
@@ -1030,7 +1815,12 @@ sub finalize_transition {
                 state_dir => $arg{state_dir}, snapshot => $moved_snapshot,
                 transition => $moved, reason => $moved->{reason},
             );
-            remove_release_quarantine(
+            test_pause('after-transition-outcome-before-archive');
+            archive_reclaim_quarantine(
+                state_dir => $arg{state_dir}, path => $quarantine,
+                snapshot => $moved_snapshot, transition => $moved,
+            );
+            archive_release_quarantine(
                 state_dir => $arg{state_dir}, path => $quarantine,
                 snapshot => $moved_snapshot, transition => $moved,
             );
@@ -1056,7 +1846,12 @@ sub finalize_transition {
     }
 
     record_transition_outcome(%arg);
-    remove_release_quarantine(
+    test_pause('after-transition-outcome-before-archive');
+    archive_reclaim_quarantine(
+        state_dir => $arg{state_dir}, path => $quarantine,
+        snapshot => $snapshot, transition => $transition,
+    );
+    archive_release_quarantine(
         state_dir => $arg{state_dir}, path => $quarantine,
         snapshot => $snapshot, transition => $transition,
     );
@@ -1075,6 +1870,7 @@ sub recover_quarantines {
         my $path = File::Spec->catdir($state_dir, $entry);
         my $snapshot = lock_snapshot($path);
         next if !defined($snapshot);
+        die invalid_snapshot_error($path, $snapshot) if !$snapshot->{valid};
         my $transition = transition_record($path);
         die "ERROR: quarantine lacks a valid transition: $path\n"
             if !validate_transition_for_snapshot($transition, $snapshot);
@@ -1085,14 +1881,20 @@ sub recover_quarantines {
             state_dir => $state_dir, lock_path => $path,
             snapshot => $snapshot, transition => $transition,
         ) if $transition->{action} eq 'release';
+        test_pause('before-quarantine-recovery-outcome');
         record_transition_outcome(
             state_dir => $state_dir, snapshot => $snapshot, transition => $transition,
             reason => $transition->{reason},
         );
-        remove_release_quarantine(
+        test_pause('after-transition-outcome-before-archive');
+        archive_release_quarantine(
             state_dir => $state_dir, path => $path,
             snapshot => $snapshot, transition => $transition,
         );
+        archive_reclaim_quarantine(
+            state_dir => $state_dir, path => $path,
+            snapshot => $snapshot, transition => $transition,
+        ) if $transition->{action} eq 'reclaim';
     }
 }
 
@@ -1126,32 +1928,31 @@ sub recover_pending_release {
 
 sub stale_reason {
     my ($state_dir, $snapshot, $fallback_ttl) = @_;
-    my $ttl = $fallback_ttl;
-    if ($snapshot->{valid}) {
-        my $generation = $snapshot->{generation};
-        $ttl = int($generation->{effective_ttl_seconds});
-        my @blocking = blocking_pins(lock_dir($state_dir), $snapshot, undef);
-        return undef if @blocking;
-        my $handoff = marker_path($state_dir, $generation->{token});
-        if (!-e $handoff && $generation->{host} eq $THIS_HOST) {
-            my $alive = kill(0, $generation->{pid}) || $!{EPERM};
-            return "dead pid=$generation->{pid} host=$generation->{host}" if !$alive;
-            my $relationship = process_start_relationship(
-                $generation->{process_start}, process_start_identity($generation->{pid})
-            );
-            return "reused pid=$generation->{pid} host=$generation->{host}"
-                if $relationship eq 'reused';
-            return undef;
-        }
+    die "ERROR: internal: stale_reason requires a valid generation snapshot\n"
+        if !$snapshot->{valid};
+    my $generation = $snapshot->{generation};
+    die "ERROR: round lock host identity is unverifiable; refusing automatic reclaim\n"
+        if $THIS_HOST eq 'unknown' || $generation->{host} eq 'unknown';
+    my $ttl = int($generation->{effective_ttl_seconds});
+    my @blocking = blocking_pins(lock_dir($state_dir), $snapshot, undef);
+    return undef if @blocking;
+    my $handoff = marker_path($state_dir, $generation->{token});
+    if (!-e $handoff && $generation->{host} eq $THIS_HOST) {
+        my $alive = kill(0, $generation->{pid}) || $!{EPERM};
+        return "dead pid=$generation->{pid} host=$generation->{host}" if !$alive;
+        my $relationship = process_start_relationship(
+            $generation->{process_start}, process_start_identity($generation->{pid})
+        );
+        return "reused pid=$generation->{pid} host=$generation->{host}"
+            if $relationship eq 'reused';
+        return undef;
     }
     return undef if $ttl == 0;
     my $now = int(time());
     return undef if $snapshot->{newest_epoch} < 1 || $snapshot->{newest_epoch} > $now;
     my $age = $now - $snapshot->{newest_epoch};
     return undef if $age < $ttl;
-    return $snapshot->{valid}
-        ? "leased generation age=${age}s ttl=${ttl}s"
-        : "legacy or malformed lock age=${age}s ttl=${ttl}s";
+    return "leased generation age=${age}s ttl=${ttl}s";
 }
 
 sub reclaim_if_stale {
@@ -1159,6 +1960,7 @@ sub reclaim_if_stale {
     my $dir = lock_dir($arg{state_dir});
     my $snapshot = lock_snapshot($dir);
     return 0 if !defined($snapshot);
+    die invalid_snapshot_error($dir, $snapshot) if !$snapshot->{valid};
     my $transition = transition_record($dir);
     my $reason;
     if (defined($transition)) {
@@ -1168,12 +1970,10 @@ sub reclaim_if_stale {
     } else {
         $reason = stale_reason($arg{state_dir}, $snapshot, $arg{stale_seconds});
         return 0 if !defined($reason);
-        my $owner_token = $snapshot->{valid} ? $snapshot->{generation}->{token} : 'legacy';
-        my $round = $snapshot->{valid} ? $snapshot->{generation}->{round_barcode} : 'legacy';
-        my $scope = $snapshot->{valid} ? $snapshot->{generation}->{scope} : 'legacy';
-        my $effective_ttl = $snapshot->{valid}
-            ? $snapshot->{generation}->{effective_ttl_seconds}
-            : $arg{stale_seconds};
+        my $owner_token = $snapshot->{generation}->{token};
+        my $round = $snapshot->{generation}->{round_barcode};
+        my $scope = $snapshot->{generation}->{scope};
+        my $effective_ttl = $snapshot->{generation}->{effective_ttl_seconds};
         $transition = install_transition(
             state_dir => $arg{state_dir}, snapshot => $snapshot, action => 'reclaim',
             owner_token => $owner_token, round_barcode => $round, scope => $scope,
@@ -1190,13 +1990,26 @@ sub reclaim_if_stale {
 sub acquire_generation {
     my (%arg) = @_;
     my $dir = lock_dir($arg{state_dir});
-    ensure_real_directory(events_dir($arg{state_dir}), 0700);
-    recover_quarantines($arg{state_dir});
     my $waited_ms = 0;
     my $limit_ms = $arg{wait_seconds} * 1000;
     while (1) {
+        my $state_fence = acquire_state_fence($arg{state_dir}, 1);
+        if (!defined($state_fence)) {
+            die "ERROR: timed out waiting for round-lock state fence\n"
+                if $limit_ms > 0 && $waited_ms >= $limit_ms;
+            usleep(100_000);
+            $waited_ms += 100;
+            next;
+        }
+        assert_operator_operations_complete($arg{state_dir});
+        recover_quarantines($arg{state_dir});
+        my $existing_snapshot = lock_snapshot($dir);
+        die invalid_snapshot_error($dir, $existing_snapshot)
+            if defined($existing_snapshot) && !$existing_snapshot->{valid};
+        ensure_real_directory(events_dir($arg{state_dir}), 0700);
         if (mkdir($dir, 0700)) {
             sync_directory($arg{state_dir});
+            test_pause('after-lock-mkdir-before-stat');
             my @st = lstat($dir);
             die "ERROR: cannot inspect newly-created round lock: $!\n" if !@st;
             my $token = new_token(join(':', $dir, $arg{round_barcode}, $arg{scope}));
@@ -1208,12 +2021,15 @@ sub acquire_generation {
                 effective_ttl_seconds => $arg{stale_seconds},
                 lock_dev => $st[0], lock_ino => $st[1],
             );
+            test_pause('after-lock-stat-before-pins');
             my $pin_token;
             my $ok = eval {
                 mkdir(pins_dir($dir), 0700)
                     or die "ERROR: cannot create generation pin directory: $!\n";
                 sync_directory($dir);
+                test_pause('after-pins-sync-before-generation');
                 install_generation($dir, \%generation);
+                test_pause('after-generation-install');
                 $pin_token = install_pin(
                     %arg, token => $token, pin_token => new_token("acquire:$token"),
                     role => 'fast_acquisition', snapshot => undef,
@@ -1230,18 +2046,25 @@ sub acquire_generation {
             if (!$ok) {
                 my $error = $@ || "ERROR: cannot initialize round lock\n";
                 my $failed = "$dir.failed-acquire-$token";
-                if (-d $dir && !rename($dir, $failed)) {
+                my $owned = { dev => $st[0], ino => $st[1] };
+                if (same_identity($owned, $dir) && !rename($dir, $failed)) {
                     die "$error" . "ERROR: failed acquisition also could not be quarantined: $!\n";
+                }
+                if (-e $dir || -l $dir) {
+                    die "$error" . "ERROR: failed acquisition lost ownership of the canonical lock; replacement preserved\n";
                 }
                 sync_directory($arg{state_dir}) if -d $failed;
                 die $error;
             }
+            release_state_fence($state_fence);
             return ($token, $pin_token);
         }
         my $exists = $!{EEXIST};
         my $error = "$!";
         die "ERROR: cannot create round lock '$dir': $error\n" if !$exists;
-        next if reclaim_if_stale(%arg);
+        my $reclaimed = reclaim_if_stale(%arg);
+        release_state_fence($state_fence);
+        next if $reclaimed;
         die "ERROR: timed out waiting for round lock '$dir'\n"
             if $limit_ms > 0 && $waited_ms >= $limit_ms;
         usleep(100_000);
@@ -1251,6 +2074,7 @@ sub acquire_generation {
 
 sub release_generation {
     my (%arg) = @_;
+    my $dir = lock_dir($arg{state_dir});
     recover_quarantines($arg{state_dir});
     my $existing = release_record(%arg);
     my $revoked = revocation_record(%arg);
@@ -1271,18 +2095,21 @@ sub release_generation {
     }
     die "ERROR: missing pin-token\n" if !defined($arg{pin_token});
     my $required_role = release_pin_role($arg{reason});
-    my ($snapshot, $generation);
-    my $ok = eval {
-        ($snapshot) = guard_pin(%arg, role => $required_role);
-        $generation = $snapshot->{generation};
-        validate_marker(%arg) if $arg{reason} eq 'full_round_released';
-        install_marker(%arg) if $arg{reason} eq 'dorado_only_early';
-        1;
-    };
-    if (!$ok) {
+    # A retry may be resuming this exact release transition.  The immutable
+    # transition is validated below against action, generation, reason, and
+    # authorizing pin before it can be finalized.
+    my ($snapshot) = assert_generation(%arg, allow_transition => 1);
+    my $generation = $snapshot->{generation};
+    my $pin = read_ready_pin($dir, $arg{pin_token}, $snapshot);
+    return 0 if !defined($pin) && $arg{best_effort};
+    die "ERROR: process pin is absent: $arg{pin_token}\n"
+        if !defined($pin);
+    if ($pin->{role} ne $required_role) {
         return 0 if $arg{best_effort};
-        die $@;
+        die "ERROR: process pin role mismatch\n";
     }
+    validate_marker(%arg) if $arg{reason} eq 'full_round_released';
+    install_marker(%arg) if $arg{reason} eq 'dorado_only_early';
     if ($arg{unless_handoff}) {
         my $marker = marker_path($arg{state_dir}, $arg{token});
         if (-e $marker) {
@@ -1303,7 +2130,6 @@ sub release_generation {
         || $transition->{owner_token} ne $arg{token}
         || $transition->{reason} ne $arg{reason}
         || $transition->{allowed_pin_token} ne $arg{pin_token}) {
-        return 0 if $arg{best_effort};
         die "ERROR: release lost transition race for generation $arg{token}\n";
     }
     my $finalized = finalize_transition(
@@ -1311,7 +2137,6 @@ sub release_generation {
         transition => $transition, reason => $arg{reason},
     );
     if (!$finalized) {
-        return 0 if $arg{best_effort};
         die "ERROR: release is blocked by another live generation pin\n";
     }
     return 1;
@@ -1460,31 +2285,95 @@ sub remove_exact_marker {
 
 my $command = shift(@ARGV) // '';
 usage() if $command eq '' || $command eq '--help' || $command eq '-h';
+my %VALID_COMMAND = map { $_ => 1 } qw(
+    acquire inflight handoff pin guard-pin unpin verify-release early-release
+    finish abort operator-quarantine-invalid
+);
+usage() if !$VALID_COMMAND{$command};
+Configure(qw(no_auto_abbrev no_getopt_compat no_bundling no_ignore_case));
 
 my %opt = (
     wait_seconds => 0,
     stale_seconds => 0,
     best_effort => 0,
+    confirm_invalid_snapshot => 0,
 );
-GetOptionsFromArray(
-    \@ARGV,
+my @common_option_spec = (
     'state-dir=s' => \$opt{state_dir},
+    'wait-seconds=s' => \$opt{wait_seconds},
+);
+my @operator_option_spec = (
+    @common_option_spec,
+    'expected-lock-dev=s' => \$opt{expected_lock_dev},
+    'expected-lock-ino=s' => \$opt{expected_lock_ino},
+    'operation-token=s' => \$opt{operation_token},
+    'operator-label=s' => \$opt{operator_label},
+    'reason=s' => \$opt{reason},
+    'source-name=s' => \$opt{source_name},
+    'confirm-invalid-snapshot!' => \$opt{confirm_invalid_snapshot},
+);
+my @runtime_option_spec = (
+    @common_option_spec,
     'round-barcode=s' => \$opt{round_barcode},
     'scope=s' => \$opt{scope},
     'token=s' => \$opt{token},
     'pin-token=s' => \$opt{pin_token},
     'role=s' => \$opt{role},
     'owner-pid=s' => \$opt{owner_pid},
-    'wait-seconds=s' => \$opt{wait_seconds},
     'stale-seconds=s' => \$opt{stale_seconds},
     'read-file=s' => \$opt{read_file},
     'best-effort!' => \$opt{best_effort},
+);
+GetOptionsFromArray(
+    \@ARGV,
+    $command eq 'operator-quarantine-invalid'
+        ? @operator_option_spec
+        : @runtime_option_spec,
 ) or usage();
 die "ERROR: unexpected arguments: @ARGV\n" if @ARGV;
+die "ERROR: --best-effort is valid only for abort or unpin\n"
+    if $opt{best_effort} && $command ne 'abort' && $command ne 'unpin';
 
+validate_failpoint_configuration();
 $opt{state_dir} = validate_text('state-dir', $opt{state_dir});
-make_path($opt{state_dir}, { mode => 0700 }) if !-d $opt{state_dir};
-die "ERROR: state-dir is not a directory: $opt{state_dir}\n" if !-d $opt{state_dir};
+my @state_st = lstat($opt{state_dir});
+if (!@state_st && $!{ENOENT} && $command ne 'operator-quarantine-invalid') {
+    make_path($opt{state_dir}, { mode => 0700 });
+    @state_st = lstat($opt{state_dir});
+}
+die "ERROR: state-dir is not a real directory: $opt{state_dir}\n"
+    if !@state_st || -l _ || !-d _;
+
+if ($command eq 'operator-quarantine-invalid') {
+    for my $required (qw(expected_lock_dev expected_lock_ino operation_token operator_label reason)) {
+        die "ERROR: missing $required\n" if !defined($opt{$required});
+    }
+    die "ERROR: operator quarantine requires --confirm-invalid-snapshot\n"
+        if !$opt{confirm_invalid_snapshot};
+    $opt{expected_lock_dev} = validate_uint(
+        'expected-lock-dev', $opt{expected_lock_dev},
+    );
+    $opt{expected_lock_ino} = validate_uint(
+        'expected-lock-ino', $opt{expected_lock_ino},
+    );
+    $opt{operation_token} = validate_token($opt{operation_token});
+    $opt{operator_label} = validate_text('operator-label', $opt{operator_label});
+    $opt{reason} = validate_text('reason', $opt{reason});
+    $opt{wait_seconds} = validate_uint('wait-seconds', $opt{wait_seconds});
+    $opt{source_name} = $opt{source_name} // '.round_inflight.lockdir';
+    die "ERROR: invalid operator quarantine source name\n"
+        if $opt{source_name}
+            !~ /\A\.round_inflight\.lockdir(?:\.(?:reclaim|release)-[0-9a-f]{64})?\z/;
+    $opt{destination_name} =
+        ".round_inflight.lockdir.operator-$opt{operation_token}";
+    my $operator_fence = acquire_state_fence_with_wait(
+        $opt{state_dir}, $opt{wait_seconds},
+    );
+    operator_quarantine_invalid(%opt);
+    release_state_fence($operator_fence);
+    exit 0;
+}
+
 $opt{round_barcode} = validate_text('round-barcode', $opt{round_barcode})
     if $command ne 'acquire' || defined($opt{round_barcode});
 $opt{scope} = validate_scope($opt{scope}) if defined($opt{scope});
@@ -1508,6 +2397,10 @@ for my $required (qw(round_barcode scope token)) {
     die "ERROR: missing $required\n" if !defined($opt{$required});
 }
 
+my $state_fence = acquire_state_fence_with_wait(
+    $opt{state_dir}, $opt{wait_seconds},
+);
+assert_operator_operations_complete($opt{state_dir});
 if ($command eq 'inflight') {
     die "ERROR: missing pin-token\n" if !defined($opt{pin_token});
     $opt{read_file} = validate_text('read-file', $opt{read_file});
@@ -1544,7 +2437,16 @@ if ($command eq 'inflight') {
             }
         }
     } else {
-        my ($snapshot, $pin) = guard_pin(%opt, role => 'fast_acquisition');
+        # A pending release transition is durable authority.  Handoff must not
+        # create a marker or event that changes that transition's meaning.
+        my ($snapshot) = assert_generation(%opt);
+        my $pin = read_ready_pin(
+            lock_dir($opt{state_dir}), $opt{pin_token}, $snapshot,
+        );
+        die "ERROR: process pin is absent: $opt{pin_token}\n"
+            if !defined($pin);
+        die "ERROR: process pin role mismatch\n"
+            if $pin->{role} ne 'fast_acquisition';
         install_marker(%opt);
         write_event(
             state_dir => $opt{state_dir}, generation_token => $opt{token},
@@ -1567,8 +2469,7 @@ if ($command eq 'inflight') {
     guard_pin(%opt);
 } elsif ($command eq 'unpin') {
     die "ERROR: missing pin-token\n" if !defined($opt{pin_token});
-    my $ok = eval { unpin_generation(%opt); 1 };
-    die $@ if !$ok && !$opt{best_effort};
+    unpin_generation(%opt);
 } elsif ($command eq 'verify-release') {
     recover_quarantines($opt{state_dir});
     recover_pending_release(%opt);
@@ -1602,10 +2503,12 @@ if ($command eq 'inflight') {
 } elsif ($command eq 'abort') {
     die "ERROR: missing pin-token\n" if !defined($opt{pin_token});
     release_generation(
-        %opt, reason => 'pre_handoff_abort', unless_handoff => 1, best_effort => 1,
+        %opt, reason => 'pre_handoff_abort', unless_handoff => 1,
+        best_effort => 1,
     );
 } else {
     usage();
 }
 
+release_state_fence($state_fence);
 exit 0;
