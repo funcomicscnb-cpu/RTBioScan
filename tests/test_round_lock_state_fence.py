@@ -28,6 +28,7 @@ from tests.round_lock_test_utils import (
     REVOCATION_SCHEMA,
     TRANSITION_SCHEMA,
     assert_exact_error_line,
+    assert_token,
     parse_acquire_output,
     perl_test_env,
     read_nofollow_bytes,
@@ -47,6 +48,15 @@ INITIALIZATION_BOUNDARIES = (
 )
 
 RELEASE_RECOVERY_BOUNDARY = "before-quarantine-recovery-outcome"
+
+RECLAIM_RECOVERY_BOUNDARIES = (
+    "before-quarantine-recovery-outcome",
+    "after-transition-receipt-before-event",
+    "after-transition-outcome-before-archive",
+    "after-terminal-archive-rename-before-sync",
+)
+
+DEAD_OWNER_PID = 99_999_999
 
 
 def _acquire_command(
@@ -186,6 +196,154 @@ def _tree_manifest(root: Path) -> tuple[tuple[object, ...], ...]:
             )
         )
     return tuple(manifest)
+
+
+def _namespace_kinds(root: Path) -> dict[str, str]:
+    """Enumerate the exact namespace without following directory symlinks."""
+    found: dict[str, str] = {}
+
+    def visit(directory: Path) -> None:
+        with os.scandir(directory) as entries:
+            for entry in sorted(entries, key=lambda item: item.name):
+                path = Path(entry.path)
+                relative = path.relative_to(root).as_posix()
+                if entry.is_symlink():
+                    kind = "symlink"
+                elif entry.is_dir(follow_symlinks=False):
+                    kind = "directory"
+                elif entry.is_file(follow_symlinks=False):
+                    kind = "file"
+                else:
+                    kind = "other"
+                found[relative] = kind
+                if kind == "directory":
+                    visit(path)
+
+    visit(root)
+    return found
+
+
+def _generation_namespace(prefix: str, pin_token: str) -> dict[str, str]:
+    return {
+        prefix: "directory",
+        f"{prefix}/generation.tsv": "file",
+        f"{prefix}/pins": "directory",
+        f"{prefix}/pins/candidate.{pin_token}.tsv": "file",
+        f"{prefix}/pins/ready.{pin_token}.tsv": "file",
+    }
+
+
+def _validated_events(state: Path) -> dict[str, dict[str, str]]:
+    """Read every event through the independent Python record oracle."""
+    records: dict[str, dict[str, str]] = {}
+    for path in sorted((state / ".round_lock_events").iterdir()):
+        record = read_record(path, schema=EVENT_SCHEMA)
+        expected_name = (
+            f"{record['generation_token']}.{record['event']}."
+            f"{record['event_id']}.tsv"
+        )
+        assert path.name == expected_name, (path.name, expected_name)
+        records[path.name] = record
+    return records
+
+
+def _assert_generation_tree(
+    path: Path,
+    *,
+    token: str,
+    pin_token: str,
+    round_barcode: str,
+    owner_pid: int,
+    expected_identity: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    directory = os.lstat(path)
+    assert stat.S_ISDIR(directory.st_mode), directory
+    assert not stat.S_ISLNK(directory.st_mode), directory
+    identity = (directory.st_dev, directory.st_ino)
+    if expected_identity is not None:
+        assert identity == expected_identity
+
+    generation = read_record(path / "generation.tsv", schema=GENERATION_SCHEMA)
+    assert generation["schema"] == "1", generation
+    assert generation["token"] == token, generation
+    assert generation["round_barcode"] == round_barcode, generation
+    assert generation["scope"] == "full_round", generation
+    assert generation["pid"] == str(owner_pid), generation
+    assert generation["effective_ttl_seconds"] == "300", generation
+    assert generation["lock_dev"] == str(identity[0]), generation
+    assert generation["lock_ino"] == str(identity[1]), generation
+
+    candidate = path / "pins" / f"candidate.{pin_token}.tsv"
+    ready = path / "pins" / f"ready.{pin_token}.tsv"
+    candidate_entry = os.lstat(candidate)
+    ready_entry = os.lstat(ready)
+    assert stat.S_ISREG(candidate_entry.st_mode), candidate_entry
+    assert stat.S_ISREG(ready_entry.st_mode), ready_entry
+    assert (candidate_entry.st_dev, candidate_entry.st_ino) == (
+        ready_entry.st_dev,
+        ready_entry.st_ino,
+    )
+    assert read_nofollow_bytes(candidate) == read_nofollow_bytes(ready)
+    pin = read_record(ready, schema=PIN_SCHEMA)
+    assert pin["schema"] == "1", pin
+    assert pin["token"] == token, pin
+    assert pin["pin_token"] == pin_token, pin
+    assert pin["round_barcode"] == round_barcode, pin
+    assert pin["scope"] == "full_round", pin
+    assert pin["role"] == "fast_acquisition", pin
+    assert pin["pid"] == str(owner_pid), pin
+    assert pin["lock_dev"] == str(identity[0]), pin
+    assert pin["lock_ino"] == str(identity[1]), pin
+    return identity
+
+
+def _assert_reclaim_revocation(
+    path: Path,
+    *,
+    generation: dict[str, str],
+    transition: dict[str, str],
+) -> dict[str, str]:
+    revocation = read_record(path, schema=REVOCATION_SCHEMA)
+    assert revocation["schema"] == "1", revocation
+    assert revocation["token"] == generation["token"], revocation
+    assert revocation["round_barcode"] == generation["round_barcode"], revocation
+    assert revocation["scope"] == generation["scope"], revocation
+    assert revocation["outcome"] == "revoked", revocation
+    assert revocation["reason"] == transition["reason"], revocation
+    assert (
+        revocation["effective_ttl_seconds"]
+        == generation["effective_ttl_seconds"]
+    ), revocation
+    assert (
+        revocation["reclaim_transition_epoch"] == transition["started_epoch"]
+    ), revocation
+    assert revocation["lock_dev"] == transition["lock_dev"], revocation
+    assert revocation["lock_ino"] == transition["lock_ino"], revocation
+    assert (
+        revocation["operation_token"] == transition["operation_token"]
+    ), revocation
+    return revocation
+
+
+def _assert_reclaim_event(
+    event: dict[str, str],
+    *,
+    generation: dict[str, str],
+    transition: dict[str, str],
+) -> None:
+    assert event["schema"] == "1", event
+    assert event["event_id"] == transition["operation_token"], event
+    assert event["generation_token"] == generation["token"], event
+    assert event["round_barcode"] == generation["round_barcode"], event
+    assert event["scope"] == generation["scope"], event
+    assert event["event"] == "reclaim", event
+    assert event["outcome"] == "quarantined", event
+    assert (
+        event["effective_ttl_seconds"] == generation["effective_ttl_seconds"]
+    ), event
+    assert event["event_epoch"] == transition["started_epoch"], event
+    assert event["lock_dev"] == transition["lock_dev"], event
+    assert event["lock_ino"] == transition["lock_ino"], event
 
 
 def _assert_absent(path: Path) -> None:
@@ -747,4 +905,334 @@ def test_release_recovery_converges_at_every_terminal_boundary(
     )
     assert replayed.returncode == 0, replayed.stderr
     assert replayed.stdout == b"dorado_only_early\n"
+    assert _tree_manifest(state) == stable
+
+
+@pytest.mark.parametrize("failpoint", RECLAIM_RECOVERY_BOUNDARIES)
+def test_reclaim_recovery_converges_at_every_terminal_boundary(
+    tmp_path: Path,
+    failpoint: str,
+) -> None:
+    """SIGKILL recovery publishes one fenced reclaim and one replacement."""
+    state = tmp_path / "state"
+    state.mkdir()
+    owner_round = "reclaim_owner"
+    replacement_round = "reclaim_replacement"
+
+    # Positive control for the reclaim premise: this PID must be absent before
+    # the helper is allowed to classify the generation and its pin as dead.
+    with pytest.raises(ProcessLookupError):
+        os.kill(DEAD_OWNER_PID, 0)
+
+    acquired = subprocess.run(
+        _acquire_command(
+            state,
+            round_barcode=owner_round,
+            owner_pid=DEAD_OWNER_PID,
+            wait_seconds=2,
+        ),
+        capture_output=True,
+        check=False,
+        env=perl_test_env(),
+        timeout=5,
+    )
+    assert acquired.returncode == 0, acquired.stderr
+    assert acquired.stderr == b"", acquired.stderr
+    old_token, old_pin = parse_acquire_output(acquired.stdout)
+    old_lock = state / LOCK_NAME
+    old_identity = _assert_generation_tree(
+        old_lock,
+        token=old_token,
+        pin_token=old_pin,
+        round_barcode=owner_round,
+        owner_pid=DEAD_OWNER_PID,
+    )
+    old_generation = read_record(
+        old_lock / "generation.tsv", schema=GENERATION_SCHEMA
+    )
+    assert old_generation["host"] != "unknown", old_generation
+
+    initial_events = _validated_events(state)
+    assert len(initial_events) == 1, initial_events
+    initial_event_name, initial_event = next(iter(initial_events.items()))
+    assert_token(initial_event["event_id"])
+    assert initial_event["generation_token"] == old_token, initial_event
+    assert initial_event["round_barcode"] == owner_round, initial_event
+    assert initial_event["scope"] == "full_round", initial_event
+    assert initial_event["event"] == "acquire", initial_event
+    assert initial_event["outcome"] == "acquired", initial_event
+    assert initial_event["effective_ttl_seconds"] == "300", initial_event
+    assert initial_event["event_epoch"].isdigit(), initial_event
+    assert initial_event["lock_dev"] == str(old_identity[0]), initial_event
+    assert initial_event["lock_ino"] == str(old_identity[1]), initial_event
+
+    # First create one durable reclaim quarantine. The four matrix cases then
+    # replay this identical captured transition, avoiding four independently
+    # generated authorities that could accidentally agree with their outputs.
+    quarantined = subprocess.run(
+        _acquire_command(
+            state,
+            round_barcode=replacement_round,
+            owner_pid=os.getpid(),
+            wait_seconds=2,
+        ),
+        capture_output=True,
+        check=False,
+        env=perl_test_env(
+            RTBIOSCAN_ROUND_LOCK_FAILPOINT="after-quarantine-rename"
+        ),
+        timeout=5,
+    )
+    assert quarantined.returncode != 0, quarantined.stdout
+    assert quarantined.stdout == b"", quarantined.stdout
+    assert_exact_error_line(
+        quarantined.stderr,
+        "ERROR: injected failure after quarantine rename",
+    )
+
+    quarantine_paths = sorted(state.glob(f"{LOCK_NAME}.reclaim-*"))
+    assert len(quarantine_paths) == 1, quarantine_paths
+    quarantine = quarantine_paths[0]
+    quarantine_entry = os.lstat(quarantine)
+    assert stat.S_ISDIR(quarantine_entry.st_mode), quarantine_entry
+    assert (quarantine_entry.st_dev, quarantine_entry.st_ino) == old_identity
+    transition_path = quarantine / "transition.tsv"
+    transition = read_record(transition_path, schema=TRANSITION_SCHEMA)
+    assert transition["schema"] == "1", transition
+    assert transition["action"] == "reclaim", transition
+    assert_token(transition["operation_token"])
+    assert quarantine.name == (
+        f"{LOCK_NAME}.reclaim-{transition['operation_token']}"
+    )
+    assert transition["owner_token"] == old_token, transition
+    assert transition["round_barcode"] == owner_round, transition
+    assert transition["scope"] == "full_round", transition
+    assert transition["reason"] == (
+        f"dead pid={DEAD_OWNER_PID} host={old_generation['host']}"
+    ), transition
+    assert transition["effective_ttl_seconds"] == "300", transition
+    assert transition["lock_dev"] == str(old_identity[0]), transition
+    assert transition["lock_ino"] == str(old_identity[1]), transition
+    assert transition["allowed_pin_token"] == "none", transition
+    assert transition["started_epoch"].isdigit(), transition
+    transition_bytes = read_nofollow_bytes(transition_path)
+    quarantine_manifest = _tree_manifest(quarantine)
+    _assert_absent(old_lock)
+
+    revocation_path = state / f".round_lock_revocation.{old_token}.tsv"
+    reclaim_event_name = (
+        f"{old_token}.reclaim.{transition['operation_token']}.tsv"
+    )
+    archive_relative = (
+        f".round_lock_archives/reclaim-{transition['operation_token']}"
+    )
+    archive = state / archive_relative
+    ready = tmp_path / f"{failpoint}.reclaim.ready"
+    release = tmp_path / f"{failpoint}.reclaim.release"
+    recovery_command = _acquire_command(
+        state,
+        round_barcode=replacement_round,
+        owner_pid=os.getpid(),
+        wait_seconds=2,
+    )
+    process = subprocess.Popen(
+        recovery_command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=perl_test_env(
+            RTBIOSCAN_ROUND_LOCK_FAILPOINT=failpoint,
+            RTBIOSCAN_ROUND_LOCK_TEST_READY=str(ready),
+            RTBIOSCAN_ROUND_LOCK_TEST_RELEASE=str(release),
+            RTBIOSCAN_ROUND_LOCK_TEST_TIMEOUT_SECONDS="10",
+        ),
+    )
+    try:
+        _wait_for_pause(process, ready, failpoint)
+        _assert_absent(release)
+        _assert_state_fence_is_held(state)
+
+        has_receipt = failpoint != "before-quarantine-recovery-outcome"
+        has_event = failpoint in {
+            "after-transition-outcome-before-archive",
+            "after-terminal-archive-rename-before-sync",
+        }
+        is_archived = failpoint == "after-terminal-archive-rename-before-sync"
+        old_prefix = archive_relative if is_archived else quarantine.name
+        old_location = archive if is_archived else quarantine
+        current_entry = os.lstat(old_location)
+        assert stat.S_ISDIR(current_entry.st_mode), current_entry
+        assert (current_entry.st_dev, current_entry.st_ino) == old_identity
+        assert _tree_manifest(old_location) == quarantine_manifest
+        assert read_nofollow_bytes(old_location / "transition.tsv") == transition_bytes
+        assert read_record(
+            old_location / "transition.tsv", schema=TRANSITION_SCHEMA
+        ) == transition
+        _assert_generation_tree(
+            old_location,
+            token=old_token,
+            pin_token=old_pin,
+            round_barcode=owner_round,
+            owner_pid=DEAD_OWNER_PID,
+            expected_identity=old_identity,
+        )
+
+        if has_receipt:
+            _assert_reclaim_revocation(
+                revocation_path,
+                generation=old_generation,
+                transition=transition,
+            )
+        else:
+            _assert_absent(revocation_path)
+
+        pause_events = _validated_events(state)
+        assert pause_events[initial_event_name] == initial_event
+        if has_event:
+            assert set(pause_events) == {
+                initial_event_name,
+                reclaim_event_name,
+            }, pause_events
+            _assert_reclaim_event(
+                pause_events[reclaim_event_name],
+                generation=old_generation,
+                transition=transition,
+            )
+        else:
+            assert pause_events == {initial_event_name: initial_event}
+
+        expected_namespace = {
+            ".round_lock_events": "directory",
+            f".round_lock_events/{initial_event_name}": "file",
+            f"{old_prefix}/transition.tsv": "file",
+        }
+        expected_namespace.update(_generation_namespace(old_prefix, old_pin))
+        if is_archived:
+            expected_namespace[".round_lock_archives"] = "directory"
+        if has_receipt:
+            expected_namespace[revocation_path.name] = "file"
+        if has_event:
+            expected_namespace[
+                f".round_lock_events/{reclaim_event_name}"
+            ] = "file"
+        assert _namespace_kinds(state) == expected_namespace
+
+        paused_manifest = _tree_manifest(state)
+        _kill_at_pause(process)
+        assert _tree_manifest(state) == paused_manifest
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
+
+    recovered = subprocess.run(
+        recovery_command,
+        capture_output=True,
+        check=False,
+        env=perl_test_env(),
+        timeout=5,
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert recovered.stderr == b"", recovered.stderr
+    replacement_token, replacement_pin = parse_acquire_output(recovered.stdout)
+    assert replacement_token != old_token
+
+    archived_identity = _assert_generation_tree(
+        archive,
+        token=old_token,
+        pin_token=old_pin,
+        round_barcode=owner_round,
+        owner_pid=DEAD_OWNER_PID,
+        expected_identity=old_identity,
+    )
+    assert archived_identity == old_identity
+    assert _tree_manifest(archive) == quarantine_manifest
+    assert read_nofollow_bytes(archive / "transition.tsv") == transition_bytes
+    assert read_record(archive / "transition.tsv", schema=TRANSITION_SCHEMA) == (
+        transition
+    )
+    replacement_identity = _assert_generation_tree(
+        state / LOCK_NAME,
+        token=replacement_token,
+        pin_token=replacement_pin,
+        round_barcode=replacement_round,
+        owner_pid=os.getpid(),
+    )
+    assert replacement_identity != old_identity
+
+    _assert_reclaim_revocation(
+        revocation_path,
+        generation=old_generation,
+        transition=transition,
+    )
+    final_events = _validated_events(state)
+    assert len(final_events) == 3, final_events
+    assert final_events[initial_event_name] == initial_event
+    _assert_reclaim_event(
+        final_events[reclaim_event_name],
+        generation=old_generation,
+        transition=transition,
+    )
+    replacement_acquires = [
+        (name, event)
+        for name, event in final_events.items()
+        if event["generation_token"] == replacement_token
+        and event["event"] == "acquire"
+    ]
+    assert len(replacement_acquires) == 1, replacement_acquires
+    replacement_event_name, replacement_event = replacement_acquires[0]
+    assert_token(replacement_event["event_id"])
+    assert replacement_event["round_barcode"] == replacement_round
+    assert replacement_event["scope"] == "full_round"
+    assert replacement_event["outcome"] == "acquired"
+    assert replacement_event["effective_ttl_seconds"] == "300"
+    assert replacement_event["lock_dev"] == str(replacement_identity[0])
+    assert replacement_event["lock_ino"] == str(replacement_identity[1])
+    assert {
+        (event["generation_token"], event["event"])
+        for event in final_events.values()
+    } == {
+        (old_token, "acquire"),
+        (old_token, "reclaim"),
+        (replacement_token, "acquire"),
+    }
+
+    expected_final_namespace = {
+        ".round_lock_archives": "directory",
+        ".round_lock_events": "directory",
+        revocation_path.name: "file",
+        f"{archive_relative}/transition.tsv": "file",
+    }
+    expected_final_namespace.update(
+        _generation_namespace(archive_relative, old_pin)
+    )
+    expected_final_namespace.update(
+        _generation_namespace(LOCK_NAME, replacement_pin)
+    )
+    expected_final_namespace.update(
+        {
+            f".round_lock_events/{name}": "file"
+            for name in final_events
+        }
+    )
+    assert _namespace_kinds(state) == expected_final_namespace
+
+    stable = _tree_manifest(state)
+    replayed = subprocess.run(
+        _acquire_command(
+            state,
+            round_barcode="reclaim_second_replacement",
+            owner_pid=os.getpid(),
+            wait_seconds=1,
+        ),
+        capture_output=True,
+        check=False,
+        env=perl_test_env(),
+        timeout=5,
+    )
+    assert replayed.returncode != 0, replayed.stdout
+    assert replayed.stdout == b"", replayed.stdout
+    assert_exact_error_line(
+        replayed.stderr,
+        f"ERROR: timed out waiting for round lock '{state / LOCK_NAME}'",
+    )
     assert _tree_manifest(state) == stable
