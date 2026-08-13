@@ -8,13 +8,35 @@ from pathlib import Path
 
 import pytest
 
-from tests.round_lock_test_utils import assert_token as _assert_token
-from tests.round_lock_test_utils import parse_acquire_output as _parse_acquire_output
-from tests.round_lock_test_utils import read_record as _read_record
+from tests.round_lock_test_utils import (
+    EVENT_SCHEMA,
+    GENERATION_SCHEMA,
+    INFLIGHT_SCHEMA,
+    MARKER_SCHEMA,
+    PIN_SCHEMA,
+    RELEASE_SCHEMA,
+    REVOCATION_SCHEMA,
+    TRANSITION_SCHEMA,
+    RecordSchema,
+    assert_exact_error_line as _assert_exact_error_line,
+    assert_token as _assert_token,
+    parse_acquire_output as _parse_acquire_output,
+    perl_test_env as _perl_test_env,
+    read_compat_inflight as _read_compat_inflight,
+    read_nofollow_bytes as _read_nofollow_bytes,
+    read_record as _read_record,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "bin" / "round_lock_generation.pl"
+FAILPOINT_ERRORS = {
+    "after-transition-install": "ERROR: injected failure after transition install",
+    "after-quarantine-rename": "ERROR: injected failure after quarantine rename",
+    "before-compat-publish": (
+        "ERROR: injected failure before compatibility inflight publish"
+    ),
+}
 
 
 def _command(
@@ -77,39 +99,54 @@ def _run(
 
 def _acquire(state: Path, **kwargs: object) -> tuple[str, str]:
     kwargs.setdefault("owner_pid", os.getpid())
-    result = _run("acquire", state, **kwargs)
+    result = subprocess.run(
+        _command("acquire", state, **kwargs),
+        capture_output=True,
+        check=False,
+        env=_perl_test_env(),
+    )
     assert result.returncode == 0, result.stderr
     return _parse_acquire_output(result.stdout)
 
 
 def _pin(state: Path, token: str, *, role: str, **kwargs: object) -> str:
     kwargs.setdefault("owner_pid", os.getpid())
-    result = _run("pin", state, token=token, role=role, **kwargs)
+    result = subprocess.run(
+        _command("pin", state, token=token, role=role, **kwargs),
+        capture_output=True,
+        check=False,
+        env=_perl_test_env(),
+    )
     assert result.returncode == 0, result.stderr
-    pin_token = result.stdout.strip()
+    assert result.stdout.endswith(b"\n"), result.stdout
+    raw_token = result.stdout[:-1]
+    assert b"\n" not in raw_token, result.stdout
+    pin_token = raw_token.decode("ascii")
     _assert_token(pin_token)
     return pin_token
 
 
-def _read_compat_inflight(path: Path) -> dict[str, str]:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    values = dict(line.split("=", 1) for line in lines)
-    checksum = values.pop("record_sha256")
-    body = "".join(f"{key}={value}\n" for key, value in values.items())
-    assert checksum == hashlib.sha256(body.encode()).hexdigest()
-    return values
-
-
-def _rewrite_record(path: Path, values: dict[str, str]) -> None:
-    body = "".join(f"{key}\t{value}\n" for key, value in values.items())
-    path.write_text(
-        body + f"record_sha256\t{hashlib.sha256(body.encode()).hexdigest()}\n",
-        encoding="utf-8",
+def _rewrite_record(
+    path: Path,
+    values: dict[str, str],
+    *,
+    schema: RecordSchema,
+) -> None:
+    assert set(values) == set(schema.fields), (values, schema)
+    body = b"".join(
+        key.encode("utf-8") + b"\t" + values[key].encode("utf-8") + b"\n"
+        for key in schema.fields
+    )
+    path.write_bytes(
+        body + b"record_sha256\t" + hashlib.sha256(body).hexdigest().encode() + b"\n"
     )
 
 
 def _generation(state: Path) -> dict[str, str]:
-    return _read_record(state / ".round_inflight.lockdir" / "generation.tsv")
+    return _read_record(
+        state / ".round_inflight.lockdir" / "generation.tsv",
+        schema=GENERATION_SCHEMA,
+    )
 
 
 def _marker(state: Path, token: str) -> Path:
@@ -132,7 +169,7 @@ def _backdate_lock(state: Path) -> None:
 
 def _event_records(state: Path) -> list[dict[str, str]]:
     return [
-        _read_record(path)
+        _read_record(path, schema=EVENT_SCHEMA)
         for path in sorted((state / ".round_lock_events").glob("*.tsv"))
     ]
 
@@ -154,7 +191,8 @@ def test_full_round_handoff_pins_release_and_exit_are_generation_bound(
         state
         / ".round_inflight.lockdir"
         / "pins"
-        / f"ready.{acquisition_pin_a}.tsv"
+        / f"ready.{acquisition_pin_a}.tsv",
+        schema=PIN_SCHEMA,
     )
     assert acquisition_pin_record["token"] == token_a
     assert acquisition_pin_record["pin_token"] == acquisition_pin_a
@@ -177,7 +215,9 @@ def test_full_round_handoff_pins_release_and_exit_are_generation_bound(
         "handoff", state, token=token_a, pin_token=acquisition_pin_a
     )
     assert handoff.returncode == 0, handoff.stderr
-    assert _read_record(_marker(state, token_a))["round_barcode"] == "run_1"
+    assert _read_record(
+        _marker(state, token_a), schema=MARKER_SCHEMA
+    )["round_barcode"] == "run_1"
     assert not (
         state
         / ".round_inflight.lockdir"
@@ -228,7 +268,7 @@ def test_full_round_handoff_pins_release_and_exit_are_generation_bound(
     assert not (state / f".round_inflight.{token_a}.tsv").exists()
     assert not _marker(state, token_a).exists()
     assert list(state.glob(".round_inflight.lockdir.release-*")) == []
-    receipt = _read_record(_release_receipt(state, token_a))
+    receipt = _read_record(_release_receipt(state, token_a), schema=RELEASE_SCHEMA)
     assert receipt["reason"] == "full_round_released"
     assert receipt["effective_ttl_seconds"] == "37"
     verified = _run("verify-release", state, token=token_a)
@@ -236,9 +276,8 @@ def test_full_round_handoff_pins_release_and_exit_are_generation_bound(
     assert verified.stdout.strip() == "full_round_released"
 
     token_b, _pin_b = _acquire(state, round_barcode="run_2")
-    generation_b_bytes = (
-        state / ".round_inflight.lockdir" / "generation.tsv"
-    ).read_bytes()
+    generation_b_path = state / ".round_inflight.lockdir" / "generation.tsv"
+    generation_b_bytes = _read_nofollow_bytes(generation_b_path)
     late_exit = _run(
         "abort",
         state,
@@ -248,9 +287,7 @@ def test_full_round_handoff_pins_release_and_exit_are_generation_bound(
     )
     assert late_exit.returncode != 0
     assert "release reason conflicts" in late_exit.stderr
-    assert (
-        state / ".round_inflight.lockdir" / "generation.tsv"
-    ).read_bytes() == generation_b_bytes
+    assert _read_nofollow_bytes(generation_b_path) == generation_b_bytes
     assert _generation(state)["token"] == token_b
 
     events = _event_records(state)
@@ -279,7 +316,7 @@ def test_dorado_only_marker_without_lock_and_prefix_cleanup_are_safe(
     assert release_1.returncode == 0, release_1.stderr
     marker_1 = _marker(state, token_1)
     assert marker_1.is_file()
-    marker_1_record = _read_record(marker_1)
+    marker_1_record = _read_record(marker_1, schema=MARKER_SCHEMA)
     assert marker_1_record["token"] == token_1
     assert marker_1_record["round_barcode"] == "run_1"
     assert marker_1_record["scope"] == "dorado_only"
@@ -311,7 +348,7 @@ def test_dorado_only_marker_without_lock_and_prefix_cleanup_are_safe(
     )
     assert release_10.returncode == 0, release_10.stderr
     marker_10 = _marker(state, token_10)
-    marker_10_bytes = marker_10.read_bytes()
+    marker_10_bytes = _read_nofollow_bytes(marker_10)
 
     finish_1 = _run(
         "finish",
@@ -322,7 +359,7 @@ def test_dorado_only_marker_without_lock_and_prefix_cleanup_are_safe(
     )
     assert finish_1.returncode == 0, finish_1.stderr
     assert not marker_1.exists()
-    assert marker_10.read_bytes() == marker_10_bytes
+    assert _read_nofollow_bytes(marker_10) == marker_10_bytes
 
 
 def test_reclaimed_full_round_cannot_publish_release_or_remove_replacement(
@@ -342,7 +379,7 @@ def test_reclaimed_full_round_cannot_publish_release_or_remove_replacement(
 
     token_b, pin_b = _acquire(state, round_barcode="same", stale_seconds=1)
     assert token_b != token_a
-    revocation_a = _read_record(_revocation(state, token_a))
+    revocation_a = _read_record(_revocation(state, token_a), schema=REVOCATION_SCHEMA)
     assert revocation_a["token"] == token_a
     assert revocation_a["round_barcode"] == "same"
     assert revocation_a["scope"] == "full_round"
@@ -369,10 +406,10 @@ def test_reclaimed_full_round_cannot_publish_release_or_remove_replacement(
         pin_token=pin_b,
         read_file="/reads/replacement.pod5",
     ).returncode == 0
-    generation_b = (
-        state / ".round_inflight.lockdir" / "generation.tsv"
-    ).read_bytes()
-    inflight_b = (state / "round_inflight.txt").read_bytes()
+    generation_b_path = state / ".round_inflight.lockdir" / "generation.tsv"
+    inflight_b_path = state / "round_inflight.txt"
+    generation_b = _read_nofollow_bytes(generation_b_path)
+    inflight_b = _read_nofollow_bytes(inflight_b_path)
 
     stale_guard = _run(
         "guard-pin",
@@ -416,10 +453,8 @@ def test_reclaimed_full_round_cannot_publish_release_or_remove_replacement(
         pin_token=pin_a,
         best_effort=True,
     ).returncode == 0
-    assert (
-        state / ".round_inflight.lockdir" / "generation.tsv"
-    ).read_bytes() == generation_b
-    assert (state / "round_inflight.txt").read_bytes() == inflight_b
+    assert _read_nofollow_bytes(generation_b_path) == generation_b
+    assert _read_nofollow_bytes(inflight_b_path) == inflight_b
     assert _generation(state)["token"] == token_b
     revoked_release = _run(
         "verify-release",
@@ -443,9 +478,9 @@ def test_existing_handoff_marker_rejects_a_displaced_generation(
 
     replacement_token = hashlib.sha256(b"replacement-generation").hexdigest()
     generation_path = state / ".round_inflight.lockdir" / "generation.tsv"
-    generation = _read_record(generation_path)
+    generation = _read_record(generation_path, schema=GENERATION_SCHEMA)
     generation["token"] = replacement_token
-    _rewrite_record(generation_path, generation)
+    _rewrite_record(generation_path, generation, schema=GENERATION_SCHEMA)
     assert not _revocation(state, token_a).exists()
 
     late_handoff = _run(
@@ -475,7 +510,7 @@ def test_legacy_or_malformed_lock_is_ttl_quarantined_without_marker_glob(
 
     token, _pin = _acquire(state, round_barcode="run_10", stale_seconds=1)
     assert _generation(state)["token"] == token
-    assert legacy_marker.read_bytes() == b"legacy-marker\n"
+    assert _read_nofollow_bytes(legacy_marker) == b"legacy-marker\n"
     quarantines = list(state.glob(".round_inflight.lockdir.reclaim-*"))
     assert len(quarantines) == 1
     legacy_events = [
@@ -502,8 +537,7 @@ def test_killed_reclaimer_is_resumed_without_moving_replacement(
     ).returncode == 0
     _backdate_lock(state)
 
-    env = dict(os.environ)
-    env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = failpoint
+    env = _perl_test_env(RTBIOSCAN_ROUND_LOCK_FAILPOINT=failpoint)
     interrupted = subprocess.run(
         _command(
             "acquire",
@@ -514,12 +548,11 @@ def test_killed_reclaimer_is_resumed_without_moving_replacement(
             wait_seconds=1,
         ),
         capture_output=True,
-        text=True,
         check=False,
         env=env,
     )
     assert interrupted.returncode != 0
-    assert "injected failure" in interrupted.stderr
+    _assert_exact_error_line(interrupted.stderr, FAILPOINT_ERRORS[failpoint])
 
     token_b, _pin_b = _acquire(
         state,
@@ -563,7 +596,6 @@ def test_concurrent_reclaimers_install_one_replacement_generation(
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
         )
         for index in range(4)
     ]
@@ -658,9 +690,8 @@ def test_delayed_reclaimer_cannot_rename_new_generation(tmp_path: Path) -> None:
     token_b, _pin_b = _acquire(
         state, round_barcode="run_3", stale_seconds=300, wait_seconds=1
     )
-    generation_b = (
-        state / ".round_inflight.lockdir" / "generation.tsv"
-    ).read_bytes()
+    generation_b_path = state / ".round_inflight.lockdir" / "generation.tsv"
+    generation_b = _read_nofollow_bytes(generation_b_path)
     replacement_paths = [
         state / ".round_inflight.lockdir",
         *(state / ".round_inflight.lockdir").iterdir(),
@@ -672,9 +703,7 @@ def test_delayed_reclaimer_cannot_rename_new_generation(tmp_path: Path) -> None:
     delayed_stdout, delayed_stderr = delayed.communicate(timeout=5)
     assert delayed.returncode != 0, delayed_stdout
     assert "timed out" in delayed_stderr
-    assert (
-        state / ".round_inflight.lockdir" / "generation.tsv"
-    ).read_bytes() == generation_b
+    assert _read_nofollow_bytes(generation_b_path) == generation_b
     assert _generation(state)["token"] == token_b
     assert len(list(state.glob(".round_inflight.lockdir.reclaim-*"))) == 1
 
@@ -684,8 +713,8 @@ def test_release_crash_recovers_authenticated_receipt_and_late_exit_is_safe(
 ) -> None:
     state = tmp_path / "state"
     token_a, pin_a = _acquire(state, scope="dorado_only", stale_seconds=19)
-    env = dict(os.environ)
-    env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-quarantine-rename"
+    failpoint = "after-quarantine-rename"
+    env = _perl_test_env(RTBIOSCAN_ROUND_LOCK_FAILPOINT=failpoint)
     interrupted = subprocess.run(
         _command(
             "early-release",
@@ -696,24 +725,23 @@ def test_release_crash_recovers_authenticated_receipt_and_late_exit_is_safe(
             stale_seconds=19,
         ),
         capture_output=True,
-        text=True,
         check=False,
         env=env,
     )
     assert interrupted.returncode != 0
+    _assert_exact_error_line(interrupted.stderr, FAILPOINT_ERRORS[failpoint])
     assert _marker(state, token_a).is_file()
     assert not _release_receipt(state, token_a).exists()
 
     token_b, _pin_b = _acquire(
         state, round_barcode="run_2", stale_seconds=30
     )
-    receipt = _read_record(_release_receipt(state, token_a))
+    receipt = _read_record(_release_receipt(state, token_a), schema=RELEASE_SCHEMA)
     assert receipt["reason"] == "dorado_only_early"
     assert receipt["effective_ttl_seconds"] == "19"
     assert list(state.glob(".round_inflight.lockdir.release-*")) == []
-    generation_b = (
-        state / ".round_inflight.lockdir" / "generation.tsv"
-    ).read_bytes()
+    generation_b_path = state / ".round_inflight.lockdir" / "generation.tsv"
+    generation_b = _read_nofollow_bytes(generation_b_path)
     late_abort = _run(
         "abort",
         state,
@@ -724,9 +752,7 @@ def test_release_crash_recovers_authenticated_receipt_and_late_exit_is_safe(
     )
     assert late_abort.returncode != 0
     assert "release reason conflicts" in late_abort.stderr
-    assert (
-        state / ".round_inflight.lockdir" / "generation.tsv"
-    ).read_bytes() == generation_b
+    assert _read_nofollow_bytes(generation_b_path) == generation_b
     assert _generation(state)["token"] == token_b
 
 
@@ -745,17 +771,15 @@ def test_full_release_crash_is_recovered_without_minting_a_new_pin(
     assert handoff.returncode == 0, handoff.stderr
     finisher_pin = _pin(state, token, role="backup_update_and_clean")
 
-    env = dict(os.environ)
-    env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = failpoint
+    env = _perl_test_env(RTBIOSCAN_ROUND_LOCK_FAILPOINT=failpoint)
     interrupted = subprocess.run(
         _command("finish", state, token=token, pin_token=finisher_pin),
         capture_output=True,
-        text=True,
         check=False,
         env=env,
     )
     assert interrupted.returncode != 0
-    assert "injected failure" in interrupted.stderr
+    _assert_exact_error_line(interrupted.stderr, FAILPOINT_ERRORS[failpoint])
 
     if failpoint == "after-transition-install":
         assert (state / ".round_inflight.lockdir" / "transition.tsv").is_file()
@@ -769,7 +793,9 @@ def test_full_release_crash_is_recovered_without_minting_a_new_pin(
 
     replay = _run("finish", state, token=token)
     assert replay.returncode == 0, replay.stderr
-    assert _read_record(_release_receipt(state, token))["reason"] == "full_round_released"
+    assert _read_record(
+        _release_receipt(state, token), schema=RELEASE_SCHEMA
+    )["reason"] == "full_round_released"
     assert not _marker(state, token).exists()
     assert not (state / ".round_inflight.lockdir").exists()
     assert list(state.glob(".round_inflight.lockdir.release-*")) == []
@@ -784,16 +810,16 @@ def test_pending_release_recovery_revalidates_the_transition_pin_role(
         "handoff", state, token=token, pin_token=acquisition_pin
     ).returncode == 0
     finisher_pin = _pin(state, token, role="backup_update_and_clean")
-    env = dict(os.environ)
-    env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-transition-install"
+    failpoint = "after-transition-install"
+    env = _perl_test_env(RTBIOSCAN_ROUND_LOCK_FAILPOINT=failpoint)
     interrupted = subprocess.run(
         _command("finish", state, token=token, pin_token=finisher_pin),
         capture_output=True,
-        text=True,
         check=False,
         env=env,
     )
     assert interrupted.returncode != 0
+    _assert_exact_error_line(interrupted.stderr, FAILPOINT_ERRORS[failpoint])
 
     ready = (
         state
@@ -801,9 +827,9 @@ def test_pending_release_recovery_revalidates_the_transition_pin_role(
         / "pins"
         / f"ready.{finisher_pin}.tsv"
     )
-    pin_record = _read_record(ready)
+    pin_record = _read_record(ready, schema=PIN_SCHEMA)
     pin_record["role"] = "state_writer"
-    _rewrite_record(ready, pin_record)
+    _rewrite_record(ready, pin_record, schema=PIN_SCHEMA)
 
     verified = _run("verify-release", state, token=token)
     assert verified.returncode != 0
@@ -826,8 +852,8 @@ def test_inflight_publish_retry_reuses_the_immutable_record_and_cleans_temp(
 ) -> None:
     state = tmp_path / "state"
     token, pin_token = _acquire(state)
-    env = dict(os.environ)
-    env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "before-compat-publish"
+    failpoint = "before-compat-publish"
+    env = _perl_test_env(RTBIOSCAN_ROUND_LOCK_FAILPOINT=failpoint)
     interrupted = subprocess.run(
         _command(
             "inflight",
@@ -837,14 +863,14 @@ def test_inflight_publish_retry_reuses_the_immutable_record_and_cleans_temp(
             read_file="/reads/run_1.pod5",
         ),
         capture_output=True,
-        text=True,
         check=False,
         env=env,
     )
     assert interrupted.returncode != 0
-    assert "injected failure before compatibility inflight publish" in interrupted.stderr
+    _assert_exact_error_line(interrupted.stderr, FAILPOINT_ERRORS[failpoint])
     exact_path = state / f".round_inflight.{token}.tsv"
-    exact_before = _read_record(exact_path)
+    exact_before = _read_record(exact_path, schema=INFLIGHT_SCHEMA)
+    exact_before_bytes = _read_nofollow_bytes(exact_path)
     assert not (state / "round_inflight.txt").exists()
     assert list((state / ".round_inflight.lockdir").glob(".round_inflight.*.tmp")) == []
 
@@ -857,9 +883,11 @@ def test_inflight_publish_retry_reuses_the_immutable_record_and_cleans_temp(
         read_file="/reads/run_1.pod5",
     )
     assert retried.returncode == 0, retried.stderr
-    exact_after = _read_record(exact_path)
+    exact_after = _read_record(exact_path, schema=INFLIGHT_SCHEMA)
+    exact_after_bytes = _read_nofollow_bytes(exact_path)
     compat = _read_compat_inflight(state / "round_inflight.txt")
     assert exact_after == exact_before
+    assert exact_after_bytes == exact_before_bytes
     assert compat["started_utc"] == exact_before["started_utc"]
     assert list((state / ".round_inflight.lockdir").glob(".round_inflight.*.tmp")) == []
 
@@ -873,9 +901,9 @@ def test_fast_release_paths_reject_a_different_pin_role(tmp_path: Path) -> None:
         / "pins"
         / f"ready.{dorado_pin}.tsv"
     )
-    dorado_record = _read_record(dorado_ready)
+    dorado_record = _read_record(dorado_ready, schema=PIN_SCHEMA)
     dorado_record["role"] = "backup_update_and_clean"
-    _rewrite_record(dorado_ready, dorado_record)
+    _rewrite_record(dorado_ready, dorado_record, schema=PIN_SCHEMA)
     early = _run(
         "early-release",
         dorado_state,
@@ -896,9 +924,9 @@ def test_fast_release_paths_reject_a_different_pin_role(tmp_path: Path) -> None:
         / "pins"
         / f"ready.{abort_pin}.tsv"
     )
-    abort_record = _read_record(abort_ready)
+    abort_record = _read_record(abort_ready, schema=PIN_SCHEMA)
     abort_record["role"] = "state_writer"
-    _rewrite_record(abort_ready, abort_record)
+    _rewrite_record(abort_ready, abort_record, schema=PIN_SCHEMA)
     aborted = _run("abort", abort_state, token=abort_token, pin_token=abort_pin)
     assert aborted.returncode == 0, aborted.stderr
     assert (abort_state / ".round_inflight.lockdir").is_dir()
@@ -916,11 +944,10 @@ def test_tampered_release_receipt_fails_closed(tmp_path: Path) -> None:
         pin_token=pin_token,
     ).returncode == 0
     receipt = _release_receipt(state, token)
-    receipt.write_text(
-        receipt.read_text(encoding="utf-8").replace(
-            "reason\tdorado_only_early", "reason\tforged"
-        ),
-        encoding="utf-8",
+    receipt.write_bytes(
+        _read_nofollow_bytes(receipt).replace(
+            b"reason\tdorado_only_early", b"reason\tforged"
+        )
     )
     verified = _run("verify-release", state, scope="dorado_only", token=token)
     assert verified.returncode != 0
@@ -940,6 +967,7 @@ def test_early_release_validates_an_existing_exact_marker(tmp_path: Path) -> Non
             "outcome": "handoff",
             "created_epoch": "1",
         },
+        schema=MARKER_SCHEMA,
     )
     released = _run(
         "early-release",
@@ -959,7 +987,9 @@ def test_pre_handoff_abort_is_not_a_resumable_release_receipt(tmp_path: Path) ->
     token, pin_token = _acquire(state)
     aborted = _run("abort", state, token=token, pin_token=pin_token)
     assert aborted.returncode == 0, aborted.stderr
-    assert _read_record(_release_receipt(state, token))["reason"] == "pre_handoff_abort"
+    assert _read_record(
+        _release_receipt(state, token), schema=RELEASE_SCHEMA
+    )["reason"] == "pre_handoff_abort"
     verified = _run("verify-release", state, token=token)
     assert verified.returncode != 0
     assert "pre-handoff abort is not a resumable release" in verified.stderr
@@ -993,10 +1023,10 @@ def test_foreign_host_pin_remains_blocking_after_lease_age(tmp_path: Path) -> No
         / "pins"
         / f"ready.{worker_pin}.tsv"
     )
-    pin_record = _read_record(ready_path)
+    pin_record = _read_record(ready_path, schema=PIN_SCHEMA)
     pin_record["host"] = "foreign.example.invalid"
     pin_record["created_epoch"] = "1"
-    _rewrite_record(ready_path, pin_record)
+    _rewrite_record(ready_path, pin_record, schema=PIN_SCHEMA)
     _backdate_lock(state)
     os.utime(_marker(state, token_a), (1, 1), follow_symlinks=False)
     blocked = _run(
@@ -1031,9 +1061,9 @@ def test_same_host_live_pin_remains_blocking_after_lease_age(tmp_path: Path) -> 
         / "pins"
         / f"ready.{worker_pin}.tsv"
     )
-    pin_record = _read_record(ready_path)
+    pin_record = _read_record(ready_path, schema=PIN_SCHEMA)
     pin_record["created_epoch"] = "1"
-    _rewrite_record(ready_path, pin_record)
+    _rewrite_record(ready_path, pin_record, schema=PIN_SCHEMA)
     _backdate_lock(state)
     os.utime(_marker(state, token_a), (1, 1), follow_symlinks=False)
 
@@ -1058,9 +1088,9 @@ def test_unverifiable_live_pid_is_not_reclaimed_after_ttl(tmp_path: Path) -> Non
         "unpin", state, token=token_a, pin_token=pin_a
     ).returncode == 0
     generation_path = state / ".round_inflight.lockdir" / "generation.tsv"
-    generation = _read_record(generation_path)
+    generation = _read_record(generation_path, schema=GENERATION_SCHEMA)
     generation["process_start"] = "unavailable"
-    _rewrite_record(generation_path, generation)
+    _rewrite_record(generation_path, generation, schema=GENERATION_SCHEMA)
     _backdate_lock(state)
 
     blocked = _run(
@@ -1086,7 +1116,7 @@ def test_verified_live_pid_wins_over_age_and_reused_pid_is_reclaimed(
         "unpin", state, token=token_a, pin_token=pin_a
     ).returncode == 0
     generation_path = state / ".round_inflight.lockdir" / "generation.tsv"
-    generation = _read_record(generation_path)
+    generation = _read_record(generation_path, schema=GENERATION_SCHEMA)
     parts = generation["process_start"].split(":")
     if len(parts) != 3 or parts[0] != "proc":
         pytest.skip("boot-aware process-start identity is unavailable")
@@ -1103,9 +1133,9 @@ def test_verified_live_pid_wins_over_age_and_reused_pid_is_reclaimed(
     assert "timed out" in blocked.stderr
     assert _generation(state)["token"] == token_a
 
-    generation = _read_record(generation_path)
+    generation = _read_record(generation_path, schema=GENERATION_SCHEMA)
     generation["process_start"] = f"proc:{parts[1]}:{int(parts[2]) + 1}"
-    _rewrite_record(generation_path, generation)
+    _rewrite_record(generation_path, generation, schema=GENERATION_SCHEMA)
     token_b, _pin_b = _acquire(
         state, round_barcode="run_3", stale_seconds=300, wait_seconds=1
     )
@@ -1139,7 +1169,10 @@ def test_script_has_no_handoff_or_inflight_glob_cleanup() -> None:
 
 def _captured_transition(state: Path) -> dict[str, str]:
     """Read the whole durable transition record, before recovery consumes it."""
-    record = _read_record(state / ".round_inflight.lockdir" / "transition.tsv")
+    record = _read_record(
+        state / ".round_inflight.lockdir" / "transition.tsv",
+        schema=TRANSITION_SCHEMA,
+    )
     assert record["started_epoch"].isdigit(), record
     _assert_token(record["operation_token"])
     return record
@@ -1163,16 +1196,17 @@ def test_release_receipt_and_event_both_equal_the_captured_transition_start(
     state = tmp_path / "state"
     token, acquisition_pin = _acquire(state, scope="dorado_only")
 
-    env = dict(os.environ)
-    env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-transition-install"
+    failpoint = "after-transition-install"
+    env = _perl_test_env(RTBIOSCAN_ROUND_LOCK_FAILPOINT=failpoint)
     interrupted = subprocess.run(
         _command(
             "early-release", state, token=token, pin_token=acquisition_pin,
             scope="dorado_only", owner_pid=os.getpid(),
         ),
-        capture_output=True, text=True, check=False, env=env,
+        capture_output=True, check=False, env=env,
     )
     assert interrupted.returncode != 0
+    _assert_exact_error_line(interrupted.stderr, FAILPOINT_ERRORS[failpoint])
     captured = _captured_transition(state)
 
     recovered = _run(
@@ -1186,7 +1220,7 @@ def test_release_receipt_and_event_both_equal_the_captured_transition_start(
         if event["generation_token"] == token and event["event"] == "release"
     ]
     assert len(release_events) == 1, release_events
-    receipt = _read_record(_release_receipt(state, token))
+    receipt = _read_record(_release_receipt(state, token), schema=RELEASE_SCHEMA)
 
     # Every value is anchored to the captured transition record, never to a
     # sibling output. Receipt and event are produced from the same source, so
@@ -1214,23 +1248,24 @@ def test_revocation_receipt_and_event_both_equal_the_captured_reclaim_transition
     ).returncode == 0
     _backdate_lock(state)
 
-    env = dict(os.environ)
-    env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-transition-install"
+    failpoint = "after-transition-install"
+    env = _perl_test_env(RTBIOSCAN_ROUND_LOCK_FAILPOINT=failpoint)
     interrupted = subprocess.run(
         _command(
             "acquire", state, round_barcode="run_2",
             owner_pid=os.getpid(), stale_seconds=1, wait_seconds=1,
         ),
-        capture_output=True, text=True, check=False, env=env,
+        capture_output=True, check=False, env=env,
     )
     assert interrupted.returncode != 0
+    _assert_exact_error_line(interrupted.stderr, FAILPOINT_ERRORS[failpoint])
     captured = _captured_transition(state)
     assert captured["action"] == "reclaim", captured
 
     recovered = _acquire(state, round_barcode="run_3", stale_seconds=1)
     assert recovered[0] != token_a
 
-    receipt = _read_record(_revocation(state, token_a))
+    receipt = _read_record(_revocation(state, token_a), schema=REVOCATION_SCHEMA)
     reclaim_events = [
         event
         for event in _event_records(state)

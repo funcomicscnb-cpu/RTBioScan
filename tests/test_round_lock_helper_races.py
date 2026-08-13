@@ -23,9 +23,15 @@ from pathlib import Path
 import pytest
 
 from tests.round_lock_test_utils import (
-    TRANSITION_ORDER,
+    GENERATION_SCHEMA,
+    MARKER_SCHEMA,
+    PIN_SCHEMA,
+    TRANSITION_SCHEMA,
+    assert_exact_error_line,
     assert_token,
     parse_acquire_output,
+    perl_test_env,
+    read_nofollow_bytes,
     read_record,
 )
 
@@ -60,6 +66,18 @@ def _acquire(state: Path, round_barcode: str = "run_1") -> subprocess.CompletedP
         capture_output=True,
         text=True,
         check=False,
+    )
+
+
+def _acquire_raw(
+    state: Path,
+    round_barcode: str = "run_1",
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        _acquire_argv(state, round_barcode),
+        capture_output=True,
+        check=False,
+        env=perl_test_env(),
     )
 
 
@@ -163,13 +181,9 @@ def test_abort_with_a_valid_pin_releases_the_lock(tmp_path: Path) -> None:
     state = tmp_path / "state"
     state.mkdir()
 
-    acquire = _acquire(state, "run_release")
+    acquire = _acquire_raw(state, "run_release")
     assert acquire.returncode == 0, acquire.stderr
-    tokens = dict(
-        line.split("=", 1)
-        for line in acquire.stdout.strip().splitlines()
-        if "=" in line
-    )
+    generation_token, pin_token = parse_acquire_output(acquire.stdout)
 
     lock_dir = state / ".round_inflight.lockdir"
     assert lock_dir.is_dir(), f"expected round lock at {lock_dir}"
@@ -186,9 +200,9 @@ def test_abort_with_a_valid_pin_releases_the_lock(tmp_path: Path) -> None:
             "--scope",
             "full_round",
             "--token",
-            tokens["generation_token"],
+            generation_token,
             "--pin-token",
-            tokens["pin_token"],
+            pin_token,
             "--owner-pid",
             str(os.getpid()),
             "--stale-seconds",
@@ -261,18 +275,13 @@ def _helper(action: str, state: Path, **opts: str) -> subprocess.CompletedProces
 
 def _handed_off_generation(state: Path) -> tuple[str, str, str]:
     """Acquire, hand off, and return (token, finisher_pin, worker_pin)."""
-    acquire = _acquire(state, "run_toctou")
+    acquire = _acquire_raw(state, "run_toctou")
     assert acquire.returncode == 0, acquire.stderr
-    tokens = dict(
-        line.split("=", 1)
-        for line in acquire.stdout.strip().splitlines()
-        if "=" in line
-    )
-    token = tokens["generation_token"]
+    token, acquisition_pin = parse_acquire_output(acquire.stdout)
 
     handoff = _helper(
         "handoff", state, token=token, round_barcode="run_toctou",
-        scope="full_round", pin_token=tokens["pin_token"],
+        scope="full_round", pin_token=acquisition_pin,
     )
     assert handoff.returncode == 0, handoff.stderr
 
@@ -486,17 +495,18 @@ def _interrupted_release(state: Path) -> tuple[list[str], str, Path, dict[str, s
     ]
     acquired = subprocess.run(
         ["perl", str(SCRIPT), "acquire", *base],
-        capture_output=True, text=True, check=False,
+        capture_output=True, check=False, env=perl_test_env(),
     )
     assert acquired.returncode == 0, acquired.stderr
     generation_token, pin_token = parse_acquire_output(acquired.stdout)
 
-    env = dict(os.environ)
-    env["RTBIOSCAN_ROUND_LOCK_FAILPOINT"] = "after-quarantine-rename"
+    env = perl_test_env(
+        RTBIOSCAN_ROUND_LOCK_FAILPOINT="after-quarantine-rename"
+    )
     injected = subprocess.run(
         ["perl", str(SCRIPT), "early-release", *base,
          "--token", generation_token, "--pin-token", pin_token],
-        capture_output=True, text=True, check=False, env=env,
+        capture_output=True, check=False, env=env,
     )
     # Prove this exact interleaving was established. The helper has three
     # distinct "injected failure" messages -- after transition install (:998),
@@ -504,9 +514,10 @@ def _interrupted_release(state: Path) -> tuple[list[str], str, Path, dict[str, s
     # publish (:1385) -- which leave different intermediate states, so the
     # substring alone cannot tell them apart.
     assert injected.returncode != 0, injected.stdout
-    assert injected.stderr.strip() == (
-        "ERROR: injected failure after quarantine rename"
-    ), injected.stderr
+    assert_exact_error_line(
+        injected.stderr,
+        "ERROR: injected failure after quarantine rename",
+    )
 
     # Assert on every entry in the namespace, then validate the sole one.
     # Filtering first and counting after cannot detect an unexpected entry: the
@@ -522,8 +533,44 @@ def _interrupted_release(state: Path) -> tuple[list[str], str, Path, dict[str, s
     entry = os.lstat(quarantine)
     assert stat.S_ISDIR(entry.st_mode), (quarantine, entry.st_mode)
 
+    generation = read_record(
+        quarantine / "generation.tsv", schema=GENERATION_SCHEMA
+    )
+    assert generation["schema"] == "1", generation
+    assert generation["token"] == generation_token, generation
+    assert generation["round_barcode"] == "r", generation
+    assert generation["scope"] == "dorado_only", generation
+    assert generation["effective_ttl_seconds"] == "30", generation
+    assert generation["lock_dev"] == str(entry.st_dev), generation
+    assert generation["lock_ino"] == str(entry.st_ino), generation
+
+    pins_dir = quarantine / "pins"
+    pin_entries = sorted(path.name for path in pins_dir.iterdir())
+    expected_pin_entries = [
+        f"candidate.{pin_token}.tsv",
+        f"ready.{pin_token}.tsv",
+    ]
+    assert pin_entries == expected_pin_entries, pin_entries
+    candidate_path = pins_dir / expected_pin_entries[0]
+    ready_path = pins_dir / expected_pin_entries[1]
+    candidate_stat = os.lstat(candidate_path)
+    ready_stat = os.lstat(ready_path)
+    assert stat.S_ISREG(candidate_stat.st_mode), candidate_stat
+    assert stat.S_ISREG(ready_stat.st_mode), ready_stat
+    assert (candidate_stat.st_dev, candidate_stat.st_ino) == (
+        ready_stat.st_dev,
+        ready_stat.st_ino,
+    )
+    assert read_nofollow_bytes(candidate_path) == read_nofollow_bytes(ready_path)
+    pin = read_record(ready_path, schema=PIN_SCHEMA)
+    assert pin["token"] == generation_token, pin
+    assert pin["pin_token"] == pin_token, pin
+    assert pin["role"] == "fast_acquisition", pin
+    assert pin["lock_dev"] == str(entry.st_dev), pin
+    assert pin["lock_ino"] == str(entry.st_ino), pin
+
     transition = read_record(
-        quarantine / "transition.tsv", required=TRANSITION_ORDER
+        quarantine / "transition.tsv", schema=TRANSITION_SCHEMA
     )
     assert_token(transition["operation_token"])
     assert transition["schema"] == "1", transition
@@ -540,6 +587,15 @@ def _interrupted_release(state: Path) -> tuple[list[str], str, Path, dict[str, s
     # still match the tree on disk.
     assert transition["lock_dev"] == str(entry.st_dev), (transition, entry.st_dev)
     assert transition["lock_ino"] == str(entry.st_ino), (transition, entry.st_ino)
+
+    marker = read_record(
+        state / f".round_lock_handoff.{generation_token}.tsv",
+        schema=MARKER_SCHEMA,
+    )
+    assert marker["token"] == generation_token, marker
+    assert marker["round_barcode"] == "r", marker
+    assert marker["scope"] == "dorado_only", marker
+    assert marker["outcome"] == "handoff", marker
 
     # Exact equality, not endswith. recover_quarantines scans an anchored
     # namespace, /\A\.round_inflight\.lockdir\.(?:reclaim|release)-[0-9a-f]{64}\z/,
