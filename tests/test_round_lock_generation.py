@@ -10,6 +10,7 @@ import pytest
 
 from tests.round_lock_test_utils import (
     EVENT_SCHEMA,
+    FINISH_SCHEMA,
     GENERATION_SCHEMA,
     INFLIGHT_SCHEMA,
     MARKER_SCHEMA,
@@ -157,6 +158,10 @@ def _release_receipt(state: Path, token: str) -> Path:
     return state / f".round_lock_release.{token}.tsv"
 
 
+def _finish_receipt(state: Path, token: str) -> Path:
+    return state / f".round_lock_finish.{token}.tsv"
+
+
 def _revocation(state: Path, token: str) -> Path:
     return state / f".round_lock_revocation.{token}.tsv"
 
@@ -271,9 +276,17 @@ def test_full_round_handoff_pins_release_and_exit_are_generation_bound(
     receipt = _read_record(_release_receipt(state, token_a), schema=RELEASE_SCHEMA)
     assert receipt["reason"] == "full_round_released"
     assert receipt["effective_ttl_seconds"] == "37"
+    finished = _read_record(_finish_receipt(state, token_a), schema=FINISH_SCHEMA)
+    assert finished["outcome"] == "finished"
+    assert finished["disposition"] == "round_complete"
+    assert finished["release_reason"] == "full_round_released"
+    assert finished["release_operation_token"] == receipt["operation_token"]
     verified = _run("verify-release", state, token=token_a)
     assert verified.returncode == 0, verified.stderr
     assert verified.stdout.strip() == "full_round_released"
+    verified_finish = _run("verify-finish", state, token=token_a)
+    assert verified_finish.returncode == 0, verified_finish.stderr
+    assert verified_finish.stdout == "full_round_released\n"
 
     token_b, _pin_b = _acquire(state, round_barcode="run_2")
     generation_b_path = state / ".round_inflight.lockdir" / "generation.tsv"
@@ -334,6 +347,15 @@ def test_dorado_only_marker_without_lock_and_prefix_cleanup_are_safe(
     )
     assert verified_1.returncode == 0, verified_1.stderr
     assert verified_1.stdout.strip() == "dorado_only_early"
+    pending_finish_1 = _run(
+        "verify-finish",
+        state,
+        round_barcode="run_1",
+        scope="dorado_only",
+        token=token_1,
+    )
+    assert pending_finish_1.returncode != 0
+    assert "missing authenticated finish receipt" in pending_finish_1.stderr
 
     token_10, pin_10 = _acquire(
         state, round_barcode="run_10", scope="dorado_only"
@@ -360,6 +382,327 @@ def test_dorado_only_marker_without_lock_and_prefix_cleanup_are_safe(
     assert finish_1.returncode == 0, finish_1.stderr
     assert not marker_1.exists()
     assert _read_nofollow_bytes(marker_10) == marker_10_bytes
+    verified_finish_1 = _run(
+        "verify-finish",
+        state,
+        round_barcode="run_1",
+        scope="dorado_only",
+        token=token_1,
+    )
+    assert verified_finish_1.returncode == 0, verified_finish_1.stderr
+    assert verified_finish_1.stdout == "dorado_only_early\n"
+    finish_receipt_1 = _read_record(
+        _finish_receipt(state, token_1), schema=FINISH_SCHEMA
+    )
+    assert finish_receipt_1["outcome"] == "finished"
+    assert finish_receipt_1["disposition"] == "round_complete"
+    assert finish_receipt_1["release_reason"] == "dorado_only_early"
+
+    wrong_round = _run(
+        "verify-finish",
+        state,
+        round_barcode="wrong",
+        scope="dorado_only",
+        token=token_1,
+    )
+    assert wrong_round.returncode != 0
+    assert "release receipt does not match generation" in wrong_round.stderr
+
+
+def test_dorado_only_failed_post_release_handoff_is_terminal_but_not_finished(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    token, pin_token = _acquire(state, scope="dorado_only")
+    released = _run(
+        "early-release",
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=pin_token,
+    )
+    assert released.returncode == 0, released.stderr
+    marker = _marker(state, token)
+    assert marker.is_file()
+
+    cancelled = _run(
+        "cancel-handoff",
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=pin_token,
+    )
+    assert cancelled.returncode == 0, cancelled.stderr
+    assert not marker.exists()
+    terminal = _read_record(_finish_receipt(state, token), schema=FINISH_SCHEMA)
+    assert terminal["outcome"] == "abandoned"
+    assert terminal["disposition"] == "fast_post_release_failure"
+    assert terminal["release_reason"] == "dorado_only_early"
+
+    replay = _run(
+        "cancel-handoff",
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=pin_token,
+    )
+    assert replay.returncode == 0, replay.stderr
+    assert _read_record(_finish_receipt(state, token), schema=FINISH_SCHEMA) == terminal
+    verified = _run("verify-finish", state, scope="dorado_only", token=token)
+    assert verified.returncode != 0
+    assert "generation handoff was abandoned" in verified.stderr
+    conflicting_finish = _run("finish", state, scope="dorado_only", token=token)
+    assert conflicting_finish.returncode != 0
+    assert "finish receipt does not match generation" in conflicting_finish.stderr
+
+
+def test_cancel_handoff_rejects_a_pin_not_bound_to_the_archived_release(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    token, pin_token = _acquire(state, scope="dorado_only")
+    released = _run(
+        "early-release",
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=pin_token,
+    )
+    assert released.returncode == 0, released.stderr
+    release = _read_record(_release_receipt(state, token), schema=RELEASE_SCHEMA)
+    archive = (
+        state
+        / ".round_lock_archives"
+        / f"release-{release['operation_token']}"
+    )
+    transition = _read_record(archive / "transition.tsv", schema=TRANSITION_SCHEMA)
+    assert transition["allowed_pin_token"] == pin_token
+    marker = _marker(state, token)
+    marker_before = _read_nofollow_bytes(marker)
+    wrong_pin = "f" * 64 if pin_token != "f" * 64 else "e" * 64
+
+    rejected = _run(
+        "cancel-handoff",
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=wrong_pin,
+    )
+
+    assert rejected.returncode != 0, rejected.stdout
+    assert "cancel-handoff pin does not authorize released generation" in rejected.stderr
+    assert _read_nofollow_bytes(marker) == marker_before
+    assert not _finish_receipt(state, token).exists()
+
+    accepted = _run(
+        "cancel-handoff",
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=pin_token,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    assert not marker.exists()
+    terminal = _read_record(_finish_receipt(state, token), schema=FINISH_SCHEMA)
+    assert terminal["outcome"] == "abandoned"
+    assert terminal["disposition"] == "fast_post_release_failure"
+
+
+def test_cancel_handoff_reconciles_first_early_release_and_replays(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    token, pin_token = _acquire(state, scope="dorado_only")
+    assert (state / ".round_inflight.lockdir").is_dir()
+    assert not _release_receipt(state, token).exists()
+    assert not _finish_receipt(state, token).exists()
+
+    cancelled = _run(
+        "cancel-handoff",
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=pin_token,
+    )
+    assert cancelled.returncode == 0, cancelled.stderr
+    release = _read_record(_release_receipt(state, token), schema=RELEASE_SCHEMA)
+    terminal = _read_record(_finish_receipt(state, token), schema=FINISH_SCHEMA)
+    assert release["reason"] == "dorado_only_early"
+    assert terminal["outcome"] == "abandoned"
+    assert terminal["disposition"] == "fast_post_release_failure"
+    assert not _marker(state, token).exists()
+    assert not (state / ".round_inflight.lockdir").exists()
+
+    replay = _run(
+        "cancel-handoff",
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=pin_token,
+    )
+    assert replay.returncode == 0, replay.stderr
+    assert _read_record(_finish_receipt(state, token), schema=FINISH_SCHEMA) == terminal
+
+
+@pytest.mark.parametrize(
+    "failpoint",
+    [
+        "after-transition-install",
+        "after-quarantine-rename",
+    ],
+)
+def test_cancel_handoff_reconciles_early_release_before_terminal_outcome(
+    tmp_path: Path,
+    failpoint: str,
+) -> None:
+    state = tmp_path / "state"
+    token, pin_token = _acquire(state, scope="dorado_only")
+    interrupted = subprocess.run(
+        _command(
+            "early-release",
+            state,
+            scope="dorado_only",
+            token=token,
+            pin_token=pin_token,
+        ),
+        capture_output=True,
+        check=False,
+        env=_perl_test_env(RTBIOSCAN_ROUND_LOCK_FAILPOINT=failpoint),
+    )
+    assert interrupted.returncode != 0
+    _assert_exact_error_line(interrupted.stderr, FAILPOINT_ERRORS[failpoint])
+    # A genuine helper transition/quarantine/recovery artifact proves this
+    # invocation reached the selected durable release boundary.
+    assert (
+        (state / ".round_inflight.lockdir" / "transition.tsv").exists()
+        or list(state.glob(".round_inflight.lockdir.release-*"))
+        or _release_receipt(state, token).exists()
+    )
+
+    reconciled = _run(
+        "cancel-handoff",
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=pin_token,
+    )
+    assert reconciled.returncode == 0, reconciled.stderr
+    terminal = _read_record(_finish_receipt(state, token), schema=FINISH_SCHEMA)
+    assert terminal["outcome"] == "abandoned"
+    assert terminal["disposition"] == "fast_post_release_failure"
+    assert not _marker(state, token).exists()
+    assert not (state / ".round_inflight.lockdir").exists()
+    assert list(state.glob(".round_inflight.lockdir.release-*")) == []
+
+
+@pytest.mark.parametrize("command", ["finish", "cancel-handoff"])
+def test_dorado_finish_disposition_replays_after_intent_before_marker_cleanup(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    state = tmp_path / "state"
+    token, pin_token = _acquire(state, scope="dorado_only")
+    released = _run(
+        "early-release",
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=pin_token,
+    )
+    assert released.returncode == 0, released.stderr
+    marker = _marker(state, token)
+    assert marker.is_file()
+
+    interrupted = subprocess.run(
+        _command(
+            command,
+            state,
+            scope="dorado_only",
+            token=token,
+            pin_token=pin_token if command == "cancel-handoff" else None,
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_perl_test_env(
+            RTBIOSCAN_ROUND_LOCK_FAILPOINT=(
+                "after-finish-install-before-marker-remove"
+            )
+        ),
+    )
+    assert interrupted.returncode != 0
+    assert "injected failure" in interrupted.stderr
+    assert marker.is_file()
+    disposition = _read_record(_finish_receipt(state, token), schema=FINISH_SCHEMA)
+    assert disposition["outcome"] == (
+        "finished" if command == "finish" else "abandoned"
+    )
+
+    verified = _run("verify-finish", state, scope="dorado_only", token=token)
+    assert not marker.exists()
+    if command == "finish":
+        assert verified.returncode == 0, verified.stderr
+        assert verified.stdout == "dorado_only_early\n"
+    else:
+        assert verified.returncode != 0
+        assert "generation handoff was abandoned" in verified.stderr
+    assert _read_record(_finish_receipt(state, token), schema=FINISH_SCHEMA) == disposition
+
+
+@pytest.mark.parametrize("command", ["finish", "cancel-handoff"])
+@pytest.mark.parametrize("marker_state", ["absent", "malformed"])
+def test_first_dorado_finish_disposition_requires_exact_handoff_marker(
+    tmp_path: Path,
+    command: str,
+    marker_state: str,
+) -> None:
+    state = tmp_path / "state"
+    token, pin_token = _acquire(state, scope="dorado_only")
+    released = _run(
+        "early-release",
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=pin_token,
+    )
+    assert released.returncode == 0, released.stderr
+    marker = _marker(state, token)
+    assert _read_record(marker, schema=MARKER_SCHEMA)["token"] == token
+
+    if marker_state == "absent":
+        marker.unlink()
+        assert not marker.exists()
+    else:
+        marker.write_bytes(b"malformed-handoff-marker\n")
+        marker_before = marker.read_bytes()
+
+    rejected = _run(
+        command,
+        state,
+        scope="dorado_only",
+        token=token,
+        pin_token=pin_token if command == "cancel-handoff" else None,
+    )
+    assert rejected.returncode != 0, rejected.stdout
+    if marker_state == "absent":
+        assert "missing handoff marker" in rejected.stderr
+        assert not marker.exists()
+    else:
+        assert "malformed record" in rejected.stderr
+        assert marker.read_bytes() == marker_before
+    assert not _finish_receipt(state, token).exists()
+
+
+def test_marker_absence_is_synced_before_finish_replay_accepts_it() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    start = source.index("sub remove_exact_marker {")
+    end = source.index("\n}\n", start)
+    body = source[start:end]
+    sync_before_lookup = body.index("sync_directory($arg{state_dir});")
+    absence_lookup = body.index("path_occupied_nofollow($path, 'handoff marker')")
+    unlink_marker = body.index("unlink($path)")
+    sync_after_unlink = body.rindex("sync_directory($arg{state_dir});")
+    assert sync_before_lookup < absence_lookup < unlink_marker < sync_after_unlink
 
 
 def test_reclaimed_full_round_cannot_publish_release_or_remove_replacement(
@@ -1230,6 +1573,59 @@ def test_pre_handoff_abort_is_not_a_resumable_release_receipt(tmp_path: Path) ->
     verified = _run("verify-release", state, token=token)
     assert verified.returncode != 0
     assert "pre-handoff abort is not a resumable release" in verified.stderr
+
+
+def test_impossible_full_round_abandonment_cannot_remove_handoff_marker(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    token, acquisition_pin = _acquire(state)
+    handoff = _run("handoff", state, token=token, pin_token=acquisition_pin)
+    assert handoff.returncode == 0, handoff.stderr
+    finisher_pin = _pin(state, token, role="backup_update_and_clean")
+
+    interrupted = subprocess.run(
+        _command("finish", state, token=token, pin_token=finisher_pin),
+        capture_output=True,
+        check=False,
+        env=_perl_test_env(
+            RTBIOSCAN_ROUND_LOCK_FAILPOINT="after-quarantine-rename"
+        ),
+    )
+    assert interrupted.returncode != 0
+    _assert_exact_error_line(
+        interrupted.stderr,
+        FAILPOINT_ERRORS["after-quarantine-rename"],
+    )
+    recovered = _run("verify-release", state, token=token)
+    assert recovered.returncode == 0, recovered.stderr
+    release = _read_record(_release_receipt(state, token), schema=RELEASE_SCHEMA)
+    marker = _marker(state, token)
+    marker_before = _read_nofollow_bytes(marker)
+
+    _rewrite_record(
+        _finish_receipt(state, token),
+        {
+            "schema": "1",
+            "token": token,
+            "round_barcode": "run_1",
+            "scope": "full_round",
+            "outcome": "abandoned",
+            "disposition": "fast_post_release_failure",
+            "release_reason": release["reason"],
+            "release_operation_token": release["operation_token"],
+            "release_transition_epoch": release["release_transition_epoch"],
+            "lock_dev": release["lock_dev"],
+            "lock_ino": release["lock_ino"],
+            "finished_epoch": "1",
+        },
+        schema=FINISH_SCHEMA,
+    )
+
+    rejected = _run("verify-finish", state, token=token)
+    assert rejected.returncode != 0, rejected.stdout
+    assert "finish receipt does not match generation" in rejected.stderr
+    assert _read_nofollow_bytes(marker) == marker_before
 
 
 def test_dead_same_host_pid_is_reclaimed_without_waiting_for_ttl(tmp_path: Path) -> None:

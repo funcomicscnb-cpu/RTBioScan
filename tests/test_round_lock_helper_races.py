@@ -867,9 +867,10 @@ def _interrupted_release(state: Path) -> tuple[list[str], str, Path, dict[str, s
         capture_output=True, check=False, env=env,
     )
     # Prove this exact interleaving was established. The helper has three
-    # distinct "injected failure" messages -- after transition install (:998),
-    # after quarantine rename (:1055), and before compatibility inflight
-    # publish (:1385) -- which leave different intermediate states, so the
+    # distinct "injected failure" messages in finalize_transition and
+    # publish_compat_inflight -- after transition install, after quarantine
+    # rename, and before compatibility inflight publish -- which leave
+    # different intermediate states, so the
     # substring alone cannot tell them apart.
     assert injected.returncode != 0, injected.stdout
     assert_exact_error_line(
@@ -885,7 +886,7 @@ def _interrupted_release(state: Path) -> tuple[list[str], str, Path, dict[str, s
     quarantine = candidates[0]
     # One lstat, not Path.is_dir(): is_dir() follows symlinks, and pairing it
     # with is_symlink() leaves a window between two checks. The helper holds
-    # itself to this standard at bin/round_lock_generation.pl:963-969. No
+    # itself to this standard in assert_fenced_directory_move_ready. No
     # FileNotFoundError guard either -- setup is single-process here, so a
     # vanished candidate is an anomaly, not a race to skip.
     entry = os.lstat(quarantine)
@@ -957,7 +958,7 @@ def _interrupted_release(state: Path) -> tuple[list[str], str, Path, dict[str, s
 
     # Exact equality, not endswith. recover_quarantines scans an anchored
     # namespace, /\A\.round_inflight\.lockdir\.(?:reclaim|release)-[0-9a-f]{64}\z/,
-    # and re-derives this same name at bin/round_lock_generation.pl:1083, so the
+    # and recover_quarantines re-derives this same name, so the
     # name is part of the recovery contract. A suffixed variant such as
     # ...release-<op>.cleanup-<op> satisfies endswith while falling outside that
     # anchor -- invisible to recovery, which is the orphaning defect withdrawn

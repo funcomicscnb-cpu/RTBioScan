@@ -145,7 +145,7 @@ def _labeled_evidence_sha256(
 ) -> tuple[str, dict[Path, tuple[str, str, str]]]:
     """Reimplement the path-labeled finalization-evidence digest."""
     digest = hashlib.sha256()
-    domain = b"RTBioScan-round-lock-operator-finalization-v1"
+    domain = b"RTBioScan-round-lock-operator-finalization-v2"
     digest.update(struct.pack(">I", len(domain)))
     digest.update(domain)
     evidence_by_path: dict[Path, tuple[str, str, str]] = {}
@@ -458,6 +458,8 @@ def _finalization_items(
         items.append((inflight_name, inflight_path))
         if os.path.lexists(inflight_path):
             items.append(("round_inflight.txt", state / "round_inflight.txt"))
+    finish_name = f".round_lock_finish.{generation_token}.tsv"
+    items.append((finish_name, state / finish_name))
     if action == "release":
         receipt_name = f".round_lock_release.{generation_token}.tsv"
         opposite_name = f".round_lock_revocation.{generation_token}.tsv"
@@ -817,7 +819,7 @@ def _assert_completed_quarantine(
             "absent", "none", "none"
         )
     for event in (intent, complete):
-        assert event["schema"] == "2"
+        assert event["schema"] == "3"
         assert event["operation_token"] == operation_token
         assert event["source_name"] == source_name
         assert event["destination_name"] == destination.name
@@ -2017,9 +2019,9 @@ def _assert_unrecoverable_operator_event(
     epoch_floor: int,
     epoch_ceiling: int,
 ) -> None:
-    """Check every schema-2 value independently of the helper validator."""
+    """Check every schema-3 value independently of the helper validator."""
     expected = {
-        "schema": "2",
+        "schema": "3",
         "operation_token": operation_token,
         "operation_kind": "abandon_unrecoverable_generation",
         "expected_generation_token": generation_token,
@@ -2661,6 +2663,76 @@ def test_finalization_quarantine_preserves_invalid_release_receipt(
         operation_label=f"invalid release receipt operator {corruption}",
         finalization_items=items,
     )
+
+
+@pytest.mark.parametrize("action", ["release", "reclaim"])
+def test_finalization_quarantine_preserves_conflicting_finish_disposition(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    if action == "release":
+        state, orphan, _round, generation_token, _pin, transition = (
+            _helper_created_release_orphan(
+                tmp_path, label="release_finish_conflict",
+            )
+        )
+    else:
+        state, orphan, _round, generation_token, transition = (
+            _helper_created_reclaim_orphan(
+                tmp_path, label="reclaim_finish_conflict",
+            )
+        )
+    finish_path = state / f".round_lock_finish.{generation_token}.tsv"
+    finish_path.write_bytes(b"malformed-finish-disposition\n")
+    finish_before = _operator_entry_evidence(finish_path)
+    orphan_before = _manifest(orphan)
+
+    # Positive control: acquisition reaches recovery of this exact helper-made
+    # terminal orphan, then fails closed on the independently planted finish
+    # disposition before installing a receipt, event, or archive.
+    blocked = _acquire(state, round_barcode=f"blocked_{action}_finish")
+    assert blocked.returncode != 0, blocked.stdout
+    assert blocked.stdout == b""
+    assert_exact_error_line(
+        blocked.stderr,
+        f"ERROR: pending {action} conflicts with an existing finish "
+        f"disposition for generation {generation_token}",
+    )
+    assert _manifest(orphan) == orphan_before
+    assert _operator_entry_evidence(finish_path) == finish_before
+    receipt_path = state / (
+        f".round_lock_release.{generation_token}.tsv"
+        if action == "release"
+        else f".round_lock_revocation.{generation_token}.tsv"
+    )
+    event_path = (
+        state / ".round_lock_events"
+        / f"{generation_token}.{action}.{transition['operation_token']}.tsv"
+    )
+    archive_path = (
+        state / ".round_lock_archives"
+        / f"{action}-{transition['operation_token']}"
+    )
+    assert not os.path.lexists(receipt_path)
+    assert not os.path.lexists(event_path)
+    assert not os.path.lexists(archive_path)
+
+    items = _finalization_items(
+        state,
+        generation_token=generation_token,
+        transition=transition,
+        canonical=False,
+    )
+    _assert_finalization_operator_success(
+        state,
+        source=orphan,
+        generation_token=generation_token,
+        transition=transition,
+        status="finish-conflict",
+        operation_label=f"{action} finish conflict operator",
+        finalization_items=items,
+    )
+    assert _operator_entry_evidence(finish_path) == finish_before
 
 
 @pytest.mark.parametrize("corruption", ["malformed", "conflicting"])

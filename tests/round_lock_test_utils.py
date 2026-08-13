@@ -5,8 +5,8 @@ Python rather than calling the helper to validate its own output. A test that
 asserted through the helper's validator would agree with the helper by
 construction and could not detect the two of them drifting together.
 
-``read_record`` mirrors ``parse_record`` in bin/round_lock_generation.pl
-(lines 368-392), which rejects, in this order:
+``read_record`` mirrors the ``parse_record`` subroutine in
+bin/round_lock_generation.pl, which rejects, in this order:
 
 * a line that does not split into exactly two tab-separated fields --
   ``split(/\\t/, $line, -1)`` with a third field is fatal, so an embedded tab
@@ -36,7 +36,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-# bin/round_lock_generation.pl:29
+# Keep this independent expression aligned with the helper's TOKEN_RE contract.
 TOKEN_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
@@ -48,9 +48,10 @@ class RecordSchema:
     fields: tuple[str, ...]
 
 
-# bin/round_lock_generation.pl:395-402. The helper validates each field *set*,
-# not its order: checksummed_content writes in this order, but parse_record only
-# checks required-present and count. Keeping named schemas prevents a caller
+# The named helper `@*_ORDER` arrays define these contracts. The helper
+# validates each field *set*, not its order: checksummed_content writes in this
+# order, but parse_record only checks required-present and count. Named schemas
+# prevent a caller
 # from accidentally omitting that required-set check or applying one record's
 # shape to another.
 GENERATION_SCHEMA = RecordSchema(
@@ -87,6 +88,15 @@ RELEASE_SCHEMA = RecordSchema(
         "schema", "token", "round_barcode", "scope", "outcome", "reason",
         "effective_ttl_seconds", "release_transition_epoch", "lock_dev",
         "lock_ino", "operation_token",
+    ),
+)
+FINISH_SCHEMA = RecordSchema(
+    "FINISH_ORDER",
+    (
+        "schema", "token", "round_barcode", "scope", "outcome", "disposition",
+        "release_reason", "release_operation_token",
+        "release_transition_epoch", "lock_dev", "lock_ino",
+        "finished_epoch",
     ),
 )
 REVOCATION_SCHEMA = RecordSchema(
@@ -137,6 +147,7 @@ HELPER_RECORD_SCHEMAS = (
     TRANSITION_SCHEMA,
     MARKER_SCHEMA,
     RELEASE_SCHEMA,
+    FINISH_SCHEMA,
     REVOCATION_SCHEMA,
     EVENT_SCHEMA,
     INFLIGHT_SCHEMA,
