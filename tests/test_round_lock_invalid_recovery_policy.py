@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import signal
 import stat
+import struct
 import subprocess
 import time
 from pathlib import Path
@@ -43,6 +45,45 @@ LOCK_NAME = ".round_inflight.lockdir"
 EVENTS_NAME = ".round_lock_events"
 
 
+def _perl_sub_source(name: str) -> str:
+    """Return one complete top-level Perl sub span, up to its successor."""
+    source = SCRIPT.read_text(encoding="utf-8")
+    starts = list(
+        re.finditer(
+            rf"(?m)^sub {re.escape(name)} \{{(?:\n|$)",
+            source,
+        )
+    )
+    assert len(starts) == 1, f"expected one top-level Perl sub {name!r}"
+    start = starts[0].start()
+    successor = re.search(
+        r"(?m)^sub [A-Za-z_][A-Za-z0-9_]* \{(?:\n|$)",
+        source[starts[0].end() :],
+    )
+    end = len(source) if successor is None else starts[0].end() + successor.start()
+    return source[start:end]
+
+
+def test_operator_pending_enumeration_adopts_its_directory_first() -> None:
+    body = _perl_sub_source("operator_pending_tokens")
+    path_assignment = body.index("my $path = operator_pending_dir($state_dir);")
+    directory_sync = body.index("sync_directory($path);")
+    directory_open = body.index("opendir(my $dh, $path)")
+    name_enumeration = body.index("readdir($dh)")
+    assert path_assignment < directory_sync < directory_open < name_enumeration
+
+
+def test_operator_manifest_adopts_each_directory_before_enumeration() -> None:
+    body = _perl_sub_source("operator_directory_manifest_add")
+    directory_sync = body.index("sync_directory($directory);")
+    directory_open = body.index("opendir(my $dh, $directory)")
+    name_enumeration = body.index("readdir($dh)")
+    recursive_descent = body.index(
+        "operator_directory_manifest_add($digest, $path, $relative)"
+    )
+    assert directory_sync < directory_open < name_enumeration < recursive_descent
+
+
 def _token(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
@@ -59,6 +100,22 @@ def test_operator_recovery_runbook_pins_the_required_safety_contract() -> None:
         "--operator-label",
         "--reason",
         "--confirm-invalid-snapshot",
+        "operator-quarantine-unrecoverable",
+        "--expected-generation-token",
+        "--confirm-stopped-world",
+        "--confirm-abandon-generation",
+        "zero-second lease",
+        "dead PID",
+        "recursive no-follow digest",
+        "External-finalization eligibility is deliberately exact",
+        "directory-valued `round_inflight.txt`",
+        "before any writer resumes",
+        "Silent activation over an existing state directory is not acceptable",
+        "schema-1 pending operation",
+        "There is no silent dual-parser migration",
+        "Tokenless",
+        "cannot recover a lost response",
+        "Production launchers must clear every",
         ".round_lock_operator_pending",
         "same operation token, source name, device, inode",
         "run the exact command once more",
@@ -781,13 +838,19 @@ def test_operator_quarantine_writes_bound_audit_and_replays_idempotently(
     assert intent["outcome"] == "prepared"
     assert complete["phase"] == "complete"
     assert complete["outcome"] == "quarantined"
+    assert complete["schema"] == "2"
+    assert complete["operation_kind"] == "invalid_snapshot"
+    assert complete["expected_generation_token"] == "none"
+    assert complete["recovery_basis"] == "generation-invalid"
     assert complete["event_epoch"].isdigit()
     assert int(complete["event_epoch"]) >= int(intent["event_epoch"])
     for field in (
-        "operation_token", "operator_label", "reason", "source_name",
+        "operation_token", "operation_kind", "expected_generation_token",
+        "recovery_basis", "operator_label", "reason", "source_name",
         "destination_name", "lock_dev", "lock_ino", "generation_status",
         "generation_entry_kind", "generation_sha256",
-        "generation_entry_fingerprint", "transition_status",
+        "generation_entry_fingerprint", "pins_status", "pins_entry_kind",
+        "pins_sha256", "pins_entry_fingerprint", "transition_status",
         "transition_entry_kind", "transition_sha256",
         "transition_entry_fingerprint",
     ):
@@ -803,6 +866,10 @@ def test_operator_quarantine_writes_bound_audit_and_replays_idempotently(
     assert complete["transition_entry_kind"] == "absent"
     assert complete["transition_sha256"] == "none"
     assert complete["transition_entry_fingerprint"] == "none"
+    assert complete["pins_status"] == "missing"
+    assert complete["pins_entry_kind"] == "absent"
+    assert complete["pins_sha256"] == "none"
+    assert complete["pins_entry_fingerprint"] == "none"
     assert sorted(path.name for path in audit.iterdir()) == [
         f"{operator_token}.complete.tsv",
         f"{operator_token}.intent.tsv",
@@ -999,7 +1066,11 @@ def test_operator_quarantine_preserves_nonregular_generation_evidence(
         schema=OPERATOR_EVENT_SCHEMA,
     )
     assert event["generation_status"] == "parse-invalid"
-    assert event["generation_sha256"] == "none"
+    assert event["generation_sha256"] == (
+        hashlib.sha256(b"").hexdigest()
+        if entry_kind == "directory"
+        else "none"
+    )
     assert event["generation_entry_kind"] == (
         "symlink" if entry_kind == "dangling-symlink" else "directory"
     )
@@ -1129,26 +1200,50 @@ def test_operator_quarantine_replays_every_crash_boundary(
     assert generation["lock_dev"] == str(source_entry.st_dev)
     assert generation["lock_ino"] != str(source_entry.st_ino)
     generation_bytes = read_nofollow_bytes(generation_path)
+    generation_fingerprint = _operator_entry_fingerprint(generation_path)
+    tree_digest = hashlib.sha256()
+    for value in (
+        "generation.tsv",
+        "regular",
+        hashlib.sha256(generation_bytes).hexdigest(),
+        generation_fingerprint,
+    ):
+        encoded = value.encode("ascii")
+        tree_digest.update(struct.pack(">I", len(encoded)))
+        tree_digest.update(encoded)
     _assert_absent(source / "transition.tsv")
     expected_event_fields = {
-        "schema": "1",
+        "schema": "2",
         "operation_token": operation_token,
+        "operation_kind": "invalid_snapshot",
+        "expected_generation_token": "none",
+        "recovery_basis": "generation-invalid",
         "operator_label": "pytest operator",
         "reason": "invalid snapshot reviewed for recovery",
         "source_name": source.name,
         "destination_name": destination.name,
         "lock_dev": str(source_entry.st_dev),
         "lock_ino": str(source_entry.st_ino),
+        "tree_sha256": tree_digest.hexdigest(),
         "generation_status": "semantic-invalid",
         "generation_entry_kind": "regular",
         "generation_sha256": hashlib.sha256(generation_bytes).hexdigest(),
-        "generation_entry_fingerprint": _operator_entry_fingerprint(
-            generation_path
-        ),
+        "generation_entry_fingerprint": generation_fingerprint,
+        "pins_status": "missing",
+        "pins_entry_kind": "absent",
+        "pins_sha256": "none",
+        "pins_entry_fingerprint": "none",
         "transition_status": "absent",
         "transition_entry_kind": "absent",
         "transition_sha256": "none",
         "transition_entry_fingerprint": "none",
+        "marker_status": "not-applicable",
+        "marker_entry_kind": "absent",
+        "marker_sha256": "none",
+        "marker_entry_fingerprint": "none",
+        "release_authority_status": "not-applicable",
+        "finalization_status": "not-applicable",
+        "finalization_sha256": "none",
     }
     command = _operator_command(
         state,

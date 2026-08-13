@@ -15,9 +15,12 @@ foreign-host pin -- blocking release indefinitely.
 
 from __future__ import annotations
 
+import fcntl
 import os
+import signal
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -42,7 +45,12 @@ SCRIPT = REPO_ROOT / "bin" / "round_lock_generation.pl"
 EVENTS_DIR_NAME = ".round_lock_events"
 
 
-def _acquire_argv(state: Path, round_barcode: str = "run_1") -> list[str]:
+def _acquire_argv(
+    state: Path,
+    round_barcode: str = "run_1",
+    *,
+    stale_seconds: int = 30,
+) -> list[str]:
     return [
         "perl",
         str(SCRIPT),
@@ -56,7 +64,7 @@ def _acquire_argv(state: Path, round_barcode: str = "run_1") -> list[str]:
         "--owner-pid",
         str(os.getpid()),
         "--stale-seconds",
-        "30",
+        str(stale_seconds),
         "--wait-seconds",
         "5",
     ]
@@ -320,6 +328,300 @@ def test_blocking_pins_adopts_pin_directory_before_enumeration() -> None:
     assert body.index(validation) < body.index(pin_sync) < body.index(enumeration), (
         "blocking_pins did not validate and sync pins/ before enumerating it"
     )
+
+
+def _write_unlink_pause_module(root: Path) -> Path:
+    """Override one exact unlink and pause after the kernel removes its name."""
+    module_dir = root / "perl-unlink-hook"
+    module_dir.mkdir()
+    (module_dir / "RTBioScanRoundLockUnlinkPause.pm").write_text(
+        r'''package RTBioScanRoundLockUnlinkPause;
+use strict;
+use warnings;
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
+use IO::Handle ();
+use Time::HiRes qw(time usleep);
+BEGIN {
+    no warnings 'redefine';
+    *CORE::GLOBAL::unlink = sub {
+        my @paths = @_;
+        my $target = $ENV{RTBIOSCAN_TEST_UNLINK_TARGET} // '';
+        if (@paths == 1 && $target ne '' && $paths[0] eq $target) {
+            my $removed = CORE::unlink(@paths);
+            die "unlink pause failed to remove exact target: $target: $!\n"
+                if $removed != 1;
+            my $ready = $ENV{RTBIOSCAN_TEST_UNLINK_READY} // '';
+            sysopen(my $ready_fh, $ready, O_WRONLY | O_CREAT | O_EXCL, 0600)
+                or die "cannot publish unlink readiness '$ready': $!\n";
+            print {$ready_fh} "unlinked\t$target\n"
+                or die "cannot write unlink readiness '$ready': $!\n";
+            $ready_fh->flush()
+                or die "cannot flush unlink readiness '$ready': $!\n";
+            $ready_fh->sync()
+                or die "cannot sync unlink readiness '$ready': $!\n";
+            close($ready_fh)
+                or die "cannot close unlink readiness '$ready': $!\n";
+            my $release = $ENV{RTBIOSCAN_TEST_UNLINK_RELEASE} // '';
+            my $deadline = time() + 10;
+            while (!-e $release) {
+                die "timed out at exact unlink pause: $target\n"
+                    if time() >= $deadline;
+                usleep(10_000);
+            }
+            return $removed;
+        }
+        return CORE::unlink(@paths);
+    };
+}
+1;
+''',
+        encoding="utf-8",
+    )
+    return module_dir
+
+
+def _regular_file_manifest(root: Path) -> dict[str, bytes]:
+    """Return every regular file and its bytes without following symlinks."""
+    manifest: dict[str, bytes] = {}
+    for path in sorted(root.rglob("*")):
+        entry = os.lstat(path)
+        if stat.S_ISREG(entry.st_mode):
+            manifest[path.relative_to(root).as_posix()] = read_nofollow_bytes(path)
+    return manifest
+
+
+def _assert_state_fence_is_held(state: Path) -> None:
+    descriptor = os.open(state, os.O_RDONLY)
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(descriptor)
+
+
+def _wait_for_exact_unlink_pause(
+    process: subprocess.Popen[bytes],
+    ready: Path,
+    target: Path,
+) -> None:
+    deadline = time.monotonic() + 5
+    expected = f"unlinked\t{target}\n".encode("utf-8")
+    while True:
+        try:
+            entry = os.lstat(ready)
+        except FileNotFoundError:
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                pytest.fail(
+                    "unpin helper exited before the exact unlink boundary: "
+                    f"rc={process.returncode}, stdout={stdout!r}, stderr={stderr!r}"
+                )
+            if time.monotonic() >= deadline:
+                process.kill()
+                stdout, stderr = process.communicate()
+                pytest.fail(
+                    "unpin helper did not publish the exact unlink boundary: "
+                    f"stdout={stdout!r}, stderr={stderr!r}"
+                )
+            time.sleep(0.01)
+            continue
+
+        assert stat.S_ISREG(entry.st_mode), entry
+        assert not stat.S_ISLNK(entry.st_mode), entry
+        assert read_nofollow_bytes(ready) == expected
+        assert process.poll() is None
+        return
+
+
+def test_reclaimer_adopts_interrupted_ready_pin_unlink(tmp_path: Path) -> None:
+    """A killed unpin is adopted before its empty ready namespace authorizes.
+
+    The external Perl hook calls the real unlink for one exact ready token and
+    pauses before returning, so ``unpin_generation`` cannot reach its pins/
+    fsync.  The subsequent reclaimer must fsync that visible namespace before
+    treating it as free of ready pins; the structural test immediately above
+    pins the otherwise power-loss-only ordering requirement.
+    """
+    state = tmp_path / "state"
+    state.mkdir()
+    acquire = subprocess.run(
+        _acquire_argv(state, "unlink_owner", stale_seconds=1),
+        capture_output=True,
+        check=False,
+        env=perl_test_env(),
+    )
+    assert acquire.returncode == 0, acquire.stderr
+    generation_token, acquisition_pin = parse_acquire_output(acquire.stdout)
+
+    handoff = _helper(
+        "handoff",
+        state,
+        token=generation_token,
+        round_barcode="unlink_owner",
+        scope="full_round",
+        pin_token=acquisition_pin,
+    )
+    assert handoff.returncode == 0, handoff.stderr
+
+    target_pin = "a" * 64
+    pin = _helper(
+        "pin",
+        state,
+        token=generation_token,
+        round_barcode="unlink_owner",
+        scope="full_round",
+        role="state_writer",
+        pin_token=target_pin,
+    )
+    assert pin.returncode == 0, pin.stderr
+    assert pin.stdout == f"{target_pin}\n"
+
+    lock = state / ".round_inflight.lockdir"
+    pins = lock / "pins"
+    candidate = pins / f"candidate.{target_pin}.tsv"
+    ready_pin = pins / f"ready.{target_pin}.tsv"
+    candidate_before = os.lstat(candidate)
+    ready_before = os.lstat(ready_pin)
+    assert stat.S_ISREG(candidate_before.st_mode), candidate_before
+    assert stat.S_ISREG(ready_before.st_mode), ready_before
+    assert (candidate_before.st_dev, candidate_before.st_ino) == (
+        ready_before.st_dev,
+        ready_before.st_ino,
+    )
+    assert candidate_before.st_nlink == ready_before.st_nlink == 2
+    pin_record = read_record(ready_pin, schema=PIN_SCHEMA)
+    assert pin_record["token"] == generation_token, pin_record
+    assert pin_record["pin_token"] == target_pin, pin_record
+    assert pin_record["role"] == "state_writer", pin_record
+    assert pin_record["pid"] == str(os.getpid()), pin_record
+    os.kill(int(pin_record["pid"]), 0)
+    candidate_bytes = read_nofollow_bytes(candidate)
+    before_files = _regular_file_manifest(state)
+    ready_relative = ready_pin.relative_to(state).as_posix()
+    assert ready_relative in before_files
+    _assert_absent(lock / "transition.tsv")
+    assert _revocations(state) == []
+    assert _release_receipts(state) == []
+
+    module_dir = _write_unlink_pause_module(tmp_path)
+    pause_ready = tmp_path / "unlink.ready"
+    pause_release = tmp_path / "unlink.release"
+    env = perl_test_env(
+        RTBIOSCAN_TEST_UNLINK_TARGET=str(ready_pin),
+        RTBIOSCAN_TEST_UNLINK_READY=str(pause_ready),
+        RTBIOSCAN_TEST_UNLINK_RELEASE=str(pause_release),
+    )
+    env["PERL5LIB"] = os.pathsep.join(
+        part for part in (str(module_dir), env.get("PERL5LIB", "")) if part
+    )
+    env["PERL5OPT"] = " ".join(
+        part
+        for part in ("-MRTBioScanRoundLockUnlinkPause", env.get("PERL5OPT", ""))
+        if part
+    )
+    unpin = subprocess.Popen(
+        [
+            "perl",
+            str(SCRIPT),
+            "unpin",
+            "--state-dir",
+            str(state),
+            "--round-barcode",
+            "unlink_owner",
+            "--scope",
+            "full_round",
+            "--token",
+            generation_token,
+            "--pin-token",
+            target_pin,
+            "--owner-pid",
+            str(os.getpid()),
+            "--stale-seconds",
+            "1",
+            "--wait-seconds",
+            "5",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        _wait_for_exact_unlink_pause(unpin, pause_ready, ready_pin)
+
+        # Positive controls for the exact crash boundary: the target name is
+        # truly gone, the wrapper and pin owner are live, and unpin still owns
+        # the state fence because the post-unlink directory sync was not run.
+        _assert_absent(ready_pin)
+        candidate_paused = os.lstat(candidate)
+        assert (candidate_paused.st_dev, candidate_paused.st_ino) == (
+            candidate_before.st_dev,
+            candidate_before.st_ino,
+        )
+        assert candidate_paused.st_nlink == 1
+        assert read_nofollow_bytes(candidate) == candidate_bytes
+        assert unpin.poll() is None
+        os.kill(unpin.pid, 0)
+        os.kill(int(pin_record["pid"]), 0)
+        _assert_state_fence_is_held(state)
+
+        expected_files = dict(before_files)
+        del expected_files[ready_relative]
+        assert _regular_file_manifest(state) == expected_files
+        _assert_absent(lock / "transition.tsv")
+        assert _revocations(state) == []
+        assert _release_receipts(state) == []
+        assert not (state / ".round_lock_archives").exists()
+
+        unpin.send_signal(signal.SIGKILL)
+        stdout, stderr = unpin.communicate(timeout=5)
+        assert unpin.returncode == -signal.SIGKILL, (unpin.returncode, stderr)
+        assert stdout == b"", stdout
+        assert stderr == b"", stderr
+    finally:
+        if unpin.poll() is None:
+            unpin.kill()
+            unpin.communicate(timeout=5)
+
+    newest_epoch = int(
+        max(
+            os.lstat(lock).st_mtime,
+            os.lstat(lock / "generation.tsv").st_mtime,
+            os.lstat(pins).st_mtime,
+            os.lstat(state / f".round_lock_handoff.{generation_token}.tsv").st_mtime,
+        )
+    )
+    deadline = time.monotonic() + 3
+    while int(time.time()) - newest_epoch < 1:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    contender = subprocess.run(
+        _acquire_argv(state, "unlink_contender"),
+        capture_output=True,
+        check=False,
+        env=perl_test_env(),
+        timeout=10,
+    )
+    assert contender.returncode == 0, contender.stderr
+    contender_token, _contender_pin = parse_acquire_output(contender.stdout)
+    assert contender_token != generation_token
+
+    archives = sorted((state / ".round_lock_archives").glob("reclaim-*"))
+    assert len(archives) == 1, archives
+    archive = archives[0]
+    transition = read_record(archive / "transition.tsv", schema=TRANSITION_SCHEMA)
+    assert transition["action"] == "reclaim", transition
+    assert transition["owner_token"] == generation_token, transition
+    archived_candidate = archive / "pins" / candidate.name
+    archived_candidate_entry = os.lstat(archived_candidate)
+    assert (archived_candidate_entry.st_dev, archived_candidate_entry.st_ino) == (
+        candidate_before.st_dev,
+        candidate_before.st_ino,
+    )
+    assert archived_candidate_entry.st_nlink == 1
+    assert read_nofollow_bytes(archived_candidate) == candidate_bytes
+    _assert_absent(archive / "pins" / ready_pin.name)
+    assert not list(state.glob(".round_inflight.lockdir.reclaim-*"))
 
 
 def _helper(action: str, state: Path, **opts: str) -> subprocess.CompletedProcess[str]:

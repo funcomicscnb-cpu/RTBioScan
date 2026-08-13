@@ -908,6 +908,102 @@ def test_release_recovery_converges_at_every_terminal_boundary(
     assert _tree_manifest(state) == stable
 
 
+def test_release_archive_collision_is_refused_without_replacement(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing exact terminal name is evidence, never rename fodder."""
+    state = tmp_path / "state"
+    state.mkdir()
+    round_barcode = "release_archive_collision"
+    acquired = subprocess.run(
+        _acquire_command(
+            state, round_barcode=round_barcode, scope="dorado_only",
+        ),
+        capture_output=True, check=False, env=perl_test_env(), timeout=5,
+    )
+    assert acquired.returncode == 0, acquired.stderr
+    token, pin_token = parse_acquire_output(acquired.stdout)
+    interrupted = subprocess.run(
+        _generation_command(
+            "early-release", state, token=token, pin_token=pin_token,
+            round_barcode=round_barcode, scope="dorado_only",
+        ),
+        capture_output=True, check=False,
+        env=perl_test_env(
+            RTBIOSCAN_ROUND_LOCK_FAILPOINT="after-quarantine-rename"
+        ),
+        timeout=5,
+    )
+    assert interrupted.returncode != 0
+    assert_exact_error_line(
+        interrupted.stderr, "ERROR: injected failure after quarantine rename",
+    )
+    quarantines = list(state.glob(f"{LOCK_NAME}.release-*"))
+    assert len(quarantines) == 1, quarantines
+    quarantine = quarantines[0]
+    quarantine_manifest = _tree_manifest(quarantine)
+    transition = read_record(
+        quarantine / "transition.tsv", schema=TRANSITION_SCHEMA,
+    )
+
+    archive_parent = state / ".round_lock_archives"
+    archive_parent.mkdir()
+    collision = archive_parent / f"release-{transition['operation_token']}"
+    collision.mkdir()
+    collision_entry = os.lstat(collision)
+    recovered = subprocess.run(
+        _generation_command(
+            "verify-release", state, token=token,
+            round_barcode=round_barcode, scope="dorado_only",
+        ),
+        capture_output=True, check=False, env=perl_test_env(), timeout=5,
+    )
+    assert recovered.returncode != 0, recovered.stdout
+    assert b"fenced directory move destination already exists" in recovered.stderr
+    current_collision = os.lstat(collision)
+    assert (current_collision.st_dev, current_collision.st_ino) == (
+        collision_entry.st_dev, collision_entry.st_ino,
+    )
+    assert list(collision.iterdir()) == []
+    assert _tree_manifest(quarantine) == quarantine_manifest
+    # Receipt/event publication precedes archival, but no namespace entry was
+    # overwritten and an exact retry fails at the same destination identity.
+    receipt = read_record(
+        state / f".round_lock_release.{token}.tsv", schema=RELEASE_SCHEMA,
+    )
+    assert receipt["operation_token"] == transition["operation_token"]
+    release_events = [
+        read_record(path, schema=EVENT_SCHEMA)
+        for path in (state / ".round_lock_events").glob("*.tsv")
+        if read_record(path, schema=EVENT_SCHEMA)["event"] == "release"
+    ]
+    assert len(release_events) == 1
+    assert release_events[0]["event_id"] == transition["operation_token"]
+    replay_quarantine = _tree_manifest(quarantine)
+    replay_collision = os.lstat(collision)
+    receipt_bytes = read_nofollow_bytes(
+        state / f".round_lock_release.{token}.tsv"
+    )
+    replay = subprocess.run(
+        _generation_command(
+            "verify-release", state, token=token,
+            round_barcode=round_barcode, scope="dorado_only",
+        ),
+        capture_output=True, check=False, env=perl_test_env(), timeout=5,
+    )
+    assert replay.returncode != 0
+    assert b"fenced directory move destination already exists" in replay.stderr
+    assert _tree_manifest(quarantine) == replay_quarantine
+    current_collision = os.lstat(collision)
+    assert (current_collision.st_dev, current_collision.st_ino) == (
+        replay_collision.st_dev, replay_collision.st_ino,
+    )
+    assert list(collision.iterdir()) == []
+    assert read_nofollow_bytes(
+        state / f".round_lock_release.{token}.tsv"
+    ) == receipt_bytes
+
+
 @pytest.mark.parametrize("failpoint", RECLAIM_RECOVERY_BOUNDARIES)
 def test_reclaim_recovery_converges_at_every_terminal_boundary(
     tmp_path: Path,

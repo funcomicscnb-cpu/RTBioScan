@@ -115,12 +115,19 @@ INFLIGHT_SCHEMA = RecordSchema(
 OPERATOR_EVENT_SCHEMA = RecordSchema(
     "OPERATOR_EVENT_ORDER",
     (
-        "schema", "operation_token", "phase", "operator_label", "reason",
+        "schema", "operation_token", "operation_kind",
+        "expected_generation_token", "recovery_basis", "phase",
+        "operator_label", "reason",
         "source_name", "destination_name", "lock_dev", "lock_ino",
+        "tree_sha256",
         "generation_status", "generation_entry_kind", "generation_sha256",
-        "generation_entry_fingerprint", "transition_status",
+        "generation_entry_fingerprint", "pins_status", "pins_entry_kind",
+        "pins_sha256", "pins_entry_fingerprint", "transition_status",
         "transition_entry_kind", "transition_sha256",
-        "transition_entry_fingerprint", "event_epoch", "outcome",
+        "transition_entry_fingerprint", "marker_status",
+        "marker_entry_kind", "marker_sha256", "marker_entry_fingerprint",
+        "release_authority_status", "finalization_status",
+        "finalization_sha256", "event_epoch", "outcome",
     ),
 )
 
