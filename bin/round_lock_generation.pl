@@ -1558,6 +1558,16 @@ sub validate_transition_for_snapshot {
     return 1;
 }
 
+sub transition_matches_release_request {
+    my ($transition, $snapshot, $token, $reason, $pin_token) = @_;
+    return defined($transition)
+        && validate_transition_for_snapshot($transition, $snapshot)
+        && $transition->{action} eq 'release'
+        && $transition->{owner_token} eq $token
+        && $transition->{reason} eq $reason
+        && $transition->{allowed_pin_token} eq $pin_token;
+}
+
 sub install_release {
     my (%arg) = @_;
     my %value = (
@@ -2098,8 +2108,9 @@ sub release_generation {
     # A retry may be resuming this exact release transition.  The immutable
     # transition is validated below against action, generation, reason, and
     # authorizing pin before it can be finalized.
-    my ($snapshot) = assert_generation(%arg, allow_transition => 1);
-    my $generation = $snapshot->{generation};
+    my ($snapshot, $generation, $pending_transition) = assert_generation(
+        %arg, allow_transition => 1,
+    );
     my $pin = read_ready_pin($dir, $arg{pin_token}, $snapshot);
     return 0 if !defined($pin) && $arg{best_effort};
     die "ERROR: process pin is absent: $arg{pin_token}\n"
@@ -2108,6 +2119,12 @@ sub release_generation {
         return 0 if $arg{best_effort};
         die "ERROR: process pin role mismatch\n";
     }
+    die "ERROR: release lost transition race for generation $arg{token}\n"
+        if defined($pending_transition)
+        && !transition_matches_release_request(
+            $pending_transition, $snapshot, $arg{token}, $arg{reason},
+            $arg{pin_token},
+        );
     validate_marker(%arg) if $arg{reason} eq 'full_round_released';
     install_marker(%arg) if $arg{reason} eq 'dorado_only_early';
     if ($arg{unless_handoff}) {
@@ -2124,12 +2141,9 @@ sub release_generation {
         effective_ttl_seconds => $generation->{effective_ttl_seconds},
         allowed_pin_token => $arg{pin_token},
     );
-    if (!defined($transition)
-        || !validate_transition_for_snapshot($transition, $snapshot)
-        || $transition->{action} ne 'release'
-        || $transition->{owner_token} ne $arg{token}
-        || $transition->{reason} ne $arg{reason}
-        || $transition->{allowed_pin_token} ne $arg{pin_token}) {
+    if (!transition_matches_release_request(
+        $transition, $snapshot, $arg{token}, $arg{reason}, $arg{pin_token},
+    )) {
         die "ERROR: release lost transition race for generation $arg{token}\n";
     }
     my $finalized = finalize_transition(

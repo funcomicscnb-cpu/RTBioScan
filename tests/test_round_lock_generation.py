@@ -998,6 +998,92 @@ def test_pending_release_recovery_revalidates_the_transition_pin_role(
     assert not _release_receipt(state, token).exists()
 
 
+@pytest.mark.parametrize(
+    "first_action,second_action,pending_reason,marker_present",
+    [
+        ("abort", "early-release", "pre_handoff_abort", False),
+        ("early-release", "abort", "dorado_only_early", True),
+    ],
+)
+def test_pending_release_reason_switch_is_rejected_before_mutation(
+    tmp_path: Path,
+    first_action: str,
+    second_action: str,
+    pending_reason: str,
+    marker_present: bool,
+) -> None:
+    """A durable release intent must win before retry-specific side effects."""
+    state = tmp_path / "state"
+    token, pin_token = _acquire(state, scope="dorado_only")
+    interrupted = subprocess.run(
+        _command(
+            first_action,
+            state,
+            token=token,
+            pin_token=pin_token,
+            scope="dorado_only",
+            owner_pid=os.getpid(),
+        ),
+        capture_output=True,
+        check=False,
+        env=_perl_test_env(
+            RTBIOSCAN_ROUND_LOCK_FAILPOINT="after-transition-install"
+        ),
+    )
+    assert interrupted.returncode != 0
+    _assert_exact_error_line(
+        interrupted.stderr,
+        FAILPOINT_ERRORS["after-transition-install"],
+    )
+
+    lock = state / ".round_inflight.lockdir"
+    transition_path = lock / "transition.tsv"
+    transition = _read_record(transition_path, schema=TRANSITION_SCHEMA)
+    assert transition["action"] == "release", transition
+    assert transition["reason"] == pending_reason, transition
+    assert transition["allowed_pin_token"] == pin_token, transition
+    transition_entry = os.lstat(transition_path)
+    transition_bytes = _read_nofollow_bytes(transition_path)
+    marker = _marker(state, token)
+    assert os.path.lexists(marker) is marker_present
+    marker_bytes = _read_nofollow_bytes(marker) if marker_present else None
+    ready_pin = lock / "pins" / f"ready.{pin_token}.tsv"
+    ready_entry = os.lstat(ready_pin)
+    ready_bytes = _read_nofollow_bytes(ready_pin)
+
+    conflicting = subprocess.run(
+        _command(
+            second_action,
+            state,
+            token=token,
+            pin_token=pin_token,
+            scope="dorado_only",
+            owner_pid=os.getpid(),
+        ),
+        capture_output=True,
+        check=False,
+        env=_perl_test_env(),
+    )
+    assert conflicting.returncode != 0, conflicting.stdout
+    _assert_exact_error_line(
+        conflicting.stderr,
+        f"ERROR: release lost transition race for generation {token}",
+    )
+    assert (os.lstat(transition_path).st_dev, os.lstat(transition_path).st_ino) == (
+        transition_entry.st_dev,
+        transition_entry.st_ino,
+    )
+    assert _read_nofollow_bytes(transition_path) == transition_bytes
+    assert os.path.lexists(marker) is marker_present
+    if marker_present:
+        assert _read_nofollow_bytes(marker) == marker_bytes
+    assert (os.lstat(ready_pin).st_dev, os.lstat(ready_pin).st_ino) == (
+        ready_entry.st_dev,
+        ready_entry.st_ino,
+    )
+    assert _read_nofollow_bytes(ready_pin) == ready_bytes
+
+
 def test_inflight_publish_retry_reuses_the_immutable_record_and_cleans_temp(
     tmp_path: Path,
 ) -> None:
