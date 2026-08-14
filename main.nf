@@ -132,6 +132,9 @@ if (!stateIdRaw) {
 }
 // Keep it filesystem-friendly.
 def stateId = stateIdRaw.replaceAll(/[^A-Za-z0-9_.-]+/, "_")
+if (!stateId || stateId in ['.', '..']) {
+    exit 1, "Invalid --state_id '${stateIdRaw}': provide one non-dot filesystem component."
+}
 def ongoingStateDir = params.outdir ? "${params.outdir}/temp/ongoing/state/${stateId}" : null
 def currentStateDir = params.outdir ? "${params.outdir}/temp/current/state/${stateId}" : null
 def currentResultsStateDir = params.outdir ? "${params.outdir}/current/state/${stateId}" : null
@@ -632,6 +635,10 @@ if (!effectiveRestartMode || effectiveRestartMode == 'null') {
     env.RUN_NAME = (custom_runName ?: workflow.runName)?.toString() ?: ''
     env.STATE_ID = (stateId ?: '') as String
     env.FORCE = parseBoolStrict(params.restart_force, false, 'restart_force') ? '1' : '0'
+    env.OPERATION_ID = (
+        java.util.UUID.randomUUID().toString() +
+        java.util.UUID.randomUUID().toString()
+    ).replace('-', '')
 
     // Avoid Groovy's ProcessGroovyMethods (`.execute()`, `.waitForProcessOutput()`), which are not available
     // in some Nextflow DSL1 runtimes. Use plain Java ProcessBuilder instead.
@@ -663,6 +670,168 @@ if (!effectiveRestartMode || effectiveRestartMode == 'null') {
         log.warn err.toString().trim()
     }
 }
+
+// Bind process cache keys to the last successfully applied restart operation,
+// not to workflow.runName (Nextflow assigns a new run name on ordinary
+// `-resume`). A legacy two-line sentinel remains readable through an exact-byte
+// digest; an interrupted schema-2 operation fails closed until it is replayed.
+def persistedRestartEpoch = 'none'
+if (params.outdir) {
+    def restartSentinelPath = java.nio.file.Paths.get(
+        params.outdir.toString(),
+        'temp',
+        ".restart_applied.${stateId}",
+    )
+    def restartSentinelAttributes = null
+    try {
+        restartSentinelAttributes = java.nio.file.Files.readAttributes(
+            restartSentinelPath,
+            java.nio.file.attribute.BasicFileAttributes,
+            java.nio.file.LinkOption.NOFOLLOW_LINKS,
+        )
+    } catch (java.nio.file.NoSuchFileException ignored) {
+        restartSentinelAttributes = null
+    } catch (Exception error) {
+        throw new RuntimeException(
+            "Unable to inspect restart sentinel: ${restartSentinelPath}",
+            error,
+        )
+    }
+    if (restartSentinelAttributes != null) {
+        if (
+            restartSentinelAttributes.isSymbolicLink() ||
+            !restartSentinelAttributes.isRegularFile()
+        ) {
+            throw new RuntimeException(
+                "Restart sentinel is not a real regular file: ${restartSentinelPath}"
+            )
+        }
+        byte[] restartSentinelBytes = java.nio.file.Files.readAllBytes(restartSentinelPath)
+        if (restartSentinelBytes.length == 0 || restartSentinelBytes.length > 4096) {
+            throw new RuntimeException(
+                "Restart sentinel has an invalid size: ${restartSentinelPath}"
+            )
+        }
+        def restartSentinelText = new String(
+            restartSentinelBytes,
+            java.nio.charset.StandardCharsets.UTF_8,
+        )
+        if (!java.util.Arrays.equals(
+            restartSentinelText.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+            restartSentinelBytes,
+        )) {
+            throw new RuntimeException(
+                "Restart sentinel is not valid UTF-8: ${restartSentinelPath}"
+            )
+        }
+        if (restartSentinelText.indexOf('\u0000') >= 0) {
+            throw new RuntimeException(
+                "Restart sentinel contains a NUL byte: ${restartSentinelPath}"
+            )
+        }
+        def restartSentinelLines = restartSentinelText.split('\\n', -1).toList()
+        if (!restartSentinelLines || restartSentinelLines[-1] != '') {
+            throw new RuntimeException(
+                "Restart sentinel is not newline terminated: ${restartSentinelPath}"
+            )
+        }
+        restartSentinelLines.remove(restartSentinelLines.size() - 1)
+
+        if (
+            restartSentinelLines.size() == 2 &&
+            restartSentinelLines[0] in ['mode=reset', 'mode=restore'] &&
+            restartSentinelLines[1].startsWith('run_name=') &&
+            restartSentinelLines[1].substring('run_name='.length()) &&
+            !restartSentinelLines[1].contains('\r')
+        ) {
+            byte[] legacyDigest = java.security.MessageDigest
+                .getInstance('SHA-256')
+                .digest(restartSentinelBytes)
+            persistedRestartEpoch = 'legacy:' + new java.math.BigInteger(
+                1,
+                legacyDigest,
+            ).toString(16).padLeft(64, '0')
+        } else {
+            def applyingRecord = (
+                restartSentinelLines.size() == 5 &&
+                restartSentinelLines[0] == 'schema=2' &&
+                restartSentinelLines[1] == 'status=applying' &&
+                restartSentinelLines[2] ==~ /operation_id=[0-9a-f]{64}/ &&
+                restartSentinelLines[3] in [
+                    'requested_mode=reset',
+                    'requested_mode=restore',
+                ] &&
+                restartSentinelLines[4].startsWith('run_name=') &&
+                restartSentinelLines[4].substring('run_name='.length()) &&
+                !restartSentinelLines[4].contains('\r')
+            )
+            if (applyingRecord) {
+                throw new RuntimeException(
+                    "Restart operation is incomplete; replay reset/restore before launching the pipeline: ${restartSentinelPath}"
+                )
+            }
+            def appliedRecord = (
+                restartSentinelLines.size() == 5 &&
+                restartSentinelLines[0] == 'schema=2' &&
+                restartSentinelLines[1] == 'status=applied' &&
+                restartSentinelLines[2] ==~ /operation_id=[0-9a-f]{64}/ &&
+                restartSentinelLines[3] in ['mode=reset', 'mode=restore'] &&
+                restartSentinelLines[4].startsWith('run_name=') &&
+                restartSentinelLines[4].substring('run_name='.length()) &&
+                !restartSentinelLines[4].contains('\r')
+            )
+            if (!appliedRecord) {
+                throw new RuntimeException(
+                    "Restart sentinel is malformed or unsupported: ${restartSentinelPath}"
+                )
+            }
+            persistedRestartEpoch = restartSentinelLines[2].substring(
+                'operation_id='.length()
+            )
+        }
+    }
+}
+
+// Nextflow does not hash scripts invoked through absolute `${baseDir}/bin/...`
+// paths. Bind cached FAST output to the exact helper and guard bytes so a
+// protocol implementation change cannot silently reuse an older acquisition.
+def roundLockRuntimeDigest = java.security.MessageDigest.getInstance('SHA-256')
+roundLockRuntimeDigest.update(
+    'RTBioScan round-lock runtime cache contract v1\n'.getBytes(
+        java.nio.charset.StandardCharsets.UTF_8
+    )
+)
+for (def runtimeEntry : [
+    [label: 'generation-helper', path: "${baseDir}/bin/round_lock_generation.pl"],
+    [label: 'process-guard', path: "${baseDir}/bin/round_lock_process_guard.sh"],
+]) {
+    def runtimePath = java.nio.file.Paths.get(runtimeEntry.path.toString())
+    if (
+        java.nio.file.Files.isSymbolicLink(runtimePath) ||
+        !java.nio.file.Files.isRegularFile(
+            runtimePath,
+            java.nio.file.LinkOption.NOFOLLOW_LINKS,
+        )
+    ) {
+        throw new RuntimeException(
+            "Round-lock runtime component is not a real regular file: ${runtimePath}"
+        )
+    }
+    byte[] runtimeBytes = java.nio.file.Files.readAllBytes(runtimePath)
+    roundLockRuntimeDigest.update(
+        (
+            "${runtimeEntry.label}\t${runtimeBytes.length}\n"
+        ).getBytes(java.nio.charset.StandardCharsets.UTF_8)
+    )
+    roundLockRuntimeDigest.update(runtimeBytes)
+    roundLockRuntimeDigest.update(
+        '\n'.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+    )
+}
+def roundLockRuntimeCacheContractId = new java.math.BigInteger(
+    1,
+    roundLockRuntimeDigest.digest(),
+).toString(16).padLeft(64, '0')
 
 // Bind rolling state to the exact reference, taxonomy, and classification contract.
 // This runs after restore/reset so a restored snapshot is checked before any process can consume it.
@@ -806,12 +975,19 @@ if (!(stateCompatibilityContractId ==~ /[0-9a-f]{64}/)) {
 summary['State Contract'] = stateCompatibilityContractId
 
 // --- PREAMBLE §5: Final computed values and channel bootstrap ---
-// Invalidate cached process scripts on restore/reset or compatibility-contract changes.
-def restartTokenParts = ["compat:${stateCompatibilityContractId}"]
-if (effectiveRestartMode in ['restore', 'reset']) {
-    restartTokenParts << "${effectiveRestartMode}:${custom_runName ?: workflow.runName}"
-}
+// Invalidate cached process scripts on state, applied-restart, or compatibility changes.
+def restartTokenParts = [
+    "state:${ongoingStateDir}",
+    "compat:${stateCompatibilityContractId}",
+    "restart:${persistedRestartEpoch}",
+    "round-lock:${roundLockRuntimeCacheContractId}",
+]
 def restartTokenForCache = restartTokenParts.join('|')
+// Make state namespace, compatibility, and explicit restart-state changes a
+// declared task-hash input. A normal resume can then reuse FAST's exact cached
+// generation token; a namespace/restart/compatibility/runtime change forces a
+// new authority check.
+roundLockFastCacheTokenCh = Channel.value(restartTokenForCache)
 def fastFilterShadowEnabled = parseBoolStrict(params.fast_filter_shadow, false, 'fast_filter_shadow')
 
 // formatOtuIdentity() → bottom of this file (hoisted method)
@@ -822,7 +998,6 @@ def fastFilterShadowEnabled = parseBoolStrict(params.fast_filter_shadow, false, 
 // STAGE A — FAST PRE-FILTER (fast_on_target_detection)
 // ============================================================
 process fast_on_target_detection {
-	cache false
 	// Reserve only 1 CPU for scheduling so this task does not starve downstream processes.
 	// Actual tool threading is controlled via params.align_threads inside the script.
 	cpus 1
@@ -830,6 +1005,7 @@ process fast_on_target_detection {
 		
 	    input:
 	    val(read_path) from reads
+		val(round_lock_fast_cache_token) from roundLockFastCacheTokenCh
 	
     output:
 	    tuple env(barcode), env(round_barcode), file("*.pod5"), file("*reads_target.list") into hq_reads_get
@@ -844,7 +1020,7 @@ process fast_on_target_detection {
 		    set -euo pipefail
 		shopt -s nullglob
 		export LC_ALL=C
-			RESTART_TOKEN="${restartTokenForCache}"
+			RESTART_TOKEN="${round_lock_fast_cache_token}"
 			DORADO_LOCK="${ongoingStateDir}/_state/.dorado.lock"
 			DORADO_LOCK_WAIT=${params.lock_wait_seconds}
 			mkdir -p "${ongoingStateDir}/_state"

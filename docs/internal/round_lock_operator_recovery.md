@@ -325,10 +325,63 @@ instead authenticate the exact early-release receipt. A keyed drain of every
 upstream generation-bound writer precedes cumulative summary mutation, so
 failed-round placeholder rows cannot advance finalization around live writers.
 Generation and scope travel as Nextflow values so a replacement generation
-changes every state-writer task hash. FAST and backup are uncached. Failed
-worker pins remain durable evidence and become nonblocking only through the
-helper's same-host dead-process rules; the guard does not replace existing
-task traps.
+changes every state-writer task hash. FAST remains cacheable during an ordinary
+`-resume` of the same state namespace: its declared cache input binds the
+selected namespace, state-compatibility contract, applied restart epoch, and a
+SHA-256 contract over the exact round-lock helper and guard bytes. This input
+does not use `workflow.runName`, which Nextflow may change on resume, so a cached
+task re-emits the exact handed-off generation and unfinished writers can
+authenticate and continue it. If no explicit `--state_id` was supplied, the
+existing run-name default selects a different namespace on a newly named run;
+use an explicit state ID when continuity across invocations is required. Each
+actually applied reset or restore, including a forced same-mode operation,
+records a new random operation epoch. Exact `.` and `..` state identifiers are
+rejected before any restart path is constructed.
+The restart handler atomically records `status=applying` after read-only
+preflight and before its first destructive mutation, then records
+`status=applied` after success. A mode-off launch fails closed on an incomplete
+or malformed record. A material copy, decompression, or cleanup failure after
+`applying` returns nonzero, releases the restart lock, and leaves that record
+for an explicit reset/restore replay. Abrupt termination is different: the
+mkdir-based restart lock can survive SIGKILL. Under the stopped-world policy,
+first verify that no restart handler or pipeline launcher remains alive, capture
+the lock pathname and metadata, require the exact
+`.restart_applied.<state_id>.lockdir` to be a real empty directory, and remove
+only that directory with `rmdir`; never glob or TTL-reclaim it. Then replay the
+explicit reset/restore operation, which reconciles the surviving `applying`
+record. An occupied, nonempty, symlinked, or otherwise unexpected restart-lock
+path is an operator stop, not cleanup authority. Legacy two-line restart
+sentinels remain readable through an exact-byte digest. A changed namespace,
+compatibility contract, applied restart epoch, or
+round-lock runtime byte contract reruns FAST; only after the helper's authority
+checks can it create a new generation, which deliberately invalidates the
+state-writer task hashes. A helper or guard byte change while an older handoff
+exists therefore requires the same stopped-world completion or reconciliation
+used for other protocol changes; do not rely on cache invalidation to reclaim
+that authority. The `applying` record gives a process-crash-visible recovery
+intent, but restart-lock removal after abrupt death remains the manual
+stopped-world step above. Physical-power-loss durability is not claimed: the
+restart handler does not fsync the sentinel and every mutated state path in a
+structural durability order.
+Backup remains uncached and idempotent. Do not move generation identity to an
+undeclared file, environment variable, or mutable "current generation" lookup;
+a cached task could then skip the helper and cross a replacement-generation
+boundary. Failed worker pins
+remain durable evidence and become nonblocking only through the helper's
+same-host dead-process rules; the guard does not replace existing task traps.
+
+The nominal helper cost is per scheduled round-task attempt, never per read or
+OTU. A fresh, fully executed `full_round` path runs the helper 39 times plus 16
+durable token-file Perl launches; `dorado_only` runs it 28 times plus 4
+token-file launches, before retries or error cleanup. A transcript-recorded,
+3-warm-up/30-iteration synthetic lifecycle benchmark on local APFS with 272 to
+340 `_state` root entries measured cumulative p50/p95 times of 1.675/1.782
+seconds for `full_round`, and 1.075/1.092 seconds for `dorado_only`. This is not
+an end-to-end or contention benchmark. Its raw timing samples were not
+retained, and local APFS does not predict fsync latency on shared storage.
+Repeat the lifecycle measurement on
+the deployment filesystem before cutover when `_state` is network- or
+shared-filesystem backed.
 
 The failpoint pause hooks are accepted as a foundation-only testability seam:
 unknown names are fatal; pause names are exact; both path environment variables

@@ -214,7 +214,7 @@ def test_fast_acquire_retains_and_replays_exact_explicit_tokens() -> None:
     text = MAIN.read_text(encoding="utf-8")
     fast = _process_blocks(text)[ACQUISITION_PROCESS]
     header = fast.split("input:", 1)[0]
-    assert "cache false" in header
+    assert "cache false" not in header
 
     generation_file = (
         "ROUND_LOCK_GENERATION_TOKEN_FILE="
@@ -395,9 +395,39 @@ def test_backup_completion_skip_and_finish_are_generation_authenticated() -> Non
 
 def test_generation_token_changes_cache_keys_without_replacing_restart_token() -> None:
     text = MAIN.read_text(encoding="utf-8")
+    assert "if (!stateId || stateId in ['.', '..'])" in text
+    assert "provide one non-dot filesystem component" in text
+    fast = _process_blocks(text)[ACQUISITION_PROCESS]
+    fast_input = fast.split("output:", 1)[0]
+    restart_parts = text[text.index("def restartTokenParts = [") :]
+    restart_parts = restart_parts[: restart_parts.index("]") + 1]
+    assert '"state:${ongoingStateDir}"' in restart_parts
+    assert '"compat:${stateCompatibilityContractId}"' in restart_parts
+    assert '"restart:${persistedRestartEpoch}"' in restart_parts
+    assert '"round-lock:${roundLockRuntimeCacheContractId}"' in restart_parts
+    assert "workflow.runName" not in restart_parts
+    assert "effectiveRestartMode" not in restart_parts
+    assert "restartTokenParts <<" not in text
+    assert "env.OPERATION_ID = (" in text
+    assert "def persistedRestartEpoch = 'none'" in text
+    assert "java.nio.file.Files.readAttributes(" in text
+    assert "catch (java.nio.file.NoSuchFileException ignored)" in text
+    assert "java.util.Arrays.equals(" in text
+    assert "Restart sentinel is not valid UTF-8" in text
+    assert "restartSentinelText.indexOf('\\u0000')" in text
+    assert text.count(".contains('\\r')") >= 3
+    assert "def roundLockRuntimeCacheContractId =" in text
+    assert "round_lock_generation.pl" in text
+    assert "round_lock_process_guard.sh" in text
+    assert "RTBioScan round-lock runtime cache contract v1" in text
+    assert "status=applying" in text
+    assert "status=applied" in text
+    assert "roundLockFastCacheTokenCh = Channel.value(restartTokenForCache)" in text
     assert (
-        'SUP_CACHE_RESTART_TOKEN="${restartTokenForCache ?: workflow.runName}"'
-        in text
+        "val(round_lock_fast_cache_token) from roundLockFastCacheTokenCh" in fast_input
     )
+    assert 'RESTART_TOKEN="${round_lock_fast_cache_token}"' in fast
+    assert 'RESTART_TOKEN="${restartTokenForCache}"' not in fast
+    assert 'SUP_CACHE_RESTART_TOKEN="${restartTokenForCache ?: workflow.runName}"' in text
     assert 'SUP_CACHE_RESTART_TOKEN="${round_generation_token}' not in text
     assert text.count("val(round_generation_token)") == 22
