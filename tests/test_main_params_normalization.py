@@ -2604,18 +2604,18 @@ def test_main_nf_guards_round_barcode_collisions_before_round_dir_use() -> None:
     assert '--round-barcode "\\$round_barcode" \\' in fast_block
     assert '--read-file "${read_file}")' in fast_block
     assert 'ERROR: round_barcode_source_guard.sh returned empty canonical path for round \'\\$round_barcode\'' in fast_block
-    assert "printf 'read_file=%s\\n' \"\\$READ_FILE_ABS\"" in fast_block
+    assert '"$ROUND_LOCK_HELPER" inflight' not in fast_block
+    assert '"\\$ROUND_LOCK_HELPER" inflight' in fast_block
+    assert '--read-file "\\$READ_FILE_ABS"' in fast_block
     guard_pos = fast_block.index('READ_FILE_ABS=\\$(bash ${baseDir}/bin/round_barcode_source_guard.sh \\')
     round_dir_pos = fast_block.index('if [ ! -d ${ongoingStateDir}/\\$round_barcode/ ];')
     assert guard_pos < round_dir_pos
-    assert 'source "${baseDir}/bin/lib/stale_lock_utils.sh"' in fast_block
-    assert 'stale_lock_maybe_reclaim \\' in fast_block
-    assert '"\\$(( ${staleLockTtlMinutesStr} * 60 ))" \\' in fast_block
-    assert '"round lock" \\' in fast_block
-    assert 'reclaim_status=\\$?' in fast_block
-    assert 'if [ "\\$reclaim_status" -eq 2 ]; then' in fast_block
-    assert 'ERROR: stale_lock_maybe_reclaim rejected round lock parameters' in fast_block
-    assert 'if [ "\\$reclaim_status" -eq 10 ]; then' in fast_block
+    assert 'source "${baseDir}/bin/lib/stale_lock_utils.sh"' not in fast_block
+    assert 'stale_lock_maybe_reclaim' not in fast_block
+    assert 'perl "\\$ROUND_LOCK_HELPER" "\\$round_lock_acquire_command"' in fast_block
+    assert 'ROUND_LOCK_ACQUIRE_OUTPUT="\\$(round_lock_acquire_once acquire)" || \\' in fast_block
+    assert 'ROUND_LOCK_ACQUIRE_OUTPUT="\\$(round_lock_acquire_once replay-acquire)"' in fast_block
+    assert '--stale-seconds "\\$ROUND_LOCK_STALE_SECONDS"' in fast_block
 
 
 def test_main_nf_report_lock_stale_ttl_uses_stale_lock_ttl_minutes() -> None:
@@ -2748,7 +2748,7 @@ def test_main_nf_wires_unassigned_cluster_prune_flow() -> None:
     consensus_block = text.split("process consensus {", 1)[1].split("process _reporting_consensus_tax {", 1)[0]
     assert 'consensus_inputs = ChannelUtils.strictRoundJoin(fastq_qced_consensus, blast2consensus)' in text
     assert 'tuple val(barcode), val(round_barcode), file(\'blast_report_annotated.txt\') into blast_agg_ch' in blast_block
-    assert 'tuple val(barcode), val(round_barcode), file("${barcode}_blastreport_sup.sam"), file("${barcode}_round_sup.tsv"), file("${barcode}_blastreport_sup_pre.fastq"), file("${barcode}_preblastreport_join.txt"), file("blast_report_annotated_preferred.txt"), file("blast_report_annotated_noadapter.txt"), file("${barcode}_blast_filter_stats.tsv") into report_blast' in blast_block
+    assert 'tuple val(barcode), val(round_barcode), file("${barcode}_blastreport_sup.sam"), file("${barcode}_round_sup.tsv"), file("${barcode}_blastreport_sup_pre.fastq"), file("${barcode}_preblastreport_join.txt"), file("blast_report_annotated_preferred.txt"), file("blast_report_annotated_noadapter.txt"), file("${barcode}_blast_filter_stats.tsv"), val(round_generation_token), val(round_lock_scope) into report_blast' in blast_block
     assert 'tuple val(barcode), val(round_barcode), file("blast_report_annotated.txt"), file("${barcode}_assigned_read_ids.list") into blast2consensus' in blast_block
     assert blast_block.count('perl "\\$BIN_DIR/blast_assigned_read_ids.pl" \\') == 1
     assert '"${barcode}_blastreport_round.txt" \\' in blast_block
@@ -2756,7 +2756,7 @@ def test_main_nf_wires_unassigned_cluster_prune_flow() -> None:
     assert 'protected_pool_added=0' in blast_block
     assert 'protected_ids_reappended' in blast_block
     assert 'PROTECTED_POOL_FASTA="\\${STATE_DIR}/${barcode}_rolling_pool_protected.fasta"' in blast_block
-    assert 'tuple val(barcode), val(round_barcode), file(fasta_hq_qced), file(blast_report), file(assigned_read_ids) from consensus_inputs' in consensus_block
+    assert 'tuple val(barcode), val(round_barcode), file(fasta_hq_qced), val(round_generation_token), val(round_lock_scope), file(blast_report), file(assigned_read_ids) from consensus_inputs' in consensus_block
     assert 'CONSENSUS_PRUNE_UNASSIGNED_CLUSTERS="${pruneUnassignedClusters ? \'1\' : \'0\'}" \\' in consensus_block
     assert 'CONSENSUS_PRUNE_UNASSIGNED_DROP_READS="${(pruneUnassignedClusters && pruneUnassignedDropReads) ? \'1\' : \'0\'}" \\' in consensus_block
     assert 'CONSENSUS_PRUNE_UNASSIGNED_GRACE_ROUNDS="${pruneUnassignedGraceRoundsStr}" \\' in consensus_block
@@ -2827,7 +2827,8 @@ def test_main_nf_routes_dorado_basecalling_through_lock_helper() -> None:
     assert 'round_barcode="\\${round_barcode}"' not in fast_block
     assert 'round_barcode="${round_barcode}"' in hac_block
     assert 'round_barcode=\\$(basename "${read_file}")' in text
-    assert 'if [ "\\$ROUND_LOCK_SCOPE" = "dorado_only" ] && [ "\\$ROUND_LOCK_EARLY_RELEASED" -ne 1 ]; then' in text
+    assert 'if [ "\\$ROUND_LOCK_SCOPE" = "dorado_only" ]; then' in text
+    assert 'round_lock_cleanup=cancel-dorado-handoff' in text
     assert 'INFO: round lock released after FAST basecalling (round_lock_scope=dorado_only)' in text
 
 
@@ -2839,9 +2840,11 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'static def strictRoundJoinAll(channels, label = null)' in CHANNEL_UTILS.read_text(encoding='utf-8')
     assert 'getting_run_summary_inputs = ChannelUtils.strictRoundJoinAll([' in text
     assert "], 'getting_run_summary_inputs')" in text
-    assert 'getting_run_summary_with_path = ChannelUtils.strictRoundJoin(getting_run_summary_inputs, get_summary_ch)' in text
+    assert 'getting_run_summary_inputs_drained = ChannelUtils.strictRoundJoin(' in text
+    assert 'getting_run_summary_with_path = ChannelUtils.strictRoundJoin(getting_run_summary_inputs_drained, get_summary_ch)' in text
     assert 'complete_round_with_path = ChannelUtils.strictRoundJoin(complete_round_ch, close_round_ch)' in text
-    assert 'tuple env(barcode), env(round_barcode), val(read_path) into close_round_ch, get_summary_ch, failed_round_source_ch' in fast_block
+    assert 'tuple env(barcode), env(round_barcode), val(read_path) into close_round_ch, get_summary_ch' in fast_block
+    assert 'tuple env(barcode), env(round_barcode), val(read_path), env(round_generation_token), env(round_lock_scope) into failed_round_source_ch' in fast_block
     assert 'def failedRoundPlaceholderRoot = file("${baseDir}/bin/report_placeholders/failed_round", checkIfExists: true)' in text
     assert "if (!(resolvedContext in ['full_collapse', 'primers_only', 'full_track', 'off'])) {" in text
     assert 'def failedRoundPlaceholderAssets = resolveFailedRoundPlaceholderAssets(demuxIdentityContext)' in text
@@ -2858,7 +2861,7 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'failed_target_rpt_summary_src_ch' in text
     assert 'failed_blast_agg_src_ch' in text
     assert 'failed_cons_agg_src_ch' in text
-    assert '[barcode, round_barcode, failedRoundPlaceholderAssets.blastOtuPretaxRpt, failedRoundPlaceholderAssets.readInfoRpt, failedRoundPlaceholderAssets.blastOtuNoadapterRpt, failedRoundPlaceholderAssets.blastFilterStats]' in text
+    assert '[barcode, round_barcode, failedRoundPlaceholderAssets.blastOtuPretaxRpt, failedRoundPlaceholderAssets.readInfoRpt, failedRoundPlaceholderAssets.blastOtuNoadapterRpt, failedRoundPlaceholderAssets.blastFilterStats, round_generation_token, round_lock_scope]' in text
     assert '[barcode, round_barcode, failedRoundPlaceholderAssets.blastConsensusTaxRpt, failedRoundPlaceholderAssets.consensusRoundProv]' in text
     assert '[barcode, round_barcode, failedRoundPlaceholderAssets.otuDefRpt, failedRoundPlaceholderAssets.otuMembersRound, failedRoundPlaceholderAssets.otuSizesRound]' in text
     assert '[barcode, round_barcode, failedRoundPlaceholderAssets.otuDefSidecar]' in text
@@ -2867,9 +2870,9 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert '[barcode, round_barcode, failedRoundPlaceholderAssets.onTargetRpt]' in text
     assert '[barcode, round_barcode, failedRoundPlaceholderAssets.blastReportAnnotated]' in text
     assert '[barcode, round_barcode, failedRoundPlaceholderAssets.consensusBlastFull]' in text
-    assert 'tuple val(barcode), val(round_barcode), file(blast_otu_pretax_rpt), file(read_info_rpt), file(blast_otu_noadapter_rpt), file(blast_filter_stats), file(blast_consensus_tax), file(consensus_round_provenance), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round), file(otu_def_rpt_sidecar), file(demult_rpt), file(demult_rpt_sidecar), file(on_target_rpt), file(summary), file(summary_otu), val(read_path) from getting_run_summary_with_path' in summary_block
+    assert 'tuple val(barcode), val(round_barcode), file(blast_otu_pretax_rpt), file(read_info_rpt), file(blast_otu_noadapter_rpt), file(blast_filter_stats), val(round_generation_token), val(round_lock_scope), file(blast_consensus_tax), file(consensus_round_provenance), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round), file(otu_def_rpt_sidecar), file(demult_rpt), file(demult_rpt_sidecar), file(on_target_rpt), file(summary), file(summary_otu), val(read_path) from getting_run_summary_with_path' in summary_block
     assert 'val(read_path) from get_summary_ch' not in summary_block
-    assert 'tuple val(barcode), val(round_barcode), val(read_path) from complete_round_with_path' in backup_block
+    assert 'tuple val(barcode), val(round_barcode), val(round_generation_token), val(round_lock_scope), val(read_path) from complete_round_with_path' in backup_block
     assert 'tuple val(barcode), val(round_barcode), file("report_render.request") into report_render_request_ch' in backup_block
     assert 'val(read_path) from close_round_ch' not in backup_block
     assert 'ROUND_REPORT_JSON="\\$ROUND_DIR/round_report.json"' in summary_block
@@ -3131,16 +3134,16 @@ def test_main_nf_uses_keyed_joins_for_high_risk_multi_input_processes() -> None:
     assert 'static def strictRoundJoin(left, right, label = null)' in CHANNEL_UTILS.read_text(encoding='utf-8')
     assert '.join(rightKeyed, by: 0, failOnMismatch: true, failOnDuplicate: true)' in CHANNEL_UTILS.read_text(encoding='utf-8')
     assert 'hq_reads_report_with_fast_control = ChannelUtils.strictRoundJoin(hq_reads_report, fast_control)' in text
-    assert 'tuple val(barcode), val(round_barcode), file(round_hac_sam), file(round_hac_fastq) from hq_reads_report_with_fast_control' in reporting_hac_block
+    assert 'tuple val(barcode), val(round_barcode), file(round_hac_sam), file(round_hac_fastq), val(round_generation_token), val(round_lock_scope) from hq_reads_report_with_fast_control' in reporting_hac_block
 
     assert 'otu_def_reporting_inputs = ChannelUtils.strictRoundJoin(report_otu, demult_control)' in text
-    assert 'tuple val(barcode), val(round_barcode), file(otu_clstr), file(demult) from otu_def_reporting_inputs' in reporting_otu_block
+    assert 'tuple val(barcode), val(round_barcode), file(otu_clstr), val(round_generation_token), val(round_lock_scope), file(demult) from otu_def_reporting_inputs' in reporting_otu_block
 
     assert 'blast_pretax_inputs = ChannelUtils.strictRoundJoinAll([' in text
-    assert 'tuple val(barcode), val(round_barcode), file(fasta_hq_qced), file(qced_reads_nr), file(read_file), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round) from blast_pretax_inputs' in blast_block
+    assert 'tuple val(barcode), val(round_barcode), file(fasta_hq_qced), file(qced_reads_nr), val(round_generation_token), val(round_lock_scope), file(read_file), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round) from blast_pretax_inputs' in blast_block
 
     assert 'report_blast_inputs = ChannelUtils.strictRoundJoin(report_blast, hac_read_control)' in text
-    assert 'tuple val(barcode), val(round_barcode), file(round_sup_sam), file(round_sup_tsv), file(blast_sup_fastq), file(blast_read), file(blast_report_otu), file(blast_report_noadapter), file(blast_filter_stats) from report_blast_inputs' in reporting_blast_block
+    assert 'tuple val(barcode), val(round_barcode), file(round_sup_sam), file(round_sup_tsv), file(blast_sup_fastq), file(blast_read), file(blast_report_otu), file(blast_report_noadapter), file(blast_filter_stats), val(round_generation_token), val(round_lock_scope) from report_blast_inputs' in reporting_blast_block
     assert 'cp ${round_sup_tsv} ${barcode}_round_sup.tsv 2>/dev/null || true' in reporting_blast_block
     assert 'persist_sup_tsv ${barcode}_round_sup.tsv' in reporting_blast_block
     assert 'perl ${doradoBin} summary ${round_sup_sam}' not in reporting_blast_block
@@ -3151,7 +3154,8 @@ def test_main_nf_uses_keyed_joins_for_high_risk_multi_input_processes() -> None:
     assert "reports_blast = ChannelUtils.strictRoundJoin(blast_agg_ch, cons_agg_ch, 'reports_blast')" in text
     assert '"\\$STATE_TMP"/*_seen_read_ids.tsv' in text
     assert '"\\$STATE_TMP"/*_on_target_state.tsv' in text
-    assert 'getting_run_summary_with_path = ChannelUtils.strictRoundJoin(getting_run_summary_inputs, get_summary_ch)' in text
+    assert 'getting_run_summary_inputs_drained = ChannelUtils.strictRoundJoin(' in text
+    assert 'getting_run_summary_with_path = ChannelUtils.strictRoundJoin(getting_run_summary_inputs_drained, get_summary_ch)' in text
     assert 'complete_round_with_path = ChannelUtils.strictRoundJoin(complete_round_ch, close_round_ch)' in text
 
     assert 'channel pairing mismatch' not in text

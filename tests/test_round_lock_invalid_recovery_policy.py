@@ -111,7 +111,7 @@ def test_operator_recovery_runbook_pins_the_required_safety_contract() -> None:
         "directory-valued `round_inflight.txt`",
         "before any writer resumes",
         "Silent activation over an existing state directory is not acceptable",
-        "schema-1 pending operation",
+        "pre-schema-3 pending operation",
         "There is no silent dual-parser migration",
         "Tokenless",
         "cannot recover a lost response",
@@ -838,7 +838,7 @@ def test_operator_quarantine_writes_bound_audit_and_replays_idempotently(
     assert intent["outcome"] == "prepared"
     assert complete["phase"] == "complete"
     assert complete["outcome"] == "quarantined"
-    assert complete["schema"] == "2"
+    assert complete["schema"] == "3"
     assert complete["operation_kind"] == "invalid_snapshot"
     assert complete["expected_generation_token"] == "none"
     assert complete["recovery_basis"] == "generation-invalid"
@@ -1213,7 +1213,7 @@ def test_operator_quarantine_replays_every_crash_boundary(
         tree_digest.update(encoded)
     _assert_absent(source / "transition.tsv")
     expected_event_fields = {
-        "schema": "2",
+        "schema": "3",
         "operation_token": operation_token,
         "operation_kind": "invalid_snapshot",
         "expected_generation_token": "none",

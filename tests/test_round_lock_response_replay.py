@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import os
 import signal
 import stat
@@ -252,6 +253,135 @@ def test_explicit_acquire_tokens_replay_after_response_loss(tmp_path: Path) -> N
     )
     assert replay.returncode == 0, replay.stderr
     assert parse_acquire_output(replay.stdout) == (generation_token, pin_token)
+    assert _tree_manifest(state) == before
+
+    replay_only = subprocess.run(
+        [
+            *command[:2],
+            "replay-acquire",
+            *command[3:],
+        ],
+        capture_output=True,
+        check=False,
+        env=perl_test_env(),
+        timeout=5,
+    )
+    assert replay_only.returncode == 0, replay_only.stderr
+    assert parse_acquire_output(replay_only.stdout) == (
+        generation_token,
+        pin_token,
+    )
+    assert _tree_manifest(state) == before
+
+
+def test_replay_acquire_never_creates_or_waits(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    generation_token = _token("replay-only absent generation")
+    pin_token = _token("replay-only absent pin")
+    ordinary = _acquire_command(
+        state,
+        generation_token=generation_token,
+        pin_token=pin_token,
+    )
+    replay_command = [*ordinary[:2], "replay-acquire", *ordinary[3:]]
+    started = time.monotonic()
+    rejected = subprocess.run(
+        replay_command,
+        capture_output=True,
+        check=False,
+        env=perl_test_env(),
+        timeout=5,
+    )
+    elapsed = time.monotonic() - started
+    assert rejected.returncode != 0, rejected.stdout
+    assert b"state-dir is not a real directory" in rejected.stderr
+    assert elapsed < 1
+    assert not state.exists()
+
+
+def test_replay_acquire_fails_immediately_when_state_fence_is_held(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    generation_token = _token("replay-only contended generation")
+    pin_token = _token("replay-only contended pin")
+    ordinary = _acquire_command(
+        state,
+        generation_token=generation_token,
+        pin_token=pin_token,
+    )
+    replay_command = [*ordinary[:2], "replay-acquire", *ordinary[3:]]
+    before = _tree_manifest(state)
+    descriptor = os.open(state, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Positive control: an independent nonblocking attempt proves this
+        # exact state-directory fence is unavailable before the helper runs.
+        control = os.open(state, os.O_RDONLY)
+        try:
+            try:
+                fcntl.flock(control, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                raise AssertionError("positive control did not hold state fence")
+        finally:
+            os.close(control)
+        started = time.monotonic()
+        rejected = subprocess.run(
+            replay_command,
+            capture_output=True,
+            check=False,
+            env=perl_test_env(),
+            timeout=5,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+    assert rejected.returncode != 0, rejected.stdout
+    assert b"state fence is busy during acquire replay" in rejected.stderr
+    assert elapsed < 1
+    assert _tree_manifest(state) == before
+
+
+def test_explicit_acquire_replay_rejects_finish_disposition_history(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    generation_token = _token("finish-history acquire generation")
+    pin_token = _token("finish-history acquire pin")
+    command = _acquire_command(
+        state,
+        generation_token=generation_token,
+        pin_token=pin_token,
+    )
+    acquired = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+        env=perl_test_env(),
+        timeout=5,
+    )
+    assert acquired.returncode == 0, acquired.stderr
+    assert parse_acquire_output(acquired.stdout) == (generation_token, pin_token)
+
+    finish = state / f".round_lock_finish.{generation_token}.tsv"
+    finish.write_bytes(b"independently-planted-finish-history\n")
+    before = _tree_manifest(state)
+
+    replay = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+        env=perl_test_env(),
+        timeout=5,
+    )
+    assert replay.returncode != 0, replay.stdout
+    assert replay.stdout == b""
+    assert b"durable progressed history" in replay.stderr
     assert _tree_manifest(state) == before
 
 

@@ -26,7 +26,7 @@ BEGIN {
 }
 
 my $SCHEMA = '1';
-my $OPERATOR_SCHEMA = '2';
+my $OPERATOR_SCHEMA = '3';
 my $TOKEN_RE = qr/\A[0-9a-f]{64}\z/;
 
 sub usage {
@@ -35,13 +35,16 @@ Usage: round_lock_generation.pl <command> --state-dir DIR [options]
 
 Commands:
   acquire        acquire a generation and print generation/pin tokens
+  replay-acquire return only an already-installed exact explicit acquisition
   inflight       publish the token-bound round_inflight.txt diagnostic
   handoff        publish full_round handoff and end the acquisition pin
   pin            acquire a process pin for a handed-off full_round generation
   guard-pin      assert an exact live process pin
   unpin          end an exact process pin
   verify-release  authenticate an idempotent release receipt for resume
+  verify-finish  authenticate that exact post-release marker cleanup completed
   early-release  create a dorado_only marker and release with the acquisition pin
+  cancel-handoff reconcile release/response loss, then abandon FAST handoff
   finish         release full_round, or clean the exact dorado_only marker
   abort          best-effort pre-handoff release with the acquisition pin
   operator-quarantine-invalid
@@ -57,8 +60,10 @@ Runtime options:
   --stale-seconds N --wait-seconds N
   For response-loss recovery, callers must durably preallocate and retain an
   exact distinct --token/--pin-token pair before acquire, or an exact
-  --pin-token before pin, then retry the identical request. Tokenless calls
-  preserve the legacy interface but cannot recover a response that was lost.
+  --pin-token before pin. After acquire fails, replay-acquire validates only
+  that identical retained tuple and never waits, creates, or reclaims. Pin
+  retries use the identical pin request. Tokenless calls preserve the legacy
+  interface but cannot recover a response that was lost.
   --best-effort suppresses only an abort/unpin authority miss after the state
   fence is acquired; fence, recovery, and malformed-state errors remain fatal
 
@@ -209,6 +214,7 @@ sub pin_candidate_path { return File::Spec->catfile(pins_dir($_[0]), "candidate.
 sub pin_ready_path { return File::Spec->catfile(pins_dir($_[0]), "ready.$_[1].tsv"); }
 sub marker_path { return File::Spec->catfile($_[0], ".round_lock_handoff.$_[1].tsv"); }
 sub release_path { return File::Spec->catfile($_[0], ".round_lock_release.$_[1].tsv"); }
+sub finish_path { return File::Spec->catfile($_[0], ".round_lock_finish.$_[1].tsv"); }
 sub revocation_path { return File::Spec->catfile($_[0], ".round_lock_revocation.$_[1].tsv"); }
 sub inflight_generation_path { return File::Spec->catfile($_[0], ".round_inflight.$_[1].tsv"); }
 sub inflight_compat_path { return File::Spec->catfile($_[0], 'round_inflight.txt'); }
@@ -321,6 +327,7 @@ sub validate_failpoint_configuration {
         after-transition-receipt-before-event
         after-transition-outcome-before-archive
         after-terminal-archive-rename-before-sync
+        after-finish-install-before-marker-remove
         before-compat-publish
     );
     die "ERROR: unknown round-lock failpoint: $name\n" if !$known{$name};
@@ -621,6 +628,7 @@ my @PIN_ORDER = qw(schema token pin_token round_barcode scope role pid host proc
 my @TRANSITION_ORDER = qw(schema action operation_token owner_token round_barcode scope reason effective_ttl_seconds lock_dev lock_ino allowed_pin_token started_epoch);
 my @MARKER_ORDER = qw(schema token round_barcode scope outcome created_epoch);
 my @RELEASE_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds release_transition_epoch lock_dev lock_ino operation_token);
+my @FINISH_ORDER = qw(schema token round_barcode scope outcome disposition release_reason release_operation_token release_transition_epoch lock_dev lock_ino finished_epoch);
 my @REVOCATION_ORDER = qw(schema token round_barcode scope outcome reason effective_ttl_seconds reclaim_transition_epoch lock_dev lock_ino operation_token);
 my @EVENT_ORDER = qw(schema event_id generation_token round_barcode scope event outcome effective_ttl_seconds event_epoch lock_dev lock_ino);
 my @INFLIGHT_ORDER = qw(round_barcode started_utc read_file generation_token scope lock_dev lock_ino);
@@ -958,7 +966,7 @@ sub operator_recovery_basis {
 sub operator_named_evidence_sha256 {
     my (@items) = @_;
     my $digest = Digest::SHA->new(256);
-    my $domain = 'RTBioScan-round-lock-operator-finalization-v1';
+    my $domain = 'RTBioScan-round-lock-operator-finalization-v2';
     $digest->add(pack('N', length($domain)), $domain);
     for my $item (@items) {
         my ($label, $evidence) = @{$item};
@@ -1092,6 +1100,17 @@ sub operator_finalization_evidence {
             }
         }
     }
+
+    my $finish_path = finish_path(
+        $arg{state_dir}, $generation->{token},
+    );
+    my $finish_evidence = operator_evidence_entry($finish_path);
+    push(@items, [
+        ".round_lock_finish.$generation->{token}.tsv", $finish_evidence,
+    ]);
+    $status = 'finish-conflict'
+        if $status eq 'ready'
+        && $finish_evidence->{entry_kind} ne 'absent';
 
     my ($receipt_path, $receipt_order, %receipt);
     if ($transition->{action} eq 'release') {
@@ -1487,14 +1506,14 @@ sub validate_operator_event_shape {
             || $record->{release_authority_status}
                 =~ /\A(?:reason-scope-invalid|marker-missing|marker-invalid|marker-conflict|pin-missing|pin-invalid|pin-role-invalid)\z/)
         && $record->{finalization_status}
-            =~ /\A(?:not-applicable|inflight-invalid|compat-invalid|receipt-invalid|opposite-outcome-conflict|event-invalid|archive-collision)\z/
+            =~ /\A(?:not-applicable|inflight-invalid|compat-invalid|finish-conflict|receipt-invalid|opposite-outcome-conflict|event-invalid|archive-collision)\z/
         && (($record->{finalization_status} eq 'not-applicable'
                 && $record->{finalization_sha256} eq 'none')
             || ($record->{finalization_status} ne 'not-applicable'
                 && $record->{finalization_sha256} =~ $TOKEN_RE))
         && (($record->{recovery_basis} eq 'finalization-invalid')
             == ($record->{finalization_status}
-                =~ /\A(?:inflight-invalid|compat-invalid|receipt-invalid|opposite-outcome-conflict|event-invalid|archive-collision)\z/))
+                =~ /\A(?:inflight-invalid|compat-invalid|finish-conflict|receipt-invalid|opposite-outcome-conflict|event-invalid|archive-collision)\z/))
         && $record->{event_epoch} =~ /\A[0-9]+\z/
         && $record->{outcome} eq ($phase eq 'intent' ? 'prepared' : 'quarantined');
 }
@@ -1566,7 +1585,7 @@ sub operator_evidence_values {
     $recovery_basis = 'finalization-invalid'
         if $local_basis eq 'healthy'
         && $finalization->{status}
-            =~ /\A(?:inflight-invalid|compat-invalid|receipt-invalid|opposite-outcome-conflict|event-invalid|archive-collision)\z/;
+            =~ /\A(?:inflight-invalid|compat-invalid|finish-conflict|receipt-invalid|opposite-outcome-conflict|event-invalid|archive-collision)\z/;
     return (
         recovery_basis => $recovery_basis,
         tree_sha256 => $tree->{sha256},
@@ -2170,6 +2189,101 @@ sub release_record {
     return $record;
 }
 
+sub validate_finish_record {
+    my ($record, $arg_ref, $release) = @_;
+    return 0 if !defined($record) || !defined($release);
+    my $scope_disposition_valid =
+        ($arg_ref->{scope} eq 'full_round'
+            && $release->{reason} eq 'full_round_released'
+            && $record->{outcome} eq 'finished'
+            && $record->{disposition} eq 'round_complete')
+        || ($arg_ref->{scope} eq 'dorado_only'
+            && $release->{reason} eq 'dorado_only_early'
+            && (($record->{outcome} eq 'finished'
+                    && $record->{disposition} eq 'round_complete')
+                || ($record->{outcome} eq 'abandoned'
+                    && $record->{disposition}
+                        eq 'fast_post_release_failure')));
+    return $record->{schema} eq $SCHEMA
+        && $record->{token} eq $arg_ref->{token}
+        && $record->{round_barcode} eq $arg_ref->{round_barcode}
+        && $record->{scope} eq $arg_ref->{scope}
+        && $scope_disposition_valid
+        && $record->{release_reason} eq $release->{reason}
+        && $record->{release_operation_token} eq $release->{operation_token}
+        && $record->{release_transition_epoch}
+            eq $release->{release_transition_epoch}
+        && $record->{lock_dev} eq $release->{lock_dev}
+        && $record->{lock_ino} eq $release->{lock_ino}
+        && $record->{finished_epoch} =~ /\A[0-9]+\z/;
+}
+
+sub finish_record {
+    my (%arg) = @_;
+    my $path = finish_path($arg{state_dir}, $arg{token});
+    my $record = record_for($path, \@FINISH_ORDER);
+    return undef if !defined($record);
+    my $release = release_record(%arg);
+    die "ERROR: finish receipt does not match generation $arg{token}\n"
+        if !validate_finish_record($record, \%arg, $release);
+    return $record;
+}
+
+sub install_finish_record {
+    my (%arg) = @_;
+    my $outcome = $arg{finish_outcome} // 'finished';
+    my $disposition = $arg{finish_disposition} // 'round_complete';
+    die "ERROR: invalid generation finish outcome\n"
+        if !($outcome eq 'finished' && $disposition eq 'round_complete')
+        && !($outcome eq 'abandoned'
+            && $disposition eq 'fast_post_release_failure');
+    my $release = release_record(%arg);
+    die "ERROR: missing authenticated release receipt for generation $arg{token}\n"
+        if !defined($release);
+    my $expected_reason = $arg{scope} eq 'full_round'
+        ? 'full_round_released'
+        : 'dorado_only_early';
+    die "ERROR: release reason conflicts for generation $arg{token}\n"
+        if $release->{reason} ne $expected_reason;
+    my $path = finish_path($arg{state_dir}, $arg{token});
+    my $existing = record_for($path, \@FINISH_ORDER);
+    if (defined($existing)) {
+        die "ERROR: finish receipt does not match generation $arg{token}\n"
+            if !validate_finish_record($existing, \%arg, $release)
+            || $existing->{outcome} ne $outcome
+            || $existing->{disposition} ne $disposition;
+        return $existing;
+    }
+    # Marker absence is replay authority only after a matching immutable
+    # disposition already exists.  A first-time disposition must authenticate
+    # the exact handoff it is about to retire.
+    validate_marker(%arg);
+    my %value = (
+        schema => $SCHEMA, token => $arg{token},
+        round_barcode => $arg{round_barcode}, scope => $arg{scope},
+        outcome => $outcome, disposition => $disposition,
+        release_reason => $release->{reason},
+        release_operation_token => $release->{operation_token},
+        release_transition_epoch => $release->{release_transition_epoch},
+        lock_dev => $release->{lock_dev}, lock_ino => $release->{lock_ino},
+        finished_epoch => int(time()),
+    );
+    my $installed = install_immutable(
+        $path, checksummed_content(\%value, \@FINISH_ORDER),
+    );
+    if (!$installed) {
+        $existing = record_for($path, \@FINISH_ORDER);
+        die "ERROR: immutable finish receipt disappeared: $arg{token}\n"
+            if !defined($existing);
+        die "ERROR: finish receipt does not match generation $arg{token}\n"
+            if !validate_finish_record($existing, \%arg, $release)
+            || $existing->{outcome} ne $outcome
+            || $existing->{disposition} ne $disposition;
+        return $existing;
+    }
+    return \%value;
+}
+
 sub revocation_record {
     my (%arg) = @_;
     my $path = revocation_path($arg{state_dir}, $arg{token});
@@ -2334,6 +2448,10 @@ sub record_transition_outcome {
     die "ERROR: pending $transition->{action} conflicts with an opposite "
         . "terminal outcome for generation $token\n"
         if path_occupied_nofollow($opposite_path, 'opposite terminal outcome');
+    my $finish_path = finish_path($arg{state_dir}, $token);
+    die "ERROR: pending $transition->{action} conflicts with an existing "
+        . "finish disposition for generation $token\n"
+        if path_occupied_nofollow($finish_path, 'finish disposition');
     if ($transition->{action} eq 'reclaim') {
         install_revocation(
             state_dir => $arg{state_dir}, token => $token, round_barcode => $round,
@@ -2459,6 +2577,47 @@ sub archive_release_quarantine {
         || $archived[1] != $arg{snapshot}->{ino};
     sync_directory($archive_parent);
     sync_directory($arg{state_dir});
+}
+
+sub assert_cancel_handoff_pin_authority {
+    my (%arg) = @_;
+    my $release = $arg{release};
+    my $archive = File::Spec->catdir(
+        terminal_archive_dir($arg{state_dir}),
+        "release-$release->{operation_token}",
+    );
+    my $snapshot = lock_snapshot($archive);
+    die "ERROR: cancel-handoff cannot authenticate archived release for "
+        . "generation $arg{token}\n"
+        if !defined($snapshot) || !$snapshot->{valid};
+    my $transition = transition_record($archive);
+    die "ERROR: cancel-handoff cannot authenticate archived release for "
+        . "generation $arg{token}\n"
+        if !defined($transition)
+        || !validate_transition_for_snapshot($transition, $snapshot)
+        || $transition->{action} ne 'release'
+        || $transition->{owner_token} ne $arg{token}
+        || $transition->{round_barcode} ne $arg{round_barcode}
+        || $transition->{scope} ne $arg{scope}
+        || $transition->{reason} ne $release->{reason}
+        || $transition->{effective_ttl_seconds}
+            ne $release->{effective_ttl_seconds}
+        || $transition->{operation_token} ne $release->{operation_token}
+        || $transition->{started_epoch}
+            ne $release->{release_transition_epoch}
+        || "$snapshot->{dev}" ne $release->{lock_dev}
+        || "$snapshot->{ino}" ne $release->{lock_ino};
+    my $archived_pin = read_ready_pin(
+        $archive, $transition->{allowed_pin_token}, $snapshot,
+    );
+    die "ERROR: cancel-handoff cannot authenticate archived release for "
+        . "generation $arg{token}\n"
+        if !defined($archived_pin)
+        || $archived_pin->{role} ne 'fast_acquisition';
+    die "ERROR: cancel-handoff pin does not authorize released generation "
+        . "$arg{token}\n"
+        if $transition->{allowed_pin_token} ne $arg{pin_token};
+    return 1;
 }
 
 sub archive_reclaim_quarantine {
@@ -2717,6 +2876,7 @@ sub assert_explicit_acquire_token_unused {
         'conflicting',
         marker_path($arg{state_dir}, $arg{token}),
         release_path($arg{state_dir}, $arg{token}),
+        finish_path($arg{state_dir}, $arg{token}),
         revocation_path($arg{state_dir}, $arg{token}),
         inflight_generation_path($arg{state_dir}, $arg{token}),
         "$dir.failed-acquire-$arg{token}",
@@ -2795,6 +2955,7 @@ sub replay_explicit_acquire {
         'progressed',
         marker_path($arg{state_dir}, $arg{token}),
         release_path($arg{state_dir}, $arg{token}),
+        finish_path($arg{state_dir}, $arg{token}),
         revocation_path($arg{state_dir}, $arg{token}),
         inflight_generation_path($arg{state_dir}, $arg{token}),
     );
@@ -3192,6 +3353,10 @@ sub remove_inflight_for_snapshot {
 sub remove_exact_marker {
     my (%arg) = @_;
     my $path = marker_path($arg{state_dir}, $arg{token});
+    # Adopt an unlink that may be visible after its writer died before syncing
+    # the parent.  Absence is authority only after the missing durability
+    # barrier has been repeated while the state fence is held.
+    sync_directory($arg{state_dir});
     return if !path_occupied_nofollow($path, 'handoff marker');
     validate_marker(%arg);
     unlink($path) or die "ERROR: cannot remove exact handoff marker '$path': $!\n";
@@ -3201,8 +3366,9 @@ sub remove_exact_marker {
 my $command = shift(@ARGV) // '';
 usage() if $command eq '' || $command eq '--help' || $command eq '-h';
 my %VALID_COMMAND = map { $_ => 1 } qw(
-    acquire inflight handoff pin guard-pin unpin verify-release early-release
-    finish abort operator-quarantine-invalid operator-quarantine-unrecoverable
+    acquire replay-acquire inflight handoff pin guard-pin unpin verify-release verify-finish
+    early-release cancel-handoff finish abort operator-quarantine-invalid
+    operator-quarantine-unrecoverable
 );
 usage() if !$VALID_COMMAND{$command};
 Configure(qw(no_auto_abbrev no_getopt_compat no_bundling no_ignore_case));
@@ -3269,7 +3435,8 @@ $opt{state_dir} = validate_text('state-dir', $opt{state_dir});
 my @state_st = lstat($opt{state_dir});
 my $operator_command = $command eq 'operator-quarantine-invalid'
     || $command eq 'operator-quarantine-unrecoverable';
-if (!@state_st && $!{ENOENT} && !$operator_command) {
+if (!@state_st && $!{ENOENT} && !$operator_command
+    && $command ne 'replay-acquire') {
     make_path($opt{state_dir}, { mode => 0700 });
     @state_st = lstat($opt{state_dir});
 }
@@ -3328,7 +3495,8 @@ if ($operator_command) {
 }
 
 $opt{round_barcode} = validate_text('round-barcode', $opt{round_barcode})
-    if $command ne 'acquire' || defined($opt{round_barcode});
+    if $command !~ /\A(?:acquire|replay-acquire)\z/
+    || defined($opt{round_barcode});
 $opt{scope} = validate_scope($opt{scope}) if defined($opt{scope});
 $opt{wait_seconds} = validate_uint('wait-seconds', $opt{wait_seconds});
 $opt{stale_seconds} = validate_uint('stale-seconds', $opt{stale_seconds});
@@ -3346,6 +3514,29 @@ if ($command eq 'acquire') {
     die "ERROR: acquire generation and pin tokens must differ\n"
         if defined($opt{token}) && $opt{token} eq $opt{pin_token};
     my ($token, $pin_token) = acquire_generation(%opt);
+    write_stdout("generation_token=$token\npin_token=$pin_token\n");
+    exit 0;
+} elsif ($command eq 'replay-acquire') {
+    $opt{round_barcode} = validate_text('round-barcode', $opt{round_barcode});
+    $opt{scope} = validate_scope($opt{scope});
+    $opt{owner_pid} = validate_pid($opt{owner_pid});
+    die "ERROR: replay-acquire requires --token and --pin-token\n"
+        if !defined($opt{token}) || !defined($opt{pin_token});
+    die "ERROR: acquire generation and pin tokens must differ\n"
+        if $opt{token} eq $opt{pin_token};
+    my $replay_fence = acquire_state_fence($opt{state_dir}, 1);
+    die "ERROR: round-lock state fence is busy during acquire replay\n"
+        if !defined($replay_fence);
+    assert_operator_operations_complete($opt{state_dir});
+    my $snapshot = lock_snapshot(lock_dir($opt{state_dir}));
+    die "ERROR: explicit acquire replay generation is absent\n"
+        if !defined($snapshot);
+    die invalid_snapshot_error(lock_dir($opt{state_dir}), $snapshot)
+        if !$snapshot->{valid};
+    my ($token, $pin_token) = replay_explicit_acquire(
+        %opt, snapshot => $snapshot,
+    );
+    release_state_fence($replay_fence);
     write_stdout("generation_token=$token\npin_token=$pin_token\n");
     exit 0;
 }
@@ -3443,15 +3634,60 @@ if ($command eq 'inflight') {
 	die "ERROR: pre-handoff abort is not a resumable release for generation $opt{token}\n"
 		if $receipt->{reason} eq 'pre_handoff_abort';
 	print "$receipt->{reason}\n";
+} elsif ($command eq 'verify-finish') {
+    recover_quarantines($opt{state_dir});
+    recover_pending_release(%opt);
+    my $receipt = release_record(%opt);
+    my $revoked = revocation_record(%opt);
+    die "ERROR: generation has both release and revocation receipts: $opt{token}\n"
+        if defined($receipt) && defined($revoked);
+    die "ERROR: missing authenticated release receipt for generation $opt{token}\n"
+        if !defined($receipt);
+    my $finished = finish_record(%opt);
+    die "ERROR: missing authenticated finish receipt for generation $opt{token}\n"
+        if !defined($finished);
+    remove_exact_marker(%opt);
+    die "ERROR: generation handoff was abandoned: $opt{token}\n"
+        if $finished->{outcome} ne 'finished'
+        || $finished->{disposition} ne 'round_complete';
+    my $marker = marker_path($opt{state_dir}, $opt{token});
+    die "ERROR: finished generation still has a handoff marker: $opt{token}\n"
+        if path_occupied_nofollow($marker, 'handoff marker');
+    print "$finished->{release_reason}\n";
 } elsif ($command eq 'early-release') {
     die "ERROR: missing pin-token\n" if !defined($opt{pin_token});
     die "ERROR: early-release is only valid for dorado_only\n"
         if $opt{scope} ne 'dorado_only';
     release_generation(%opt, reason => 'dorado_only_early', unless_handoff => 0);
+} elsif ($command eq 'cancel-handoff') {
+    die "ERROR: missing pin-token\n" if !defined($opt{pin_token});
+    die "ERROR: cancel-handoff is only valid for dorado_only\n"
+        if $opt{scope} ne 'dorado_only';
+    # This command is armed before early-release.  It therefore has to decide
+    # the pre/post-response-loss boundary under the state fence: either finish
+    # the exact early release using its retained acquisition pin, or adopt an
+    # already durable matching release.  No shell-side check-then-act split is
+    # used as authority.
+    release_generation(
+        %opt, reason => 'dorado_only_early', unless_handoff => 0,
+    );
+    my $receipt = release_record(%opt);
+    die "ERROR: dorado_only generation lacks authenticated early-release receipt\n"
+        if !defined($receipt) || $receipt->{reason} ne 'dorado_only_early';
+    die "ERROR: dorado_only generation was revoked\n"
+        if defined(revocation_record(%opt));
+    assert_cancel_handoff_pin_authority(%opt, release => $receipt);
+    install_finish_record(
+        %opt, finish_outcome => 'abandoned',
+        finish_disposition => 'fast_post_release_failure',
+    );
+    die "ERROR: injected failure after finish install before marker remove\n"
+        if configured_failpoint()
+            eq 'after-finish-install-before-marker-remove';
+    remove_exact_marker(%opt);
 } elsif ($command eq 'finish') {
     if ($opt{scope} eq 'full_round') {
         release_generation(%opt, reason => 'full_round_released', unless_handoff => 0);
-        remove_exact_marker(%opt);
     } else {
         recover_quarantines($opt{state_dir});
         my $receipt = release_record(%opt);
@@ -3459,8 +3695,12 @@ if ($command eq 'inflight') {
             if !defined($receipt) || $receipt->{reason} ne 'dorado_only_early';
         die "ERROR: dorado_only generation was revoked\n"
             if defined(revocation_record(%opt));
-        remove_exact_marker(%opt);
     }
+    install_finish_record(%opt);
+    die "ERROR: injected failure after finish install before marker remove\n"
+        if configured_failpoint()
+            eq 'after-finish-install-before-marker-remove';
+    remove_exact_marker(%opt);
 } elsif ($command eq 'abort') {
     die "ERROR: missing pin-token\n" if !defined($opt{pin_token});
     release_generation(
