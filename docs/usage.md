@@ -772,6 +772,7 @@ Available profiles:
 | `test` | Requires `db/toDefault/` | Test configuration pointing to `db/toDefault/` databases (`conf/test.config`). Requires those databases to be present; no bundled test data. |
 | `barcoding` | Batch mode | Batch-mode configuration (`conf/barcoding.config`, `watch = false`). Intended for diversity runs from pre-collected POD5 files. |
 | `voucher` | Single specimen | Reference sequence generation from a single known individual (`conf/voucher.config`). Tighter clustering (99%), higher consensus depth, pruning disabled. Use with `bin/voucher_export.sh` to format outputs for BOLD/GenBank. |
+| `broad_its2` | Opt-in length preset | Keeps the default COI limits and broadens ITS2 to 200–800 bp for the default `COI|ITS2` target order (`conf/broad_its2.config`). Invoke with `nextflow run main.nf -profile broad_its2`. |
 
 If `-profile` is not specified, all tools must be installed and available on the `PATH`.
 
@@ -1346,8 +1347,9 @@ Global read length thresholds used outside per-marker contexts (e.g. the initial
 Pipe-separated per-marker read-length thresholds, in the same order as `--targets`. Applied after reads are labelled with the target marker.
 
 - Defaults: `350|286` / `532|360` (COI: 350–532 bp; ITS2: 286–360 bp).
+- Opt-in broad ITS2 preset: `nextflow run main.nf -profile broad_its2` resolves to `350|200` / `532|800` for the default `COI|ITS2` target order; COI limits are unchanged.
 - Add a third value to cover a third marker: `--min_read_lengths "350|286|400"`.
-- Applied after reads are labelled with the target marker.
+- Each marker-specific minimum is enforced at the earlier marker-specific filter and again after adapter trimming. The retained insert can therefore be shorter than the original read and is discarded if it falls below that marker's minimum after trimming.
 
 ---
 
