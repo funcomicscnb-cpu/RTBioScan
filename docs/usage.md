@@ -457,7 +457,7 @@ Key differences vs. the default profile (all set automatically by `conf/voucher.
 ### Exporting sequences for database submission
 [back to Top](#rtbioscan-usage)
 
-After the pipeline completes, run `bin/voucher_export.sh` to extract the dominant consensus sequence per sample and target marker, and reformat the FASTA headers for database submission:
+After the pipeline completes, run `bin/voucher_export.sh` to extract the dominant consensus sequence per biological sample and target marker, and reformat the FASTA headers for database submission:
 
 ```bash
 bash bin/voucher_export.sh \
@@ -473,13 +473,23 @@ Options:
 | `--out DIR` | `./voucher_output` | Output directory |
 | `--sample NAME` | all | Export only this sample |
 | `--marker NAME` | all | Export only this marker (e.g. `COI` or `ITS2`) |
+| `--state ID` | automatic when unique | Select `results/current/state/ID`; required when more than one published state is eligible |
+| `--run-id ID` | unique identity layout | Select exactly `results/sample_info/ID`; required when more than one direct identity root is eligible |
 
 Output files:
 
-- `voucher_output/voucher_sequences.fasta` — one record per sample+marker, using the dominant OTU (highest read count). Header format: `>SAMPLE|MARKER|reads-N[|BLAST:Genus_species]`
+- `voucher_output/voucher_sequences.fasta` — one record per biological-sample+marker, using the dominant OTU (highest read count). Header format: `>SAMPLE|MARKER|reads-N[|BLAST:Genus_species]`
 - `voucher_output/voucher_summary.tsv` — tabular summary with columns: `sample`, `marker`, `reads`, `otu_key`, `blast_suggestion`
 
-The BLAST taxonomy is attached as `|BLAST:Genus_species` when a match exists and is above threshold. When no match is found (new species), the field is omitted — absence of a BLAST suggestion is expected and does not indicate a pipeline failure.
+The exporter reads only the selected published snapshot at `results/current/state/<state_id>/`: consensus FASTAs come from `sequences/Consensus/`, and taxonomy comes from that same state's `tables/*_blast_consensus_tax_rpt.txt`. It never combines temporary, ongoing, round, `single_exp`, or other state copies. `--state` selects that published state; it is unrelated to `-name`, which sets Nextflow's `workflow.runName`. The `Run` shown in the state's `README.html` is therefore diagnostic execution metadata, not the biological input run ID used under `results/sample_info/`.
+
+An explicit `--run-id ID` selects exactly `results/sample_info/ID` and never falls back to another identity root. Without it, the exporter considers only direct identity layouts: the flat `results/sample_info/` root and each immediate child directory containing `track_identity.tsv` or `replicate_identity.tsv`. Exactly one eligible root is accepted as a unique-layout fallback; none or more than one is an error, regardless of the README execution name. Within the selected root, `track_identity.tsv` is preferred and a malformed preferred file is fatal rather than falling back to `replicate_identity.tsv`. The identity bridge collapses tracked units and replicates to their biological `sample_id` while keeping distinct samples separate. `--sample` filters that biological identity.
+
+Within each biological-sample+marker key, greatest `reads-N` support wins. Ties use the bytewise lexicographically smallest `otu_key`, then original header, then sequence; output rows are ordered by sample and marker. Identical repeated evidence therefore cannot produce duplicate primaries. Positional marker fields such as `|COI|` and `|ITS2|` are recognized, as is the compatibility form `|marker=ITS2|`; unrelated header tokens are not inferred as markers. When a mapped unit's primer identity marker disagrees with its consensus/homology marker, the sequence is reported on stderr and excluded before filtering or primary selection. A corresponding discordant taxonomy row is also reported and ignored rather than annotating a compatible sequence.
+
+The BLAST taxonomy is joined by the report's named consensus identifier, sample, marker, and OTU fields and attached as `|BLAST:Genus_species` when a compatible match exists. When no match is found (for example, a new species), the field is omitted. Conflicting identity or taxonomy mappings and missing or ambiguous authoritative states fail without replacing existing exports.
+
+A valid selected state with no matching records, including an empty `--sample` or `--marker` selection, exits successfully and replaces any stale export with an empty FASTA plus a header-only summary.
 
 > `main_barcoding.nf` — the earlier standalone pipeline for this use case — is retained under `extras/` and historical snapshots under `extras/versions/` for reference. The voucher profile supersedes it, using the same robust infrastructure as the main pipeline (state management, round locking, SUP consensus, HTML reports).
 
