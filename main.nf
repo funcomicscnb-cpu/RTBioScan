@@ -3519,10 +3519,11 @@ process blast_OTU_pretax {
 	    : > blast_report_annotated_otu_evidence.txt
 	    : > blast_report_annotated_preferred.txt
 
-			    # Only attempt refinement when both inputs are non-empty.
+			    # Attempt refinement whenever accumulated clusters are non-empty;
+			    # an empty BLAST report is a valid all-unassigned result.
 			    # Refinement is a core classification step, so unexpected failure is fatal.
 				    _t_otu_refine_wrapper_start=\$(now_ms)
-			    if [ -s "${barcode}_blastreport_round.txt" ] && [ -s "${qced_reads_nr}" ]; then
+			    if [ -s "${qced_reads_nr}" ]; then
 			        if ! OTU_REFINE_ROUND_ID="${round_barcode}" \
 		             OTU_REFINE_PHASE_TIMINGS_FILE="\$OTU_REFINE_PHASE_TIMINGS_FILE" \
 		             OTU_REFINE_PHASE_TIMINGS_MS_FILE="\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" \

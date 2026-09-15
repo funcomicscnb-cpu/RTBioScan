@@ -123,7 +123,7 @@ annotated_bytes=0
 annotated_file_bytes=0
 _t_wrapper_total_start=$(now_ms)
 
-if [ ! -s "$BLAST_REPORT" ] || [ ! -s "$CLSTR_FILE" ]; then
+if [ ! -e "$BLAST_REPORT" ] || [ ! -s "$CLSTR_FILE" ]; then
     write_workload_stats "$cluster_count" "$cluster_records" "$blastreport_rows" "$cluster_taxids_rows" "$worker_count" "$shard_count" "$shard_scheduler_mode" "$target_records_per_shard" "$smallest_shard_records" "$median_shard_records" "$largest_shard_records" "$largest_shard_fraction" "$max_single_cluster_records" "$max_single_cluster_fraction" "$merged_pairs_rows" "$merged_pairs_bytes" "$annotated_rows" "$annotated_bytes" "$annotated_file_bytes"
     exit 0
 fi

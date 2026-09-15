@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+MAIN_NF = REPO_ROOT / "main.nf"
 SERIAL_SCRIPT = REPO_ROOT / "bin" / "otu_refine_blastreport.pl"
 PARALLEL_SCRIPT = REPO_ROOT / "bin" / "otu_refine_blastreport_parallel.sh"
 WORKER_SCRIPT = REPO_ROOT / "bin" / "otu_refine_blastreport_worker.pl"
@@ -66,6 +67,90 @@ def _run_worker(tmp_path: Path, cluster_taxids_rows: str, clstr_rows: str):
     )
 
 
+def _extract_main_refinement_shell() -> str:
+    main_text = MAIN_NF.read_text(encoding="utf-8")
+    process_start = "process blast_OTU_pretax {"
+    process_end = "process _reporting_blast_pretax {"
+    assert main_text.count(process_start) == 1, "blast_OTU_pretax process anchor changed"
+    assert main_text.count(process_end) == 1, "reporting process anchor changed"
+    process = main_text.split(process_start, 1)[1].split(process_end, 1)[0]
+
+    lines = process.splitlines(keepends=True)
+    output_anchors = [
+        ": > blast_report_annotated.txt",
+        ": > blast_report_annotated_otu.txt",
+        ": > blast_report_annotated_otu_evidence.txt",
+        ": > blast_report_annotated_preferred.txt",
+    ]
+    starts = [
+        idx
+        for idx in range(len(lines) - len(output_anchors) + 1)
+        if [line.strip() for line in lines[idx : idx + len(output_anchors)]] == output_anchors
+    ]
+    end_anchor = "# Ensure OTU tokens always include marker when possible (OTUB_xxx-MARKER)."
+    ends = [idx for idx, line in enumerate(lines) if line.strip() == end_anchor]
+    assert len(starts) == 1, "refinement output anchors changed"
+    assert len(ends) == 1, "refinement end anchor changed"
+    assert starts[0] < ends[0], "refinement production anchors are out of order"
+    block = "".join(lines[starts[0] : ends[0]])
+    wrapper_call = 'bash "\\$BIN_DIR/otu_refine_blastreport_parallel.sh"'
+    assert block.count(wrapper_call) == 1, "refinement wrapper call anchor changed"
+
+    rendered = block.replace(
+        "${baseDir}/${params.nonncbi_id2lineage_target}", "id2lineage.tsv"
+    )
+    rendered = rendered.replace("${barcode}", "barcode01")
+    rendered = rendered.replace("${round_barcode}", "round01")
+    rendered = rendered.replace("${qced_reads_nr}", "reads.clstr")
+    rendered = rendered.replace("\\$", "$")
+    assert "${" not in rendered, "unrendered Groovy interpolation in refinement block"
+    return rendered
+
+
+def _run_main_refinement_shell(tmp_path: Path, blast_rows: str, clstr_rows: str):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "barcode01_blastreport_round.txt").write_text(blast_rows, encoding="utf-8")
+    (tmp_path / "reads.clstr").write_text(clstr_rows, encoding="utf-8")
+    (tmp_path / "id2lineage.tsv").write_text("", encoding="utf-8")
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir()
+    _write_executable(
+        stub_bin / "otu_refine_blastreport_parallel.sh",
+        "#!/usr/bin/env bash\n"
+        "printf 'called\\n' >> \"$OTU_REFINE_CALLS_FILE\"\n"
+        "printf '#seq_id\\ttax_id\\tlineage\\n'\n",
+    )
+    calls_file = tmp_path / "wrapper.calls"
+    env = os.environ.copy()
+    env.update(
+        {
+            "BIN_DIR": str(stub_bin),
+            "THREADS": "2",
+            "OTU_REFINE_CALLS_FILE": str(calls_file),
+            "OTU_REFINE_PHASE_TIMINGS_FILE": str(tmp_path / "phase.tsv"),
+            "OTU_REFINE_PHASE_TIMINGS_MS_FILE": str(tmp_path / "phase_ms.tsv"),
+            "OTU_REFINE_WORKLOAD_STATS_FILE": str(tmp_path / "workload.tsv"),
+        }
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "set -e\n"
+            "now_ms() { printf '0\\n'; }\n"
+            "append_otu_refine_breakdown() { :; }\n"
+            + _extract_main_refinement_shell(),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        cwd=tmp_path,
+    )
+    calls = calls_file.read_text(encoding="utf-8").splitlines() if calls_file.exists() else []
+    return result, calls
+
+
 def test_parallel_wrapper_matches_serial_output_for_single_worker(tmp_path: Path) -> None:
     tax_rows = "read1|COI|sup;TX1\nread2|COI|sup;TX1\n"
     clstr_rows = (
@@ -124,6 +209,89 @@ def test_parallel_wrapper_matches_serial_output_for_cluster_shards(tmp_path: Pat
     assert "OTUB_0-COI\tTX1\tK__One" in parallel.stdout
     assert "read7|COI|sup|OTUB_3-COI\tTX_UNKNOWN\tK__Unassigned" in parallel.stdout
     assert "read8|ITS2|sup|OTUB_3-ITS2\tTX_UNKNOWN\tK__Unassigned" in parallel.stdout
+
+
+def test_parallel_wrapper_distinguishes_empty_and_missing_blast_report(tmp_path: Path) -> None:
+    clstr_rows = (
+        ">Cluster 0\n"
+        "0\t100nt, >read1|COI|hac... *\n"
+        "1\t100nt, >read2|COI|hac... at +/99%\n"
+        ">Cluster 1\n"
+        "0\t100nt, >read3|ITS2|sup... *\n"
+        "1\t100nt, >read4|ITS2|sup... at +/99%\n"
+    )
+    lineage_rows = "TX1\tK__One;p__One;c__One;o__One;f__One;g__One;s__One\n"
+    fallback = (
+        "K__Unassigned;p__Unassigned;c__Unassigned;o__Unassigned;"
+        "f__Unassigned;g__Unassigned;s__Unassigned"
+    )
+
+    all_negative_parallel = _run_parallel(
+        tmp_path / "all-negative-parallel", "", clstr_rows, lineage_rows, 2
+    )
+
+    assert all_negative_parallel.returncode == 0, all_negative_parallel.stderr
+    assert all_negative_parallel.stdout.splitlines() == [
+        "#seq_id\ttax_id\tlineage",
+        f"read1|COI|hac|OTUB_0-COI\t\t{fallback}",
+        f"read2|COI|hac|OTUB_0-COI\t\t{fallback}",
+        f"read3|ITS2|sup|OTUB_1-ITS2\t\t{fallback}",
+        f"read4|ITS2|sup|OTUB_1-ITS2\t\t{fallback}",
+    ]
+
+    mixed_serial = _run_serial(
+        tmp_path / "mixed-serial", "read1|COI|hac;TX1\n", clstr_rows, lineage_rows
+    )
+    mixed_parallel = _run_parallel(
+        tmp_path / "mixed-parallel", "read1|COI|hac;TX1\n", clstr_rows, lineage_rows, 2
+    )
+
+    assert mixed_serial.returncode == 0, mixed_serial.stderr
+    assert mixed_parallel.returncode == 0, mixed_parallel.stderr
+    assert mixed_parallel.stdout == mixed_serial.stdout
+
+    missing_dir = tmp_path / "missing-report"
+    missing_dir.mkdir()
+    missing_report = missing_dir / "missing-blastreport.txt"
+    missing_clstr = missing_dir / "reads.clstr"
+    missing_lineage = missing_dir / "id2lineage.tsv"
+    missing_clstr.write_text(clstr_rows, encoding="utf-8")
+    missing_lineage.write_text(lineage_rows, encoding="utf-8")
+    assert not missing_report.exists()
+    missing = subprocess.run(
+        [
+            "bash",
+            str(PARALLEL_SCRIPT),
+            str(missing_report),
+            str(missing_clstr),
+            str(missing_lineage),
+            "2",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=missing_dir,
+    )
+    assert missing.returncode == 0, missing.stderr
+    assert missing.stdout == ""
+    assert not missing_report.exists()
+
+
+def test_main_refinement_block_reaches_wrapper_by_cluster_content(tmp_path: Path) -> None:
+    cases = (
+        ("empty-report", "", ">Cluster 0\n0\t100nt, >read1|COI|hac... *\n", 1),
+        (
+            "nonempty-report",
+            "read1|COI|hac;TX1\n",
+            ">Cluster 0\n0\t100nt, >read1|COI|hac... *\n",
+            1,
+        ),
+        ("empty-clstr", "read1|COI|hac;TX1\n", "", 0),
+    )
+    for name, blast_rows, clstr_rows, expected_calls in cases:
+        result, calls = _run_main_refinement_shell(tmp_path / name, blast_rows, clstr_rows)
+        assert result.returncode == 0, f"{name}: {result.stderr}"
+        assert len(calls) == expected_calls, f"{name}: wrapper calls={calls}"
 
 
 def test_parallel_wrapper_matches_serial_output_with_taxonkit_resolution(tmp_path: Path) -> None:
@@ -493,11 +661,11 @@ def test_parallel_worker_fails_when_cluster_taxids_are_incomplete(tmp_path: Path
     assert "Missing cluster taxid for cluster 1" in result.stderr
 
 
-def test_parallel_wrapper_returns_empty_output_when_inputs_are_empty(tmp_path: Path) -> None:
+def test_parallel_wrapper_returns_empty_output_when_cluster_file_is_empty(tmp_path: Path) -> None:
     tax_file = tmp_path / "blastreport.txt"
     clstr_file = tmp_path / "reads.clstr"
     lineage_file = tmp_path / "id2lineage.tsv"
-    tax_file.write_text("", encoding="utf-8")
+    tax_file.write_text("read1|COI|sup;TX1\n", encoding="utf-8")
     clstr_file.write_text("", encoding="utf-8")
     lineage_file.write_text("TX1\tK__One\n", encoding="utf-8")
 
