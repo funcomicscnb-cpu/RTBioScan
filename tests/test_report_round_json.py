@@ -1,5 +1,6 @@
 import json
 import hashlib
+import os
 import subprocess
 from pathlib import Path
 
@@ -111,6 +112,1802 @@ def _otu_species_row_by_sample(data: dict, sample_label: str) -> dict:
         if row.get("sample") == sample_label:
             return row
     raise AssertionError(f"Missing OTU species row for sample {sample_label}: {data['otu']['assignments_by_level']['species']}")
+
+
+def test_main_002_producer_round_renumbering_excludes_stale_history(tmp_path: Path) -> None:
+    env = dict(os.environ, RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="full_collapse")
+    demux = tmp_path / "demult.tsv"
+    demux.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\tsubsample\treplicate\tidentity_scope\tidentity_value\n"
+        + "".join(
+            f"r{i}\tCOI\thac\tsample_A\tunknown\tunknown\tunknown\tunknown\tsample\tsample_A\n"
+            for i in range(1, 7)
+        )
+        + "other\tCOI\thac\tsample_B\tunknown\tunknown\tunknown\tunknown\tsample\tsample_B\n",
+        encoding="utf-8",
+    )
+    frozen = tmp_path / "frozen.tsv"
+    frozen.write_text("", encoding="utf-8")
+    otu_keys = {}
+    for name, cluster_id, include_other in (("round1", "1", True), ("round2", "0", False)):
+        round_dir = tmp_path / name
+        round_dir.mkdir()
+        active = round_dir / "active.tsv"
+        active.write_text(
+            ("0\tother|COI|hac|barcode=COI|adapter=sample_B\t1\n" if include_other else "")
+            + "".join(
+                f"{cluster_id}\tr{i}|COI|hac|barcode=COI|adapter=sample_A\t{1 if i == 1 else 0}\n"
+                for i in range(1, 7)
+            ),
+            encoding="utf-8",
+        )
+        merged = round_dir / "merged.clstr"
+        subprocess.run(
+            ["perl", str(REPO_ROOT / "bin" / "otu_merge_clstr.pl"), str(frozen), str(active), str(merged)],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "perl", str(REPO_ROOT / "bin" / "reporting_otu_definition.pl"),
+                str(merged), str(demux), name, "RTBioScan", "COI",
+            ],
+            cwd=round_dir,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        lines = (round_dir / "RTBioScan_otu_def_rpt.txt").read_text(encoding="utf-8").splitlines()
+        columns = lines[0].split("\t")
+        rows = [dict(zip(columns, line.split("\t"))) for line in lines[1:]]
+        otu_keys[name] = next(row["OTU_id"] for row in rows if row["read_id"] == "r1")
+
+    cumulative = tmp_path / "cumulative_blast.tsv"
+    cumulative.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        + "".join(
+            f"r{i}\tCOI\thac\tsample_A\thit\t123\t100\t99\t{otu}\tF1\tG1\tS1\n"
+            for otu in otu_keys.values()
+            for i in range(1, 7)
+        ),
+        encoding="utf-8",
+    )
+    lock = tmp_path / "lock.tsv"
+    lock.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n" + f"{otu_keys['round2']}\t0\t0\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "round_report.json"
+    result = _run([
+        "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "round2",
+        "--out", str(out), "--demult", str(demux),
+        "--otu-def", str(tmp_path / "round2" / "RTBioScan_otu_def_rpt.txt"),
+        "--otu-sizes-round", str(tmp_path / "round2" / "RTBioScan_otu_sizes_round.tsv"),
+        "--otu-lock-summary", str(lock), "--blast-otu", str(cumulative),
+        "--blast-otu-cumulative", str(cumulative),
+    ])
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert otu_keys == {"round1": "OTUB_1-COI", "round2": "OTUB_0-COI"}
+    assert row["otu_count"] == 1
+    assert row["reads_total"] == 6
+
+
+def test_main_002_valid_empty_membership_disables_historical_fallback(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_def_rows="",
+        otu_size=1,
+    )
+    assert data["otu"]["assignments_by_level"]["species"] == []
+
+
+def test_main_002_unavailable_membership_preserves_historical_fallback(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_size=1,
+    )
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["otu_count"] == 1
+    assert row["reads_total"] == 1
+
+
+def test_main_002_duplicate_current_membership_counts_distinct_reads(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="rep1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_def_rows="rep1\tsample_A\tOTUB_F-COI\tREPRESENTATIVE\n" * 10,
+        otu_size=1,
+    )
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["reads_total"] == 1
+    assert row["otu_reads_global_total"] == 1
+
+
+def test_main_002_duplicate_frozen_membership_counts_distinct_reads(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows="rep1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        otu_def_rows="rep1\tsample_A\tOTUB_F-COI\tREPRESENTATIVE\n",
+        frozen_member_rows="FROZEN_h1\trep1|COI|sup|barcode=|adapter=sample_A\t0\n" * 10,
+        otu_size=1,
+    )
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["reads_total"] == 1
+    assert row["otu_reads_global_total"] == 1
+
+
+def test_main_002_conflicting_current_and_frozen_membership_is_fatal(tmp_path: Path) -> None:
+    cases = (
+        (
+            "current_otu",
+            "r1\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\nr1\tsample_A\tOTUB_B-COI\tMEMBER\n",
+            None,
+        ),
+        (
+            "current_sample",
+            "r1\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\nr1\tsample_B\tOTUB_A-COI\tMEMBER\n",
+            None,
+        ),
+        (
+            "frozen_sample",
+            "rep1\tno_adapter\tOTUB_A-COI\tREPRESENTATIVE\n",
+            "FROZEN_h1\tr1|COI|sup|barcode=|adapter=sample_A\t0\nFROZEN_h1\tr1|COI|sup|barcode=|adapter=sample_B\t0\n",
+        ),
+    )
+    for name, otu_rows, frozen_rows in cases:
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        blast = case_dir / "blast.tsv"
+        blast.write_text(
+            "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+            "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n",
+            encoding="utf-8",
+        )
+        otu_def = case_dir / "otu_def.tsv"
+        otu_def.write_text("read_id\tsample\tOTU_id\tOTU_role\n" + otu_rows, encoding="utf-8")
+        sizes = case_dir / "sizes.tsv"
+        sizes.write_text("otu_id\tsize\nOTUB_A-COI\t1\n", encoding="utf-8")
+        lock = case_dir / "lock.tsv"
+        lock.write_text(
+            "otu_key\teffective_consolidated\tis_frozen\n"
+            + ("OTUB_A-COI\t0\t1\n" if frozen_rows is not None else "OTUB_A-COI\t0\t0\n"),
+            encoding="utf-8",
+        )
+        if frozen_rows is not None:
+            state_dir = case_dir / "_state"
+            state_dir.mkdir()
+            (case_dir / "RTBioScan_otu_hash_map.tsv").write_text("rep1\th1\n", encoding="utf-8")
+            (state_dir / "otu_frozen_meta.tsv").write_text("FROZEN_h1\trep1\th1\n", encoding="utf-8")
+            (state_dir / "otu_frozen_members.tsv").write_text(frozen_rows, encoding="utf-8")
+        result = _run([
+            "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "output_round_1",
+            "--out", str(case_dir / "out.json"), "--blast-otu", str(blast),
+            "--otu-def", str(otu_def), "--otu-sizes-round", str(sizes),
+            "--otu-lock-summary", str(lock),
+        ])
+        assert result.returncode != 0, name
+        assert "conflicting rows for read_id 'r1'" in result.stderr
+
+
+def test_main_002_explicit_frozen_and_consolidated_otus_are_retained_once(tmp_path: Path) -> None:
+    data = _run_frozen_assignment_case(
+        tmp_path,
+        blast_rows=(
+            "f1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n"
+            "c1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_C-COI\tF1\tG1\tS1\n"
+            "a1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n"
+        ),
+        otu_def_rows=(
+            "rep1\tno_adapter\tOTUB_F-COI\tREPRESENTATIVE\n"
+            "a1\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\n"
+        ),
+        frozen_member_rows="FROZEN_h1\tf1|COI|sup|barcode=|adapter=sample_A\t0\n",
+        otu_sizes_rows="OTUB_F-COI\t1\nOTUB_C-COI\t1\nOTUB_A-COI\t1\n",
+        lock_summary_rows="OTUB_F-COI\t0\t1\nOTUB_C-COI\t1\t0\nOTUB_A-COI\t0\t0\n",
+    )
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["otu_count"] == 3
+    assert row["reads_total"] == 3
+    assert row["frozen_otu_count"] == 1
+    assert row["frozen_otu_reads_total"] == 1
+
+
+def _run_main_002_consensus_case(tmp_path: Path, current_ids: list[str], consolidated_ids: list[str]) -> dict:
+    header = (
+        "consensus_id\tsample\tbarcode_by_homology\tnumber_of_reads\tperc_id\taln_length"
+        "\tconsensus_family\tconsensus_genus\tconsensus_species\n"
+    )
+    current = tmp_path / "current.tsv"
+    current.write_text(
+        header + "".join(f"{cons_id}\tsample_A\tCOI\t5\t99\t100\tF\tG\tS\n" for cons_id in current_ids),
+        encoding="utf-8",
+    )
+    consolidated = tmp_path / "consolidated.tsv"
+    consolidated.write_text(
+        header + "".join(f"{cons_id}\tsample_A\tCOI\t5\t99\t100\tF\tG\tS\n" for cons_id in consolidated_ids),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.json"
+    result = _run([
+        "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "output_round_1",
+        "--out", str(out), "--blast-consensus", str(current),
+        "--blast-consensus-consolidated", str(consolidated),
+    ])
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    return next(entry for entry in data["sample_metrics"].values() if entry["label"] == "sample_A")
+
+
+def test_main_002_overlapping_consensus_ids_use_unique_total(tmp_path: Path) -> None:
+    entry = _run_main_002_consensus_case(tmp_path, ["Consensus1"], ["Consensus1"])
+    assert entry["consensus_emitted"] == 1
+    assert entry["consensus_consolidated"] == 1
+    assert entry["consensus_total"] == 1
+
+
+def test_main_002_disjoint_consensus_ids_retain_additive_total(tmp_path: Path) -> None:
+    entry = _run_main_002_consensus_case(tmp_path, ["Consensus1"], ["Consensus2"])
+    assert entry["consensus_emitted"] == 1
+    assert entry["consensus_consolidated"] == 1
+    assert entry["consensus_total"] == 2
+
+
+def _run_main_002_current_frozen_overlap(
+    tmp_path: Path,
+    *,
+    current_otu: str,
+    current_sample: str,
+    frozen_otu: str,
+    frozen_sample: str,
+    frozen_selected: bool = True,
+    blast_samples: list[str] | None = None,
+    also_consolidated: bool = False,
+    reverse_blast: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    same_otu = current_otu == frozen_otu
+    representative = "r1" if same_otu else "repF"
+    otu_def_rows = (
+        f"r1\t{current_sample}\t{current_otu}\t{'REPRESENTATIVE' if same_otu else 'MEMBER'}\n"
+    )
+    if not same_otu:
+        otu_def_rows = f"repF\tno_adapter\t{frozen_otu}\tREPRESENTATIVE\n" + otu_def_rows
+
+    blast_rows = []
+    if blast_samples is None:
+        blast_rows.append(
+            f"r1\tCOI\thac\t{current_sample}\thit\t123\t100\t99\t{current_otu}\tF1\tG1\tS1\n"
+        )
+        if current_otu != frozen_otu or current_sample != frozen_sample:
+            blast_rows.append(
+                f"r1\tCOI\thac\t{frozen_sample}\thit\t123\t100\t99\t{frozen_otu}\tF1\tG1\tS1\n"
+            )
+    else:
+        blast_rows.extend(
+            f"r1{' metadata' if index else ''}\tCOI\thac\t{sample}\thit\t123\t100\t99\t{frozen_otu}\tF1\tG1\tS1\n"
+            for index, sample in enumerate(blast_samples)
+        )
+    if reverse_blast:
+        blast_rows.reverse()
+    blast = tmp_path / "blast.tsv"
+    blast.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        + "".join(blast_rows),
+        encoding="utf-8",
+    )
+    otu_def = tmp_path / "members.tsv"
+    otu_def.write_text(
+        "read_id\tsample\tOTU_id\tOTU_role\n" + otu_def_rows,
+        encoding="utf-8",
+    )
+    lock = tmp_path / "lock.tsv"
+    lock.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n"
+        + f"{frozen_otu}\t0\t{1 if frozen_selected else 0}\n"
+        + (f"{frozen_otu}\t1\t0\n" if also_consolidated else "")
+        + ("" if same_otu else f"{current_otu}\t0\t0\n"),
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "_state"
+    state_dir.mkdir()
+    (tmp_path / "RTBioScan_otu_hash_map.tsv").write_text(
+        f"{representative}\th1\n",
+        encoding="utf-8",
+    )
+    (state_dir / "otu_frozen_meta.tsv").write_text(
+        f"FROZEN_h1\t{representative}\th1\n",
+        encoding="utf-8",
+    )
+    (state_dir / "otu_frozen_members.tsv").write_text(
+        f"FROZEN_h1\tr1|COI|hac|barcode=COI|adapter={frozen_sample}\t0\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.json"
+    result = _run([
+        "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "output_round_1",
+        "--out", str(out), "--blast-otu", str(blast), "--otu-def", str(otu_def),
+        "--otu-lock-summary", str(lock),
+    ])
+    return result, out
+
+
+def test_main_002_current_frozen_incompatible_effective_otus_are_fatal(tmp_path: Path) -> None:
+    result, _ = _run_main_002_current_frozen_overlap(
+        tmp_path,
+        current_otu="OTUB_A-COI",
+        current_sample="sample_A",
+        frozen_otu="OTUB_F-COI",
+        frozen_sample="sample_A",
+    )
+    assert result.returncode != 0
+    assert "conflicting effective OTUs for read_id 'r1'" in result.stderr
+
+
+def test_main_002_current_frozen_incompatible_samples_are_fatal(tmp_path: Path) -> None:
+    result, _ = _run_main_002_current_frozen_overlap(
+        tmp_path,
+        current_otu="OTUB_F-COI",
+        current_sample="sample_A",
+        frozen_otu="OTUB_F-COI",
+        frozen_sample="sample_B",
+    )
+    assert result.returncode != 0
+    assert "conflicting samples for read_id 'r1'" in result.stderr
+
+
+def test_main_002_current_frozen_same_assignment_is_represented_once(tmp_path: Path) -> None:
+    result, out = _run_main_002_current_frozen_overlap(
+        tmp_path,
+        current_otu="OTUB_F-COI",
+        current_sample="sample_A",
+        frozen_otu="OTUB_F-COI",
+        frozen_sample="sample_A",
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["otu_count"] == 1
+    assert row["reads_total"] == 1
+    assert row["frozen_otu_reads_total"] == 1
+
+
+def test_main_002_frozen_sample_authority_overrides_current_no_adapter(tmp_path: Path) -> None:
+    result, out = _run_main_002_current_frozen_overlap(
+        tmp_path,
+        current_otu="OTUB_F-COI",
+        current_sample="no_adapter",
+        frozen_otu="OTUB_F-COI",
+        frozen_sample="sample_A",
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["otu_count"] == 1
+    assert row["reads_total"] == 1
+    assert not any(
+        candidate.get("sample") == "no_adapter"
+        for candidate in data["otu"]["assignments_by_level"]["species"]
+    )
+
+
+def _run_main_002_sampleless_membership(
+    tmp_path: Path,
+    blast_rows: str,
+    *,
+    extra_args: list[str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    blast = tmp_path / "blast.tsv"
+    blast.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        + blast_rows,
+        encoding="utf-8",
+    )
+    membership = tmp_path / "members.tsv"
+    membership.write_text(
+        "read_id\tsample\tOTU_id\tOTU_role\nr1\t\tOTUB_A-COI\tMEMBER\n",
+        encoding="utf-8",
+    )
+    lock = tmp_path / "lock.tsv"
+    lock.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\nOTUB_A-COI\t0\t0\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.json"
+    args = [
+        "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "output_round_1",
+        "--out", str(out), "--blast-otu", str(blast), "--otu-def", str(membership),
+        "--otu-lock-summary", str(lock),
+    ]
+    if extra_args:
+        args.extend(extra_args)
+    return _run(args), out
+
+
+def test_main_002_membership_intersection_normalizes_whitespace_metadata(tmp_path: Path) -> None:
+    result, out = _run_main_002_sampleless_membership(
+        tmp_path,
+        "r1 metadata\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n",
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["reads_total"] == 1
+
+
+def test_main_002_sampleless_member_conflicting_blast_samples_is_fatal(tmp_path: Path) -> None:
+    result, _ = _run_main_002_sampleless_membership(
+        tmp_path,
+        "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n"
+        "r1\tCOI\thac\tsample_B\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n",
+    )
+    assert result.returncode != 0
+    assert "conflicting samples for read_id 'r1'" in result.stderr
+
+
+def test_main_002_repeated_normalized_blast_assignment_is_idempotent(tmp_path: Path) -> None:
+    result, out = _run_main_002_sampleless_membership(
+        tmp_path,
+        "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n"
+        "r1 metadata\tCOI\thac\tsample_A\thit\t123\t100\t98\tOTUB_A-COI\tF1\tG1\tS1\n",
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["otu_count"] == 1
+    assert row["reads_total"] == 1
+
+
+def test_main_002_one_read_reconciles_to_one_effective_sample(tmp_path: Path) -> None:
+    result, out = _run_main_002_sampleless_membership(
+        tmp_path,
+        "r1\tCOI\thac\tsample_A_1\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n"
+        "r1 metadata\tCOI\thac\tsample_A_2\thit\t123\t100\t98\tOTUB_A-COI\tF1\tG1\tS1\n",
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    rows = data["otu"]["assignments_by_level"]["species"]
+    assert [(row["sample"], row["reads_total"]) for row in rows] == [("sample_A", 1)]
+
+
+def test_main_002_g01_unselected_frozen_mapping_is_ignored(tmp_path: Path) -> None:
+    result, out = _run_main_002_current_frozen_overlap(
+        tmp_path,
+        current_otu="OTUB_A-COI",
+        current_sample="sample_A",
+        frozen_otu="OTUB_A-COI",
+        frozen_sample="sample_B",
+        frozen_selected=False,
+        blast_samples=["sample_A", "sample_B"],
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    rows = data["otu"]["assignments_by_level"]["species"]
+    assert [(row["sample"], row["otu_count"], row["reads_total"]) for row in rows] == [
+        ("sample_A", 1, 1)
+    ]
+
+
+def test_main_002_g02_frozen_authority_ignores_historical_sample_conflict(tmp_path: Path) -> None:
+    result, out = _run_main_002_current_frozen_overlap(
+        tmp_path,
+        current_otu="OTUB_F-COI",
+        current_sample="",
+        frozen_otu="OTUB_F-COI",
+        frozen_sample="sample_A",
+        blast_samples=["sample_A", "sample_B"],
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    rows = data["otu"]["assignments_by_level"]["species"]
+    assert [(row["sample"], row["reads_total"], row["frozen_otu_reads_total"]) for row in rows] == [
+        ("sample_A", 1, 1)
+    ]
+
+
+def _run_main_002_consolidated_selection(
+    tmp_path: Path,
+    *,
+    membership_rows: str | None,
+    blast_rows: str,
+    lock_rows: str,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    blast = tmp_path / "blast.tsv"
+    blast.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        + blast_rows,
+        encoding="utf-8",
+    )
+    lock = tmp_path / "lock.tsv"
+    lock.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n" + lock_rows,
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.json"
+    args = [
+        "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "output_round_1",
+        "--out", str(out), "--blast-otu", str(blast),
+        "--otu-lock-summary", str(lock),
+    ]
+    if membership_rows is not None:
+        membership = tmp_path / "members.tsv"
+        membership.write_text(
+            "read_id\tsample\tOTU_id\tOTU_role\n" + membership_rows,
+            encoding="utf-8",
+        )
+        args.extend(["--otu-def", str(membership)])
+    result = _run(args)
+    return result, out
+
+
+def _run_main_002_membership_header_case(
+    tmp_path: Path,
+    membership_content: bytes | None,
+    *,
+    membership_path_is_directory: bool = False,
+    blast_read_id: str = "r1",
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    blast = tmp_path / "blast.tsv"
+    blast.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\t"
+        "aln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        f"{blast_read_id}\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n",
+        encoding="utf-8",
+    )
+    lock = tmp_path / "lock.tsv"
+    lock.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\nOTUB_A-COI\t0\t0\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.json"
+    args = [
+        "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "output_round_1",
+        "--out", str(out), "--blast-otu", str(blast), "--otu-lock-summary", str(lock),
+    ]
+    if membership_content is not None or membership_path_is_directory:
+        membership = tmp_path / "members.tsv"
+        if membership_path_is_directory:
+            membership.mkdir()
+        else:
+            membership.write_bytes(membership_content or b"")
+        args.extend(["--otu-def", str(membership)])
+    return _run(args), out
+
+
+def test_main_002_n01_membership_header_availability_contract(tmp_path: Path) -> None:
+    unavailable_cases = {
+        "absent": (None, False),
+        "zero_byte": (b"", False),
+        "unreadable_source": (None, True),
+        "malformed": (b"wrong\tcolumns\nr1\tOTUB_A-COI\n", False),
+    }
+    for name, (content, is_directory) in unavailable_cases.items():
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        result, out = _run_main_002_membership_header_case(
+            case_dir,
+            content,
+            membership_path_is_directory=is_directory,
+        )
+        assert result.returncode == 0, result.stderr
+        rows = json.loads(out.read_text(encoding="utf-8"))["otu"]["assignments_by_level"]["species"]
+        assert [(entry["sample"], entry["otu_count"], entry["reads_total"]) for entry in rows] == [
+            ("sample_A", 1, 1)
+        ]
+
+    available_cases = {
+        "header_only": b"read_id\tsample\tOTU_id\tOTU_role\n",
+        "populated": (
+            b"read_id\tsample\tOTU_id\tOTU_role\n"
+            b"r1\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\n"
+        ),
+        "crlf": (
+            b"read_id\tsample\tOTU_id\tOTU_role\r\n"
+            b"r1\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\r\n"
+        ),
+        "repeated_header": (
+            b"read_id\tsample\tOTU_id\tOTU_role\n"
+            b"read_id\tsample\tOTU_id\tOTU_role\n"
+            b"r1\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\n"
+        ),
+    }
+    for name, content in available_cases.items():
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        result, out = _run_main_002_membership_header_case(case_dir, content)
+        assert result.returncode == 0, result.stderr
+        rows = json.loads(out.read_text(encoding="utf-8"))["otu"]["assignments_by_level"]["species"]
+        if name == "header_only":
+            assert rows == []
+        else:
+            assert [(entry["sample"], entry["otu_count"], entry["reads_total"]) for entry in rows] == [
+                ("sample_A", 1, 1)
+            ]
+
+    bare_cr_cases = {
+        "header_only_bare_cr": b"read_id\tsample\tOTU_id\tOTU_role\r",
+        "populated_bare_cr": (
+            b"read_id\tsample\tOTU_id\tOTU_role\r"
+            b"r1\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\r"
+        ),
+    }
+    for name, content in bare_cr_cases.items():
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        result, out = _run_main_002_membership_header_case(case_dir, content)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(out.read_text(encoding="utf-8"))["otu"]["assignments_by_level"]["species"] == []
+
+
+def test_main_002_n01_logical_header_line_endings_exclude_stale_history(tmp_path: Path) -> None:
+    for name, newline in (("lf", b"\n"), ("crlf", b"\r\n"), ("bare_cr", b"\r")):
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        membership = newline.join((
+            b"read_id\tOTU_id",
+            b"current_read\tOTUB_A-COI",
+            b"",
+        ))
+        result, out = _run_main_002_membership_header_case(
+            case_dir,
+            membership,
+            blast_read_id="stale_read",
+        )
+        assert result.returncode == 0, result.stderr
+        assignments = json.loads(out.read_text(encoding="utf-8"))["otu"]["assignments_by_level"]
+        for level in ("species", "genus", "family"):
+            assert assignments[level] == []
+
+
+def test_main_002_n01_header_probe_does_not_fill_file_text_cache(tmp_path: Path) -> None:
+    membership = tmp_path / "large_members.tsv"
+    membership.write_bytes(
+        b"read_id\tOTU_id\n"
+        + b"ignored_read\tOTUB_A-COI\n" * 60000
+    )
+    source = SCRIPT.read_text(encoding="utf-8")
+    cache_start = source.index("sub cached_file_text {")
+    cache_end = source.index("\nsub parse_pipe_values", cache_start)
+    loader_start = source.index("sub read_otu_membership_header {")
+    loader_end = source.index("\nsub load_canonical_otu_taxonomy", loader_start)
+    perl_program = rf"""
+use strict;
+use warnings;
+my %opt = (otu_def => $ARGV[0], identity_mode => 'collapse');
+my %file_text_cache;
+sub trim_text {{
+  my ($value) = @_;
+  $value = '' unless defined $value;
+  $value =~ s/^\s+|\s+$//g;
+  return $value;
+}}
+sub header_index_fallback {{
+  my ($idx, @keys) = @_;
+  for my $key (@keys) {{
+    return $idx->{{$key}} if exists $idx->{{$key}};
+    return $idx->{{lc($key)}} if exists $idx->{{lc($key)}};
+  }}
+  return undef;
+}}
+sub get_parsed_rows {{ return []; }}
+sub canonical_otu_alias {{ return $_[0]; }}
+sub normalize_lock_otu_key {{ return $_[0]; }}
+{source[cache_start:cache_end]}
+{source[loader_start:loader_end]}
+my @maps = load_otu_membership_maps({{}});
+my $cached_bytes = exists $file_text_cache{{$opt{{otu_def}}}}
+  ? length($file_text_cache{{$opt{{otu_def}}}})
+  : 0;
+print "$maps[6]\t$cached_bytes\n";
+"""
+    result = subprocess.run(
+        ["perl", "-e", perl_program, str(membership)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "1\t0\n"
+
+
+def test_main_002_n01_empty_alias_map_skips_lock_key_normalization() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    start = source.index("sub canonical_otu_alias {")
+    end = source.index("\nsub load_otu_membership_maps", start)
+    function_source = source[start:end]
+    perl_program = rf"""
+my $normalization_calls = 0;
+sub normalize_lock_otu_key {{
+  $normalization_calls++;
+  return $_[0] eq 'OTUB_A-COI-extra' ? 'OTUB_A-COI' : $_[0];
+}}
+{function_source}
+my %empty;
+die 'undef alias map changed OTU' unless canonical_otu_alias('OTUB_A-COI-extra', undef) eq 'OTUB_A-COI-extra';
+die 'non-hash alias map changed OTU' unless canonical_otu_alias('OTUB_A-COI-extra', []) eq 'OTUB_A-COI-extra';
+die 'empty alias map changed OTU' unless canonical_otu_alias('OTUB_A-COI-extra', \%empty) eq 'OTUB_A-COI-extra';
+die 'empty alias map normalized lock key' unless $normalization_calls == 0;
+my %aliases = ('OTUB_A-COI' => 'OTUB_Z-COI');
+die 'direct alias failed' unless canonical_otu_alias('OTUB_A-COI', \%aliases) eq 'OTUB_Z-COI';
+die 'direct alias normalized lock key' unless $normalization_calls == 0;
+die 'normalized alias failed' unless canonical_otu_alias('OTUB_A-COI-extra', \%aliases) eq 'OTUB_Z-COI';
+die 'normalized alias call count changed' unless $normalization_calls == 1;
+die 'alias miss changed OTU' unless canonical_otu_alias('OTUB_X-COI', \%aliases) eq 'OTUB_X-COI';
+die 'alias miss did not normalize once' unless $normalization_calls == 2;
+"""
+    result = subprocess.run(
+        ["perl", "-e", perl_program],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_main_002_g03_consolidated_fallback_rejects_two_effective_otus(tmp_path: Path) -> None:
+    result, _ = _run_main_002_consolidated_selection(
+        tmp_path,
+        membership_rows="r1\tsample_A\tOTUB_A-COI\tMEMBER\n",
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n"
+            "r1 metadata\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_C-COI\tF1\tG1\tS1\n"
+        ),
+        lock_rows="OTUB_A-COI\t0\t0\nOTUB_C-COI\t1\t0\n",
+    )
+    assert result.returncode != 0
+    assert "conflicting effective OTUs for read_id 'r1'" in result.stderr
+
+
+def test_main_002_g03_consolidated_fallback_rejects_two_samples(tmp_path: Path) -> None:
+    result, _ = _run_main_002_consolidated_selection(
+        tmp_path,
+        membership_rows="",
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_C-COI\tF1\tG1\tS1\n"
+            "r1 metadata\tCOI\thac\tsample_B\thit\t123\t100\t99\tOTUB_C-COI\tF1\tG1\tS1\n"
+        ),
+        lock_rows="OTUB_C-COI\t1\t0\n",
+    )
+    assert result.returncode != 0
+    assert "conflicting samples for read_id 'r1'" in result.stderr
+
+
+def test_main_002_g03_compatible_current_frozen_consolidated_overlap_counts_once(tmp_path: Path) -> None:
+    result, out = _run_main_002_current_frozen_overlap(
+        tmp_path,
+        current_otu="OTUB_F-COI",
+        current_sample="sample_A",
+        frozen_otu="OTUB_F-COI",
+        frozen_sample="sample_A",
+        also_consolidated=True,
+        blast_samples=["sample_A", "sample_A"],
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    row = _otu_species_row_by_sample(data, "sample_A")
+    assert row["otu_count"] == 1
+    assert row["reads_total"] == 1
+    assert row["frozen_otu_reads_total"] == 1
+
+
+def test_main_002_g03_unselected_history_does_not_conflict(tmp_path: Path) -> None:
+    result, out = _run_main_002_consolidated_selection(
+        tmp_path,
+        membership_rows="r1\tsample_A\tOTUB_A-COI\tMEMBER\n",
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n"
+            "r1 metadata\tCOI\thac\tsample_B\thit\t123\t100\t99\tOTUB_H-COI\tF1\tG1\tS1\n"
+        ),
+        lock_rows="OTUB_A-COI\t0\t0\n",
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    rows = data["otu"]["assignments_by_level"]["species"]
+    assert [(row["sample"], row["reads_total"]) for row in rows] == [("sample_A", 1)]
+
+
+def test_main_002_g_selection_and_conflicts_are_row_order_independent(tmp_path: Path) -> None:
+    selected_rows = []
+    for reverse in (False, True):
+        case_dir = tmp_path / f"unselected_{reverse}"
+        case_dir.mkdir()
+        result, out = _run_main_002_current_frozen_overlap(
+            case_dir,
+            current_otu="OTUB_A-COI",
+            current_sample="sample_A",
+            frozen_otu="OTUB_A-COI",
+            frozen_sample="sample_B",
+            frozen_selected=False,
+            blast_samples=["sample_A", "sample_B"],
+            reverse_blast=reverse,
+        )
+        assert result.returncode == 0, result.stderr
+        data = json.loads(out.read_text(encoding="utf-8"))
+        selected_rows.append(data["otu"]["assignments_by_level"]["species"])
+    assert selected_rows[0] == selected_rows[1]
+
+    errors = []
+    conflicting_rows = [
+        "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n",
+        "r1 metadata\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_C-COI\tF1\tG1\tS1\n",
+    ]
+    for reverse in (False, True):
+        case_dir = tmp_path / f"consolidated_{reverse}"
+        case_dir.mkdir()
+        rows = list(reversed(conflicting_rows)) if reverse else conflicting_rows
+        result, _ = _run_main_002_consolidated_selection(
+            case_dir,
+            membership_rows="r1\tsample_A\tOTUB_A-COI\tMEMBER\n",
+            blast_rows="".join(rows),
+            lock_rows="OTUB_A-COI\t0\t0\nOTUB_C-COI\t1\t0\n",
+        )
+        assert result.returncode != 0
+        errors.append(result.stderr)
+    assert all("conflicting effective OTUs for read_id 'r1'" in error for error in errors)
+
+
+def _run_main_002_h_frozen_selection_case(
+    tmp_path: Path,
+    *,
+    unselected_member_rows: list[str],
+    reverse_members: bool,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    blast = tmp_path / "blast.tsv"
+    blast.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_F-COI\tF1\tG1\tS1\n",
+        encoding="utf-8",
+    )
+    membership = tmp_path / "members.tsv"
+    membership.write_text(
+        "read_id\tsample\tOTU_id\tOTU_role\n"
+        "repF\tno_adapter\tOTUB_F-COI\tREPRESENTATIVE\n"
+        "repU\tno_adapter\tOTUB_U-COI\tREPRESENTATIVE\n",
+        encoding="utf-8",
+    )
+    lock = tmp_path / "lock.tsv"
+    lock.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n"
+        "OTUB_F-COI\t0\t1\n"
+        "OTUB_U-COI\t0\t0\n",
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "_state"
+    state_dir.mkdir()
+    (tmp_path / "RTBioScan_otu_hash_map.tsv").write_text(
+        "repF\thF\nrepU\thU\n",
+        encoding="utf-8",
+    )
+    (state_dir / "otu_frozen_meta.tsv").write_text(
+        "FROZEN_f\trepF\thF\nFROZEN_u\trepU\thU\n",
+        encoding="utf-8",
+    )
+    member_rows = [
+        "FROZEN_f\tr1|COI|hac|barcode=COI|adapter=sample_A\t0\n",
+        *unselected_member_rows,
+    ]
+    if reverse_members:
+        member_rows.reverse()
+    (state_dir / "otu_frozen_members.tsv").write_text(
+        "".join(member_rows),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.json"
+    result = _run([
+        "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "output_round_1",
+        "--out", str(out), "--blast-otu", str(blast), "--otu-def", str(membership),
+        "--otu-lock-summary", str(lock),
+    ])
+    return result, out
+
+
+def test_main_002_h01_unselected_frozen_conflicts_are_not_validated(tmp_path: Path) -> None:
+    cases = {
+        "selected_overlap": [
+            "FROZEN_u\tr1 metadata|COI|hac|barcode=COI|adapter=sample_B\t0\n",
+        ],
+        "unselected_internal": [
+            "FROZEN_u\tunused|COI|hac|barcode=COI|adapter=sample_B\t0\n",
+            "FROZEN_u\tunused metadata|COI|hac|barcode=COI|adapter=sample_C\t0\n",
+        ],
+    }
+    for case_name, unselected_rows in cases.items():
+        for reverse in (False, True):
+            case_dir = tmp_path / f"{case_name}_{reverse}"
+            case_dir.mkdir()
+            result, out = _run_main_002_h_frozen_selection_case(
+                case_dir,
+                unselected_member_rows=unselected_rows,
+                reverse_members=reverse,
+            )
+            assert result.returncode == 0, result.stderr
+            data = json.loads(out.read_text(encoding="utf-8"))
+            rows = data["otu"]["assignments_by_level"]["species"]
+            assert [(row["sample"], row["otu_count"], row["reads_total"]) for row in rows] == [
+                ("sample_A", 1, 1)
+            ]
+
+
+def test_main_002_h01_selected_frozen_effective_otu_conflict_remains_fatal(tmp_path: Path) -> None:
+    blast = tmp_path / "blast.tsv"
+    blast.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n",
+        encoding="utf-8",
+    )
+    membership = tmp_path / "members.tsv"
+    membership.write_text(
+        "read_id\tsample\tOTU_id\tOTU_role\n"
+        "repA\tno_adapter\tOTUB_A-COI\tREPRESENTATIVE\n"
+        "repB\tno_adapter\tOTUB_B-COI\tREPRESENTATIVE\n",
+        encoding="utf-8",
+    )
+    lock = tmp_path / "lock.tsv"
+    lock.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n"
+        "OTUB_A-COI\t0\t1\n"
+        "OTUB_B-COI\t0\t1\n",
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "_state"
+    state_dir.mkdir()
+    (tmp_path / "RTBioScan_otu_hash_map.tsv").write_text(
+        "repA\thA\nrepB\thB\n",
+        encoding="utf-8",
+    )
+    (state_dir / "otu_frozen_meta.tsv").write_text(
+        "FROZEN_a\trepA\thA\nFROZEN_b\trepB\thB\n",
+        encoding="utf-8",
+    )
+    (state_dir / "otu_frozen_members.tsv").write_text(
+        "FROZEN_a\tr1|COI|hac|barcode=COI|adapter=sample_A\t0\n"
+        "FROZEN_b\tr1 metadata|COI|hac|barcode=COI|adapter=sample_A\t0\n",
+        encoding="utf-8",
+    )
+    result = _run([
+        "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "output_round_1",
+        "--out", str(tmp_path / "out.json"), "--blast-otu", str(blast),
+        "--otu-def", str(membership), "--otu-lock-summary", str(lock),
+    ])
+    assert result.returncode != 0
+    assert "conflicting rows for read_id 'r1'" in result.stderr
+
+
+def test_main_002_h02_named_sample_replaces_fallback_placeholders(tmp_path: Path) -> None:
+    for placeholder in ("", "unknown", "no_adapter"):
+        rows = [
+            f"r1\tCOI\thac\t{placeholder}\thit\t123\t100\t99\tOTUB_C-COI\tF1\tG1\tS1\n",
+            "r1 metadata\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_C-COI\tF1\tG1\tS1\n",
+        ]
+        for reverse in (False, True):
+            case_dir = tmp_path / f"{placeholder or 'blank'}_{reverse}"
+            case_dir.mkdir()
+            result, out = _run_main_002_consolidated_selection(
+                case_dir,
+                membership_rows="",
+                blast_rows="".join(reversed(rows) if reverse else rows),
+                lock_rows="OTUB_C-COI\t1\t0\n",
+            )
+            assert result.returncode == 0, result.stderr
+            data = json.loads(out.read_text(encoding="utf-8"))
+            output_rows = data["otu"]["assignments_by_level"]["species"]
+            assert [(row["sample"], row["otu_count"], row["reads_total"]) for row in output_rows] == [
+                ("sample_A", 1, 1)
+            ]
+
+
+def test_main_002_h03_unavailable_membership_validates_selected_rows(tmp_path: Path) -> None:
+    rows = [
+        "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_A-COI\tF1\tG1\tS1\n",
+        "r1 metadata\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_C-COI\tF1\tG1\tS1\n",
+    ]
+    for reverse in (False, True):
+        case_dir = tmp_path / str(reverse)
+        case_dir.mkdir()
+        result, _ = _run_main_002_consolidated_selection(
+            case_dir,
+            membership_rows=None,
+            blast_rows="".join(reversed(rows) if reverse else rows),
+            lock_rows="OTUB_A-COI\t0\t0\nOTUB_C-COI\t1\t0\n",
+        )
+        assert result.returncode != 0
+        assert "conflicting effective OTUs for read_id 'r1'" in result.stderr
+
+
+def test_main_002_h03_unavailable_membership_excludes_unselected_history(tmp_path: Path) -> None:
+    rows = [
+        "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_C-COI\tF1\tG1\tS1\n",
+        "r1 metadata\tCOI\thac\tsample_B\thit\t123\t100\t99\tOTUB_U-COI\tF1\tG1\tS1\n",
+    ]
+    for reverse in (False, True):
+        case_dir = tmp_path / str(reverse)
+        case_dir.mkdir()
+        result, out = _run_main_002_consolidated_selection(
+            case_dir,
+            membership_rows=None,
+            blast_rows="".join(reversed(rows) if reverse else rows),
+            lock_rows="OTUB_C-COI\t1\t0\n",
+        )
+        assert result.returncode == 0, result.stderr
+        data = json.loads(out.read_text(encoding="utf-8"))
+        output_rows = data["otu"]["assignments_by_level"]["species"]
+        assert [(row["sample"], row["otu_count"], row["reads_total"]) for row in output_rows] == [
+            ("sample_A", 1, 1)
+        ]
+
+
+def test_main_002_h03_compatible_fallback_overlap_counts_normalized_read_once(tmp_path: Path) -> None:
+    result, out = _run_main_002_consolidated_selection(
+        tmp_path,
+        membership_rows=None,
+        blast_rows=(
+            "r1\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_C-COI\tF1\tG1\tS1\n"
+            "r1 metadata\tCOI\thac\tsample_A\thit\t123\t100\t98\tOTUB_C-COI\tF1\tG1\tS1\n"
+        ),
+        lock_rows="OTUB_C-COI\t1\t0\n",
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    rows = data["otu"]["assignments_by_level"]["species"]
+    assert [(row["sample"], row["otu_count"], row["reads_total"]) for row in rows] == [
+        ("sample_A", 1, 1)
+    ]
+
+
+def _run_main_002_i01_producer_chain(
+    tmp_path: Path,
+    *,
+    reverse_alias_blocks: bool,
+    alias_lock_rows: tuple[tuple[int, int, int], ...] | None = None,
+    blast_alias_mode: str = "later",
+) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
+    cluster = tmp_path / "active.clstr"
+    cluster.write_text(
+        ">Cluster 0\n"
+        "0\t300nt, >r1|COI|hac|barcode=COI|adapter=sample_A... *\n"
+        "1\t298nt, >r2|COI|hac|barcode=COI|adapter=sample_A... at +/99.00%\n"
+        "2\t297nt, >r3|COI|hac|barcode=COI|adapter=sample_A... at +/98.50%\n"
+        ">Cluster 1\n"
+        "0\t310nt, >r4|COI|hac|barcode=COI|adapter=sample_A... *\n"
+        "1\t309nt, >r5|COI|hac|barcode=COI|adapter=sample_A... at +/99.00%\n",
+        encoding="utf-8",
+    )
+    active_members = tmp_path / "active_members.tsv"
+    subprocess.run(
+        [
+            "perl", str(REPO_ROOT / "bin" / "otu_parse_clstr.pl"),
+            str(cluster), str(active_members), str(tmp_path / "active_counts.tsv"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    state_dir = tmp_path / "_state"
+    state_dir.mkdir()
+    promoted = tmp_path / "promoted.tsv"
+    promoted.write_text("CLUST_0\n", encoding="utf-8")
+    frozen_meta = state_dir / "otu_frozen_meta.tsv"
+    frozen_meta.write_text(
+        "FROZEN_h1\tr1|COI|hac|barcode=COI|adapter=sample_A\th1\tround7\n",
+        encoding="utf-8",
+    )
+    frozen_members = state_dir / "otu_frozen_members.tsv"
+    frozen_members.write_text(
+        "FROZEN_h1\tr1|COI|hac|barcode=COI|adapter=sample_A\t1\n",
+        encoding="utf-8",
+    )
+    active_hash_map = tmp_path / "RTBioScan_active_hash_map.tsv"
+    active_hash_map.write_text(
+        "".join(
+            f"r{i}|COI|hac|barcode=COI|adapter=sample_A\th{i}\n"
+            for i in range(1, 6)
+        ),
+        encoding="utf-8",
+    )
+    snapshot = tmp_path / "snapshot.tsv"
+    subprocess.run(
+        [
+            "perl", str(REPO_ROOT / "bin" / "otu_snapshot_frozen_members.pl"),
+            str(promoted), str(active_members), str(frozen_meta), str(active_hash_map),
+            str(snapshot), "strict", "pipe_only", "false",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "perl", str(REPO_ROOT / "bin" / "otu_members_append_unique.pl"),
+            str(frozen_members), str(snapshot), str(state_dir / "otu_frozen_members_seen.tsv"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (tmp_path / "RTBioScan_otu_nr_hash_map.tsv").write_text(
+        "r1\th1\nr4\th4\n",
+        encoding="utf-8",
+    )
+    merged = tmp_path / "merged.clstr"
+    subprocess.run(
+        [
+            "perl", str(REPO_ROOT / "bin" / "otu_merge_clstr.pl"),
+            str(frozen_members), str(active_members), str(merged),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    demult = tmp_path / "demult.tsv"
+    demult.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\tsubsample\treplicate\tidentity_scope\tidentity_value\n"
+        + "".join(
+            f"r{i}\tCOI\thac\tsample_A\tunknown\tunknown\tunknown\tunknown\tsample\tsample_A\n"
+            for i in range(1, 6)
+        ),
+        encoding="utf-8",
+    )
+    env = dict(os.environ, RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="full_collapse")
+    subprocess.run(
+        [
+            "perl", str(REPO_ROOT / "bin" / "reporting_otu_definition.pl"),
+            str(merged), str(demult), "round7", "RTBioScan", "COI",
+        ],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    otu_def = tmp_path / "RTBioScan_otu_def_rpt.txt"
+    lines = otu_def.read_text(encoding="utf-8").splitlines()
+    columns = lines[0].split("\t")
+    parsed = [dict(zip(columns, line.split("\t"))) for line in lines[1:]]
+    order = list(dict.fromkeys(row["OTU_id"] for row in parsed))
+    blocks = {
+        otu_id: [line for line, row in zip(lines[1:], parsed) if row["OTU_id"] == otu_id]
+        for otu_id in order
+    }
+    alias_ids = [
+        otu_id
+        for otu_id in order
+        if {row["read_id"] for row in parsed if row["OTU_id"] == otu_id} == {"r1", "r2", "r3"}
+    ]
+    assert alias_ids == ["OTUB_0-COI", "OTUB_2-COI"]
+    if reverse_alias_blocks:
+        order = list(reversed(order))
+        otu_def.write_text(
+            lines[0] + "\n" + "\n".join(line for otu_id in order for line in blocks[otu_id]) + "\n",
+            encoding="utf-8",
+        )
+        alias_ids.reverse()
+
+    lock = tmp_path / "lock.tsv"
+    if alias_lock_rows is None:
+        alias_lock_rows = ((0, 0, 1), (1, 0, 1))
+    lock.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n"
+        "OTUB_1-COI\t0\t0\n"
+        + "".join(
+            f"{alias_ids[index]}\t{consolidated}\t{frozen}\n"
+            for index, consolidated, frozen in alias_lock_rows
+        ),
+        encoding="utf-8",
+    )
+    later_alias = alias_ids[1]
+    blast_aliases = alias_ids if blast_alias_mode == "both" else [later_alias]
+    blast = tmp_path / "blast.tsv"
+    blast.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+        + "".join(
+            f"r{i}\tCOI\thac\tsample_A\thit\t123\t100\t99\t{otu_id}\tF1\tG1\tS1\n"
+            for otu_id in blast_aliases
+            for i in range(1, 4)
+        )
+        + "".join(
+            f"r{i}\tCOI\thac\tsample_A\thit\t123\t100\t99\tOTUB_1-COI\tF1\tG1\tS1\n"
+            for i in range(4, 6)
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.json"
+    result = _run([
+        "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "round7",
+        "--out", str(out), "--demult", str(demult), "--otu-def", str(otu_def),
+        "--otu-sizes-round", str(tmp_path / "RTBioScan_otu_sizes_round.tsv"),
+        "--otu-lock-summary", str(lock), "--blast-otu", str(blast),
+        "--blast-otu-cumulative", str(blast),
+    ])
+    return result, out, alias_ids
+
+
+def test_main_002_i01_producer_promotion_alias_uses_first_encountered_id(tmp_path: Path) -> None:
+    for reverse in (False, True):
+        case_dir = tmp_path / str(reverse)
+        case_dir.mkdir()
+        result, out, alias_ids = _run_main_002_i01_producer_chain(
+            case_dir,
+            reverse_alias_blocks=reverse,
+        )
+        assert result.returncode == 0, result.stderr
+        assert alias_ids[0] == ("OTUB_2-COI" if reverse else "OTUB_0-COI")
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assignments = data["otu"]["assignments_by_level"]
+        for level in ("species", "genus", "family"):
+            assert [(row["sample"], row["otu_count"], row["reads_total"]) for row in assignments[level]] == [
+                ("sample_A", 2, 5)
+            ]
+        rows = assignments["species"]
+        assert rows[0]["frozen_otu_count"] == 1
+        assert rows[0]["frozen_otu_reads_total"] == 3
+        sample_entry = next(
+            entry for entry in data["sample_metrics"].values() if entry["label"] == "sample_A"
+        )
+        assert sample_entry["otu_active"] == 2
+
+
+def test_main_002_i01_proven_aliases_ignore_consolidated_lock_state(tmp_path: Path) -> None:
+    for reverse in (False, True):
+        for consolidated_index in (0, 1):
+            case_dir = tmp_path / f"{reverse}_{consolidated_index}"
+            case_dir.mkdir()
+            alias_rows = tuple(
+                (index, int(index == consolidated_index), 1)
+                for index in (0, 1)
+            )
+            result, out, _ = _run_main_002_i01_producer_chain(
+                case_dir,
+                reverse_alias_blocks=reverse,
+                alias_lock_rows=alias_rows,
+            )
+            assert result.returncode == 0, result.stderr
+            data = json.loads(out.read_text(encoding="utf-8"))
+            canonical = data["otu"]["canonical"]
+            assert canonical["active"] == 2
+            assert canonical["consolidated"] == 0
+            assert canonical["frozen_not_consolidated"] == 1
+            assert canonical["active_not_frozen"] == 1
+            row = data["otu"]["assignments_by_level"]["species"][0]
+            assert (row["otu_count"], row["reads_total"]) == (2, 5)
+            assert (row["frozen_otu_count"], row["frozen_otu_reads_total"]) == (1, 3)
+
+
+def test_main_002_i01_proven_aliases_ignore_missing_lock_row(tmp_path: Path) -> None:
+    for reverse in (False, True):
+        for retained_index in (0, 1):
+            case_dir = tmp_path / f"{reverse}_{retained_index}"
+            case_dir.mkdir()
+            result, out, _ = _run_main_002_i01_producer_chain(
+                case_dir,
+                reverse_alias_blocks=reverse,
+                alias_lock_rows=((retained_index, 0, 1),),
+            )
+            assert result.returncode == 0, result.stderr
+            canonical = json.loads(out.read_text(encoding="utf-8"))["otu"]["canonical"]
+            assert canonical["active"] == 2
+            assert canonical["consolidated"] == 0
+            assert canonical["frozen_not_consolidated"] == 1
+            assert canonical["active_not_frozen"] == 1
+
+
+def test_main_002_i01_dual_alias_blast_support_counts_one_effective_otu(tmp_path: Path) -> None:
+    for reverse in (False, True):
+        case_dir = tmp_path / str(reverse)
+        case_dir.mkdir()
+        result, out, _ = _run_main_002_i01_producer_chain(
+            case_dir,
+            reverse_alias_blocks=reverse,
+            blast_alias_mode="both",
+        )
+        assert result.returncode == 0, result.stderr
+        data = json.loads(out.read_text(encoding="utf-8"))
+        species = data["otu"]["assignments_by_level"]["species"]
+        assert [(row["sample"], row["otu_count"], row["reads_total"]) for row in species] == [
+            ("sample_A", 2, 5)
+        ]
+        assert data["otu"]["canonical"]["active"] == 2
+        sample_entry = next(
+            entry for entry in data["sample_metrics"].values() if entry["label"] == "sample_A"
+        )
+        assert sample_entry["otu_active"] == 2
+        assert sample_entry["reads_blast_assigned"] == 5
+
+
+def _run_main_002_i01_independent_alias_selection_case(
+    tmp_path: Path,
+    *,
+    alias_class_count: int,
+    reverse_membership: bool,
+    hash_seed: tuple[str, str],
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    state_dir = tmp_path / "_state"
+    state_dir.mkdir()
+    membership_rows = ["r1\tsample_A\tOTUB_F-COI\tREPRESENTATIVE\n"]
+    lock_rows = ["OTUB_F-COI\t0\t1\n", "OTUB_F-COI\t1\t0\n"]
+    hash_rows = ["r1\thF\n"]
+    meta_rows = ["FROZEN_f\tr1\thF\n"]
+    frozen_rows = [
+        f"FROZEN_f\tr{i}|COI|hac|adapter=sample_A\t0\n"
+        for i in (1, 2)
+    ]
+    blast_rows = ["r1\tCOI\tsample_A\t123\t99\t100\tOTUB_F-COI\tF1\tG1\tS1\n"]
+    size_rows = ["OTUB_F-COI\t2\n"]
+    alias_specs = [
+        ("sample_B", "r3", "hA", ("OTUB_Z-COI", "OTUB_A-COI")),
+        ("sample_C", "r4", "hB", ("OTUB_Y-COI", "OTUB_B-COI")),
+    ]
+    for index, (sample, rid, hash_value, aliases) in enumerate(alias_specs[:alias_class_count]):
+        class_rows = [f"{rid}\t{sample}\t{otu}\tREPRESENTATIVE\n" for otu in aliases]
+        membership_rows.extend(reversed(class_rows) if reverse_membership else class_rows)
+        lock_rows.extend(f"{otu}\t0\t1\n" for otu in aliases)
+        hash_rows.append(f"{rid}\t{hash_value}\n")
+        meta_rows.append(f"FROZEN_{hash_value}\t{rid}\t{hash_value}\n")
+        frozen_rows.append(f"FROZEN_{hash_value}\t{rid}|COI|hac|adapter={sample}\t1\n")
+        supported_alias = aliases[0] if reverse_membership else aliases[1]
+        blast_rows.append(
+            f"{rid}\tCOI\t{sample}\t123\t99\t100\t{supported_alias}\tF{index + 2}\tG{index + 2}\tS{index + 2}\n"
+        )
+        size_rows.extend(f"{otu}\t1\n" for otu in aliases)
+
+    membership = tmp_path / "members.tsv"
+    membership.write_text(
+        "read_id\tsample\tOTU_id\tOTU_role\n" + "".join(membership_rows),
+        encoding="utf-8",
+    )
+    lock = tmp_path / "lock.tsv"
+    lock.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n" + "".join(lock_rows),
+        encoding="utf-8",
+    )
+    (tmp_path / "RTBioScan_otu_hash_map.tsv").write_text("".join(hash_rows), encoding="utf-8")
+    (state_dir / "otu_frozen_meta.tsv").write_text("".join(meta_rows), encoding="utf-8")
+    (state_dir / "otu_frozen_members.tsv").write_text("".join(frozen_rows), encoding="utf-8")
+    blast = tmp_path / "blast.tsv"
+    blast.write_text(
+        "read_id\tbarcode_by_homology\tsample\ttaxid\tperc_id\taln_length\totu_id\totu_family\totu_genus\totu_species\n"
+        + "".join(blast_rows),
+        encoding="utf-8",
+    )
+    sizes = tmp_path / "sizes.tsv"
+    sizes.write_text("otu_id\tsize\n" + "".join(size_rows), encoding="utf-8")
+    out = tmp_path / "out.json"
+    result = subprocess.run(
+        [
+            "perl", str(SCRIPT), "--run-id", "runA", "--barcode", "RTBioScan",
+            "--round-barcode", "round3", "--out", str(out), "--otu-def", str(membership),
+            "--otu-lock-summary", str(lock), "--blast-otu", str(blast),
+            "--otu-sizes-round", str(sizes),
+        ],
+        env=dict(os.environ, PERL_HASH_SEED=hash_seed[0], PERL_PERTURB_KEYS=hash_seed[1]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, out
+
+
+def test_main_002_i01_independent_aliases_preserve_unrelated_frozen_reads(tmp_path: Path) -> None:
+    expected_sample_a = None
+    for alias_class_count in (0, 1, 2):
+        for reverse in (False, True):
+            for seed in (("0", "0"), ("1", "1"), ("17", "2")):
+                case_dir = tmp_path / f"{alias_class_count}_{reverse}_{seed[0]}"
+                case_dir.mkdir()
+                result, out = _run_main_002_i01_independent_alias_selection_case(
+                    case_dir,
+                    alias_class_count=alias_class_count,
+                    reverse_membership=reverse,
+                    hash_seed=seed,
+                )
+                assert result.returncode == 0, result.stderr
+                data = json.loads(out.read_text(encoding="utf-8"))
+                sample_a = _otu_species_row_by_sample(data, "sample_A")
+                observed = {
+                    "otu_count": sample_a["otu_count"],
+                    "reads_total": sample_a["reads_total"],
+                    "frozen_otu_count": sample_a["frozen_otu_count"],
+                    "frozen_otu_reads_total": sample_a["frozen_otu_reads_total"],
+                    "otu_reads_global_total": sample_a["otu_reads_global_total"],
+                }
+                expected_sample_a = expected_sample_a or observed
+                assert observed == expected_sample_a == {
+                    "otu_count": 1,
+                    "reads_total": 2,
+                    "frozen_otu_count": 1,
+                    "frozen_otu_reads_total": 2,
+                    "otu_reads_global_total": 2,
+                }
+
+
+def _run_main_002_i01_replicate_alias_case(
+    tmp_path: Path,
+    *,
+    reverse_alias_blocks: bool,
+    support: str,
+    output_kind: str,
+    hash_seed: tuple[str, str],
+    qualified_alias_labels: bool = False,
+    reverse_blast_rows: bool = False,
+    alias_lock_states: tuple[tuple[int, int], ...] | None = None,
+    reverse_lock_rows: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    state_dir = tmp_path / "_state"
+    state_dir.mkdir()
+    aliases = ["OTUB_Z-COI", "OTUB_A-COI"]
+    if reverse_alias_blocks:
+        aliases.reverse()
+    sampleless = output_kind in {"sampleless_otu", "cumulative_only"}
+    membership_rows = []
+    for otu in aliases:
+        for index in (1, 2):
+            sample = "" if sampleless else f"sample_A_{index}"
+            role = "REPRESENTATIVE" if index == 1 else "MEMBER"
+            membership_rows.append(f"r{index}\tCOI\t{sample}\t{otu}\t{role}\n")
+    membership = tmp_path / "members.tsv"
+    membership.write_text(
+        "read_id\tbarcode_by_homology\tsample\tOTU_id\tOTU_role\n"
+        + "".join(membership_rows),
+        encoding="utf-8",
+    )
+    (tmp_path / "RTBioScan_otu_hash_map.tsv").write_text("r1\th1\n", encoding="utf-8")
+    (state_dir / "otu_frozen_meta.tsv").write_text("FROZEN_h1\tr1\th1\n", encoding="utf-8")
+    (state_dir / "otu_frozen_members.tsv").write_text(
+        "".join(
+            f"FROZEN_h1\tr{index}|COI|hac|adapter=sample_A_{index}\t{int(index == 1)}\n"
+            for index in (1, 2)
+        ),
+        encoding="utf-8",
+    )
+    lock = tmp_path / "lock.tsv"
+    if alias_lock_states is None:
+        alias_lock_states = ((0, 1), (0, 1))
+    lock_rows = [
+        f"{otu}\t{consolidated}\t{frozen}\n"
+        for otu, (consolidated, frozen) in zip(aliases, alias_lock_states)
+    ]
+    if reverse_lock_rows:
+        lock_rows.reverse()
+    lock.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n"
+        + "".join(lock_rows),
+        encoding="utf-8",
+    )
+    supported_aliases = aliases if support == "both" else [aliases[0 if support == "first" else 1]]
+    blast_rows = [
+        (
+            f"r{index}\tCOI\t"
+            f"{'sample_A_COI_' if qualified_alias_labels and otu == 'OTUB_A-COI' else 'sample_A_'}{index}"
+            f"\t123\t99\t100\t{otu}\tF1\tG1\tS1\n"
+        )
+        for otu in supported_aliases
+        for index in (1, 2)
+    ]
+    if reverse_blast_rows:
+        blast_rows.reverse()
+    blast = tmp_path / "blast.tsv"
+    blast.write_text(
+        "read_id\tbarcode_by_homology\tsample\ttaxid\tperc_id\taln_length\totu_id\totu_family\totu_genus\totu_species\n"
+        + "".join(blast_rows),
+        encoding="utf-8",
+    )
+    consensus = tmp_path / "consensus.tsv"
+    consensus.write_text(
+        "consensus_id\tsample\tbarcode_by_homology\tnumber_of_reads\tperc_id\taln_length\tconsensus_family\tconsensus_genus\tconsensus_species\n"
+        "cons1\tsample_A\tCOI\t2\t99\t100\tF1\tG1\tS1\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.json"
+    args = [
+        "perl", str(SCRIPT), "--run-id", "runA", "--barcode", "RTBioScan",
+        "--round-barcode", "round3", "--out", str(out), "--otu-def", str(membership),
+        "--otu-lock-summary", str(lock),
+    ]
+    if output_kind == "cumulative_only":
+        args.extend(["--blast-otu-cumulative", str(blast)])
+    else:
+        args.extend(["--blast-otu", str(blast), "--blast-otu-cumulative", str(blast)])
+    if output_kind == "consensus":
+        args.extend(["--blast-consensus", str(consensus)])
+    if output_kind == "track":
+        roster = tmp_path / "track_roster.tsv"
+        roster.write_text(
+            "sample_id\ttrack_id\treplicate_number\n"
+            "sample_A\tsample_A_1\t1\n"
+            "sample_A\tsample_A_2\t2\n",
+            encoding="utf-8",
+        )
+        track_identity = tmp_path / "track_identity.tsv"
+        track_identity.write_text(
+            "sample_id\ttrack_id\treplicate_number\tmarker_id\tunit_id_track\n"
+            "sample_A\tsample_A_1\t1\tCOI\tsample_A_1_COI\n"
+            "sample_A\tsample_A_2\t2\tCOI\tsample_A_2_COI\n",
+            encoding="utf-8",
+        )
+        args.extend([
+            "--identity-mode", "track", "--sample-roster", str(roster),
+            "--track-identity", str(track_identity),
+        ])
+    result = subprocess.run(
+        args,
+        env=dict(os.environ, PERL_HASH_SEED=hash_seed[0], PERL_PERTURB_KEYS=hash_seed[1]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, out
+
+
+def test_main_002_n04_proven_alias_lock_state_truth_table(tmp_path: Path) -> None:
+    cases = {
+        "consolidated_only": (((1, 1), (1, 1)), (1, 0, 0), (0, None)),
+        "frozen_only": (((0, 1), (0, 1)), (0, 1, 0), (1, 2)),
+        "mixed": (((1, 1), (0, 1)), (0, 1, 0), (1, 2)),
+        "active_only": (((0, 0), (0, 0)), (0, 0, 1), (0, None)),
+    }
+    for name, (lock_states, expected_buckets, expected_frozen) in cases.items():
+        for reverse_membership in (False, True):
+            for reverse_lock in (False, True):
+                for seed in (("0", "0"), ("17", "2")):
+                    case_dir = tmp_path / f"{name}_{reverse_membership}_{reverse_lock}_{seed[0]}"
+                    case_dir.mkdir()
+                    result, out = _run_main_002_i01_replicate_alias_case(
+                        case_dir,
+                        reverse_alias_blocks=reverse_membership,
+                        support="both",
+                        output_kind="consensus",
+                        hash_seed=seed,
+                        alias_lock_states=lock_states,
+                        reverse_lock_rows=reverse_lock,
+                    )
+                    assert result.returncode == 0, result.stderr
+                    data = json.loads(out.read_text(encoding="utf-8"))
+                    canonical = data["otu"]["canonical"]
+                    assert canonical["active"] == 1
+                    assert (
+                        canonical["consolidated"],
+                        canonical["frozen_not_consolidated"],
+                        canonical["active_not_frozen"],
+                    ) == expected_buckets
+                    assert sum(expected_buckets) == 1
+                    for level in ("species", "genus", "family"):
+                        row = data["otu"]["assignments_by_level"][level][0]
+                        assert (row["otu_count"], row["reads_total"]) == (1, 2)
+                        assert (
+                            row["frozen_otu_count"],
+                            row["frozen_otu_reads_total"],
+                        ) == expected_frozen
+                    canonical_id = "OTUB_A-COI" if reverse_membership else "OTUB_Z-COI"
+                    assert set(data["otu"]["replicate_reads"]) == {canonical_id}
+
+
+def test_main_002_i01_alias_replicate_reads_are_normalized_read_unions(tmp_path: Path) -> None:
+    expected_replicates = {"rep_1": 1, "rep_2": 1}
+    for output_kind in ("consensus", "sampleless_otu", "cumulative_only"):
+        for reverse in (False, True):
+            for seed in (("0", "0"), ("1", "1"), ("17", "2")):
+                for support in ("first", "later", "both"):
+                    case_dir = tmp_path / f"{output_kind}_{reverse}_{seed[0]}_{support}"
+                    case_dir.mkdir()
+                    result, out = _run_main_002_i01_replicate_alias_case(
+                        case_dir,
+                        reverse_alias_blocks=reverse,
+                        support=support,
+                        output_kind=output_kind,
+                        hash_seed=seed,
+                    )
+                    assert result.returncode == 0, result.stderr
+                    data = json.loads(out.read_text(encoding="utf-8"))
+                    assert data["otu"]["canonical"]["active"] == 1
+                    otu_row = data["otu"]["assignments_by_level"]["species"][0]
+                    assert otu_row["otu_count"] == 1
+                    assert otu_row["reads_total"] == 2
+                    assert {row["label"]: row["count"] for row in otu_row["replicate_reads"]} == expected_replicates
+                    if output_kind == "consensus":
+                        consensus_row = data["consensus"]["assignments_by_level"]["species"][0]
+                        assert consensus_row["reads_total"] == 2
+                        assert {
+                            row["label"]: row["count"]
+                            for row in consensus_row["replicate_reads"]
+                        } == expected_replicates
+                    if output_kind == "cumulative_only":
+                        assert next(iter(data["sample_metrics"].values()))["otu_total"] == 1
+                    else:
+                        sample_entry = next(iter(data["sample_metrics"].values()))
+                        assert sample_entry["otu_active"] == 1
+                        assert sample_entry["reads_blast_assigned"] == 2
+                        assert {
+                            entry["otu_active"] for entry in sample_entry["replicates"].values()
+                        } == {1}
+                        assert {
+                            entry["reads_blast_assigned"] for entry in sample_entry["replicates"].values()
+                        } == {1}
+
+
+def test_main_002_i01_equivalent_sample_labels_share_final_replicate_identity(tmp_path: Path) -> None:
+    expected_replicates = {"rep_1": 1, "rep_2": 1}
+    for output_kind in ("consensus", "sampleless_otu", "cumulative_only"):
+        for reverse_membership in (False, True):
+            for reverse_blast in (False, True):
+                for seed in (("0", "0"), ("17", "2"), ("4294967295", "2")):
+                    observed_by_support = {}
+                    for support in ("first", "later", "both"):
+                        case_dir = tmp_path / (
+                            f"{output_kind}_{reverse_membership}_{reverse_blast}_{seed[0]}_{support}"
+                        )
+                        case_dir.mkdir()
+                        result, out = _run_main_002_i01_replicate_alias_case(
+                            case_dir,
+                            reverse_alias_blocks=reverse_membership,
+                            support=support,
+                            output_kind=output_kind,
+                            hash_seed=seed,
+                            qualified_alias_labels=True,
+                            reverse_blast_rows=reverse_blast,
+                        )
+                        assert result.returncode == 0, result.stderr
+                        data = json.loads(out.read_text(encoding="utf-8"))
+                        assert data["otu"]["canonical"]["active"] == 1
+                        section = "consensus" if output_kind == "consensus" else "otu"
+                        level_replicates = {}
+                        for level in ("species", "genus", "family"):
+                            row = data[section]["assignments_by_level"][level][0]
+                            assert row["reads_total"] == 2
+                            level_replicates[level] = {
+                                rep["label"]: rep["count"] for rep in row["replicate_reads"]
+                            }
+                            assert level_replicates[level] == expected_replicates
+                        if output_kind != "consensus":
+                            otu_replicates = next(iter(data["otu"]["replicate_reads"].values()))["sample_A"]
+                            assert {
+                                rep["label"]: rep["count"] for rep in otu_replicates
+                            } == expected_replicates
+                        observed_by_support[support] = level_replicates
+                    assert observed_by_support["both"] == observed_by_support["first"]
+                    assert observed_by_support["both"] == observed_by_support["later"]
+
+
+def test_main_002_i01_alias_track_units_match_canonical_totals(tmp_path: Path) -> None:
+    for reverse in (False, True):
+        for seed in (("0", "0"), ("1", "1"), ("17", "2")):
+            for support in ("first", "later", "both"):
+                case_dir = tmp_path / f"{reverse}_{seed[0]}_{support}"
+                case_dir.mkdir()
+                result, out = _run_main_002_i01_replicate_alias_case(
+                    case_dir,
+                    reverse_alias_blocks=reverse,
+                    support=support,
+                    output_kind="track",
+                    hash_seed=seed,
+                )
+                assert result.returncode == 0, result.stderr
+                data = json.loads(out.read_text(encoding="utf-8"))
+                assert data["otu"]["canonical"]["active"] == 1
+                otu_rows = data["otu"]["assignments_by_level"]["species"]
+                assert {
+                    row["track_unit_id"]: (row["otu_count"], row["reads_total"])
+                    for row in otu_rows
+                } == {
+                    "sample_A_1_COI": (1, 1),
+                    "sample_A_2_COI": (1, 1),
+                }
+                assert {
+                    entry["label"]: (entry["otu_active"], entry["reads_blast_assigned"])
+                    for entry in data["sample_metrics"].values()
+                } == {
+                    "sample_A_1": (1, 1),
+                    "sample_A_2": (1, 1),
+                }
+                assert {
+                    unit_id: (entry["otu_active"], entry["reads_blast_assigned"])
+                    for unit_id, entry in data["track_unit_metrics"].items()
+                } == {
+                    "sample_A_1_COI": (1, 1),
+                    "sample_A_2_COI": (1, 1),
+                }
+
+
+def _run_main_002_i01_rejection_case(
+    tmp_path: Path,
+    *,
+    membership_rows: str,
+    lock_rows: str,
+    hash_rows: str,
+    meta_rows: str,
+    frozen_rows: str,
+) -> subprocess.CompletedProcess[str]:
+    membership = tmp_path / "members.tsv"
+    membership.write_text(
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\tidentity_value\tOTU_id\tOTU_role\n"
+        + membership_rows,
+        encoding="utf-8",
+    )
+    lock = tmp_path / "lock.tsv"
+    lock.write_text(
+        "otu_key\teffective_consolidated\tis_frozen\n" + lock_rows,
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "_state"
+    state_dir.mkdir()
+    (tmp_path / "RTBioScan_otu_hash_map.tsv").write_text(hash_rows, encoding="utf-8")
+    (state_dir / "otu_frozen_meta.tsv").write_text(meta_rows, encoding="utf-8")
+    (state_dir / "otu_frozen_members.tsv").write_text(frozen_rows, encoding="utf-8")
+    return _run([
+        "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "round7",
+        "--out", str(tmp_path / "out.json"), "--otu-def", str(membership),
+        "--otu-lock-summary", str(lock),
+    ])
+
+
+def test_main_002_i01_rejects_unproven_or_incompatible_aliases(tmp_path: Path) -> None:
+    cases = {
+        "different_frozen_identity": {
+            "membership_rows": (
+                "r1\tCOI\thac\tsample_A\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\n"
+                "r2\tCOI\thac\tsample_A\tsample_A\tOTUB_A-COI\tMEMBER\n"
+                "r2\tCOI\thac\tsample_A\tsample_A\tOTUB_B-COI\tREPRESENTATIVE\n"
+                "r1\tCOI\thac\tsample_A\tsample_A\tOTUB_B-COI\tMEMBER\n"
+            ),
+            "hash_rows": "r1\thA\nr2\thB\n",
+            "meta_rows": "FROZEN_a\tr1\thA\nFROZEN_b\tr2\thB\n",
+        },
+        "missing_shared_provenance": {
+            "membership_rows": (
+                "r1\tCOI\thac\tsample_A\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\n"
+                "r2\tCOI\thac\tsample_A\tsample_A\tOTUB_A-COI\tMEMBER\n"
+                "r1\tCOI\thac\tsample_A\tsample_A\tOTUB_B-COI\tREPRESENTATIVE\n"
+                "r2\tCOI\thac\tsample_A\tsample_A\tOTUB_B-COI\tMEMBER\n"
+            ),
+            "hash_rows": "",
+            "meta_rows": "FROZEN_a\tr1\thA\n",
+        },
+        "partial_overlap": {
+            "membership_rows": (
+                "r1\tCOI\thac\tsample_A\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\n"
+                "r2\tCOI\thac\tsample_A\tsample_A\tOTUB_A-COI\tMEMBER\n"
+                "r1\tCOI\thac\tsample_A\tsample_A\tOTUB_B-COI\tREPRESENTATIVE\n"
+                "r3\tCOI\thac\tsample_A\tsample_A\tOTUB_B-COI\tMEMBER\n"
+            ),
+            "hash_rows": "r1\thA\n",
+            "meta_rows": "FROZEN_a\tr1\thA\n",
+        },
+        "sample_conflict": {
+            "membership_rows": (
+                "r1\tCOI\thac\tsample_A\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\n"
+                "r1\tCOI\thac\tsample_B\tsample_B\tOTUB_B-COI\tREPRESENTATIVE\n"
+            ),
+            "hash_rows": "r1\thA\n",
+            "meta_rows": "FROZEN_a\tr1\thA\n",
+        },
+        "marker_conflict": {
+            "membership_rows": (
+                "r1\tCOI\thac\tsample_A\tsample_A\tOTUB_A-COI\tREPRESENTATIVE\n"
+                "r1\tITS2\thac\tsample_A\tsample_A\tOTUB_B-ITS2\tREPRESENTATIVE\n"
+            ),
+            "hash_rows": "r1\thA\n",
+            "meta_rows": "FROZEN_a\tr1\thA\n",
+        },
+    }
+    for name, case in cases.items():
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        result = _run_main_002_i01_rejection_case(
+            case_dir,
+            membership_rows=case["membership_rows"],
+            lock_rows=(
+                "OTUB_A-COI\t0\t1\n"
+                + ("OTUB_B-ITS2\t0\t1\n" if name == "marker_conflict" else "OTUB_B-COI\t0\t1\n")
+            ),
+            hash_rows=case["hash_rows"],
+            meta_rows=case["meta_rows"],
+            frozen_rows="FROZEN_a\tr1|COI|hac|barcode=COI|adapter=sample_A\t1\n",
+        )
+        assert result.returncode != 0, name
+        assert "conflicting rows for read_id" in result.stderr
 
 
 def test_report_round_json_basic(tmp_path: Path) -> None:
@@ -281,7 +2078,7 @@ def test_report_round_json_basic(tmp_path: Path) -> None:
     assert "species" in assignments
     assert assignments["species"][0]["taxon"] == "S1"
     assert assignments["species"][0]["otu_count"] == 1
-    assert assignments["species"][0]["reads_total"] == 2
+    assert assignments["species"][0]["reads_total"] == 1
     assert data["otu"]["canonical"]["frozen_not_consolidated"] == 0
     assert data["otu"]["canonical"]["active_not_frozen"] == 1
     assert data["otu"]["canonical"]["informative_dynamic"] == 0

@@ -1917,7 +1917,7 @@ sub build_public_marker_split_read_fate {
 }
 
 sub collect_blast_read_fate_and_sample_metrics {
-  my ($path, $sample_metrics, $label_to_id, $id_to_label, $track_unit_metrics) = @_;
+  my ($path, $sample_metrics, $label_to_id, $id_to_label, $track_unit_metrics, $alias_ref) = @_;
   my %out = (
     enabled => 0,
     assignment_status => undef,
@@ -2044,6 +2044,7 @@ sub collect_blast_read_fate_and_sample_metrics {
     if (defined $otu_idx && $otu_idx <= $#f) {
       my $otu = trim_text($f[$otu_idx]);
       if ($otu ne '' && uc($otu) ne 'NA') {
+        $otu = canonical_otu_alias($otu, $alias_ref);
         $entry->{otu_active} = 0 unless defined $entry->{otu_active};
         my $otu_key = "$sid\t$otu";
         if (!$seen_sample_otu{$otu_key}) {
@@ -2249,26 +2250,102 @@ sub _rep_reads_array {
   return \@sorted;
 }
 
+sub canonical_otu_alias {
+  my ($otu, $alias_ref) = @_;
+  return $otu unless defined $alias_ref && ref($alias_ref) eq 'HASH' && %{$alias_ref};
+  return $alias_ref->{$otu} if exists $alias_ref->{$otu};
+  my $lock_key = normalize_lock_otu_key($otu);
+  return $alias_ref->{$lock_key} if $lock_key ne '' && exists $alias_ref->{$lock_key};
+  return $otu;
+}
+
+sub read_otu_membership_header {
+  my ($FH) = @_;
+  my $header = '';
+  while (1) {
+    my $bytes_read = read($FH, my $char, 1);
+    return undef unless defined $bytes_read;
+    last if $bytes_read == 0 || $char eq "\n" || $char eq "\r";
+    $header .= $char;
+  }
+  return $header;
+}
+
 sub load_otu_membership_maps {
-  return ({}, {}, {}) unless defined $opt{otu_def} && $opt{otu_def} ne '';
+  my ($alias_ref) = @_;
+  return ({}, {}, {}, {}, {}, {}, 0) unless defined $opt{otu_def} && $opt{otu_def} ne '';
+  return ({}, {}, {}, {}, {}, {}, 0) unless -e $opt{otu_def} && -s $opt{otu_def};
+  open my $FH, '<', $opt{otu_def}
+    or return ({}, {}, {}, {}, {}, {}, 0);
+  my $header = read_otu_membership_header($FH);
+  close $FH;
+  return ({}, {}, {}, {}, {}, {}, 0) unless defined $header;
+  chomp $header;
+  my @cols = split /\t/, $header, -1;
+  my %idx;
+  for my $i (0 .. $#cols) {
+    my $key = trim_text($cols[$i]);
+    $idx{lc($key)} = $i if $key ne '';
+  }
+  return ({}, {}, {}, {}, {}, {}, 0)
+    unless defined header_index_fallback(\%idx, 'OTU_id', 'otu_id')
+      && defined header_index_fallback(\%idx, 'read_id');
+
   my $rows = get_parsed_rows($opt{otu_def});
-  return ({}, {}, {}) unless defined $rows && @$rows;
-  my (%member_counts, %rep_reads_map, %total_members);
+  return ({}, {}, {}, {}, {}, {}, 0) unless defined $rows;
+  my (%member_counts, %rep_reads_map, %total_members, %read_members, %sample_evidence_otus);
+  my %assignment_by_read;
   for my $row (@$rows) {
     next unless defined $row && ref($row) eq 'HASH';
     my $otu = trim_text($row->{OTU_id} // $row->{otu_id} // '');
     next if $otu eq '' || uc($otu) eq 'NA';
+    $otu = canonical_otu_alias($otu, $alias_ref);
     my $lock_key = normalize_lock_otu_key($otu);
     next if $lock_key eq '';
-    $total_members{$otu}++;
+    my $rid = normalize_read_id($row->{read_id});
+    next if $rid eq '';
 
     my $raw_sample = trim_text($row->{sample} // '');
     my $raw_label = resolve_reporting_identity($raw_sample);
     my $label = trim_text($row->{identity_value} // '');
     $label = resolve_reporting_identity($label) if $label ne '';
     $label = $raw_label if ($label eq '' || lc($label) eq 'unknown') && defined $raw_label && $raw_label ne '';
-    if (defined $label && $label ne '') {
+    $label = '' unless defined $label;
+    my $raw_sample_key = $raw_sample ne '' ? (SampleLabel::normalize_sample_label($raw_sample) // '') : '';
+    $raw_sample_key = trim_text($raw_sample_key);
+
+    if (exists $assignment_by_read{$rid}) {
+      my $prev = $assignment_by_read{$rid};
+      if ($prev->{otu} ne $otu
+          || ($prev->{raw_sample_key} ne '' && $raw_sample_key ne '' && $prev->{raw_sample_key} ne $raw_sample_key)
+          || ($prev->{label} ne '' && $label ne '' && $prev->{label} ne $label)) {
+        die "ERROR: OTU membership '$opt{otu_def}' has conflicting rows for read_id '$rid'\n";
+      }
+      $prev->{raw_sample} = $raw_sample if $prev->{raw_sample} eq '' && $raw_sample ne '';
+      $prev->{raw_sample_key} = $raw_sample_key if $prev->{raw_sample_key} eq '' && $raw_sample_key ne '';
+      $prev->{label} = $label if $prev->{label} eq '' && $label ne '';
+      next;
+    }
+    $assignment_by_read{$rid} = {
+      otu => $otu,
+      lock_key => $lock_key,
+      raw_sample => $raw_sample,
+      raw_sample_key => $raw_sample_key,
+      label => $label,
+    };
+  }
+
+  for my $rid (keys %assignment_by_read) {
+    my $assignment = $assignment_by_read{$rid};
+    my $otu = $assignment->{otu};
+    my $lock_key = $assignment->{lock_key};
+    my $raw_sample = $assignment->{raw_sample};
+    my $label = $assignment->{label};
+    $total_members{$otu}++;
+    $read_members{$otu}{$rid} = 1;
+    if ($label ne '') {
       $member_counts{$lock_key}{$label}++;
+      $sample_evidence_otus{$otu} = 1;
     }
 
     next unless $opt{identity_mode} eq 'collapse';
@@ -2286,11 +2363,11 @@ sub load_otu_membership_maps {
     }
     delete $rep_reads_map{$otu} unless %{$rep_reads_map{$otu}};
   }
-  return (\%member_counts, \%rep_reads_map, \%total_members);
+  return (\%member_counts, \%rep_reads_map, \%total_members, \%read_members, \%sample_evidence_otus, \%assignment_by_read, 1);
 }
 
 sub load_canonical_otu_taxonomy {
-  my ($blast_otu_path) = @_;
+  my ($blast_otu_path, $alias_ref) = @_;
   return undef unless defined $blast_otu_path && $blast_otu_path ne '' && -e $blast_otu_path && -s $blast_otu_path;
 
   my $FH = open_cached_text_handle($blast_otu_path);
@@ -2331,6 +2408,7 @@ sub load_canonical_otu_taxonomy {
     next if $otu_idx > $#f;
     my $otu = trim_text($f[$otu_idx]);
     next if $otu eq '' || uc($otu) eq 'NA';
+    $otu = canonical_otu_alias($otu, $alias_ref);
     my $marker = (defined $marker_idx && $marker_idx <= $#f) ? marker_from_token($f[$marker_idx]) : marker_from_token($otu);
     my $kingdom = (defined $kingdom_idx && $kingdom_idx <= $#f) ? trim_text($f[$kingdom_idx]) : '';
     next unless is_kingdom_consistent($kingdom, $marker, $CONFIGURED_TARGET_TAX_MAP);
@@ -2404,34 +2482,207 @@ sub _extract_adapter_from_member_id {
   return undef;
 }
 
+sub load_otu_promotion_alias_map {
+  my %alias;
+  return \%alias unless defined $opt{otu_def} && $opt{otu_def} ne '';
+  my $rows = get_parsed_rows($opt{otu_def});
+  return \%alias unless defined $rows && @$rows;
+
+  my (@otu_order, %otu_seen, %members_by_otu, %reps_by_otu);
+  my (%markers_by_otu, %raw_samples_by_otu_read, %labels_by_otu_read);
+  for my $row (@$rows) {
+    next unless defined $row && ref($row) eq 'HASH';
+    my $otu = trim_text($row->{OTU_id} // $row->{otu_id} // '');
+    next if $otu eq '' || uc($otu) eq 'NA';
+    my $lock_key = normalize_lock_otu_key($otu);
+    next if $lock_key eq '';
+    if (!$otu_seen{$otu}++) {
+      push @otu_order, $otu;
+    }
+    my $rid = normalize_read_id($row->{read_id});
+    next if $rid eq '';
+    $members_by_otu{$otu}{$rid} = 1;
+    my $role = trim_text($row->{OTU_role} // $row->{otu_role} // $row->{role} // '');
+    $reps_by_otu{$otu}{$rid} = 1 if uc($role) eq 'REPRESENTATIVE';
+
+    my $marker = marker_from_token($row->{barcode_by_homology} // '');
+    $marker = marker_from_token($otu) if !defined $marker || $marker eq '';
+    $markers_by_otu{$otu}{$marker} = 1 if defined $marker && $marker ne '';
+
+    my $raw_sample = trim_text($row->{sample} // '');
+    my $raw_sample_key = $raw_sample ne ''
+      ? trim_text(SampleLabel::normalize_sample_label($raw_sample) // '')
+      : '';
+    $raw_samples_by_otu_read{$otu}{$rid}{$raw_sample_key} = 1 if $raw_sample_key ne '';
+    my $raw_label = resolve_reporting_identity($raw_sample);
+    my $label = trim_text($row->{identity_value} // '');
+    $label = resolve_reporting_identity($label) if $label ne '';
+    $label = $raw_label if ($label eq '' || lc($label) eq 'unknown')
+      && defined $raw_label && $raw_label ne '';
+    $label = trim_text($label // '');
+    $labels_by_otu_read{$otu}{$rid}{$label} = 1 if $label ne '';
+  }
+
+  my $round_anchor = defined $opt{otu_lock_summary} && $opt{otu_lock_summary} ne ''
+    ? $opt{otu_lock_summary}
+    : $opt{otu_def};
+  my $round_dir = _path_dirname($round_anchor);
+  my @state_dirs = _candidate_state_dirs_for_round_dir($round_dir);
+  my ($state_dir) = grep {
+    -s "$_/otu_frozen_meta.tsv" && -s "$_/otu_frozen_members.tsv"
+  } @state_dirs;
+  return \%alias unless defined $state_dir && $state_dir ne '';
+
+  my %hashes_by_read;
+  my @hash_map_paths = (
+    "$round_dir/$opt{barcode}_otu_nr_hash_map.tsv",
+    "$round_dir/$opt{barcode}_otu_hash_map.tsv",
+    "$state_dir/$opt{barcode}_otu_nr_hash_map.tsv",
+    "$state_dir/$opt{barcode}_otu_hash_map.tsv",
+  );
+  my %seen_hash_map_path;
+  for my $path (@hash_map_paths) {
+    next if !defined $path || $path eq '' || $seen_hash_map_path{$path}++;
+    next unless -s $path;
+    my $FH = open_cached_text_handle($path);
+    next unless defined $FH;
+    while (my $line = <$FH>) {
+      chomp $line;
+      next if $line =~ /^\s*$/;
+      my ($rid_raw, $hash) = split /\t/, $line, 3;
+      my $rid = normalize_read_id($rid_raw);
+      $hash = trim_text($hash // '');
+      next if $rid eq '' || $hash eq '';
+      $hashes_by_read{$rid}{$hash} = 1;
+    }
+    close $FH;
+  }
+
+  my %frozen_ids_by_hash;
+  my $meta_fh = open_cached_text_handle("$state_dir/otu_frozen_meta.tsv");
+  return \%alias unless defined $meta_fh;
+  while (my $line = <$meta_fh>) {
+    chomp $line;
+    next if $line =~ /^\s*$/;
+    my ($frozen_id, undef, $hash) = split /\t/, $line, 4;
+    $frozen_id = trim_text($frozen_id // '');
+    $hash = trim_text($hash // '');
+    next if $frozen_id eq '' || $hash eq '';
+    $frozen_ids_by_hash{$hash}{$frozen_id} = 1;
+  }
+  close $meta_fh;
+
+  my %frozen_id_by_otu;
+  for my $otu (@otu_order) {
+    my @reps = sort keys %{$reps_by_otu{$otu} || {}};
+    next unless @reps == 1;
+    my @hashes = sort keys %{$hashes_by_read{$reps[0]} || {}};
+    next unless @hashes == 1 && exists $frozen_ids_by_hash{$hashes[0]};
+    my @frozen_ids = sort keys %{$frozen_ids_by_hash{$hashes[0]}};
+    next unless @frozen_ids == 1;
+    $frozen_id_by_otu{$otu} = $frozen_ids[0];
+  }
+
+  my %alias_classes;
+  for my $otu (@otu_order) {
+    next unless exists $frozen_id_by_otu{$otu};
+    my @members = sort keys %{$members_by_otu{$otu} || {}};
+    next unless @members;
+    my $class_key = join("\x1e", $frozen_id_by_otu{$otu}, @members);
+    push @{$alias_classes{$class_key}}, $otu;
+  }
+
+  CLASS:
+  for my $class_ref (values %alias_classes) {
+    next unless @$class_ref > 1;
+    my %markers;
+    for my $otu (@$class_ref) {
+      $markers{$_} = 1 for keys %{$markers_by_otu{$otu} || {}};
+    }
+    next if scalar(keys %markers) > 1;
+    my $first_otu = $class_ref->[0];
+    for my $rid (keys %{$members_by_otu{$first_otu}}) {
+      my (%raw_samples, %labels);
+      for my $otu (@$class_ref) {
+        $raw_samples{$_} = 1 for keys %{$raw_samples_by_otu_read{$otu}{$rid} || {}};
+        $labels{$_} = 1 for keys %{$labels_by_otu_read{$otu}{$rid} || {}};
+      }
+      next CLASS if scalar(keys %raw_samples) > 1 || scalar(keys %labels) > 1;
+    }
+    my $canonical = $class_ref->[0];
+    for my $otu (@$class_ref) {
+      $alias{$otu} = $canonical;
+    }
+  }
+  return \%alias;
+}
+
+sub canonicalize_otu_set {
+  my ($set_ref, $alias_ref) = @_;
+  return $set_ref unless defined $set_ref && ref($set_ref) eq 'HASH';
+  my %canonical;
+  for my $otu (keys %$set_ref) {
+    $canonical{canonical_otu_alias($otu, $alias_ref)} = 1;
+  }
+  return \%canonical;
+}
+
+sub apply_otu_alias_map_to_lock_sets {
+  my ($lock_sets_ref, $alias_ref) = @_;
+  return unless defined $lock_sets_ref && defined $alias_ref && %{$alias_ref};
+  for my $kind (qw(consolidated frozen_not_consolidated active_not_frozen)) {
+    $lock_sets_ref->{sets}{$kind} = canonicalize_otu_set(
+      $lock_sets_ref->{sets}{$kind},
+      $alias_ref,
+    );
+  }
+  # A proven alias class can surface in more than one lock state during promotion.
+  # Resolve only those classes; unrelated overlap retains its existing frozen authority.
+  my %alias_canonical = map { $alias_ref->{$_} => 1 } keys %{$alias_ref};
+  for my $otu (keys %alias_canonical) {
+    if (exists $lock_sets_ref->{sets}{frozen_not_consolidated}{$otu}) {
+      delete $lock_sets_ref->{sets}{consolidated}{$otu};
+      delete $lock_sets_ref->{sets}{active_not_frozen}{$otu};
+    } elsif (exists $lock_sets_ref->{sets}{consolidated}{$otu}) {
+      delete $lock_sets_ref->{sets}{active_not_frozen}{$otu};
+    }
+  }
+  for my $kind (qw(consolidated frozen_not_consolidated active_not_frozen)) {
+    $lock_sets_ref->{counts}{$kind} = scalar keys %{$lock_sets_ref->{sets}{$kind}};
+  }
+}
+
 sub load_frozen_sample_reads {
-  return {} unless defined $opt{otu_lock_summary} && $opt{otu_lock_summary} ne '';
+  my ($selected_frozen_ref, $alias_ref) = @_;
+  return ({}, {}) unless defined $opt{otu_lock_summary} && $opt{otu_lock_summary} ne '';
 
   my $round_dir = _path_dirname($opt{otu_lock_summary});
   my @state_dirs = _candidate_state_dirs_for_round_dir($round_dir);
   my ($state_dir) = grep {
     -s "$_/otu_frozen_meta.tsv" && -s "$_/otu_frozen_members.tsv"
   } @state_dirs;
-  return {} unless defined $state_dir && $state_dir ne '';
-  return {} unless defined $opt{otu_def} && $opt{otu_def} ne '';
+  return ({}, {}) unless defined $state_dir && $state_dir ne '';
+  return ({}, {}) unless defined $opt{otu_def} && $opt{otu_def} ne '';
 
   my $otu_def_rows = get_parsed_rows($opt{otu_def});
-  return {} unless defined $otu_def_rows && @$otu_def_rows;
+  return ({}, {}) unless defined $otu_def_rows && @$otu_def_rows;
 
   my %rep_read_by_otu;
   for my $row (@$otu_def_rows) {
     next unless defined $row && ref($row) eq 'HASH';
     my $otu = trim_text($row->{OTU_id} // $row->{otu_id} // '');
     next if $otu eq '' || uc($otu) eq 'NA';
+    $otu = canonical_otu_alias($otu, $alias_ref);
     my $role = trim_text($row->{OTU_role} // $row->{otu_role} // $row->{role} // '');
     next unless uc($role) eq 'REPRESENTATIVE';
     my $rid = normalize_read_id($row->{read_id});
     next if $rid eq '';
     my $lock_key = normalize_lock_otu_key($otu);
     next if $lock_key eq '';
+    next unless defined $selected_frozen_ref && exists $selected_frozen_ref->{$lock_key};
     $rep_read_by_otu{$lock_key} = $rid unless exists $rep_read_by_otu{$lock_key};
   }
-  return {} unless %rep_read_by_otu;
+  return ({}, {}) unless %rep_read_by_otu;
 
   my %hashes_by_read;
   my @hash_map_paths = (
@@ -2460,7 +2711,7 @@ sub load_frozen_sample_reads {
   my %frozen_id_by_hash;
   my $meta_fh = open_cached_text_handle("$state_dir/otu_frozen_meta.tsv");
   if (!defined $meta_fh) {
-    return {};
+    return ({}, {});
   }
   while (my $line = <$meta_fh>) {
     chomp $line;
@@ -2474,10 +2725,23 @@ sub load_frozen_sample_reads {
   }
   close $meta_fh;
 
+  my %selected_frozen_ids;
+  for my $otu (keys %rep_read_by_otu) {
+    my $rid = $rep_read_by_otu{$otu};
+    next unless exists $hashes_by_read{$rid};
+    my @hashes = sort keys %{$hashes_by_read{$rid}};
+    next unless @hashes == 1;
+    my $hash = $hashes[0];
+    next unless exists $frozen_id_by_hash{$hash};
+    $selected_frozen_ids{$frozen_id_by_hash{$hash}} = 1;
+  }
+
   my %counts_by_frozen;
+  my %read_ids_by_frozen;
+  my %assignment_by_read;
   my $members_fh = open_cached_text_handle("$state_dir/otu_frozen_members.tsv");
   if (!defined $members_fh) {
-    return {};
+    return ({}, {});
   }
   while (my $line = <$members_fh>) {
     chomp $line;
@@ -2486,15 +2750,34 @@ sub load_frozen_sample_reads {
     next unless defined $frozen_id && defined $member_id;
     $frozen_id = trim_text($frozen_id);
     next if $frozen_id eq '';
+    next unless exists $selected_frozen_ids{$frozen_id};
+    my $rid = normalize_read_id($member_id);
+    next if $rid eq '';
     my $adapter = _extract_adapter_from_member_id($member_id);
     next unless defined $adapter && $adapter ne '';
     my $label = resolve_reporting_identity($adapter);
     next unless defined $label && $label ne '';
+    my $raw_sample_key = SampleLabel::normalize_sample_label($adapter) // '';
+    $raw_sample_key = trim_text($raw_sample_key);
+    if (exists $assignment_by_read{$rid}) {
+      my $prev = $assignment_by_read{$rid};
+      if ($prev->{frozen_id} ne $frozen_id || $prev->{raw_sample_key} ne $raw_sample_key) {
+        die "ERROR: frozen OTU membership '$state_dir/otu_frozen_members.tsv' has conflicting rows for read_id '$rid'\n";
+      }
+      next;
+    }
+    $assignment_by_read{$rid} = {
+      frozen_id => $frozen_id,
+      raw_sample_key => $raw_sample_key,
+      label => $label,
+    };
+    $read_ids_by_frozen{$frozen_id}{$rid} = 1;
     $counts_by_frozen{$frozen_id}{$label}++;
   }
   close $members_fh;
 
   my %map;
+  my %selected_assignment_by_read;
   for my $otu (keys %rep_read_by_otu) {
     my $rid = $rep_read_by_otu{$otu};
     next unless exists $hashes_by_read{$rid};
@@ -2505,12 +2788,85 @@ sub load_frozen_sample_reads {
     my $frozen_id = $frozen_id_by_hash{$hash};
     next unless exists $counts_by_frozen{$frozen_id};
     $map{$otu} = { %{$counts_by_frozen{$frozen_id}} };
+    for my $member_rid (keys %{$read_ids_by_frozen{$frozen_id} || {}}) {
+      my $assignment = $assignment_by_read{$member_rid};
+      if (exists $selected_assignment_by_read{$member_rid}
+          && $selected_assignment_by_read{$member_rid}{lock_key} ne $otu) {
+        die "ERROR: frozen OTU membership '$state_dir/otu_frozen_members.tsv' has conflicting effective OTUs for read_id '$member_rid'\n";
+      }
+      $selected_assignment_by_read{$member_rid} = {
+        lock_key => $otu,
+        label => $assignment->{label},
+      };
+    }
   }
-  return %map ? \%map : {};
+  return %map ? (\%map, \%selected_assignment_by_read) : ({}, {});
+}
+
+sub validate_current_frozen_membership_assignments {
+  my ($current_ref, $frozen_ref) = @_;
+  return unless defined $current_ref && defined $frozen_ref;
+  for my $rid (keys %$frozen_ref) {
+    next unless exists $current_ref->{$rid};
+    my $current = $current_ref->{$rid};
+    my $frozen = $frozen_ref->{$rid};
+    if (($current->{lock_key} // '') ne ($frozen->{lock_key} // '')) {
+      die "ERROR: current/frozen OTU membership has conflicting effective OTUs for read_id '$rid'\n";
+    }
+    my $current_label = trim_text($current->{label} // '');
+    my $frozen_label = trim_text($frozen->{label} // '');
+    my $current_sample_is_authoritative = $current_label ne ''
+      && lc($current_label) ne 'unknown'
+      && !SampleLabel::is_no_adapter_label($current_label);
+    if ($current_sample_is_authoritative
+        && $frozen_label ne ''
+        && $current_label ne $frozen_label) {
+      die "ERROR: current/frozen OTU membership has conflicting samples for read_id '$rid'\n";
+    }
+  }
+}
+
+sub build_selected_membership_assignments {
+  my ($current_ref, $frozen_ref, $selected_frozen_ref) = @_;
+  my %selected;
+  if (defined $current_ref) {
+    for my $rid (keys %$current_ref) {
+      my $assignment = $current_ref->{$rid};
+      my $lock_key = $assignment->{lock_key} // '';
+      next if $lock_key ne ''
+        && defined $selected_frozen_ref
+        && exists $selected_frozen_ref->{$lock_key};
+      $selected{$rid} = {
+        lock_key => $lock_key,
+        label => trim_text($assignment->{label} // ''),
+        source => 'current',
+      };
+    }
+  }
+  if (defined $frozen_ref) {
+    for my $rid (keys %$frozen_ref) {
+      my $assignment = $frozen_ref->{$rid};
+      $selected{$rid} = {
+        lock_key => $assignment->{lock_key} // '',
+        label => trim_text($assignment->{label} // ''),
+        source => 'frozen',
+      };
+    }
+  }
+  return \%selected;
+}
+
+sub reporting_sample_authority_rank {
+  my ($label) = @_;
+  $label = trim_text($label // '');
+  return 0 if $label eq '';
+  return 1 if lc($label) eq 'unknown';
+  return 2 if SampleLabel::is_no_adapter_label($label);
+  return 3;
 }
 
 sub load_otu_sizes_round {
-  my ($path) = @_;
+  my ($path, $alias_ref) = @_;
   my %sizes;
   return \%sizes if !defined $path || $path eq '' || !-e $path || !-s $path;
   my $FH = open_cached_text_handle($path);
@@ -2545,6 +2901,7 @@ sub load_otu_sizes_round {
     next if $otu_idx > $#f || $size_idx > $#f;
     my $otu = trim_text($f[$otu_idx]);
     next if $otu eq '' || uc($otu) eq 'NA';
+    $otu = canonical_otu_alias($otu, $alias_ref);
     my $size = trim_text($f[$size_idx]);
     next unless $size =~ /^\d+$/;
     $sizes{$otu} = 0 + $size;
@@ -2554,19 +2911,29 @@ sub load_otu_sizes_round {
 }
 
 sub collect_otu_assignments_by_level {
-  my ($blast_otu_path, $otu_sizes_path, $spec_interest_ref, $spec_interest_enabled, $lock_frozen_ref, $thresholds_by_level, $frozen_sample_reads_ref, $otu_all_sample_reads_ref, $canonical_otu_ref, $otu_membership_maps_ref) = @_;
+  my ($blast_otu_path, $otu_sizes_path, $spec_interest_ref, $spec_interest_enabled, $lock_frozen_ref, $lock_consolidated_ref, $lock_active_ref, $thresholds_by_level, $frozen_sample_reads_ref, $otu_all_sample_reads_ref, $canonical_otu_ref, $otu_membership_maps_ref, $alias_ref) = @_;
   my %by_level = (species => [], genus => [], family => []);
   my %otu_rep_reads;           # { otu => { collapsed_sample => { rep_label => count } } }
   my %sample_marker_rep_reads; # { collapsed_sample => { marker => { rep_label => count } } }
   return (\%by_level, \%otu_rep_reads, \%sample_marker_rep_reads) if !defined $blast_otu_path || $blast_otu_path eq '' || !-e $blast_otu_path || !-s $blast_otu_path;
 
-  my $size_map = load_otu_sizes_round($otu_sizes_path);
-  my %counts_fallback;
+  my $size_map = load_otu_sizes_round($otu_sizes_path, $alias_ref);
   my %counts_fallback_by_otu;
+  my %counts_current_membership;
+  my %counts_selected_fallback;
+  my %selected_fallback_row_keys;
+  my %inferred_current_assignment_by_read;
+  my %selected_assignment_by_read = map {
+    $_ => { %{$otu_membership_maps_ref->{selected_assignments_by_read}{$_}} }
+  } keys %{defined $otu_membership_maps_ref
+    ? ($otu_membership_maps_ref->{selected_assignments_by_read} || {})
+    : {}};
   my %best;
   my %otu_seen;
   my %raw_otu_sample_rep;    # { otu => { raw_sample => count } } — for OTU-level rep breakdown
   my %raw_sample_marker_rep; # { raw_sample => { marker => count } } — for consensus-level rep breakdown
+  my %seen_raw_otu_sample_rep_read;
+  my %seen_raw_sample_marker_rep_read;
 
   my $FH = open_cached_text_handle($blast_otu_path);
   if (!defined $FH) {
@@ -2612,28 +2979,96 @@ sub collect_otu_assignments_by_level {
     next if $otu_idx > $#f;
     my $otu = trim_text($f[$otu_idx]);
     next if $otu eq '' || uc($otu) eq 'NA';
+    $otu = canonical_otu_alias($otu, $alias_ref);
     my $_raw_sample_col = (defined $sample_idx && $sample_idx <= $#f) ? trim_text($f[$sample_idx]) : '';
     my $sample = resolve_reporting_identity($_raw_sample_col);
     my $marker = (defined $marker_idx && $marker_idx <= $#f) ? marker_from_token($f[$marker_idx]) : marker_from_token($otu);
+    my $rid = (defined $read_idx && $read_idx <= $#f) ? normalize_read_id($f[$read_idx]) : '';
     # Accumulate per-OTU-per-raw-sample and per-marker-per-raw-sample counts
     # for replicate breakdown (collapse mode only).
     if ($opt{identity_mode} eq 'collapse'
         && $_raw_sample_col ne ''
         && !SampleLabel::is_no_adapter_label($_raw_sample_col)) {
-      $raw_otu_sample_rep{$otu}{$_raw_sample_col}++;
       my $_mk = $marker ne '' ? $marker : 'OTHER';
-      $raw_sample_marker_rep{$_raw_sample_col}{$_mk}++;
+      my $_rep = adapter_to_rep_label($_raw_sample_col);
+      if ($rid eq '' || !$seen_raw_otu_sample_rep_read{$otu}{$sample}{$_rep}{$rid}++) {
+        $raw_otu_sample_rep{$otu}{$_raw_sample_col}++;
+      }
+      if ($rid eq '' || !$seen_raw_sample_marker_rep_read{$sample}{$_mk}{$_rep}{$rid}++) {
+        $raw_sample_marker_rep{$_raw_sample_col}{$_mk}++;
+      }
     }
     my $kingdom = (defined $kingdom_idx && $kingdom_idx <= $#f) ? trim_text($f[$kingdom_idx]) : '';
     next unless is_kingdom_consistent($kingdom, $marker, $CONFIGURED_TARGET_TAX_MAP);
     my $key = join("\t", $sample, $marker, $otu);
+    my $lock_key = normalize_lock_otu_key($otu);
+    my $membership_available = defined $otu_membership_maps_ref
+      && $otu_membership_maps_ref->{available};
+    my $is_selected_frozen = $lock_key ne ''
+      && defined $lock_frozen_ref
+      && exists $lock_frozen_ref->{$lock_key};
+    my $has_current_members = $membership_available
+      && exists $otu_membership_maps_ref->{read_members}{$otu};
+    my $is_selected_consolidated = !$is_selected_frozen
+      && $lock_key ne ''
+      && defined $lock_consolidated_ref
+      && exists $lock_consolidated_ref->{$lock_key}
+      && (!$membership_available || !$has_current_members);
+    my $selection_available = defined $otu_membership_maps_ref
+      && $otu_membership_maps_ref->{selection_available};
+    my $is_selected_active = $lock_key ne ''
+      && defined $lock_active_ref
+      && exists $lock_active_ref->{$lock_key};
+    my $is_legacy_fallback = !$membership_available && !$selection_available;
+    my $is_selected_fallback = !$is_selected_frozen
+      && ($is_selected_consolidated
+        || (!$membership_available && ($is_selected_active || $is_legacy_fallback)));
 
     if (defined $read_idx && $read_idx <= $#f) {
-      my $rid = trim_text($f[$read_idx]);
-      $rid =~ s/\|.*$//;
       if ($rid ne '') {
-        $counts_fallback{$key}{$rid} = 1;
         $counts_fallback_by_otu{$otu}{$rid} = 1;
+        if (defined $otu_membership_maps_ref
+            && $otu_membership_maps_ref->{available}
+            && !$is_selected_frozen
+            && exists $otu_membership_maps_ref->{read_members}{$otu}
+            && exists $otu_membership_maps_ref->{read_members}{$otu}{$rid}) {
+          if (!exists $otu_membership_maps_ref->{sample_evidence_otus}{$otu}) {
+            if (exists $inferred_current_assignment_by_read{$rid}
+                && $inferred_current_assignment_by_read{$rid}{sample} ne $sample) {
+              die "ERROR: BLAST sample inference '$blast_otu_path' has conflicting samples for read_id '$rid'\n";
+            }
+            $inferred_current_assignment_by_read{$rid} = {
+              otu => $otu,
+              sample => $sample,
+            };
+          }
+          $counts_current_membership{$key}{$rid} = 1;
+        }
+        if ($is_selected_fallback) {
+          if (exists $selected_assignment_by_read{$rid}) {
+            my $prev = $selected_assignment_by_read{$rid};
+            if (($prev->{lock_key} // '') ne $lock_key) {
+              die "ERROR: selected OTU support '$blast_otu_path' has conflicting effective OTUs for read_id '$rid'\n";
+            }
+            my $prev_label = trim_text($prev->{label} // '');
+            my $prev_rank = reporting_sample_authority_rank($prev_label);
+            my $sample_rank = reporting_sample_authority_rank($sample);
+            if ($prev_rank == 3 && $sample_rank == 3 && $prev_label ne $sample) {
+              die "ERROR: selected OTU support '$blast_otu_path' has conflicting samples for read_id '$rid'\n";
+            }
+            if ($sample_rank > $prev_rank
+                || ($sample_rank == $prev_rank && $sample ne '' && $sample lt $prev_label)) {
+              $prev->{label} = $sample;
+            }
+          } else {
+            $selected_assignment_by_read{$rid} = {
+              lock_key => $lock_key,
+              label => $sample,
+              source => 'fallback',
+            };
+          }
+          $selected_fallback_row_keys{$rid}{$key} = 1;
+        }
       }
     }
 
@@ -2678,6 +3113,25 @@ sub collect_otu_assignments_by_level {
     $otu_seen{$key} = 1;
   }
   close $FH;
+
+  for my $rid (keys %selected_fallback_row_keys) {
+    next unless exists $selected_assignment_by_read{$rid};
+    my $sample = trim_text($selected_assignment_by_read{$rid}{label} // '');
+    my @candidate_keys = sort keys %{$selected_fallback_row_keys{$rid}};
+    my ($source_key) = grep {
+      my ($candidate_sample) = split /\t/, $_, 2;
+      $candidate_sample eq $sample;
+    } @candidate_keys;
+    $source_key = $candidate_keys[0] if !defined $source_key;
+    next if !defined $source_key || !exists $best{$source_key};
+    my (undef, $marker, $otu) = split /\t/, $source_key, 3;
+    my $key = join("\t", $sample, $marker, $otu);
+    if (!exists $best{$key}) {
+      $best{$key} = { %{$best{$source_key}}, sample => $sample };
+      $otu_seen{$key} = 1;
+    }
+    $counts_selected_fallback{$key}{$rid} = 1;
+  }
 
   if (defined $canonical_otu_ref && defined $otu_all_sample_reads_ref) {
     for my $key (keys %best) {
@@ -2767,6 +3221,14 @@ sub collect_otu_assignments_by_level {
     my $lock_key = normalize_lock_otu_key($otu);
     my $sample = $row->{sample} // '';
     my $is_frozen = ($lock_key ne '' && defined $lock_frozen_ref && exists $lock_frozen_ref->{$lock_key}) ? 1 : 0;
+    my $membership_available = defined $otu_membership_maps_ref && $otu_membership_maps_ref->{available};
+    my $has_current_members = $membership_available
+      && exists $otu_membership_maps_ref->{read_members}{$otu};
+    my $has_membership_samples = $membership_available
+      && exists $otu_membership_maps_ref->{sample_evidence_otus}{$otu};
+    my $is_consolidated = $lock_key ne ''
+      && defined $lock_consolidated_ref
+      && exists $lock_consolidated_ref->{$lock_key};
     my $global_reads = defined $size_map->{$otu}
       ? $size_map->{$otu}
       : (defined $otu_membership_maps_ref
@@ -2790,9 +3252,13 @@ sub collect_otu_assignments_by_level {
           && $sample ne ''
           && exists $otu_all_sample_reads_ref->{$lock_key}{$sample}) {
         $sample_reads = 0 + $otu_all_sample_reads_ref->{$lock_key}{$sample};
-      } elsif ((!defined $otu_all_sample_reads_ref || $lock_key eq '' || !exists $otu_all_sample_reads_ref->{$lock_key})
-          && exists $counts_fallback{$key}) {
-        $sample_reads = scalar(keys %{$counts_fallback{$key}});
+      } elsif ($membership_available
+          && $has_current_members
+          && !$has_membership_samples
+          && exists $counts_current_membership{$key}) {
+        $sample_reads = scalar(keys %{$counts_current_membership{$key}});
+      } elsif (exists $counts_selected_fallback{$key}) {
+        $sample_reads = scalar(keys %{$counts_selected_fallback{$key}});
       }
     }
     next unless defined $sample_reads && $sample_reads > 0;
@@ -3358,7 +3824,7 @@ sub otu_active_by_marker_from_otu_def {
 }
 
 sub otu_assigned_by_marker_from_blast_otu {
-  my ($path, $filter_set) = @_;
+  my ($path, $filter_set, $alias_ref) = @_;
   return undef unless defined $path && $path ne '';
   if (exists $_parsed_rows{$path}) {
     return undef unless defined $_parsed_rows{$path};
@@ -3367,6 +3833,7 @@ sub otu_assigned_by_marker_from_blast_otu {
     for my $row (@{$_parsed_rows{$path}}) {
       my $otu = trim_text($row->{otu_id} // $row->{OTU_id} // '');
       next if $otu eq '' || uc($otu) eq 'NA';
+      $otu = canonical_otu_alias($otu, $alias_ref);
       if (defined $filter_set && ref($filter_set) eq 'HASH') {
         my $norm = normalize_otu_key($otu);
         next if $norm eq '' || !exists $filter_set->{$norm};
@@ -3422,6 +3889,7 @@ sub otu_assigned_by_marker_from_blast_otu {
     next if $otu_idx > $#f || $tax_idx > $#f;
     my $otu = trim_text($f[$otu_idx]);
     next if $otu eq '' || uc($otu) eq 'NA';
+    $otu = canonical_otu_alias($otu, $alias_ref);
     if (defined $filter_set && ref($filter_set) eq 'HASH') {
       my $norm = normalize_otu_key($otu);
       next if $norm eq '' || !exists $filter_set->{$norm};
@@ -4396,7 +4864,9 @@ my $reads_hac      = count_non_na_in_column($opt{read_info}, 'hac_length');
 my $reads_sup      = count_non_na_in_column($opt{read_info}, 'sup_length');
 
 my $round_index = load_round_index($opt{round_index_file});
+my $otu_alias_map = load_otu_promotion_alias_map();
 my $otu_lock_sets   = otu_lock_sets($opt{otu_lock_summary});
+apply_otu_alias_map_to_lock_sets($otu_lock_sets, $otu_alias_map);
 my $otu_lock_break  = $otu_lock_sets->{counts};
 my $lock_cons_set = $otu_lock_sets->{sets}{consolidated} || {};
 my $lock_frozen_set = $otu_lock_sets->{sets}{frozen_not_consolidated} || {};
@@ -4410,6 +4880,10 @@ my $otu_fate_universe = select_otu_fate_universe(
   $opt{otu_def},
   ($otu_lock_sets->{sets}{active_not_frozen} || {}),
 );
+$otu_fate_universe->{set} = canonicalize_otu_set(
+  $otu_fate_universe->{set},
+  $otu_alias_map,
+) if defined $otu_fate_universe->{set};
 my $otu_fate_universe_source = $otu_fate_universe->{source};
 my $otu_fate_universe_reason = $otu_fate_universe->{reason};
 my $otu_fate_universe_sizes_status = $otu_fate_universe->{sizes_status};
@@ -4470,6 +4944,14 @@ my $size_min_members = to_nonneg_int($opt{otu_blast_min_members});
 my $size_streak_enabled = (defined($size_streak_mode) && $size_streak_mode ne '' && $size_streak_mode ne 'off') ? 1 : 0;
 my $size_streak_sets = load_size_streak_sets($opt{otu_size_streak}, $size_streak_min_rounds, $size_streak_enabled);
 my $blast_unassigned_sets = load_blast_unassigned_otus($opt{blast_otu});
+$blast_unassigned_sets->{assigned} = canonicalize_otu_set(
+  $blast_unassigned_sets->{assigned},
+  $otu_alias_map,
+);
+$blast_unassigned_sets->{seen} = canonicalize_otu_set(
+  $blast_unassigned_sets->{seen},
+  $otu_alias_map,
+);
 my $size_sets = {
   enabled => $size_streak_sets->{enabled},
   status => $size_streak_sets->{status},
@@ -4623,19 +5105,27 @@ my $otu_informative_by_marker = $informative_source_available
 my $_blast_otu_for_sunburst = (defined $opt{blast_otu_cumulative} && $opt{blast_otu_cumulative} ne '' && -s $opt{blast_otu_cumulative})
   ? $opt{blast_otu_cumulative} : $opt{blast_otu};
 my $otu_informative_assigned_by_marker = $informative_source_available
-  ? otu_assigned_by_marker_from_blast_otu($_blast_otu_for_sunburst, \%otu_informative_set)
+  ? otu_assigned_by_marker_from_blast_otu($_blast_otu_for_sunburst, \%otu_informative_set, $otu_alias_map)
   : undef;
 my $consolidated_cons_set = load_id_set($opt{consensus_consolidated_ids});
-my ($otu_member_counts, $otu_def_rep_reads, $otu_def_totals) = load_otu_membership_maps();
-my $canonical_otu_tax = load_canonical_otu_taxonomy($_blast_otu_for_sunburst);
-my $otu_all_sample_reads = %$otu_member_counts ? $otu_member_counts : undef;
-my $frozen_sample_reads = load_frozen_sample_reads();
+my ($otu_member_counts, $otu_def_rep_reads, $otu_def_totals, $otu_def_read_members, $otu_def_sample_evidence_otus, $otu_def_assignments_by_read, $otu_membership_available) = load_otu_membership_maps($otu_alias_map);
+my $canonical_otu_tax = load_canonical_otu_taxonomy($_blast_otu_for_sunburst, $otu_alias_map);
+my $otu_all_sample_reads = $otu_membership_available ? $otu_member_counts : undef;
+my ($frozen_sample_reads, $frozen_assignments_by_read) = load_frozen_sample_reads($lock_frozen_set, $otu_alias_map);
+validate_current_frozen_membership_assignments($otu_def_assignments_by_read, $frozen_assignments_by_read);
+my $selected_membership_assignments = build_selected_membership_assignments(
+  $otu_def_assignments_by_read,
+  $frozen_assignments_by_read,
+  $lock_frozen_set,
+);
 my ($otu_assignments_by_level, $otu_rep_reads, $sample_marker_rep_reads) = collect_otu_assignments_by_level(
   $_blast_otu_for_sunburst,
   $opt{otu_sizes_round},
   \%spec_interest,
   $spec_interest_enabled,
   $lock_frozen_set,
+  $lock_cons_set,
+  ($otu_lock_sets->{sets}{active_not_frozen} || {}),
   $otu_assignment_thresholds,
   $frozen_sample_reads,
   $otu_all_sample_reads,
@@ -4643,7 +5133,17 @@ my ($otu_assignments_by_level, $otu_rep_reads, $sample_marker_rep_reads) = colle
   {
     rep_reads_map => $otu_def_rep_reads,
     total_members => $otu_def_totals,
+    read_members => $otu_def_read_members,
+    sample_evidence_otus => $otu_def_sample_evidence_otus,
+    selected_assignments_by_read => $selected_membership_assignments,
+    selection_available => (
+      defined($otu_lock_cons_raw)
+      || defined($otu_lock_frozen_raw)
+      || defined($otu_lock_active_raw)
+    ) ? 1 : 0,
+    available => $otu_membership_available,
   },
+  $otu_alias_map,
 );
 my $consensus_assignments_by_level = collect_consensus_assignments_by_level($opt{blast_consensus}, \%spec_interest, $spec_interest_enabled, $consolidated_cons_set, $opt{identity_mode}, $sample_marker_rep_reads);
 my %otu_active_by_marker_taxon = (
@@ -4973,6 +5473,7 @@ my $blast_read_fate = collect_blast_read_fate_and_sample_metrics(
   \%sample_label_to_id,
   \%sample_id_to_label,
   ((scalar keys %TRACK_UNIT_METRICS) ? \%TRACK_UNIT_METRICS : undef),
+  $otu_alias_map,
 );
 if ($blast_read_fate->{enabled}) {
   $blast_assignment_status = $blast_read_fate->{assignment_status};
@@ -4987,6 +5488,8 @@ if ($blast_read_fate->{enabled}) {
   $blast_unassigned_reads_adapter = $blast_read_fate->{unassigned}{adapter};
   $blast_unassigned_reads_no_adapter = $blast_read_fate->{unassigned}{no_adapter};
 }
+
+my %seen_consensus_total;
 
 # consensus_emitted: unique consensus IDs grouped by sample.
 if (defined $opt{blast_consensus} && $opt{blast_consensus} ne '') {
@@ -5025,6 +5528,7 @@ if (defined $opt{blast_consensus} && $opt{blast_consensus} ne '') {
             my $entry = $sample_metrics{$sid};
             $entry->{consensus_emitted} = 0 unless defined $entry->{consensus_emitted};
             my $k = "$sid\t$cons_id";
+            $seen_consensus_total{$sid}{$cons_id} = 1;
             if (!$seen_sample_consensus{$k}) {
               $entry->{consensus_emitted}++;
               $seen_sample_consensus{$k} = 1;
@@ -5082,6 +5586,7 @@ if (defined $opt{blast_consensus_consolidated} && $opt{blast_consensus_consolida
           my $ccons_id = trim_text($cf[$ccons_idx]);
           next if $ccons_id eq '' || uc($ccons_id) eq 'NA';
           my $ck = "$csid\t$ccons_id";
+          $seen_consensus_total{$csid}{$ccons_id} = 1;
           unless ($seen_cons{$ck}) {
             $sample_metrics{$csid}{consensus_consolidated} = 0 unless defined $sample_metrics{$csid}{consensus_consolidated};
             $sample_metrics{$csid}{consensus_consolidated}++;
@@ -5106,6 +5611,8 @@ if (defined $opt{blast_otu_cumulative} && $opt{blast_otu_cumulative} ne '' && -s
     \%cum_metrics,
     \%sample_label_to_id,
     \%sample_id_to_label,
+    undef,
+    $otu_alias_map,
   );
   for my $csid (keys %cum_metrics) {
     next unless defined $cum_metrics{$csid}{otu_active};
@@ -5113,11 +5620,11 @@ if (defined $opt{blast_otu_cumulative} && $opt{blast_otu_cumulative} ne '' && -s
   }
 }
 
-# consensus_total: emitted (this round) + consolidated (previous rounds cached).
+# consensus_total: unique union of current and consolidated consensus IDs.
 for my $sid (keys %sample_metrics) {
   my $entry = $sample_metrics{$sid};
   if (defined $entry->{consensus_emitted} || defined $entry->{consensus_consolidated}) {
-    $entry->{consensus_total} = ($entry->{consensus_emitted} // 0) + ($entry->{consensus_consolidated} // 0);
+    $entry->{consensus_total} = scalar keys %{$seen_consensus_total{$sid} || {}};
   }
 }
 
