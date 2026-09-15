@@ -5011,6 +5011,130 @@ def test_assignments_sample_marker_suffix_stripped(tmp_path: Path) -> None:
     assert cons_samples == {"MySample"}, f"Consensus assignment samples wrong: {cons_samples}"
 
 
+def test_assignment_arrays_keep_all_rows_beyond_200_with_independent_support_order(tmp_path: Path) -> None:
+    blast_header = (
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid"
+        "\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+    )
+    otu_rows = []
+    otu_sizes = ["otu_id\tsize\n"]
+    lock_rows = ["otu_key\teffective_consolidated\tis_frozen\n"]
+    consensus_rows = [
+        "consensus_id\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample"
+        "\ttaxid\tblast_hit\taln_length\tperc_id\tconsensus_kingdom\tconsensus_phylum"
+        "\tconsensus_class\tconsensus_order\tconsensus_family\tconsensus_genus\tconsensus_species\n"
+    ]
+    expected_taxa = set()
+    for idx in range(205):
+        otu_id = f"OTUB_{idx:03d}-COI"
+        sample = f"sample_{idx:03d}"
+        species = f"Species_{idx:03d}"
+        expected_taxa.add(species)
+        otu_support = 1 + (idx % 7)
+        consensus_support = 1 + ((204 - idx) % 7)
+        for read_idx in range(otu_support):
+            otu_rows.append(
+                f"r{idx}_{read_idx}\tCOI\thac\t{sample}\thit\t{1000 + idx}\t400\t99"
+                f"\t{otu_id}\tFamily_{idx:03d}\tGenus_{idx:03d}\t{species}\n"
+            )
+        otu_sizes.append(f"{otu_id}\t{otu_support}\n")
+        lock_rows.append(f"{otu_id}\t0\t0\n")
+        consensus_rows.append(
+            f"Cons_{idx:03d}\tCOI\tconsensus\t{consensus_support}\t{sample}\t{1000 + idx}"
+            f"\thit\t400\t99\tMetazoa\tP\tC\tO\tFamily_{idx:03d}\tGenus_{idx:03d}\t{species}\n"
+        )
+
+    blast_otu = tmp_path / "blast_otu.tsv"
+    blast_otu.write_text(blast_header + "".join(otu_rows), encoding="utf-8")
+    blast_consensus = tmp_path / "blast_consensus.tsv"
+    blast_consensus.write_text("".join(consensus_rows), encoding="utf-8")
+    otu_sizes_round = tmp_path / "otu_sizes.tsv"
+    otu_sizes_round.write_text("".join(otu_sizes), encoding="utf-8")
+    lock_summary = tmp_path / "lock.tsv"
+    lock_summary.write_text("".join(lock_rows), encoding="utf-8")
+    out = tmp_path / "round_report.json"
+
+    result = _run([
+        "--run-id", "runA",
+        "--barcode", "RTBioScan",
+        "--round-barcode", "output_round_1",
+        "--out", str(out),
+        "--blast-otu", str(blast_otu),
+        "--blast-consensus", str(blast_consensus),
+        "--otu-sizes-round", str(otu_sizes_round),
+        "--otu-lock-summary", str(lock_summary),
+        "--blast-filter-mode", "off",
+    ])
+    assert result.returncode == 0, result.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+    otu_species = data["otu"]["assignments_by_level"]["species"]
+    consensus_species = data["consensus"]["assignments_by_level"]["species"]
+
+    assert len(otu_species) == 205
+    assert len(consensus_species) == 205
+    assert {row["taxon"] for row in otu_species} == expected_taxa
+    assert {row["taxon"] for row in consensus_species} == expected_taxa
+    assert otu_species[0]["taxon"] == "Species_006"
+    assert consensus_species[0]["taxon"] == "Species_002"
+
+
+def _run_otu_assignment_source_case(tmp_path: Path, current_rows: str, cumulative_rows: str) -> dict:
+    header = (
+        "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid"
+        "\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+    )
+    blast_otu = tmp_path / "blast_otu.tsv"
+    blast_otu.write_text(header + current_rows, encoding="utf-8")
+    blast_otu_cumulative = tmp_path / "blast_otu_cumulative.tsv"
+    blast_otu_cumulative.write_text(header + cumulative_rows, encoding="utf-8")
+    out = tmp_path / "round_report.json"
+    result = _run([
+        "--run-id", "runA",
+        "--barcode", "RTBioScan",
+        "--round-barcode", "output_round_1",
+        "--out", str(out),
+        "--blast-otu", str(blast_otu),
+        "--blast-otu-cumulative", str(blast_otu_cumulative),
+        "--blast-filter-mode", "off",
+    ])
+    assert result.returncode == 0, result.stderr
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def test_header_only_cumulative_otu_assignments_fall_back_to_current_rows(tmp_path: Path) -> None:
+    current_row = (
+        "current_r1\tCOI\thac\tcurrent_sample\thit\t101\t400\t99"
+        "\tOTUB_current-COI\tCurrentFamily\tCurrentGenus\tCurrentSpecies\n"
+    )
+    data = _run_otu_assignment_source_case(tmp_path, current_row, "")
+    rows = data["otu"]["assignments_by_level"]["species"]
+    assert [row["taxon"] for row in rows] == ["CurrentSpecies"]
+
+
+def test_usable_cumulative_otu_assignments_remain_preferred(tmp_path: Path) -> None:
+    current_row = (
+        "current_r1\tCOI\thac\tcurrent_sample\thit\t101\t400\t99"
+        "\tOTUB_current-COI\tCurrentFamily\tCurrentGenus\tCurrentSpecies\n"
+    )
+    cumulative_row = (
+        "cumulative_r1\tCOI\thac\tcumulative_sample\thit\t202\t400\t99"
+        "\tOTUB_cumulative-COI\tCumulativeFamily\tCumulativeGenus\tCumulativeSpecies\n"
+    )
+    data = _run_otu_assignment_source_case(tmp_path, current_row, cumulative_row)
+    rows = data["otu"]["assignments_by_level"]["species"]
+    assert [row["taxon"] for row in rows] == ["CumulativeSpecies"]
+
+
+def test_no_usable_otu_assignment_source_emits_empty_arrays(tmp_path: Path) -> None:
+    unusable_cumulative_row = (
+        "cumulative_r1\tCOI\thac\tcumulative_sample\thit\t202\t400\t99"
+        "\tNA\tCumulativeFamily\tCumulativeGenus\tCumulativeSpecies\n"
+    )
+    data = _run_otu_assignment_source_case(tmp_path, "", unusable_cumulative_row)
+    for level in ("species", "genus", "family"):
+        assert data["otu"]["assignments_by_level"][level] == []
+
+
 def test_assignments_by_level_track_mode_isolates_track_units(tmp_path: Path) -> None:
     """In track mode, assignments_by_level must emit separate rows per track unit.
     Two replicates (sample_A_1, sample_A_2) with different species must NOT be

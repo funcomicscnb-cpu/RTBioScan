@@ -2283,7 +2283,7 @@ Enable or disable incremental HTML report rendering (`${params.outdir}/report_ht
   - One invalid round nulls the run/index read-fate chart.
 - The Runs table is driven by `${params.outdir}/report_html/runs_index.jsonl` and links to per-run reports.
 - Run status uses a time-based cadence: Fresh (≤1.5×), Aging (1.5–3×), Stale (>3×) relative to the last two updates (or start→first round).
-- Per-run reports include an "OTU Assignments (Latest Round)" table with Species/Genus/Family tabs, sorted by supporting reads, paginated in 10-row pages (top 200 per level).
+- Per-run reports include OTU and consensus assignment tables for the current state through the latest completed round, including carried-forward evidence where applicable. Species/Genus/Family tabs remain sorted by supporting reads and paginated in 10-row pages; the backing JSON and TSV exports retain the complete row set. The OTU table shows rows with at least five sample-scoped supporting reads; the assignment-by-sample matrix retains lower-support OTU rows in light orange and excludes them from supported totals.
 Note: run reports are easiest to browse over HTTP, but with the default empty `--html_report_url_prefix` they use relative links rather than root-absolute paths.
 
 #### `--html_report_auto_refresh`

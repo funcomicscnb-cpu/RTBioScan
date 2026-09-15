@@ -3424,9 +3424,6 @@ sub collect_otu_assignments_by_level {
         || ($a->{sample} // '') cmp ($b->{sample} // '')
         || ($a->{marker} // '') cmp ($b->{marker} // '')
     } @agg;
-    if (@agg > 200) {
-      @agg = @agg[0..199];
-    }
     $by_level{$level} = \@agg;
   }
 
@@ -3633,9 +3630,6 @@ sub collect_consensus_assignments_by_level {
         || ($a->{sample} // '') cmp ($b->{sample} // '')
         || ($a->{marker} // '') cmp ($b->{marker} // '')
     } @agg;
-    if (@agg > 200) {
-      @agg = @agg[0..199];
-    }
     $by_level{$level} = \@agg;
   }
 
@@ -3920,6 +3914,48 @@ sub otu_counts_by_marker_from_set {
     $counts{$marker}++;
   }
   return \%counts;
+}
+
+sub blast_otu_has_usable_data_row {
+  my ($path) = @_;
+  return 0 unless defined $path && $path ne '' && -e $path && -s $path;
+  my $FH = open_cached_text_handle($path);
+  if (!defined $FH) {
+    warn_once("open_failed:$path");
+    return 0;
+  }
+  my $header = <$FH>;
+  if (!defined $header) {
+    close $FH;
+    return 0;
+  }
+  chomp $header;
+  my @cols = split /\t/, $header, -1;
+  my %idx;
+  for my $i (0 .. $#cols) {
+    my $key = trim_text($cols[$i]);
+    $idx{lc($key)} = $i if $key ne '';
+  }
+  my $otu_idx = header_index_fallback(\%idx, 'otu_id', 'OTU_id');
+  if (!defined $otu_idx) {
+    close $FH;
+    warn_once("missing_column:$path:otu_id_or_OTU_id");
+    return 0;
+  }
+  while (my $line = <$FH>) {
+    chomp $line;
+    next if $line =~ /^\s*$/;
+    next if is_repeated_header_line($line, $header);
+    my @fields = split /\t/, $line, -1;
+    next if $otu_idx > $#fields;
+    my $otu = trim_text($fields[$otu_idx]);
+    if ($otu ne '' && uc($otu) ne 'NA') {
+      close $FH;
+      return 1;
+    }
+  }
+  close $FH;
+  return 0;
 }
 
 sub kv_value {
@@ -5102,7 +5138,8 @@ if ($informative_source_available) {
 my $otu_informative_by_marker = $informative_source_available
   ? otu_counts_by_marker_from_set(\%otu_informative_set)
   : undef;
-my $_blast_otu_for_sunburst = (defined $opt{blast_otu_cumulative} && $opt{blast_otu_cumulative} ne '' && -s $opt{blast_otu_cumulative})
+my $_blast_otu_for_sunburst = (defined $opt{blast_otu_cumulative} && $opt{blast_otu_cumulative} ne ''
+    && blast_otu_has_usable_data_row($opt{blast_otu_cumulative}))
   ? $opt{blast_otu_cumulative} : $opt{blast_otu};
 my $otu_informative_assigned_by_marker = $informative_source_available
   ? otu_assigned_by_marker_from_blast_otu($_blast_otu_for_sunburst, \%otu_informative_set, $otu_alias_map)

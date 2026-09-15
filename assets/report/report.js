@@ -1193,6 +1193,16 @@
     drawConsensusEmittedByMarker(null, { chartId: "run_consensus_emitted", pageIndex: 0 });
   }
 
+  function assignmentScopeText(round) {
+    const roundBarcode = round && round.round_barcode != null
+      ? String(round.round_barcode).trim()
+      : "";
+    const roundIdentifier = roundBarcode.replace(/^round_/i, "").trim();
+    return roundIdentifier
+      ? `Current state through round ${roundIdentifier}`
+      : "Current state through latest completed round";
+  }
+
   function renderOtuAssignmentsTable(round, mountNode = charts) {
     if (!mountNode) return;
     const levels = ["species", "genus", "family"];
@@ -1207,6 +1217,7 @@
     }
     renderAssignmentsTable({
       title: "OTU Assignments",
+      scopeText: assignmentScopeText(round),
       dataRoot,
       countKey: "otu_count",
       countLabel: "OTUs",
@@ -1224,6 +1235,7 @@
     const dataRoot = round && round.consensus && round.consensus.assignments_by_level ? round.consensus.assignments_by_level : {};
     renderAssignmentsTable({
       title: "Consensus Assignments",
+      scopeText: assignmentScopeText(round),
       dataRoot,
       countKey: "consensus_count",
       countLabel: "Consensus",
@@ -1507,7 +1519,7 @@
     return entry ? (entry.count || 0) : 0;
   }
 
-  function renderAssignmentsTable({ title, dataRoot, countKey, countLabel, emptyText, extraCols = [], mountNode = charts, readValueFn = null }) {
+  function renderAssignmentsTable({ title, scopeText = "", dataRoot, countKey, countLabel, emptyText, extraCols = [], mountNode = charts, readValueFn = null }) {
     if (!mountNode) return;
     const levels = ["species", "genus", "family"];
     const card = document.createElement("div");
@@ -1733,6 +1745,12 @@
     ]);
     header.appendChild(makeDownloadLink(title, makeTsv(tsvCols, tsvRows)));
     card.appendChild(header);
+    if (scopeText) {
+      const scope = document.createElement("p");
+      scope.className = "otu-assign-scope otu-assign-empty";
+      scope.textContent = scopeText;
+      card.appendChild(scope);
+    }
     card.appendChild(tabBar);
     card.appendChild(tableWrap);
     card.appendChild(pager);

@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -339,9 +340,11 @@ def test_render_html_with_empty_history(tmp_path: Path) -> None:
     assert out_state.exists()
     state = json.loads(out_state.read_text(encoding="utf-8"))
     meta = _extract_js_json(html, "window.REPORT_META = ")
+    payload = _extract_js_json(html, "window.REPORT_PAYLOAD = ")
     assert set(state.keys()) == {"schema_version", "generated_at_utc", "report_revision"}
     assert meta["schema_version"] == state["schema_version"] == "2.0"
     assert len(state["report_revision"]) == 64
+    assert payload["rounds"] == []
 
 
 def test_render_html_skips_malformed_history_lines(tmp_path: Path) -> None:
@@ -887,6 +890,99 @@ def test_report_js_otu_heatmap_contract_for_frozen_fields() -> None:
     )
 
 
+def test_report_js_assignment_cards_show_latest_round_scope_without_changing_table_policy() -> None:
+    node_path = shutil.which("node")
+    if node_path is None:
+        pytest.skip("node not found in PATH")
+    source = JS.read_text(encoding="utf-8")
+
+    def extract_function(name: str) -> str:
+        start = source.index(f"  function {name}(")
+        opening_brace = source.index(") {", start) + 2
+        depth = 0
+        for position in range(opening_brace, len(source)):
+            if source[position] == "{":
+                depth += 1
+            elif source[position] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:position + 1]
+        raise AssertionError(f"Unable to extract JavaScript function {name}")
+
+    functions = "\n".join(extract_function(name) for name in (
+        "flatMapCompat",
+        "assignmentScopeText",
+        "renderOtuAssignmentsTable",
+        "renderConsensusAssignmentsTable",
+        "collectReplicateLabels",
+        "replicateCountForLabel",
+        "renderAssignmentsTable",
+    ))
+    harness = functions + r'''
+class Element {
+  constructor(tagName) {
+    this.tagName = String(tagName).toUpperCase();
+    this.children = [];
+    this.className = "";
+    this.textContent = "";
+    this.classList = { add() {}, remove() {}, toggle() {} };
+  }
+  appendChild(child) { this.children.push(child); return child; }
+  addEventListener() {}
+}
+const document = { createElement(tagName) { return new Element(tagName); } };
+const charts = null;
+const otuSampleReads = () => 0;
+const isSupportedOtuAssignment = () => true;
+const otuRowMeetsConfiguredThreshold = () => true;
+const clearNode = (node) => { node.children = []; };
+const makeTsv = () => "";
+const makeDownloadLink = () => new Element("a");
+
+function renderScopes(round) {
+  const mount = new Element("main");
+  renderOtuAssignmentsTable(round, mount);
+  renderConsensusAssignmentsTable(round, mount);
+  return mount.children.map((card) => {
+    const scope = card.children.find((child) => child.className.includes("otu-assign-scope"));
+    return { text: scope.textContent, childCount: scope.children.length };
+  });
+}
+
+console.log(JSON.stringify({
+  normalized: renderScopes({round_barcode: "  round_006  "}),
+  caseInsensitive: renderScopes({round_barcode: "ROUND_007"}),
+  unrelated: renderScopes({round_barcode: "MYRUN_12"}),
+  embedded: renderScopes({round_barcode: "ground_006"}),
+  noRound: renderScopes(null),
+  empty: renderScopes({round_barcode: "round_"}),
+  htmlLike: renderScopes({round_barcode: "round_<img src=x onerror=alert(1)>"}),
+}));
+'''
+    result = subprocess.run([node_path, "-e", harness], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    rendered = json.loads(result.stdout)
+
+    assert [item["text"] for item in rendered["normalized"]] == ["Current state through round 006"] * 2
+    assert all("round round_006" not in item["text"] for item in rendered["normalized"])
+    assert [item["text"] for item in rendered["caseInsensitive"]] == ["Current state through round 007"] * 2
+    assert [item["text"] for item in rendered["unrelated"]] == ["Current state through round MYRUN_12"] * 2
+    assert [item["text"] for item in rendered["embedded"]] == ["Current state through round ground_006"] * 2
+    assert [item["text"] for item in rendered["noRound"]] == ["Current state through latest completed round"] * 2
+    assert [item["text"] for item in rendered["empty"]] == ["Current state through latest completed round"] * 2
+    assert [item["text"] for item in rendered["htmlLike"]] == [
+        "Current state through round <img src=x onerror=alert(1)>"
+    ] * 2
+    assert all(item["childCount"] == 0 for item in rendered["htmlLike"])
+
+    assert 'title: "OTU Assignments"' in source
+    assert 'title: "Consensus Assignments"' in source
+    assert "scope.textContent = scopeText" in source
+    assert "scope.innerHTML" not in source
+    assert "const pageSize = 10" in source
+    assert "numAny(otuSampleReads(row)) >= OTU_ASSIGNMENT_MIN_READS" in source
+
+
 def test_iter_sample_assignment_rows_collapses_track_sample_replicates() -> None:
     report_render = _load_report_render_module()
     round_obj = {
@@ -966,6 +1062,73 @@ def test_write_assignments_produces_nonempty_tsv(tmp_path: Path) -> None:
     assert frozen_sp.exists(), "frozen_otu_assignments_species.tsv should be written"
     frozen_lines = frozen_sp.read_text(encoding="utf-8").strip().splitlines()
     assert len(frozen_lines) >= 2, "frozen TSV must have header + at least one data row"
+
+
+def test_write_assignments_refreshes_populated_and_empty_tsvs_with_signatures(tmp_path: Path) -> None:
+    report_render = _load_report_render_module()
+    populated_round = {
+        "identity_mode": "collapse",
+        "otu": {
+            "assignments_by_level": {
+                "species": [
+                    {"sample": "sample_A", "marker": "COI", "taxon": "Species_A", "otu_count": 1,
+                     "frozen_otu_count": 1, "reads_total": 5},
+                ],
+            }
+        },
+        "consensus": {
+            "assignments_by_level": {
+                "species": [
+                    {"sample": "sample_A", "marker": "COI", "taxon": "Species_A", "consensus_count": 1,
+                     "consolidated_consensus_count": 1, "reads_total": 5},
+                ],
+            }
+        },
+    }
+    empty_round = {
+        "identity_mode": "collapse",
+        "otu": {"assignments_by_level": {"species": [], "genus": [], "family": []}},
+        "consensus": {"assignments_by_level": {"species": [], "genus": [], "family": []}},
+    }
+    tsv_dir = tmp_path / "figures"
+    sig_root = tmp_path / "report_assets" / ".private_signatures"
+    otu_path = tsv_dir / "otu_assignments_species.tsv"
+    consensus_path = tsv_dir / "consensus_assignments_species.tsv"
+    otu_sig_path = sig_root / "figures" / "runX" / "otu_assignments_species.tsv.sig"
+    consensus_sig_path = sig_root / "figures" / "runX" / "consensus_assignments_species.tsv.sig"
+
+    report_render.write_chart_tsvs([populated_round], tsv_dir, run_id="runX", sig_root=sig_root)
+    populated_otu_text = otu_path.read_text(encoding="utf-8")
+    populated_consensus_text = consensus_path.read_text(encoding="utf-8")
+    populated_otu_sig = otu_sig_path.read_text(encoding="utf-8")
+    populated_consensus_sig = consensus_sig_path.read_text(encoding="utf-8")
+    assert len(populated_otu_text.splitlines()) == 2
+    assert len(populated_consensus_text.splitlines()) == 2
+
+    report_render.write_chart_tsvs([empty_round], tsv_dir, run_id="runX", sig_root=sig_root)
+    otu_lines = otu_path.read_text(encoding="utf-8").splitlines()
+    consensus_lines = consensus_path.read_text(encoding="utf-8").splitlines()
+    assert otu_lines == [
+        "taxon\tsample\tmarker\tfamily\tgenus\tspecies\totu_count\tfrozen_otu_count"
+        "\tfrozen_otu_reads_total\tfrozen_otu_reads_sample_total\totu_reads_sample_total"
+        "\treads_total\totu_reads_global_total\tfrozen_otu_reads_global_total"
+        "\tperc_id_min\tperc_id_max\taln_length_min\taln_length_max"
+    ]
+    assert consensus_lines == [
+        "taxon\tsample\tmarker\tfamily\tgenus\tspecies\tconsensus_count"
+        "\tconsolidated_consensus_count\tconsolidated_consensus_reads_total\treads_total"
+        "\tperc_id_min\tperc_id_max\taln_length_min\taln_length_max"
+    ]
+    empty_otu_sig = otu_sig_path.read_text(encoding="utf-8")
+    empty_consensus_sig = consensus_sig_path.read_text(encoding="utf-8")
+    assert empty_otu_sig != populated_otu_sig
+    assert empty_consensus_sig != populated_consensus_sig
+
+    report_render.write_chart_tsvs([populated_round], tsv_dir, run_id="runX", sig_root=sig_root)
+    assert otu_path.read_text(encoding="utf-8") == populated_otu_text
+    assert consensus_path.read_text(encoding="utf-8") == populated_consensus_text
+    assert otu_sig_path.read_text(encoding="utf-8") == populated_otu_sig
+    assert consensus_sig_path.read_text(encoding="utf-8") == populated_consensus_sig
 
 
 def test_natural_round_key_sorts_ordinal_round_words() -> None:
@@ -1210,6 +1373,7 @@ def test_render_includes_otu_assignments_payload(tmp_path: Path) -> None:
                 "round_barcode": "round_001",
                 "timestamp_utc": "2026-03-06T00:01:00Z",
                 "otu": {"assignments_by_level": {"species": [{"otu_id": "OTU1", "reads": 5}]}},
+                "consensus": {"assignments_by_level": {"species": [{"consensus_id": "CONS1", "reads_total": 5}]}},
                 "warnings": [],
             }
         )
@@ -1222,6 +1386,209 @@ def test_render_includes_otu_assignments_payload(tmp_path: Path) -> None:
     assert rc.returncode == 0, rc.stderr
     payload = _extract_js_json(out_html.read_text(encoding="utf-8"), "window.REPORT_PAYLOAD = ")
     assert payload["rounds"][0]["otu"]["assignments_by_level"]["species"][0]["otu_id"] == "OTU1"
+    assert payload["rounds"][0]["consensus"]["assignments_by_level"]["species"][0]["consensus_id"] == "CONS1"
+
+
+def test_render_payload_keeps_only_latest_assignment_rows_for_run_and_index(tmp_path: Path) -> None:
+    row_count = 205
+
+    def assignment_round(round_number: int) -> dict:
+        marker = "ITS2" if round_number == 1 else "COI"
+        otu_levels = {}
+        consensus_levels = {}
+        for level in ("species", "genus", "family"):
+            otu_levels[level] = [
+                {
+                    "taxon": f"{level}_otu_{round_number}_{idx}",
+                    "sample": "sample_A",
+                    "marker": marker,
+                    "otu_count": 1,
+                    "frozen_otu_count": 0,
+                    "reads_total": 5,
+                    "otu_reads_sample_total": 5,
+                }
+                for idx in range(row_count)
+            ]
+            consensus_levels[level] = [
+                {
+                    "taxon": f"{level}_consensus_{round_number}_{idx}",
+                    "sample": "sample_A",
+                    "marker": marker,
+                    "consensus_count": 1,
+                    "consolidated_consensus_count": 0,
+                    "reads_total": 5,
+                }
+                for idx in range(row_count)
+            ]
+        otu_levels["species_interest_enabled"] = False
+        consensus_levels["species_interest_enabled"] = False
+        return {
+            "schema_version": "2.0",
+            "run_id": "runA",
+            "barcode": "B1",
+            "round_barcode": f"round_{round_number:03d}",
+            "timestamp_utc": f"2026-03-06T00:0{round_number}:00Z",
+            "round_metadata": {"sentinel": f"metadata_{round_number}"},
+            "markers": {"order": [] if round_number == 1 else [marker]},
+            "otu": {
+                "canonical": {"active": round_number},
+                "assignments_by_level": otu_levels,
+            },
+            "consensus": {
+                "emitted": round_number,
+                "assignments_by_level": consensus_levels,
+            },
+            "warnings": [],
+        }
+
+    rounds = [assignment_round(round_number) for round_number in range(1, 5)]
+    report_render = _load_report_render_module()
+    page_rounds = report_render.build_page_rounds(rounds)
+    assert len(page_rounds[0]["otu"]["assignments_by_level"]["species"]) == 0
+    assert len(rounds[0]["otu"]["assignments_by_level"]["species"]) == row_count
+    history = tmp_path / "history.jsonl"
+    history.write_text("\n".join(json.dumps(row) for row in rounds) + "\n", encoding="utf-8")
+    history_before = history.read_bytes()
+
+    index_html = tmp_path / "index.html"
+    index_state = tmp_path / "index_state.json"
+    index_result = _run(history, index_html, index_state, extra_args=["--sample-plot-max", "0"])
+    assert index_result.returncode == 0, index_result.stderr
+    index_payload = _extract_js_json(index_html.read_text(encoding="utf-8"), "window.REPORT_PAYLOAD = ")
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    run_html = run_dir / "report.html"
+    run_state = run_dir / "report_state.json"
+    run_result = _run(
+        history,
+        run_html,
+        run_state,
+        extra_args=["--run-id-filter", "runA", "--sample-plot-max", "0"],
+    )
+    assert run_result.returncode == 0, run_result.stderr
+    run_payload = _extract_js_json(run_html.read_text(encoding="utf-8"), "window.REPORT_PAYLOAD = ")
+    assert "run_otu_sunburst_ITS2" in run_payload["chart_exports"]
+
+    for payload in (index_payload, run_payload):
+        assert payload["history_count"] == 4
+        assert len(payload["rounds"]) == 4
+        for round_index, embedded_round in enumerate(payload["rounds"]):
+            assert embedded_round["round_metadata"] == {"sentinel": f"metadata_{round_index + 1}"}
+            assert embedded_round["otu"]["canonical"]["active"] == round_index + 1
+            assert embedded_round["consensus"]["emitted"] == round_index + 1
+            for source_key in ("otu", "consensus"):
+                assignments = embedded_round[source_key]["assignments_by_level"]
+                assert assignments["species_interest_enabled"] is False
+                expected_count = row_count if round_index == 3 else 0
+                for level in ("species", "genus", "family"):
+                    assert len(assignments[level]) == expected_count
+
+    assert history.read_bytes() == history_before
+    full_history = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines()]
+    for round_obj in full_history:
+        for source_key in ("otu", "consensus"):
+            for level in ("species", "genus", "family"):
+                assert len(round_obj[source_key]["assignments_by_level"][level]) == row_count
+
+    assert len((run_dir / "figures" / "otu_assignments_species.tsv").read_text(encoding="utf-8").splitlines()) == row_count + 1
+    assert len((run_dir / "figures" / "consensus_assignments_species.tsv").read_text(encoding="utf-8").splitlines()) == row_count + 1
+
+    compact_json = lambda value: json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+    full_rounds_size = len(compact_json(rounds))
+    embedded_rounds_size = len(compact_json(run_payload["rounds"]))
+    latest_round_size = len(compact_json(rounds[-1]))
+    assert embedded_rounds_size <= latest_round_size + 12_000
+    assert embedded_rounds_size * 2 < full_rounds_size
+
+
+def test_main_authoritative_consumers_receive_full_history_before_page_trimming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_render = _load_report_render_module()
+    expected_otu_rows = [
+        {"taxon": "Old otu A", "sample": "sample_A", "marker": "ITS2", "otu_count": 1, "reads_total": 3},
+        {"taxon": "Old otu B", "sample": "sample_A", "marker": "ITS2", "otu_count": 1, "reads_total": 1},
+    ]
+    expected_consensus_rows = [
+        {"taxon": "Old consensus A", "sample": "sample_A", "marker": "ITS2", "consensus_count": 1, "reads_total": 3},
+        {"taxon": "Old consensus B", "sample": "sample_A", "marker": "ITS2", "consensus_count": 1, "reads_total": 2},
+    ]
+    rounds = [
+        {
+            "schema_version": "2.0",
+            "run_id": "runA",
+            "barcode": "B1",
+            "round_barcode": "round_001",
+            "timestamp_utc": "2026-03-06T00:01:00Z",
+            "sample_metrics": {
+                "sample_a": {"sample_id": "sample_a", "label": "sample_A", "reads_demux": 4},
+            },
+            "otu": {"assignments_by_level": {"species": expected_otu_rows, "genus": [], "family": []}},
+            "consensus": {"assignments_by_level": {"species": expected_consensus_rows, "genus": [], "family": []}},
+            "warnings": [],
+        },
+        {
+            "schema_version": "2.0",
+            "run_id": "runA",
+            "barcode": "B1",
+            "round_barcode": "round_002",
+            "timestamp_utc": "2026-03-06T00:02:00Z",
+            "sample_metrics": {
+                "sample_a": {"sample_id": "sample_a", "label": "sample_A", "reads_demux": 6},
+            },
+            "otu": {"assignments_by_level": {"species": [{"taxon": "New otu", "sample": "sample_A", "marker": "COI", "otu_count": 1, "reads_total": 6}], "genus": [], "family": []}},
+            "consensus": {"assignments_by_level": {"species": [{"taxon": "New consensus", "sample": "sample_A", "marker": "COI", "consensus_count": 1, "reads_total": 6}], "genus": [], "family": []}},
+            "warnings": [],
+        },
+    ]
+    history = tmp_path / "history.jsonl"
+    history.write_text("\n".join(json.dumps(row) for row in rounds) + "\n", encoding="utf-8")
+    calls = []
+
+    class AuthoritativeHistoryError(BaseException):
+        pass
+
+    def assert_complete_history(consumer_name, sorted_rounds):
+        oldest = sorted_rounds[0]
+        if oldest["otu"]["assignments_by_level"]["species"] != expected_otu_rows:
+            raise AuthoritativeHistoryError(f"{consumer_name} received incomplete oldest-round OTU assignments")
+        if oldest["consensus"]["assignments_by_level"]["species"] != expected_consensus_rows:
+            raise AuthoritativeHistoryError(f"{consumer_name} received incomplete oldest-round consensus assignments")
+        calls.append(consumer_name)
+
+    def fake_build_chart_exports(sorted_rounds, _sorted_runs, _out_path, _run_id):
+        assert_complete_history("build_chart_exports", sorted_rounds)
+        return {}
+
+    def fake_append_generated_sample_figures(sorted_rounds, *_args, **_kwargs):
+        assert_complete_history("append_generated_sample_figures", sorted_rounds)
+
+    def fake_write_chart_tsvs(sorted_rounds, *_args, **_kwargs):
+        assert_complete_history("write_chart_tsvs", sorted_rounds)
+
+    def reject_external_processes(*_args, **_kwargs):
+        raise AssertionError("authoritative-consumer ordering test must not invoke external processes")
+
+    monkeypatch.setattr(report_render, "build_chart_exports", fake_build_chart_exports)
+    monkeypatch.setattr(report_render, "append_generated_sample_figures", fake_append_generated_sample_figures)
+    monkeypatch.setattr(report_render, "write_chart_tsvs", fake_write_chart_tsvs)
+    monkeypatch.setattr(report_render, "collect_consensus_sequence_rows", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(report_render.subprocess, "run", reject_external_processes)
+    monkeypatch.setattr(sys, "argv", [
+        str(SCRIPT),
+        "--history", str(history),
+        "--template", str(TEMPLATE),
+        "--css", str(CSS),
+        "--js", str(JS),
+        "--out", str(tmp_path / "report.html"),
+        "--state-out", str(tmp_path / "report_state.json"),
+        "--run-id-filter", "runA",
+    ])
+
+    assert report_render.main() is None
+    assert calls == ["build_chart_exports", "append_generated_sample_figures", "write_chart_tsvs"]
 
 
 def test_render_concurrent_writes_keep_outputs_valid(tmp_path: Path) -> None:

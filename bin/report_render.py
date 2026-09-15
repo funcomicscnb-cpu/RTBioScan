@@ -325,6 +325,34 @@ def sort_rounds(rounds):
     return sorted(rounds, key=sort_key)
 
 
+def build_page_rounds(sorted_rounds):
+    """Keep complete latest assignments while making older page payloads lightweight."""
+    rounds = list(sorted_rounds or [])
+    if len(rounds) <= 1:
+        return rounds
+    page_rounds = []
+    for round_index, round_obj in enumerate(rounds):
+        if round_index == len(rounds) - 1 or not isinstance(round_obj, dict):
+            page_rounds.append(round_obj)
+            continue
+        page_round = copy.copy(round_obj)
+        for source_key in ("otu", "consensus"):
+            source = round_obj.get(source_key)
+            if not isinstance(source, dict):
+                continue
+            assignments = source.get("assignments_by_level")
+            if not isinstance(assignments, dict):
+                continue
+            page_source = copy.copy(source)
+            page_assignments = copy.copy(assignments)
+            for level in ("species", "genus", "family"):
+                page_assignments[level] = []
+            page_source["assignments_by_level"] = page_assignments
+            page_round[source_key] = page_source
+        page_rounds.append(page_round)
+    return page_rounds
+
+
 def sort_runs(runs):
     def sort_key(item):
         ts = item.get("last_updated_utc") or item.get("last_round_timestamp_utc")
@@ -3163,6 +3191,33 @@ def write_chart_tsvs(sorted_rounds, tsv_dir, run_id=None, sig_root=None, report_
             pass
 
     # Assignment tables from the latest round
+    def empty_assignment_columns(src_key, level):
+        common = ["taxon", "sample", "marker", "family", "genus", "species"]
+        if src_key == "otu":
+            columns = common + [
+                "otu_count", "frozen_otu_count", "frozen_otu_reads_total",
+                "frozen_otu_reads_sample_total", "otu_reads_sample_total",
+                "reads_total", "otu_reads_global_total", "frozen_otu_reads_global_total",
+                "perc_id_min", "perc_id_max", "aln_length_min", "aln_length_max",
+            ]
+        else:
+            columns = common + [
+                "consensus_count", "consolidated_consensus_count",
+                "consolidated_consensus_reads_total", "reads_total",
+                "perc_id_min", "perc_id_max", "aln_length_min", "aln_length_max",
+            ]
+        source = latest_round.get(src_key) if isinstance(latest_round, dict) else None
+        assignments = source.get("assignments_by_level", {}) if isinstance(source, dict) else {}
+        if level == "species" and isinstance(assignments, dict) and assignments.get("species_interest_enabled") is True:
+            columns.append("species_interest")
+        if isinstance(latest_round, dict) and latest_round.get("identity_mode") == "track":
+            columns.extend([
+                "track_unit_id", "track_sample_label", "track_replicate_id",
+                "track_replicate_number", "track_replicate_label",
+                "track_sample_replicate_label", "track_primer_label",
+            ])
+        return columns
+
     def write_assignments(src_key, level, count_field, fname):
         rows = []
         if isinstance(latest_round, dict):
@@ -3174,9 +3229,8 @@ def write_chart_tsvs(sorted_rounds, tsv_dir, run_id=None, sig_root=None, report_
                     rows = [r for r in level_rows
                             if isinstance(r, dict)
                             and (not count_field or num_any(r.get(count_field, 0)) > 0)]
-        if not rows:
-            return
-        cols = list(dict.fromkeys(k for r in rows for k in r))
+        cols = (list(dict.fromkeys(k for r in rows for k in r))
+                if rows else empty_assignment_columns(src_key, level))
         _write_tsv_with_sig(tsv_dir / fname, cols, [[r.get(c, "") for c in cols] for r in rows])
 
     for _lvl in ("species", "genus", "family"):
@@ -3464,9 +3518,10 @@ def main():
             "is_active": True,
         }]
     figures_payload = latest_round.get("figures", []) if args.run_id_filter else []
+    page_rounds = build_page_rounds(sorted_rounds)
 
     payload = {
-        "rounds": sorted_rounds,
+        "rounds": page_rounds,
         "history_count": len(sorted_rounds),
         "generated_at_utc": generated_at_utc,
         "parse_warnings": parse_warnings + run_warnings,

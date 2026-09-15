@@ -167,10 +167,11 @@ Fields (integers or `null` if unavailable):
 ### `otu.assignments_by_level`
 [back to Top](#report-schema-round-reportjson)
 
-Per-round OTU taxonomic assignment summary for the latest round in run reports.
+OTU taxonomic assignment summary for the current state through this completed round,
+including carried-forward evidence where applicable.
 Structured as `{species, genus, family}` arrays with rows **aggregated by taxon + sample + marker**.
 Rows are sorted by `reads_total` (desc), then `otu_count` (desc), then taxon.
-Each level is capped to the top 200 rows.
+Each level contains the complete sorted row set; client displays may paginate it.
 
 Each row includes:
 - `taxon` (string; taxon name for the level)
@@ -194,10 +195,11 @@ Additional field:
 ### `consensus.assignments_by_level`
 [back to Top](#report-schema-round-reportjson)
 
-Per-round consensus taxonomic assignment summary for the latest round in run reports.
+Consensus taxonomic assignment summary for the current state through this completed round,
+including carried-forward evidence where applicable.
 Structured as `{species, genus, family}` arrays with rows **aggregated by taxon + sample + marker**.
 Rows are sorted by `reads_total` (desc), then `consensus_count` (desc), then taxon.
-Each level is capped to the top 200 rows.
+Each level contains the complete sorted row set; client displays may paginate it.
 
 Each row includes:
 - `taxon` (string; taxon name for the level)
