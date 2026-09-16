@@ -346,6 +346,16 @@ scan_restart_tree() {
 
     for entry in ${entries[@]+"${entries[@]}"}; do
         name="${entry##*/}"
+        if [ "$MODE" = "restore" ] && [ "$root" = "$CURRENT_ROOT" ] &&
+            { [ -d "$CURRENT_ROOT/tables" ] || [ -d "$CURRENT_ROOT/plots" ]; }; then
+            case "$entry" in
+                "$CURRENT_ROOT/live_round"|"$CURRENT_ROOT/.live_round_payloads")
+                    # These direct current-state entries are presentation-only.
+                    # Restore neither inspects nor copies their contents.
+                    continue
+                    ;;
+            esac
+        fi
         if is_round_lock_namespace "$name"; then
             restart_refuse_path "$entry" "protected round-lock namespace in ${purpose}"
             return 1

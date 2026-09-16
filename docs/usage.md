@@ -1069,6 +1069,8 @@ One-shot rolling-state recovery action applied before the run starts.
   - `restore`: restore `results/temp/current/state/<state_id>` into `results/temp/ongoing/state/<state_id>`.
   - `reset`: wipe both `results/temp/current/state/<state_id>` and `results/temp/ongoing/state/<state_id>` before starting.
 
+During restore scanning, the presentation-only direct `live_round` and `.live_round_payloads` entries in `results/current/state/<state_id>` are ignored when that state has the structured `tables/` or `plots/` layout; they are never restored. Without that layout, normal symlink refusal remains in force.
+
 #### `--restart_force`
 [back to Top](#rtbioscan-usage)
 

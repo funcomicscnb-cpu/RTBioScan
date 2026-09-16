@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -15,6 +17,8 @@ HANDLER = Path(
         REPO_ROOT / "bin" / "restart_handler.sh",
     )
 )
+REPORT_LIVE_STAGE = REPO_ROOT / "bin" / "report_live_stage.sh"
+REPORT_LIVE_PUBLISH = REPO_ROOT / "bin" / "report_live_publish.sh"
 TOKEN = "a" * 64
 OPERATION_A = "1" * 64
 OPERATION_B = "2" * 64
@@ -99,6 +103,100 @@ def _make_evidence(path: Path, kind: str) -> Path:
 def _identity(path: Path) -> tuple[int, int, int, bytes]:
     st = os.lstat(path)
     return st.st_dev, st.st_ino, st.st_mode, path.read_bytes()
+
+
+def _make_structured_current_root(current: Path) -> Path:
+    witness = current / "tables" / "structured-layout-witness.tsv"
+    witness.parent.mkdir(parents=True, exist_ok=True)
+    witness.write_bytes(b"real structured layout witness\n")
+    return witness
+
+
+def _build_published_current_state(tmp_path: Path, outdir: Path) -> dict[str, Path]:
+    inputs = tmp_path / "published-state-inputs"
+    stage_root = inputs / "stage"
+    round_dir = inputs / "round"
+    state_dir = inputs / "state"
+    consensus_dir = inputs / "consensus"
+    report_asset = stage_root / "report_assets" / "overview.png"
+    round_table = round_dir / "round-table.tsv"
+    round_sequence = round_dir / "round-sequence.fasta"
+    state_table = state_dir / "barcode01_read_info_rpt.txt"
+    consensus = consensus_dir / "sample-a" / "otu.consensus.fasta"
+    for path, content in (
+        (report_asset, b"fixture-png-bytes\n"),
+        (round_table, b"sample\treads\nsample-a\t4\n"),
+        (round_sequence, b">round-sequence\nACGT\n"),
+        (state_table, b"sample-a\t4\n"),
+        (consensus, b">otu-a\nACGTACGT\n"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    staged = subprocess.run(
+        [
+            "/bin/bash",
+            str(REPORT_LIVE_STAGE),
+            "--stage-root",
+            str(stage_root),
+            "--round-dir",
+            str(round_dir),
+            "--state-dir",
+            str(state_dir),
+            "--consensus-dir",
+            str(consensus_dir),
+            "--barcode",
+            "barcode01",
+            "--run-id",
+            "restart-restore-test",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert staged.returncode == 0, staged.stderr
+
+    current = outdir / "current" / "state" / "state-a"
+    current.mkdir(parents=True)
+    for name in ("tables", "plots", "sequences"):
+        shutil.copytree(stage_root / name, current / name, symlinks=True)
+
+    published = subprocess.run(
+        [
+            "/bin/bash",
+            str(REPORT_LIVE_PUBLISH),
+            "--stage-root",
+            str(stage_root),
+            "--state-root",
+            str(current),
+            "--run-asset-root",
+            str(outdir / "assets"),
+            "--round-barcode",
+            "round-001",
+            "--lock-path",
+            str(tmp_path / "live-publish"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert published.returncode == 0, published.stderr
+
+    payloads = list((current / ".live_round_payloads").iterdir())
+    assert len(payloads) == 1
+    payload = payloads[0]
+    live_round = current / "live_round"
+    payload_asset = payload / "report_assets" / "overview.png"
+    assert live_round.is_symlink()
+    assert os.readlink(live_round) == f".live_round_payloads/{payload.name}"
+    assert payload_asset.is_symlink()
+    assert os.readlink(payload_asset) == "../plots/png/overview.png"
+    return {
+        "current": current,
+        "payload": payload,
+        "live_round": live_round,
+        "payload_asset": payload_asset,
+    }
 
 
 def test_normal_reset_still_wipes_both_mutable_state_roots(tmp_path: Path) -> None:
@@ -751,6 +849,363 @@ def test_restore_never_flat_copies_a_presentation_only_structured_snapshot(
     assert outside.read_text(encoding="utf-8") == "outside\n"
 
 
+def test_restore_accepts_published_live_round_without_copying_presentation_artifacts(
+    tmp_path: Path,
+) -> None:
+    outdir = tmp_path / "results"
+    paths = _paths(outdir)
+    published = _build_published_current_state(tmp_path, outdir)
+    stale = paths["state"] / "stale.tsv"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale\n", encoding="utf-8")
+
+    result = _run("restore", outdir)
+
+    assert result.returncode == 0, result.stderr
+    assert not stale.exists()
+    assert (paths["state"] / "round-table.tsv").read_bytes() == (
+        b"sample\treads\nsample-a\t4\n"
+    )
+    assert (paths["state"] / "png" / "overview.png").read_bytes() == (
+        b"fixture-png-bytes\n"
+    )
+    restored_consensus = paths["state"] / "Consensus" / "sample-a" / "otu.consensus.fasta"
+    assert restored_consensus.read_bytes() == b">otu-a\nACGTACGT\n"
+    assert (
+        paths["ongoing"] / "Consensus" / "sample-a" / "otu.consensus.fasta"
+    ).read_bytes() == restored_consensus.read_bytes()
+    assert published["live_round"].is_symlink()
+    assert published["payload_asset"].is_symlink()
+    assert not os.path.lexists(paths["ongoing"] / "live_round")
+    assert not os.path.lexists(paths["ongoing"] / ".live_round_payloads")
+    assert not os.path.lexists(paths["state"] / "live_round")
+    assert not os.path.lexists(paths["state"] / ".live_round_payloads")
+    assert not any(path.name == "report_assets" for path in paths["ongoing"].rglob("*"))
+    assert not any(path.is_symlink() for path in paths["ongoing"].rglob("*"))
+    assert not any(
+        path.name in {"live_round", ".live_round_payloads", "report_assets"}
+        for path in (paths["state"] / "Consensus").rglob("*")
+    )
+    assert paths["sentinel"].read_text(encoding="utf-8") == _applied_record("restore")
+
+
+@pytest.mark.parametrize(
+    ("removed", "expected_path", "expected_bytes"),
+    [
+        ("plots", ("round-table.tsv",), b"sample\treads\nsample-a\t4\n"),
+        ("tables", ("png", "overview.png"), b"fixture-png-bytes\n"),
+    ],
+)
+def test_restore_accepts_published_live_round_with_one_structured_directory(
+    tmp_path: Path,
+    removed: str,
+    expected_path: tuple[str, ...],
+    expected_bytes: bytes,
+) -> None:
+    outdir = tmp_path / "results"
+    paths = _paths(outdir)
+    published = _build_published_current_state(tmp_path, outdir)
+    shutil.rmtree(published["current"] / removed)
+    stale = paths["state"] / "stale.tsv"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale\n")
+
+    result = _run("restore", outdir)
+
+    assert result.returncode == 0, result.stderr
+    assert not stale.exists()
+    assert (paths["state"].joinpath(*expected_path)).read_bytes() == expected_bytes
+    restored_consensus = paths["state"] / "Consensus" / "sample-a" / "otu.consensus.fasta"
+    assert restored_consensus.read_bytes() == b">otu-a\nACGTACGT\n"
+    assert (
+        paths["ongoing"] / "Consensus" / "sample-a" / "otu.consensus.fasta"
+    ).read_bytes() == restored_consensus.read_bytes()
+    assert published["live_round"].is_symlink()
+    assert published["payload_asset"].is_symlink()
+    assert not os.path.lexists(paths["ongoing"] / "live_round")
+    assert not os.path.lexists(paths["ongoing"] / ".live_round_payloads")
+    assert not os.path.lexists(paths["state"] / "live_round")
+    assert not os.path.lexists(paths["state"] / ".live_round_payloads")
+    assert not any(path.is_symlink() for path in paths["ongoing"].rglob("*"))
+    assert paths["sentinel"].read_text(encoding="utf-8") == _applied_record("restore")
+
+
+def test_restore_refuses_published_presentation_symlink_without_structured_layout(
+    tmp_path: Path,
+) -> None:
+    outdir = tmp_path / "results"
+    paths = _paths(outdir)
+    published = _build_published_current_state(tmp_path, outdir)
+    shutil.rmtree(published["current"] / "tables")
+    shutil.rmtree(published["current"] / "plots")
+    outside = tmp_path / "outside-presentation-target"
+    outside.write_bytes(b"outside target must survive\n")
+    published["payload_asset"].unlink()
+    published["payload_asset"].symlink_to(outside)
+    live = paths["state"] / "must-survive.tsv"
+    live.parent.mkdir(parents=True)
+    live.write_bytes(b"must survive refused restore\n")
+    live_before_bytes = live.read_bytes()
+    live_before_sha256 = hashlib.sha256(live_before_bytes).hexdigest()
+    live_before_stat = os.lstat(live)
+    payload_link_before = os.lstat(published["payload_asset"])
+    outside_before = _identity(outside)
+
+    result = _run("restore", outdir)
+
+    assert result.returncode != 0, result.stderr
+    assert "unsafe symlink in restore snapshot state" in result.stderr
+    assert str(published["payload_asset"]) in result.stderr
+    live_after_stat = os.lstat(live)
+    assert live.read_bytes() == live_before_bytes
+    assert hashlib.sha256(live.read_bytes()).hexdigest() == live_before_sha256
+    assert (
+        live_after_stat.st_dev,
+        live_after_stat.st_ino,
+        live_after_stat.st_mode,
+    ) == (
+        live_before_stat.st_dev,
+        live_before_stat.st_ino,
+        live_before_stat.st_mode,
+    )
+    payload_link_after = os.lstat(published["payload_asset"])
+    assert (
+        payload_link_after.st_dev,
+        payload_link_after.st_ino,
+        payload_link_after.st_mode,
+    ) == (
+        payload_link_before.st_dev,
+        payload_link_before.st_ino,
+        payload_link_before.st_mode,
+    )
+    assert _identity(outside) == outside_before
+    assert not paths["sentinel"].exists()
+    assert not os.path.lexists(paths["ongoing"] / "live_round")
+    assert not os.path.lexists(paths["ongoing"] / ".live_round_payloads")
+    assert not os.path.lexists(paths["state"] / "live_round")
+    assert not os.path.lexists(paths["state"] / ".live_round_payloads")
+
+
+@pytest.mark.parametrize("name", ["live_round", ".live_round_payloads"])
+def test_restore_refuses_direct_legacy_presentation_symlink_before_mutation(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    outdir = tmp_path / "results"
+    paths = _paths(outdir)
+    live = paths["state"] / "must-survive.tsv"
+    outside = tmp_path / f"outside-{name}"
+    unsafe = paths["legacy"] / name
+    table = paths["legacy"] / "tables" / "safe.tsv"
+    live.parent.mkdir(parents=True)
+    unsafe.parent.mkdir(parents=True)
+    table.parent.mkdir(parents=True)
+    live.write_bytes(b"must survive refused restore\n")
+    outside.write_bytes(b"outside target must survive\n")
+    table.write_bytes(b"safe structured content\n")
+    unsafe.symlink_to(outside)
+    live_before = _identity(live)
+    outside_before = _identity(outside)
+
+    result = _run("restore", outdir)
+
+    assert result.returncode != 0, result.stderr
+    assert "unsafe symlink in restore snapshot state" in result.stderr
+    assert str(unsafe) in result.stderr
+    assert _identity(live) == live_before
+    assert _identity(outside) == outside_before
+    assert not paths["sentinel"].exists()
+
+
+def test_restore_refuses_unrelated_direct_current_symlink_before_mutation(
+    tmp_path: Path,
+) -> None:
+    outdir = tmp_path / "results"
+    paths = _paths(outdir)
+    live = paths["state"] / "must-survive.tsv"
+    outside = tmp_path / "outside.tsv"
+    unsafe = paths["current"] / "unrelated-link"
+    live.parent.mkdir(parents=True)
+    unsafe.parent.mkdir(parents=True)
+    _make_structured_current_root(paths["current"])
+    live.write_bytes(b"must survive refused restore\n")
+    outside.write_bytes(b"outside target\n")
+    unsafe.symlink_to(outside)
+    live_before = _identity(live)
+    unsafe_before = os.lstat(unsafe)
+    outside_before = _identity(outside)
+
+    result = _run("restore", outdir)
+
+    assert result.returncode != 0, result.stderr
+    assert "unsafe symlink in restore snapshot state" in result.stderr
+    assert str(unsafe) in result.stderr
+    assert _identity(live) == live_before
+    unsafe_after = os.lstat(unsafe)
+    assert (unsafe_after.st_dev, unsafe_after.st_ino, unsafe_after.st_mode) == (
+        unsafe_before.st_dev,
+        unsafe_before.st_ino,
+        unsafe_before.st_mode,
+    )
+    assert _identity(outside) == outside_before
+    assert not paths["sentinel"].exists()
+
+
+def test_restore_refuses_nested_sequence_symlink_before_mutation(tmp_path: Path) -> None:
+    outdir = tmp_path / "results"
+    paths = _paths(outdir)
+    live = paths["state"] / "must-survive.tsv"
+    outside = tmp_path / "outside.tsv"
+    unsafe = paths["current"] / "sequences" / "sample-a" / "unsafe.tsv"
+    live.parent.mkdir(parents=True)
+    unsafe.parent.mkdir(parents=True)
+    _make_structured_current_root(paths["current"])
+    live.write_bytes(b"must survive refused restore\n")
+    outside.write_bytes(b"outside target\n")
+    unsafe.symlink_to(outside)
+    live_before = _identity(live)
+
+    result = _run("restore", outdir)
+
+    assert result.returncode != 0, result.stderr
+    assert "unsafe symlink in restore snapshot state" in result.stderr
+    assert str(unsafe) in result.stderr
+    assert _identity(live) == live_before
+    assert not paths["sentinel"].exists()
+
+
+def test_restore_does_not_exempt_nested_symlink_named_live_round(
+    tmp_path: Path,
+) -> None:
+    outdir = tmp_path / "results"
+    paths = _paths(outdir)
+    live = paths["state"] / "must-survive.tsv"
+    outside = tmp_path / "outside-live-round"
+    unsafe = paths["current"] / "sequences" / "nested" / "live_round"
+    live.parent.mkdir(parents=True)
+    unsafe.parent.mkdir(parents=True)
+    _make_structured_current_root(paths["current"])
+    live.write_bytes(b"must survive refused restore\n")
+    outside.write_bytes(b"outside target\n")
+    unsafe.symlink_to(outside)
+    live_before = _identity(live)
+
+    result = _run("restore", outdir)
+
+    assert result.returncode != 0, result.stderr
+    assert "unsafe symlink in restore snapshot state" in result.stderr
+    assert str(unsafe) in result.stderr
+    assert _identity(live) == live_before
+    assert not paths["sentinel"].exists()
+
+
+def test_restore_structured_published_state_refuses_nested_live_round_before_mutation(
+    tmp_path: Path,
+) -> None:
+    outdir = tmp_path / "results"
+    paths = _paths(outdir)
+    published = _build_published_current_state(tmp_path, outdir)
+    unsafe = published["current"] / "sequences" / "Consensus" / "live_round"
+    outside = tmp_path / "outside-live-round"
+    live = paths["state"] / "must-survive.tsv"
+    outside.write_bytes(b"outside target must survive\n")
+    unsafe.symlink_to(outside)
+    live.parent.mkdir(parents=True)
+    live.write_bytes(b"must survive refused restore\n")
+    live_before_bytes = live.read_bytes()
+    live_before_sha256 = hashlib.sha256(live_before_bytes).hexdigest()
+    live_before_stat = os.lstat(live)
+    outside_before = _identity(outside)
+
+    result = _run("restore", outdir)
+
+    assert result.returncode != 0, result.stderr
+    assert "unsafe symlink in restore snapshot state" in result.stderr
+    assert str(unsafe) in result.stderr
+    live_after_stat = os.lstat(live)
+    assert live.read_bytes() == live_before_bytes
+    assert hashlib.sha256(live.read_bytes()).hexdigest() == live_before_sha256
+    assert (
+        live_after_stat.st_dev,
+        live_after_stat.st_ino,
+        live_after_stat.st_mode,
+    ) == (
+        live_before_stat.st_dev,
+        live_before_stat.st_ino,
+        live_before_stat.st_mode,
+    )
+    assert _identity(outside) == outside_before
+    assert not paths["sentinel"].exists()
+    assert not os.path.lexists(f"{paths['sentinel']}.lockdir")
+    assert not os.path.lexists(f"{paths['sentinel']}.tmp.{OPERATION_A}")
+    assert not os.path.lexists(paths["ongoing"] / "Consensus" / "live_round")
+    assert not os.path.lexists(paths["state"] / "round-table.tsv")
+    assert not os.path.lexists(paths["state"] / "png" / "overview.png")
+    assert not os.path.lexists(paths["ongoing"] / "live_round")
+    assert not os.path.lexists(paths["ongoing"] / ".live_round_payloads")
+
+
+@pytest.mark.parametrize("entry_name", ["tables", "plots"])
+@pytest.mark.parametrize(
+    "shape",
+    ["symlink_to_directory", "regular_file", "dangling_symlink"],
+)
+def test_restore_refuses_non_directory_structured_boundary_before_mutation(
+    tmp_path: Path,
+    entry_name: str,
+    shape: str,
+) -> None:
+    outdir = tmp_path / "results"
+    paths = _paths(outdir)
+    published = _build_published_current_state(tmp_path, outdir)
+    other_entry = "plots" if entry_name == "tables" else "tables"
+    shutil.rmtree(published["current"] / other_entry)
+    tested_entry = published["current"] / entry_name
+    shutil.rmtree(tested_entry)
+    external_witness = None
+    missing_target = None
+    if shape == "symlink_to_directory":
+        external_target = tmp_path / f"outside-{entry_name}"
+        external_witness = external_target / "must-survive.tsv"
+        external_witness.parent.mkdir()
+        external_witness.write_bytes(b"outside target must survive\n")
+        tested_entry.symlink_to(external_target, target_is_directory=True)
+        expected_unsafe = tested_entry
+    elif shape == "regular_file":
+        tested_entry.write_bytes(b"not a structured directory\n")
+        expected_unsafe = published["payload_asset"]
+    else:
+        missing_target = tmp_path / f"missing-{entry_name}"
+        tested_entry.symlink_to(missing_target, target_is_directory=True)
+        expected_unsafe = published["payload_asset"]
+    live = paths["state"] / "must-survive.tsv"
+    live.parent.mkdir(parents=True)
+    live.write_bytes(b"must survive refused restore\n")
+    live_before = _identity(live)
+    external_before = (
+        _identity(external_witness) if external_witness is not None else None
+    )
+
+    result = _run("restore", outdir)
+
+    assert result.returncode != 0, (entry_name, shape, result.stderr)
+    assert "unsafe symlink in restore snapshot state" in result.stderr
+    assert str(expected_unsafe) in result.stderr
+    assert _identity(live) == live_before
+    if external_witness is not None:
+        assert _identity(external_witness) == external_before
+    if missing_target is not None:
+        assert not os.path.lexists(missing_target)
+        assert os.path.lexists(tested_entry)
+        assert tested_entry.is_symlink()
+    assert not paths["sentinel"].exists()
+    assert not os.path.lexists(paths["ongoing"] / "live_round")
+    assert not os.path.lexists(paths["ongoing"] / ".live_round_payloads")
+    assert not os.path.lexists(paths["state"] / "round-table.tsv")
+    assert not os.path.lexists(paths["state"] / "png" / "overview.png")
+    assert not any(path.is_symlink() for path in paths["ongoing"].rglob("*"))
+
+
 @pytest.mark.parametrize(
     ("name", "kind"),
     [
@@ -838,6 +1293,7 @@ def test_restore_refuses_hidden_protected_snapshot_entry_before_wiping_live_stat
         / f".round_lock_revocation.{TOKEN}.tsv"
     )
     _make_evidence(protected, "file")
+    _make_structured_current_root(paths["current"])
     protected_before = _identity(protected)
 
     result = _run("restore", outdir)
