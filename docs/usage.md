@@ -1811,6 +1811,8 @@ Controls taxonomy admission into consensus generation. Values are exact and case
 
 The permissive mode is dormant by default and no bundled profile enables it. Both modes require an explicit, valid, aligned marker/taxon contract; missing, blank, malformed, duplicate-marker, or count-mismatched contracts fail before consensus processing.
 
+In `allow_unassigned` mode, `Consensus/consensus_taxonomy_admission.tsv` is an optional, current-round evidence sidecar whose rows are bound to the SHA-256 digest of the exact merged consensus FASTA; a missing or header-only sidecar, a digest mismatch, or any status other than literal `unassigned` must be treated by future readers as unknown rather than inferred as classified or compatible. The sidecar is never created or touched in `required` mode, so reusing a published `state_id` after changing from `allow_unassigned` to `required` requires a state reset; future Slice 4 readers will additionally require the newest completed round to match before using this evidence.
+
 #### `--consensus_min_reads` / `--consensus_max_reads`
 [back to Top](#rtbioscan-usage)
 

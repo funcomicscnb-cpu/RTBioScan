@@ -710,11 +710,12 @@ prefilter_input_rows=0
 prefilter_output_rows=0
 prefilter_metazoa_coi_rows=0
 prefilter_viridiplantae_its2_rows=0
+taxonomy_admission_otus="$out_dir/_taxonomy_admission_otus.tmp"
 _t_startup_state_end=$(timing_now)
 append_timing_row "$phase_timings_raw_file" "global" "-" "startup_validation_and_state" "$_t_startup_state_start" "$_t_startup_state_end"
 _t_prefilter_partition_start=$(timing_now)
 if [ -s "$blast_report" ]; then
-	awk -v stat="$prefilter_status" -v out_hdr="tmp_clean_blast_report_full.txt" -v targets_raw="$target_tokens_env" -v target_taxa_raw="$target_taxa_env" -v taxonomy_mode="$consensus_taxonomy_mode" '
+	awk -v stat="$prefilter_status" -v out_hdr="tmp_clean_blast_report_full.txt" -v targets_raw="$target_tokens_env" -v target_taxa_raw="$target_taxa_env" -v taxonomy_mode="$consensus_taxonomy_mode" -v admission_out="$taxonomy_admission_otus" '
 		BEGIN{
 			OFS="\t";
 			has_header=0;
@@ -736,6 +737,12 @@ if [ -s "$blast_report" ]; then
 					pair_order[++pair_count]=pair_key;
 				}
 			}
+			# RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN prefilter_init
+			if (taxonomy_mode=="allow_unassigned") {
+				printf "%s", "" > admission_out;
+				close(admission_out);
+			}
+			# RTBIOSCAN_TAXONOMY_ADMISSION_END prefilter_init
 		}
 		function marker_norm(v, out) {
 			out=toupper(v);
@@ -759,6 +766,16 @@ if [ -s "$blast_report" ]; then
 			}
 			return "";
 		}
+		# RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN otu_token
+		function read_otu_token(read_id, fallback, fields, n, i) {
+			n=split(read_id, fields, /\|/);
+			for (i=1; i<=n; i++) {
+				if (fields[i] ~ /^OTUB_[^|[:space:]]+$/) return fields[i];
+			}
+			if (fallback ~ /^OTUB_[^|[:space:]]+$/) return fallback;
+			return "";
+		}
+		# RTBIOSCAN_TAXONOMY_ADMISSION_END otu_token
 		function slugify(v, out) {
 			out=tolower(v);
 			gsub(/[^a-z0-9]+/, "_", out);
@@ -794,6 +811,15 @@ if [ -s "$blast_report" ]; then
 			if (compatible || unassigned) {
 				print;
 				out_rows++;
+				# RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN prefilter_tally
+				if (taxonomy_mode=="allow_unassigned") {
+					otu_token=read_otu_token($1, (NF>=2 ? $2 : ""));
+					if (otu_token != "") {
+						if (compatible) admission_compatible[otu_token]=1;
+						else if (unassigned) admission_unassigned[otu_token]=1;
+					}
+				}
+				# RTBIOSCAN_TAXONOMY_ADMISSION_END prefilter_tally
 				pair_rows[match_key]++;
 				if (ml=="COI" && kl=="metazoa") mc_rows++;
 				if (ml=="ITS2" && kl=="viridiplantae") vi_rows++;
@@ -809,6 +835,14 @@ if [ -s "$blast_report" ]; then
 				split(key, parts, SUBSEP);
 				print "prefilter_pair_" i "_" slugify(parts[1]) "_" slugify(parts[2]) "_rows\t" (pair_rows[key]+0) > stat;
 			}
+			# RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN prefilter_emit
+			if (taxonomy_mode=="allow_unassigned") {
+				for (otu_token in admission_unassigned) {
+					if (!(otu_token in admission_compatible)) print otu_token > admission_out;
+				}
+				close(admission_out);
+			}
+			# RTBIOSCAN_TAXONOMY_ADMISSION_END prefilter_emit
 			if (!has_header) {
 				# Keep downstream contracts stable even when input has no header.
 				print "read_id\totu_id\totu_kingdom\tbarcode_by_homology" > out_hdr;
@@ -830,6 +864,11 @@ else
 		printf "prefilter_metazoa_coi_rows\t0\n"
 		printf "prefilter_viridiplantae_its2_rows\t0\n"
 	} > "$prefilter_status"
+	# RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN empty_prefilter
+	if [ "$consensus_taxonomy_mode" = "allow_unassigned" ]; then
+		: > "$taxonomy_admission_otus"
+	fi
+	# RTBIOSCAN_TAXONOMY_ADMISSION_END empty_prefilter
 fi
 
 sample_partition_dir="$out_dir/_sample_partitions"
@@ -1115,6 +1154,17 @@ while IFS= read -r sample; do
 		sample_blast="$out_dir/$sample/${sample}_blast_report.txt"
 		sample_parsed="$out_dir/$sample/${sample}_blast_report.parsed.tsv"
 		otu_list="$out_dir/$sample/${sample}_otu_keys.list"
+		taxonomy_admission_tokens=""
+		taxonomy_admission_keys=""
+		taxonomy_admission_rows=""
+		# RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN sample_paths
+		if [ "$consensus_taxonomy_mode" = "allow_unassigned" ]; then
+			taxonomy_admission_tokens="$taxonomy_admission_otus"
+			taxonomy_admission_keys="$out_dir/$sample/_taxonomy_admission_keys.tmp"
+			taxonomy_admission_rows="$out_dir/$sample/_taxonomy_admission.tmp"
+			: > "$taxonomy_admission_rows"
+		fi
+		# RTBIOSCAN_TAXONOMY_ADMISSION_END sample_paths
 		sample_otu_dir="$out_dir/$sample/otu_rows"
 		sample_otu_resolved_dir="$out_dir/$sample/otu_rows_resolved"
 		sample_cache_dir="$cache_root/$sample"
@@ -1272,7 +1322,16 @@ while IFS= read -r sample; do
 			_t_otu_prepare_start=$(timing_now)
 			echo "Generating consensus for sample $sample"
 				mkdir -p "$sample_otu_dir" "$sample_otu_resolved_dir"
-			awk -v dir="$sample_otu_dir" -v min="$min_reads" 'BEGIN{FS=OFS="\t"}
+			awk -v dir="$sample_otu_dir" -v min="$min_reads" -v admission_tokens="$taxonomy_admission_tokens" -v admission_keys="$taxonomy_admission_keys" 'BEGIN{FS=OFS="\t"
+				# RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN key_load
+				if (admission_tokens != "") {
+					while ((getline admission_token < admission_tokens) > 0) {
+						if (admission_token != "") admission_otu[admission_token]=1;
+					}
+					close(admission_tokens);
+				}
+				# RTBIOSCAN_TAXONOMY_ADMISSION_END key_load
+			}
 			function make_key(otu, bc, k) {
 				k=otu;
 				if (bc != "" && bc != "NA" && k !~ ("-" bc "$")) k=k "-" bc;
@@ -1281,10 +1340,21 @@ while IFS= read -r sample; do
 			{
 				k=make_key($2, $3);
 				c[k]++;
+				# RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN key_tally
+				if ($2 in admission_otu) admission_key[k]=1;
+				# RTBIOSCAN_TAXONOMY_ADMISSION_END key_tally
 				print > (dir "/" k ".tsv");
 			}
 				END{
 					for (k in c) if (c[k] >= min) print k;
+					# RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN key_emit
+					if (admission_tokens != "") {
+						printf "%s", "" > admission_keys;
+						close(admission_keys);
+						for (k in admission_key) print k, "unassigned" > admission_keys;
+						close(admission_keys);
+					}
+					# RTBIOSCAN_TAXONOMY_ADMISSION_END key_emit
 				}
 			' "$sample_parsed" | LC_ALL=C sort > "$otu_list"
 			sample_requested_ids="$out_dir/$sample/_requested_ids.list"
@@ -2747,6 +2817,25 @@ while IFS= read -r sample; do
 								cons_token=$(printf "%s\n" "$cons_header" | awk -F'|' 'NF>=2{print $2}')
 								[ -n "$cons_token" ] && printf "%s\n" "$cons_token" >> "$current_original_reads_tokens"
 								consensus_id=$(printf "%s\n" "$cons_header" | awk -F'|' 'NF>=2{print $2 "_" $1}')
+								# RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN winner_join
+								if [ "$consensus_taxonomy_mode" = "allow_unassigned" ] && [ -s "$taxonomy_admission_keys" ]; then
+									admission_public_otu=$(printf "%s\n" "$cons_header" | awk -F'|' '
+										{
+											otu="";
+											for (i=1; i<=NF; i++) {
+												if ($i ~ /^OTU=/) { otu=$i; sub(/^OTU=/, "", otu); }
+											}
+											print otu;
+										}')
+									if [ -n "$admission_public_otu" ] && awk -F'\t' -v otu="$admission_public_otu" '
+										NF==2 && $1==otu && $2=="unassigned" { found=1 }
+										END { exit(found ? 0 : 1) }
+									' "$taxonomy_admission_keys"; then
+										printf "%s\t%s\t%s\t%s\tunassigned\n" \
+											"$round_id" "$sample" "$admission_public_otu" "$consensus_id" >> "$taxonomy_admission_rows"
+									fi
+								fi
+								# RTBIOSCAN_TAXONOMY_ADMISSION_END winner_join
 								prior_keep=0
 								if [ "$policy_reset_sample" -eq 0 ] && [ -n "$_cons_ids_prev_file" ]; then
 									if grep -Fxq "$cons_header" "$_cons_ids_prev_file"; then
@@ -2859,6 +2948,33 @@ for _pid in "${_sample_jobs[@]+"${_sample_jobs[@]}"}"; do
 done
 _t_sample_workers_end=$(timing_now)
 append_timing_row "$phase_timings_raw_file" "global" "-" "sample_worker_compute_elapsed" "$_t_sample_workers_start" "$_t_sample_workers_end"
+
+# RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN finalize_sidecar
+if [ "$consensus_taxonomy_mode" = "allow_unassigned" ]; then
+	taxonomy_admission_sidecar="$out_dir/consensus_taxonomy_admission.tsv"
+	printf 'round_barcode\tsample\totu_key\tconsensus_id\ttaxonomy_admission_status\tmerged_fasta_sha256\n' > "$taxonomy_admission_sidecar"
+	: > "$taxonomy_admission_otus"
+	for taxonomy_admission_rows in "$out_dir"/*/_taxonomy_admission.tmp; do
+		[ -s "$taxonomy_admission_rows" ] || continue
+		taxonomy_sample_dir=$(dirname "$taxonomy_admission_rows")
+		taxonomy_sample=$(basename "$taxonomy_sample_dir")
+		taxonomy_merged_fasta="$taxonomy_sample_dir/${taxonomy_sample}_Merged_Consensus.fasta"
+		[ -f "$taxonomy_merged_fasta" ] || continue
+		taxonomy_digest=$(perl -MDigest::SHA=sha256_hex -0777 -ne 'print sha256_hex($_)' "$taxonomy_merged_fasta")
+		if [[ "$taxonomy_digest" =~ ^[0-9a-f]{64}$ ]]; then
+			awk -F'\t' -v OFS='\t' -v digest="$taxonomy_digest" '
+				NF==5 && $5=="unassigned" { print $1, $2, $3, $4, $5, digest }
+			' "$taxonomy_admission_rows" >> "$taxonomy_admission_otus"
+		fi
+	done
+	if [ -s "$taxonomy_admission_otus" ]; then
+		LC_ALL=C sort -u "$taxonomy_admission_otus" >> "$taxonomy_admission_sidecar"
+	fi
+	rm -f "$taxonomy_admission_otus" \
+		"$out_dir"/*/_taxonomy_admission_keys.tmp \
+		"$out_dir"/*/_taxonomy_admission.tmp
+fi
+# RTBIOSCAN_TAXONOMY_ADMISSION_END finalize_sidecar
 
 # O5: collect per-sample dirty markers into a single list for the caller
 : > "$out_dir/modified_samples.list"

@@ -1,3 +1,4 @@
+import hashlib
 import os
 import shutil
 import subprocess
@@ -69,7 +70,9 @@ def _install_stub_tools(
             "if [ -z \"$in\" ] || [ -z \"$out\" ]; then\n"
             "  exit 2\n"
             "fi\n"
-            "if [ \"${RTBIOSCAN_TEST_VSEARCH_MIX_ALL:-0}\" = \"1\" ]; then\n"
+            "if [ \"${RTBIOSCAN_TEST_VSEARCH_ONE_PER_RECORD:-0}\" = \"1\" ]; then\n"
+            "  awk -v out=\"$out\" 'BEGIN{RS=\">\"; ORS=\"\"} NR>1{print \">\" $0 > (out (NR-2)); close(out (NR-2))}' \"$in\"\n"
+            "elif [ \"${RTBIOSCAN_TEST_VSEARCH_MIX_ALL:-0}\" = \"1\" ]; then\n"
             "  cp \"$in\" \"${out}0\"\n"
             "else\n"
             "  awk -v out=\"$out\" 'BEGIN{RS=\">\"; ORS=\"\"} NR>1{record=$0; seq=record; sub(/^[^\\n]*\\n/,\"\",seq); key=seq; gsub(/[\\r\\n]/,\"\",key); if(!(key in cluster)) cluster[key]=count++; file=out cluster[key]; print \">\" record >> file; close(file)}' \"$in\"\n"
@@ -117,15 +120,18 @@ def _run_consensus(
     script_path: Path | None = None,
     supply_target_contract: bool = True,
     reads_mode: str = "representative",
+    consensus_script: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if script_path is None:
         script_path = REPO_ROOT / "bin"
     if supply_target_contract:
         env.setdefault("RTBIOSCAN_TARGET_TOKENS", "COI|ITS2")
         env.setdefault("RTBIOSCAN_TARGET_TAXA", "Metazoa|Viridiplantae")
+    if consensus_script is None:
+        consensus_script = SCRIPT
     cmd = [
         "bash",
-        str(SCRIPT),
+        str(consensus_script),
         str(script_path),
         "98",
         min_reads,
@@ -180,16 +186,34 @@ def _run_taxonomy_fixture(
     min_reads: str = "1",
     samples: str = "no_adapter\n",
     emit_consensus: bool = False,
+    round_id: str | None = None,
+    target_tokens: str = "COI|ITS2",
+    target_taxa: str = "Metazoa|Viridiplantae",
+    frozen_members_text: str = "",
+    extra_env: dict[str, str] | None = None,
+    consensus_script: Path | None = None,
 ):
     bindir = _install_stub_tools(tmp_path, emit_consensus=emit_consensus)
     _write_common_inputs(tmp_path, blast_lines, fasta_lines, qscore_lines, samples=samples)
     frozen = tmp_path / "otu_frozen_members.tsv"
-    frozen.write_text("", encoding="utf-8")
+    frozen.write_text(frozen_members_text, encoding="utf-8")
     env = os.environ.copy()
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
+    env["RTBIOSCAN_TARGET_TOKENS"] = target_tokens
+    env["RTBIOSCAN_TARGET_TAXA"] = target_taxa
     if mode is not None:
         env["CONSENSUS_TAXONOMY_MODE"] = mode
-    return _run_consensus(tmp_path, env, min_reads=min_reads, frozen_members=str(frozen))
+    if round_id is not None:
+        env["CONSENSUS_ROUND_ID"] = round_id
+    if extra_env:
+        env.update(extra_env)
+    return _run_consensus(
+        tmp_path,
+        env,
+        min_reads=min_reads,
+        frozen_members=str(frozen),
+        consensus_script=consensus_script,
+    )
 
 
 def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
@@ -202,6 +226,96 @@ def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
         values = line.split("\t")
         rows.append(dict(zip(header, values)))
     return rows
+
+
+def _consensus_non_timing_snapshot(
+    tmp_path: Path,
+    *,
+    exclude_admission_sidecar: bool = False,
+) -> list[tuple[str, str]]:
+    consensus = tmp_path / "Consensus"
+    rows = []
+    for path in sorted(candidate for candidate in consensus.rglob("*") if candidate.is_file()):
+        relative = path.relative_to(consensus)
+        if "timing" in path.name or path.name == "consensus_cache_hydration_stats.tsv":
+            continue
+        if exclude_admission_sidecar and relative == Path("consensus_taxonomy_admission.tsv"):
+            continue
+        rows.append((str(relative), hashlib.sha256(path.read_bytes()).hexdigest()))
+    return rows
+
+
+def _without_taxonomy_admission_sidecar(tmp_path: Path) -> Path:
+    control_bin = tmp_path / "control_bin"
+    control_bin.mkdir()
+    shutil.copytree(REPO_ROOT / "bin" / "lib", control_bin / "lib")
+    shutil.copy2(
+        REPO_ROOT / "bin" / "filter_blast_rows_by_adapter_class.sh",
+        control_bin / "filter_blast_rows_by_adapter_class.sh",
+    )
+    shutil.copy2(
+        REPO_ROOT / "bin" / "partition_blast_rows_by_adapter_class.sh",
+        control_bin / "partition_blast_rows_by_adapter_class.sh",
+    )
+    output = control_bin / "Consensus_simple.sh"
+    lines = SCRIPT.read_text(encoding="utf-8").splitlines(keepends=True)
+    stripped = []
+    skipping = False
+    for line in lines:
+        if "RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN" in line:
+            assert not skipping
+            skipping = True
+            continue
+        if "RTBIOSCAN_TAXONOMY_ADMISSION_END" in line:
+            assert skipping
+            skipping = False
+            continue
+        if not skipping:
+            stripped.append(line)
+    assert not skipping
+    output.write_text("".join(stripped), encoding="utf-8")
+    output.chmod(0o755)
+    return output
+
+
+def _taxonomy_fixture_text(
+    specs: list[tuple[str, str, str, list[str], int]],
+    *,
+    sample: str = "sample_A",
+    barcode: str = "",
+    read_prefix: str = "admission",
+) -> tuple[str, str, str, str]:
+    blast_lines = []
+    fasta_lines = []
+    qscore_lines = []
+    first_fasta_header = ""
+    read_number = 0
+    for otu, kingdom, marker, sequences, qscore in specs:
+        for sequence in sequences:
+            read_number += 1
+            read_id = f"{read_prefix}-{read_number:02d}"
+            blast_header = _make_header(
+                read_id,
+                True,
+                target=marker,
+                barcode=barcode,
+                adapter=sample,
+                otu_token=otu,
+            )
+            fasta_header = _make_header(
+                read_id,
+                False,
+                model="hac",
+                target=marker,
+                barcode=barcode,
+                adapter=sample,
+            )
+            if not first_fasta_header:
+                first_fasta_header = fasta_header
+            blast_lines.append(f"{blast_header}\t{otu}\t{kingdom}\t{marker}\n")
+            fasta_lines.append(f">{fasta_header}\n{sequence}\n")
+            qscore_lines.append(f"{read_id}\thac\t{qscore}\n")
+    return "".join(blast_lines), "".join(fasta_lines), "".join(qscore_lines), first_fasta_header
 
 
 def _f01a_sequence(index: int) -> str:
@@ -1102,7 +1216,13 @@ def test_required_taxonomy_mode_matches_default_bytes(tmp_path: Path) -> None:
     required_dir = tmp_path / "required"
 
     default = _run_taxonomy_fixture(
-        default_dir, blast_lines, fasta_lines, qscore_lines, samples="sample_A\n"
+        default_dir,
+        blast_lines,
+        fasta_lines,
+        qscore_lines,
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="round_required_equivalence",
     )
     required = _run_taxonomy_fixture(
         required_dir,
@@ -1111,15 +1231,15 @@ def test_required_taxonomy_mode_matches_default_bytes(tmp_path: Path) -> None:
         qscore_lines,
         mode="required",
         samples="sample_A\n",
+        emit_consensus=True,
+        round_id="round_required_equivalence",
     )
 
     assert default.returncode == 0, default.stderr
     assert required.returncode == 0, required.stderr
-    for relative_path in (
-        Path("Consensus/prefilter_status.tsv"),
-        Path("Consensus/sample_A/otu_meta.tsv"),
-    ):
-        assert (default_dir / relative_path).read_bytes() == (required_dir / relative_path).read_bytes()
+    assert _consensus_non_timing_snapshot(default_dir) == _consensus_non_timing_snapshot(required_dir)
+    assert not (default_dir / "Consensus" / "consensus_taxonomy_admission.tsv").exists()
+    assert not (required_dir / "Consensus" / "consensus_taxonomy_admission.tsv").exists()
     assert _read_status(default_dir / "Consensus" / "prefilter_status.tsv")["prefilter_output_rows"] == "2"
 
 
@@ -1260,6 +1380,573 @@ def test_allow_unassigned_blocks_no_adapter_from_consensus_and_voucher_export(tm
         "voucher_A\tCOI\t1\tOTUB_2-COI\t",
     ]
     assert "no_adapter" not in (voucher_out / "voucher_sequences.fasta").read_text(encoding="utf-8")
+
+
+def test_taxonomy_admission_sidecar_binds_current_winner_to_exact_fasta(tmp_path: Path) -> None:
+    blast_a, fasta_a, qscores_a, _first_header = _taxonomy_fixture_text(
+        [
+            ("OTUB_1-COI", "Unassigned", "COI", ["ACGTACGT", "ACGTTCGT"], 31),
+            ("OTUB_2-COI", "Metazoa", "COI", ["TTTTACGT", "TTTTTCGT"], 35),
+            ("OTUB_3-COI", "Unassigned", "COI", ["GGGGACGT", "GGGGTCGT"], 33),
+        ],
+        sample="sample_A",
+        read_prefix="sample-a",
+    )
+    blast_b, fasta_b, qscores_b, _ = _taxonomy_fixture_text(
+        [
+            ("OTUB_4-COI", "Unassigned", "COI", ["TGCATGCA", "TGCGTGCA"], 32),
+            ("OTUB_5-COI", "Metazoa", "COI", ["CCCCACGT", "CCCCTCGT"], 34),
+        ],
+        sample="sample_B",
+        read_prefix="sample-b",
+    )
+    result = _run_taxonomy_fixture(
+        tmp_path,
+        blast_a + blast_b,
+        fasta_a + fasta_b,
+        qscores_a + qscores_b,
+        mode="allow_unassigned",
+        samples="sample_A\nsample_B\n",
+        emit_consensus=True,
+        round_id="round_admission_1",
+        extra_env={"RTBIOSCAN_TEST_VSEARCH_ONE_PER_RECORD": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+
+    sidecar = tmp_path / "Consensus" / "consensus_taxonomy_admission.tsv"
+    sidecar_lines = sidecar.read_text(encoding="utf-8").splitlines()
+    assert sidecar_lines[0] == (
+        "round_barcode\tsample\totu_key\tconsensus_id\t"
+        "taxonomy_admission_status\tmerged_fasta_sha256"
+    )
+    assert all(len(line.split("\t")) == 6 for line in sidecar_lines)
+    rows = _read_tsv_rows(sidecar)
+    assert len(rows) == 3
+    assert [(item["sample"], item["otu_key"]) for item in rows] == [
+        ("sample_A", "OTUB_1-COI"),
+        ("sample_A", "OTUB_3-COI"),
+        ("sample_B", "OTUB_4-COI"),
+    ]
+    data_lines = sidecar_lines[1:]
+    assert data_lines == sorted(set(data_lines))
+    row = rows[0]
+    assert row["round_barcode"] == "round_admission_1"
+    assert row["sample"] == "sample_A"
+    assert row["otu_key"] == "OTUB_1-COI"
+    assert row["taxonomy_admission_status"] == "unassigned"
+
+    expected_otus = {
+        "sample_A": {"OTUB_1-COI", "OTUB_3-COI"},
+        "sample_B": {"OTUB_4-COI"},
+    }
+    assert {item["sample"] for item in rows} == set(expected_otus)
+    merged_paths = {
+        sample: tmp_path / "Consensus" / sample / f"{sample}_Merged_Consensus.fasta"
+        for sample in expected_otus
+    }
+    merged_digests = {
+        sample: hashlib.sha256(path.read_bytes()).hexdigest()
+        for sample, path in merged_paths.items()
+    }
+    assert merged_digests["sample_A"] != merged_digests["sample_B"]
+    for sidecar_row in rows:
+        sample = sidecar_row["sample"]
+        assert sidecar_row["round_barcode"] == "round_admission_1"
+        assert sidecar_row["otu_key"] in expected_otus[sample]
+        assert sidecar_row["taxonomy_admission_status"] == "unassigned"
+        assert sidecar_row["merged_fasta_sha256"] == merged_digests[sample]
+        for other_sample, other_digest in merged_digests.items():
+            if other_sample != sample:
+                assert sidecar_row["merged_fasta_sha256"] != other_digest
+
+    merged = merged_paths["sample_A"]
+    matching_header = next(
+        line
+        for line in merged.read_text(encoding="utf-8").splitlines()
+        if line.startswith(">") and "|OTU=OTUB_1-COI|" in line
+    )
+    assert "|n=NA|" not in matching_header
+    assert "|minQ=NA|" not in matching_header
+
+    provenance = tmp_path / "Consensus" / "consensus_round_provenance.tsv"
+    provenance_result = subprocess.run(
+        [
+            "perl",
+            str(EMIT_PROVENANCE),
+            "--consensus-dir",
+            str(tmp_path / "Consensus"),
+            "--round-barcode",
+            "round_admission_1",
+            "--out",
+            str(provenance),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert provenance_result.returncode == 0, provenance_result.stderr
+    provenance_rows = {
+        (item["sample"], item["otu_key"]): item for item in _read_tsv_rows(provenance)
+    }
+    for sidecar_row in rows:
+        provenance_row = provenance_rows[(sidecar_row["sample"], sidecar_row["otu_key"])]
+        assert sidecar_row["consensus_id"] == provenance_row["consensus_id"]
+        assert sidecar_row["otu_key"] == provenance_row["otu_key"]
+    sidecar_text = sidecar.read_text(encoding="utf-8")
+    assert F01A_PRIVATE_TAG not in sidecar_text
+    assert str(tmp_path) not in sidecar_text
+    assert not list((tmp_path / "Consensus").rglob("_taxonomy_admission*.tmp"))
+
+
+def test_taxonomy_admission_header_only_for_nonqualifying_evidence(tmp_path: Path) -> None:
+    cases = [
+        (
+            "compatible",
+            [("OTUB_1-COI", "Metazoa", "COI", ["ACGT", "ACGA"], 30)],
+            "sample_A",
+            "",
+            "COI|ITS2",
+            "Metazoa|Viridiplantae",
+        ),
+        (
+            "configured-literal-unassigned",
+            [("OTUB_1-COI", "Unassigned", "COI", ["ACGT", "ACGA"], 30)],
+            "sample_A",
+            "",
+            "COI",
+            "Unassigned",
+        ),
+        (
+            "mixed-compatible-unassigned",
+            [
+                ("OTUB_1-COI", "Metazoa", "COI", ["ACGT"], 30),
+                ("OTUB_1-COI", "Unassigned", "COI", ["ACGA"], 30),
+            ],
+            "sample_A",
+            "",
+            "COI",
+            "Metazoa",
+        ),
+        (
+            "assigned-mismatch",
+            [("OTUB_1-COI", "Viridiplantae", "COI", ["ACGT"], 30)],
+            "sample_A",
+            "",
+            "COI",
+            "Metazoa",
+        ),
+        (
+            "unconfigured-marker",
+            [("OTUB_1-18S", "Unassigned", "18S", ["ACGT"], 30)],
+            "sample_A",
+            "",
+            "COI",
+            "Metazoa",
+        ),
+        (
+            "malformed-otu-evidence",
+            [("MALFORMED", "Unassigned", "COI", ["ACGT"], 30)],
+            "sample_A",
+            "",
+            "COI",
+            "Metazoa",
+        ),
+        (
+            "no-adapter",
+            [("OTUB_1-COI", "Unassigned", "COI", ["ACGT"], 30)],
+            "no_adapter",
+            "no_adapter_1",
+            "COI",
+            "Metazoa",
+        ),
+    ]
+    expected_header = (
+        "round_barcode\tsample\totu_key\tconsensus_id\t"
+        "taxonomy_admission_status\tmerged_fasta_sha256"
+    )
+    for name, specs, sample, barcode, target_tokens, target_taxa in cases:
+        case_dir = tmp_path / name
+        blast, fasta, qscores, _first_header = _taxonomy_fixture_text(
+            specs,
+            sample=sample,
+            barcode=barcode,
+        )
+        result = _run_taxonomy_fixture(
+            case_dir,
+            blast,
+            fasta,
+            qscores,
+            mode="allow_unassigned",
+            samples=f"{sample}\n",
+            emit_consensus=True,
+            round_id=f"round_{name}",
+            target_tokens=target_tokens,
+            target_taxa=target_taxa,
+        )
+        assert result.returncode == 0, result.stderr
+        sidecar = case_dir / "Consensus" / "consensus_taxonomy_admission.tsv"
+        assert sidecar.read_text(encoding="utf-8").splitlines() == [expected_header]
+
+
+def test_taxonomy_admission_uses_emitted_vsearch_winner(tmp_path: Path) -> None:
+    cases = (
+        ("unassigned-wins", 3, 2, "OTUB_1-COI", 1, False),
+        ("compatible-wins-reversed", 2, 3, "OTUB_2-COI", 0, True),
+    )
+    for name, unassigned_count, compatible_count, winner, expected_rows, reverse in cases:
+        case_dir = tmp_path / name
+        blast, fasta, qscores, _first_header = _taxonomy_fixture_text(
+            [
+                ("OTUB_1-COI", "Unassigned", "COI", ["ACGT"] * unassigned_count, 31),
+                ("OTUB_2-COI", "Metazoa", "COI", ["ACGT"] * compatible_count, 35),
+            ]
+        )
+        result = _run_taxonomy_fixture(
+            case_dir,
+            blast,
+            fasta,
+            qscores,
+            mode="allow_unassigned",
+            samples="sample_A\n",
+            emit_consensus=True,
+            round_id=f"round_{name}",
+            extra_env={
+                "RTBIOSCAN_TEST_VSEARCH_MIX_ALL": "1",
+                "RTBIOSCAN_TEST_VSEARCH_REVERSE": "1" if reverse else "0",
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        merged = case_dir / "Consensus" / "sample_A" / "sample_A_Merged_Consensus.fasta"
+        headers = [line for line in merged.read_text(encoding="utf-8").splitlines() if line.startswith(">")]
+        assert len(headers) == 1
+        assert f"|OTU={winner}|" in headers[0]
+        rows = _read_tsv_rows(case_dir / "Consensus" / "consensus_taxonomy_admission.tsv")
+        assert len(rows) == expected_rows
+        if expected_rows:
+            assert rows[0]["otu_key"] == winner
+
+
+def test_taxonomy_admission_current_cache_and_frozen_evidence_but_not_carry_forward(
+    tmp_path: Path,
+) -> None:
+    specs = [("OTUB_1-COI", "Unassigned", "COI", ["ACGTACGT", "ACGTTCGT"], 31)]
+    blast, fasta, qscores, first_header = _taxonomy_fixture_text(specs)
+
+    cache_round1 = tmp_path / "cache-round1"
+    result1 = _run_taxonomy_fixture(
+        cache_round1,
+        blast,
+        fasta,
+        qscores,
+        mode="allow_unassigned",
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="round_cache_1",
+        extra_env={"CONSENSUS_LOCK_ENABLED": "0"},
+    )
+    assert result1.returncode == 0, result1.stderr
+
+    cache_round2 = tmp_path / "cache-round2"
+    shutil.copytree(cache_round1 / "Consensus" / ".cache", cache_round2 / "Consensus" / ".cache")
+    result2 = _run_taxonomy_fixture(
+        cache_round2,
+        blast,
+        fasta,
+        qscores,
+        mode="allow_unassigned",
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="round_cache_2",
+        extra_env={"CONSENSUS_LOCK_ENABLED": "0", "CONSENSUS_DEBUG": "1"},
+    )
+    assert result2.returncode == 0, result2.stderr
+    assert _read_tsv_rows(cache_round2 / "Consensus" / "consensus_taxonomy_admission.tsv")[0][
+        "round_barcode"
+    ] == "round_cache_2"
+    assert "cache_reuse count=2" in (
+        cache_round2 / "Consensus" / "consensus_debug.log"
+    ).read_text(encoding="utf-8")
+
+    frozen_dir = tmp_path / "frozen-current"
+    frozen_sequences = [_f01a_sequence(index) for index in range(1, 11)]
+    frozen_blast, frozen_fasta, frozen_qscores, frozen_header = _taxonomy_fixture_text(
+        [("OTUB_3-COI", "Unassigned", "COI", frozen_sequences, 40)]
+    )
+    frozen_result = _run_taxonomy_fixture(
+        frozen_dir,
+        frozen_blast,
+        frozen_fasta,
+        frozen_qscores,
+        mode="allow_unassigned",
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="round_frozen",
+        frozen_members_text=f"FROZEN_1\t{frozen_header}\t1\n",
+        extra_env={
+            "CONSENSUS_LOCK_ENABLED": "0",
+            "CONSENSUS_PRUNE_FROZEN_POLICY": "never",
+        },
+    )
+    assert frozen_result.returncode == 0, frozen_result.stderr
+    frozen_rows = _read_tsv_rows(frozen_dir / "Consensus" / "consensus_taxonomy_admission.tsv")
+    assert len(frozen_rows) == 1
+    frozen_merged = frozen_dir / "Consensus" / "sample_A" / "sample_A_Merged_Consensus.fasta"
+    frozen_header_out = next(
+        line for line in frozen_merged.read_text(encoding="utf-8").splitlines() if line.startswith(">")
+    )
+    assert "|n=NA|" not in frozen_header_out and "|minQ=NA|" not in frozen_header_out
+    assert "|frozen=1|consolidated=1" in frozen_header_out
+
+    carry_dir = tmp_path / "carry-forward"
+    shutil.copytree(cache_round1 / "Consensus" / ".cache", carry_dir / "Consensus" / ".cache")
+    previous_keys = carry_dir / "previous_keys.tsv"
+    previous_keys.write_text("sample_A\tOTUB_1-COI\n", encoding="utf-8")
+    carry_blast, carry_fasta, carry_qscores, _carry_header = _taxonomy_fixture_text(
+        [("OTUB_2-COI", "Metazoa", "COI", ["TTTT", "TTTA"], 35)]
+    )
+    carry_result = _run_taxonomy_fixture(
+        carry_dir,
+        carry_blast,
+        carry_fasta,
+        carry_qscores,
+        mode="allow_unassigned",
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="round_carry",
+        extra_env={
+            "CONSENSUS_LOCK_ENABLED": "1",
+            "CONSENSUS_LOCK_KEYS_PREV": str(previous_keys),
+        },
+    )
+    assert carry_result.returncode == 0, carry_result.stderr
+    carry_merged = carry_dir / "Consensus" / "sample_A" / "sample_A_Merged_Consensus.fasta"
+    assert "|OTU=OTUB_1-COI|" in carry_merged.read_text(encoding="utf-8")
+    assert _read_tsv_rows(carry_dir / "Consensus" / "consensus_taxonomy_admission.tsv") == []
+
+
+def test_taxonomy_admission_tag_mismatch_stale_replacement_and_required_non_touch(
+    tmp_path: Path,
+) -> None:
+    mismatch_dir = tmp_path / "tag-mismatch"
+    mismatch_blast, mismatch_fasta, mismatch_qscores, _header = _taxonomy_fixture_text(
+        [("OTUB_1-COI", "Unassigned", "COI", ["ACGTACGT", "ACGTTCGT"], 31)],
+        barcode="sample_A",
+    )
+    mismatch_result = _run_taxonomy_fixture(
+        mismatch_dir,
+        mismatch_blast,
+        mismatch_fasta,
+        mismatch_qscores,
+        mode="allow_unassigned",
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="round_mismatch",
+    )
+    assert mismatch_result.returncode == 0, mismatch_result.stderr
+    assert _read_tsv_rows(mismatch_dir / "Consensus" / "consensus_taxonomy_admission.tsv") == []
+    mismatch_merged = mismatch_dir / "Consensus" / "sample_A" / "sample_A_Merged_Consensus.fasta"
+    mismatch_header = next(
+        line for line in mismatch_merged.read_text(encoding="utf-8").splitlines() if line.startswith(">")
+    )
+    assert "|n=NA|" not in mismatch_header and "|minQ=NA|" not in mismatch_header
+    cached = next((mismatch_dir / "Consensus" / ".cache" / "sample_A").glob("*.consensus.fasta"))
+    cached_header = cached.read_text(encoding="utf-8").splitlines()[0]
+    assert len(cached_header[1:].split("|")) == 5
+
+    stale_dir = tmp_path / "stale-replacement"
+    stale_sidecar = stale_dir / "Consensus" / "consensus_taxonomy_admission.tsv"
+    stale_sidecar.parent.mkdir(parents=True)
+    stale_sidecar.write_text(
+        "round_barcode\tsample\totu_key\tconsensus_id\ttaxonomy_admission_status\tmerged_fasta_sha256\n"
+        "old_round\told_sample\tOTUB_OLD-COI\tConsensus9_old\tunassigned\t"
+        + "0" * 64
+        + "\n",
+        encoding="utf-8",
+    )
+    clean_blast, clean_fasta, clean_qscores, _clean_header = _taxonomy_fixture_text(
+        [("OTUB_3-COI", "Unassigned", "COI", ["TTTT", "TTTA"], 33)]
+    )
+    stale_result = _run_taxonomy_fixture(
+        stale_dir,
+        clean_blast,
+        clean_fasta,
+        clean_qscores,
+        mode="allow_unassigned",
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="current_round",
+    )
+    assert stale_result.returncode == 0, stale_result.stderr
+    stale_rows = _read_tsv_rows(stale_sidecar)
+    assert len(stale_rows) == 1
+    assert stale_rows[0]["round_barcode"] == "current_round"
+    assert stale_rows[0]["otu_key"] == "OTUB_3-COI"
+    assert "old_round" not in stale_sidecar.read_text(encoding="utf-8")
+
+    required_dir = tmp_path / "required-non-touch"
+    required_sidecar = required_dir / "Consensus" / "consensus_taxonomy_admission.tsv"
+    required_sidecar.parent.mkdir(parents=True)
+    sentinel = b"pre-existing-required-mode-sentinel\n"
+    required_sidecar.write_bytes(sentinel)
+    required_result = _run_taxonomy_fixture(
+        required_dir,
+        clean_blast,
+        clean_fasta,
+        clean_qscores,
+        mode="required",
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="required_round",
+    )
+    assert required_result.returncode == 0, required_result.stderr
+    assert required_sidecar.read_bytes() == sentinel
+
+
+def test_taxonomy_admission_sidecar_does_not_change_existing_outputs(tmp_path: Path) -> None:
+    candidate_dir = tmp_path / "candidate"
+    control_dir = tmp_path / "control"
+    required_candidate_dir = tmp_path / "required-candidate"
+    required_control_dir = tmp_path / "required-control"
+    control_script = _without_taxonomy_admission_sidecar(tmp_path)
+    bash_check = subprocess.run(["/bin/bash", "-n", str(control_script)], capture_output=True, text=True)
+    assert bash_check.returncode == 0, bash_check.stderr
+
+    blast, fasta, qscores, _header = _taxonomy_fixture_text(
+        [("OTUB_1-COI", "Unassigned", "COI", ["ACGTACGT", "ACGTTCGT"], 31)]
+    )
+    candidate = _run_taxonomy_fixture(
+        candidate_dir,
+        blast,
+        fasta,
+        qscores,
+        mode="allow_unassigned",
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="round_equivalence",
+    )
+    control = _run_taxonomy_fixture(
+        control_dir,
+        blast,
+        fasta,
+        qscores,
+        mode="allow_unassigned",
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="round_equivalence",
+        consensus_script=control_script,
+    )
+    assert candidate.returncode == 0, candidate.stderr
+    assert control.returncode == 0, control.stderr
+    assert (candidate_dir / "Consensus" / "consensus_taxonomy_admission.tsv").exists()
+    assert not (control_dir / "Consensus" / "consensus_taxonomy_admission.tsv").exists()
+
+    for root in (candidate_dir, control_dir):
+        provenance_result = subprocess.run(
+            [
+                "perl",
+                str(EMIT_PROVENANCE),
+                "--consensus-dir",
+                str(root / "Consensus"),
+                "--round-barcode",
+                "round_equivalence",
+                "--out",
+                str(root / "Consensus" / "consensus_round_provenance.tsv"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert provenance_result.returncode == 0, provenance_result.stderr
+
+    assert _consensus_non_timing_snapshot(
+        candidate_dir,
+        exclude_admission_sidecar=True,
+    ) == _consensus_non_timing_snapshot(control_dir)
+    for relative in (
+        Path("sample_A/sample_A_Merged_Consensus.fasta"),
+        Path("consensus_otu_map.tsv"),
+        Path("sample_A/otu_meta.tsv"),
+        Path("consolidated_consensus_ids.txt"),
+        Path("consensus_round_provenance.tsv"),
+    ):
+        assert (candidate_dir / "Consensus" / relative).read_bytes() == (
+            control_dir / "Consensus" / relative
+        ).read_bytes()
+
+    required_candidate = _run_taxonomy_fixture(
+        required_candidate_dir,
+        blast,
+        fasta,
+        qscores,
+        mode="required",
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="round_required_equivalence",
+    )
+    required_control = _run_taxonomy_fixture(
+        required_control_dir,
+        blast,
+        fasta,
+        qscores,
+        mode="required",
+        samples="sample_A\n",
+        emit_consensus=True,
+        round_id="round_required_equivalence",
+        consensus_script=control_script,
+    )
+    assert required_candidate.returncode == required_control.returncode == 0, (
+        required_candidate.stderr,
+        required_control.stderr,
+    )
+    required_candidate_snapshot = _consensus_non_timing_snapshot(required_candidate_dir)
+    required_control_snapshot = _consensus_non_timing_snapshot(required_control_dir)
+    assert [relative for relative, _digest in required_candidate_snapshot] == [
+        relative for relative, _digest in required_control_snapshot
+    ]
+    assert dict(required_candidate_snapshot) == dict(required_control_snapshot)
+    for root in (required_candidate_dir, required_control_dir):
+        consensus = root / "Consensus"
+        assert not (consensus / "consensus_taxonomy_admission.tsv").exists()
+        assert not (consensus / "_taxonomy_admission_otus.tmp").exists()
+        assert not list(consensus.glob("*/_taxonomy_admission_keys.tmp"))
+        assert not list(consensus.glob("*/_taxonomy_admission.tmp"))
+
+
+def test_taxonomy_admission_structure_and_unknown_semantics_are_guarded() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    blocks = []
+    active = False
+    current = []
+    for line in source.splitlines():
+        if "RTBIOSCAN_TAXONOMY_ADMISSION_BEGIN" in line:
+            assert not active
+            active = True
+            current = []
+            continue
+        if "RTBIOSCAN_TAXONOMY_ADMISSION_END" in line:
+            assert active
+            active = False
+            blocks.append("\n".join(current))
+            continue
+        if active:
+            current.append(line)
+    assert not active
+    admission_source = "\n".join(blocks)
+    assert "blast_report_annotated" not in admission_source
+    assert "tmp_clean_blast_report_full" not in admission_source
+    assert "Digest::SHA=sha256_hex" in admission_source
+    assert source.count(
+        "round_barcode\\tsample\\totu_key\\tconsensus_id\\t"
+        "taxonomy_admission_status\\tmerged_fasta_sha256"
+    ) == 1
+
+    provenance_source = EMIT_PROVENANCE.read_text(encoding="utf-8")
+    assert 'my $header = "round_barcode\\tsample\\totu_key\\tconsensus_id\\treads_used_round\\n";' in provenance_source
+    docs = (REPO_ROOT / "docs" / "usage.md").read_text(encoding="utf-8")
+    assert "missing or header-only sidecar" in docs
+    assert "digest mismatch" in docs
+    assert "literal `unassigned`" in docs
+    assert "treated by future readers as unknown" in docs
+    assert "changing from `allow_unassigned` to `required` requires a state reset" in docs
+    assert "newest completed round" in docs
 
 
 def test_taxonomy_mode_and_target_contract_fail_before_processing(tmp_path: Path) -> None:
