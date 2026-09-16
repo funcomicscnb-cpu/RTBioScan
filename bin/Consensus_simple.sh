@@ -918,12 +918,21 @@ _best_consensus_addition() {
 		if [[ $_bca_line =~ ^\> ]]; then
 			_bca_hraw="${_bca_line#>}"
 			_bca_hraw="${_bca_hraw%$'\r'}"
-			_bca_reads=$(printf '%s\n' "$_bca_line" | sed -E 's/.*reads-([0-9]+).*/\1/')
+			_bca_reads=$(printf '%s\n' "$_bca_line" | awk -F'|' '
+				{
+					for (i=1; i<NF; i++) {
+						if ($i ~ /^reads-[0-9]+$/ && $(i+1) ~ /^OTU=/) {
+							v=$i; sub(/^reads-/, "", v); print v; exit;
+						}
+					}
+				}')
 			if ! printf '%s\n' "$_bca_reads" | awk 'BEGIN{ok=1} /^[0-9]+$/{next} {ok=0} END{exit ok?0:1}'; then
 				_bca_reads=0
 			fi
 			_bca_otu=""
-			if [[ "$_bca_line" =~ \|OTU=([^|]+) ]]; then
+			if [[ "$_bca_line" =~ \|RTBIOSCAN_INTERNAL_OTU=([^|]+) ]]; then
+				_bca_otu="${BASH_REMATCH[1]}"
+			elif [[ "$_bca_line" =~ \|OTU=([^|]+) ]]; then
 				_bca_otu="${BASH_REMATCH[1]}"
 			else
 				_bca_otu=$(printf '%s\n' "$_bca_line" | tr '|' '\n' | awk '/^OTUB_/{print; exit}')
@@ -964,6 +973,7 @@ _best_consensus_addition() {
 	fi
 	if [ -n "$_bca_sel_otu" ]; then
 		local _bca_mode="${CONSENSUS_READS_MODE:-representative}"
+		rm -f "$_bca_sup"
 		if [ "$_bca_mode" = "cluster_total" ]; then
 			: > "$_bca_orig"
 			local _bca_tr="${_bca_orig}.tmp" _bca_ts="${_bca_sup}.tmp"
@@ -972,14 +982,19 @@ _best_consensus_addition() {
 			while IFS= read -r _bca_line; do
 				if [[ $_bca_line =~ ^\> ]]; then
 					_bca_hdr="$_bca_line"; _bca_otu=""
-					if [[ "$_bca_hdr" =~ \|OTU=([^|]+) ]]; then
+					if [[ "$_bca_hdr" =~ \|RTBIOSCAN_INTERNAL_OTU=([^|]+) ]]; then
+						_bca_otu="${BASH_REMATCH[1]}"
+					elif [[ "$_bca_hdr" =~ \|OTU=([^|]+) ]]; then
 						_bca_otu="${BASH_REMATCH[1]}"
 					else
 						_bca_otu=$(printf '%s\n' "$_bca_hdr" | tr '|' '\n' | awk '/^OTUB_/{print; exit}')
 						[ -z "$_bca_otu" ] && _bca_otu=$(printf '%s\n' "$_bca_hdr" | cut -d'|' -f2)
 					fi
 					[ -n "$_bca_otu" ] && [ -f "$_bca_out_dir/${_bca_otu}_all_reads.list"  ] && cat "$_bca_out_dir/${_bca_otu}_all_reads.list"  >> "$_bca_tr"
-					[ -n "$_bca_otu" ] && [ -f "$_bca_out_dir/${_bca_otu}_reads_sup.fasta" ] && cat "$_bca_out_dir/${_bca_otu}_reads_sup.fasta" >> "$_bca_ts"
+					if [ -n "$_bca_otu" ] && [ -f "$_bca_out_dir/${_bca_otu}_reads_sup.fasta" ]; then
+						cat "$_bca_out_dir/${_bca_otu}_reads_sup.fasta" >> "$_bca_ts"
+						awk '/^>/{sub(/^>/, ""); print}' "$_bca_out_dir/${_bca_otu}_reads_sup.fasta" >> "$_bca_tr"
+					fi
 				fi
 			done < "$fasta_file"
 			[ -s "$_bca_tr" ] && LC_ALL=C sort -u "$_bca_tr" > "$_bca_orig"
@@ -998,7 +1013,18 @@ _best_consensus_addition() {
 	local _bca_rmode="${CONSENSUS_READS_MODE:-representative}"
 	local _bca_rval="$_bca_sel_reads"
 	[ "$_bca_rmode" = "cluster_total" ] && _bca_rval=$_bca_total
-	printf '%s\n%s\n' "$_bca_best_entry" "$_bca_best_seq" | sed -E "s/(reads-)[0-9]+/\1$_bca_rval/"
+	printf '%s\n%s\n' "$_bca_best_entry" "$_bca_best_seq" \
+		| awk -v reads="$_bca_rval" '
+			/^>/ {
+				n=split($0, f, /\|/); out="";
+				for (i=1; i<=n; i++) {
+					if (f[i] ~ /^RTBIOSCAN_INTERNAL_OTU=/) continue;
+					if (i<n && f[i] ~ /^reads-[0-9]+$/ && f[i+1] ~ /^OTU=/) f[i]="reads-" reads;
+					out=(out=="" ? f[i] : out "|" f[i]);
+				}
+				print out; next;
+			}
+			{print}'
 }
 
 hydrate_sample_cache() {
@@ -2187,6 +2213,14 @@ while IFS= read -r sample; do
 				printf "%s\t%s\n" "$sample" "$otu_key" >> "$consolidated_otu_keys_current"
 			fi
 			printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$otu_key" "$sample" "$n_cand" "${min_cand_use:-$min_cand}" "$is_frozen" "$effective_consolidated" >> "$sample_meta"
+			# Expose current selected-read evidence under the complete internal key
+			# before any cache/rank-1 early continue. An empty list is authoritative
+			# when no current selected-read evidence exists.
+			current_reads_list="$out_dir/$sample/${otu_key}_all_reads.list"
+			: > "$current_reads_list"
+			if [ -s "$candidate_list" ]; then
+				awk 'NF && !seen[$0]++ {print}' "$candidate_list" > "$current_reads_list"
+			fi
 			if [ "$cache_cons_consolidated" -eq 1 ] && [ "$should_consolidate" -eq 0 ]; then
 				[ "$CONS_DEBUG" = "1" ] && cons_log "OTU=$otu_key consolidated_cache_reuse cache_cons=$cache_cons"
 				echo "$cache_cons" >> "$cached_list"
@@ -2229,6 +2263,7 @@ while IFS= read -r sample; do
 				fi
 				continue
 			fi
+			rm -f "$current_reads_list"
 			# Accumulate candidate IDs for batched seqtk extraction (PR5)
 			candidate_reads_fasta="$out_dir/$sample/${otu_key}_reads_sup.fasta"
 			: > "$candidate_reads_fasta"
@@ -2507,23 +2542,35 @@ while IFS= read -r sample; do
 				annotated_tmp="${merged}.annotated"
 				awk -v meta="$sample_meta" -v map="$consensus_map" -v sample="$sample" 'BEGIN{FS=OFS="\t";
 					while((getline< meta)>0){
-						if(NF>=6){ m[$1]=$0; }
+						if(NF>=6){
+							m[$1]=$0;
+							encoded=$1;
+							gsub(/-/, "|", encoded);
+							internal_by_encoded[encoded]=$1;
+						}
 					}
 				}
 				/^>/{
 					h_raw=substr($0,2);
 					n=split(h_raw,a,/\|/);
-					otu_key="NA";
+					public_otu="NA";
 					tmp=h_raw;
 					while (match(tmp, /\|OTU=[^|]+/)) {
-						otu_key=substr(tmp, RSTART+5, RLENGTH-5);
+						public_otu=substr(tmp, RSTART+5, RLENGTH-5);
 						tmp=substr(tmp, RSTART+RLENGTH);
 					}
-					if (otu_key=="NA" && n>=3) {
-						otu_key=a[2];
-						if (a[3] != "" && otu_key !~ ("-" a[3] "$")) { otu_key=otu_key "-" a[3]; }
+					if (public_otu=="NA" && n>=3) {
+						public_otu=a[2];
+						if (a[3] != "" && public_otu !~ ("-" a[3] "$")) { public_otu=public_otu "-" a[3]; }
 					}
-					info=m[otu_key];
+					encoded="";
+					for (i=2; i<=n; i++) {
+						if (a[i] ~ /^reads-[0-9]+$/) break;
+						if (a[i] ~ /^(OTU|n|minQ|frozen|consolidated|RTBIOSCAN_INTERNAL_OTU)=/) break;
+						encoded=(encoded=="" ? a[i] : encoded "|" a[i]);
+					}
+					internal_otu=(encoded in internal_by_encoded ? internal_by_encoded[encoded] : "");
+					info=(internal_otu!="" ? m[internal_otu] : "");
 					n_reads="NA"; minq="NA"; frozen="0"; cons="0";
 					if (info!="") {
 						split(info,f,"\t");
@@ -2545,9 +2592,12 @@ while IFS= read -r sample; do
 					gsub(/\|minQ=[^|]*/, "", h);
 					gsub(/\|frozen=[^|]*/, "", h);
 					gsub(/\|consolidated=[^|]*/, "", h);
-					newh=h "|OTU=" otu_key "|n=" n_reads "|minQ=" minq "|frozen=" frozen "|consolidated=" cons;
-					print ">" newh;
-					print newh "\t" otu_key "\t" sample "\t" n_reads "\t" minq "\t" frozen "\t" cons >> map;
+					gsub(/\|RTBIOSCAN_INTERNAL_OTU=[^|]*/, "", h);
+					publich=h "|OTU=" public_otu "|n=" n_reads "|minQ=" minq "|frozen=" frozen "|consolidated=" cons;
+					internalh=publich;
+					if (internal_otu!="") internalh=internalh "|RTBIOSCAN_INTERNAL_OTU=" internal_otu;
+					print ">" internalh;
+					print publich "\t" public_otu "\t" sample "\t" n_reads "\t" minq "\t" frozen "\t" cons >> map;
 					next;
 				}
 				{print}' "$merged" > "$annotated_tmp" && mv "$annotated_tmp" "$merged"
@@ -2562,6 +2612,8 @@ while IFS= read -r sample; do
 			if [ -s "$merged" ]; then
 				vsearch --cluster_fast "$merged" --id "$consensus_id" --clusters "$out_dir/${sample}/${sample}_Consensus" --iddef 3 --threads $RSCRIPT_WORKERS
 				if [ ! -e "$out_dir/$sample/OriginalReads" ]; then mkdir "$out_dir/$sample/OriginalReads"; fi
+				current_original_reads_tokens="$out_dir/$sample/_current_original_reads_tokens.list"
+				: > "$current_original_reads_tokens"
 				: > "$out_dir/${sample}/${sample}_Merged_Consensus.fasta"
 				cluster_files=( "$out_dir/${sample}/${sample}_Consensus"* )
 				# Load consolidated keys once for all cluster files in this sample
@@ -2592,22 +2644,33 @@ while IFS= read -r sample; do
 						/^>/{
 							h=$0; sub(/^>/,"",h);
 							reads=0;
-							if (h ~ /reads-[0-9]+/) {
-								tmp=h; sub(/.*reads-/,"",tmp); gsub(/[^0-9].*/,"",tmp); reads=tmp+0;
-							}
-							otu="";
-							tmp=h;
-							while (match(tmp, /\|OTU=[^|]+/)) {
-								otu=substr(tmp, RSTART+5, RLENGTH-5);
-								tmp=substr(tmp, RSTART+RLENGTH);
-							}
-							if (otu == "") {
-								n=split(h, p, /\|/);
-								if (n>=2) {
-									otu=p[2];
-									if (n>=3 && p[3] != "" && otu !~ ("-" p[3] "$")) otu=otu "-" p[3];
+							n_fields=split(h, read_field, /\|/);
+							for (read_i=1; read_i<n_fields; read_i++) {
+								if (read_field[read_i] ~ /^reads-[0-9]+$/ && read_field[read_i+1] ~ /^OTU=/) {
+									tmp=read_field[read_i]; sub(/^reads-/,"",tmp); reads=tmp+0; break;
 								}
 							}
+							public_otu="";
+							tmp=h;
+							while (match(tmp, /\|OTU=[^|]+/)) {
+								public_otu=substr(tmp, RSTART+5, RLENGTH-5);
+								tmp=substr(tmp, RSTART+RLENGTH);
+							}
+							if (public_otu == "") {
+								n=split(h, p, /\|/);
+								if (n>=2) {
+									public_otu=p[2];
+									if (n>=3 && p[3] != "" && public_otu !~ ("-" p[3] "$")) public_otu=public_otu "-" p[3];
+								}
+							}
+							internal_otu="";
+							tmp=h;
+							while (match(tmp, /\|RTBIOSCAN_INTERNAL_OTU=[^|]+/)) {
+								tag="|RTBIOSCAN_INTERNAL_OTU=";
+								internal_otu=substr(tmp, RSTART+length(tag), RLENGTH-length(tag));
+								tmp=substr(tmp, RSTART+RLENGTH);
+							}
+							otu=(internal_otu!="" ? internal_otu : public_otu);
 							cons=-1;
 							tmp=h;
 							while (match(tmp, /\|consolidated=[01]/)) {
@@ -2681,6 +2744,8 @@ while IFS= read -r sample; do
 							printf "%s\n" "$out_block" >> $out_dir/${sample}/${sample}_Merged_Consensus.fasta
 							cons_header=$(printf "%s\n" "$out_block" | head -n1 | sed 's/^>//')
 							if [ -n "$cons_header" ]; then
+								cons_token=$(printf "%s\n" "$cons_header" | awk -F'|' 'NF>=2{print $2}')
+								[ -n "$cons_token" ] && printf "%s\n" "$cons_token" >> "$current_original_reads_tokens"
 								consensus_id=$(printf "%s\n" "$cons_header" | awk -F'|' 'NF>=2{print $2 "_" $1}')
 								prior_keep=0
 								if [ "$policy_reset_sample" -eq 0 ] && [ -n "$_cons_ids_prev_file" ]; then
@@ -2699,7 +2764,19 @@ while IFS= read -r sample; do
 							fi
 						fi
 						rm -f "$i"
+			done
+				for stale_original_reads in \
+					"$out_dir/$sample/OriginalReads/"*_reads.list \
+					"$out_dir/$sample/OriginalReads/"*_reads_sup.fasta; do
+					[ -f "$stale_original_reads" ] || continue
+					stale_token=$(basename "$stale_original_reads")
+					stale_token=${stale_token%_reads_sup.fasta}
+					stale_token=${stale_token%_reads.list}
+					if ! grep -Fxq "$stale_token" "$current_original_reads_tokens"; then
+						rm -f "$stale_original_reads"
+					fi
 				done
+				rm -f "$current_original_reads_tokens"
 				fi
 				rm -f $out_dir/$sample/${sample}_consensus.fasta "$cached_fasta" "$merged"
 				rm -f $out_dir/$sample/*_all_reads.list $out_dir/$sample/*_all_reads_full.list $out_dir/$sample/*_all_read_ids.list

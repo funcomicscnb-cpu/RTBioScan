@@ -10,6 +10,8 @@ VOUCHER_EXPORT = REPO_ROOT / "bin" / "voucher_export.sh"
 VALIDATE_PHASE1_WORKLOAD = REPO_ROOT / "bin" / "lib" / "validate_phase1_workload.sh"
 SYNC_SCRIPT = REPO_ROOT / "bin" / "sync_dir_atomic.sh"
 DROP_FILTER_AWK = REPO_ROOT / "bin" / "consensus_drop_filter.awk"
+EMIT_PROVENANCE = REPO_ROOT / "bin" / "emit_consensus_round_provenance.pl"
+F01A_PRIVATE_TAG = "RTBIOSCAN_INTERNAL_OTU"
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -43,11 +45,10 @@ def _install_stub_tools(
             "for input in *_reads_sup.fasta; do\n"
             "  [ -f \"$input\" ] || continue\n"
             "  otu=${input%_reads_sup.fasta}\n"
-            "  marker=${otu#*-}\n"
-            "  marker=${marker%%-*}\n"
+            "  otu_header=$(printf '%s' \"$otu\" | tr '-' '|')\n"
             "  reads=$(awk '/^>/{n++} END{print n+0}' \"$input\")\n"
             "  sequence=$(awk '!/^>/{printf \"%s\", $0} END{print \"\"}' \"$input\")\n"
-            "  printf '>%s|%s|%s|reads-%s\\n%s\\n' \"$sample\" \"$otu\" \"$marker\" \"$reads\" \"$sequence\" > \"${otu}_consensus.fasta\"\n"
+            "  printf '>%s|%s|reads-%s\\n%s\\n' \"$sample\" \"$otu_header\" \"$reads\" \"$sequence\" > \"${otu}_consensus.fasta\"\n"
             "  cat \"${otu}_consensus.fasta\" >> \"${sample}_consensus.fasta\"\n"
             "done\n"
         )
@@ -68,7 +69,18 @@ def _install_stub_tools(
             "if [ -z \"$in\" ] || [ -z \"$out\" ]; then\n"
             "  exit 2\n"
             "fi\n"
-            "cp \"$in\" \"${out}0\"\n",
+            "if [ \"${RTBIOSCAN_TEST_VSEARCH_MIX_ALL:-0}\" = \"1\" ]; then\n"
+            "  cp \"$in\" \"${out}0\"\n"
+            "else\n"
+            "  awk -v out=\"$out\" 'BEGIN{RS=\">\"; ORS=\"\"} NR>1{record=$0; seq=record; sub(/^[^\\n]*\\n/,\"\",seq); key=seq; gsub(/[\\r\\n]/,\"\",key); if(!(key in cluster)) cluster[key]=count++; file=out cluster[key]; print \">\" record >> file; close(file)}' \"$in\"\n"
+            "fi\n"
+            "if [ \"${RTBIOSCAN_TEST_VSEARCH_REVERSE:-0}\" = \"1\" ]; then\n"
+            "  for cluster in \"${out}\"*; do\n"
+            "    [ -f \"$cluster\" ] || continue\n"
+            "    awk 'BEGIN{RS=\">\"; ORS=\"\"} NR>1{record[++n]=$0} END{for(i=n;i>0;i--) print \">\" record[i]}' \"$cluster\" > \"${cluster}.reverse\"\n"
+            "    mv \"${cluster}.reverse\" \"$cluster\"\n"
+            "  done\n"
+            "fi\n",
         )
     if include_seqtk:
         _write_exec(
@@ -104,6 +116,7 @@ def _run_consensus(
     frozen_members: str = "",
     script_path: Path | None = None,
     supply_target_contract: bool = True,
+    reads_mode: str = "representative",
 ) -> subprocess.CompletedProcess[str]:
     if script_path is None:
         script_path = REPO_ROOT / "bin"
@@ -120,7 +133,7 @@ def _run_consensus(
         "15",
         "20",
         frozen_members,
-        "representative",
+        reads_mode,
         "4",
     ]
     return subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, text=True)
@@ -189,6 +202,590 @@ def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
         values = line.split("\t")
         rows.append(dict(zip(header, values)))
     return rows
+
+
+def _f01a_sequence(index: int) -> str:
+    alphabet = "ACGT"
+    value = index
+    encoded = []
+    for _ in range(8):
+        encoded.append(alphabet[value % 4])
+        value //= 4
+    return "ACGT" + "".join(encoded)
+
+
+def _run_f01a_case(
+    tmp_path: Path,
+    *,
+    mode: str,
+    otu_specs: list[tuple[str, int, int, bool]],
+    r_path: bool,
+    mix_all: bool = False,
+    taxonomy_mode: str = "required",
+    rank1_otus: set[str] | None = None,
+    primer: str = "COI_Probe",
+    reverse_cluster: bool = False,
+    hash_seed: int | None = None,
+    debug: bool = False,
+    reads_mode: str = "representative",
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    bindir = _install_stub_tools(tmp_path, emit_consensus=True)
+    if mode == "collapse":
+        sample, barcode, adapter = "Larch", "", "Larch_COI"
+    elif mode == "track":
+        sample, barcode, adapter = "Sable_2_COI", "", "Sable_2_COI"
+    elif mode == "primers":
+        sample = barcode = adapter = primer
+    else:
+        raise AssertionError(f"unsupported F-01A mode: {mode}")
+
+    blast_lines = []
+    fasta_lines = []
+    qscore_lines = []
+    frozen_lines = []
+    for otu_index, (otu, count, qscore, frozen) in enumerate(otu_specs, start=1):
+        for read_index in range(1, count + 1):
+            uuid = f"f01a-{otu_index:02d}-{read_index:02d}"
+            blast_header = _make_header(
+                uuid,
+                True,
+                barcode=barcode,
+                adapter=adapter,
+                otu_token=otu,
+            )
+            fasta_header = _make_header(
+                uuid,
+                False,
+                model="hac",
+                barcode=barcode,
+                adapter=adapter,
+            )
+            use_rank1 = not r_path or (rank1_otus is not None and otu in rank1_otus)
+            sequence = "ACGTACGTACGT" if use_rank1 else _f01a_sequence(read_index)
+            blast_lines.append(f"{blast_header}\t{otu}\tMetazoa\tCOI\n")
+            fasta_lines.append(f">{fasta_header}\n{sequence}\n")
+            qscore_lines.append(f"{uuid}\thac\t{qscore}\n")
+            if frozen and read_index == 1:
+                frozen_lines.append(f"FROZEN_{otu_index}\t{fasta_header}\t1\n")
+
+    _write_common_inputs(
+        tmp_path,
+        "".join(blast_lines),
+        "".join(fasta_lines),
+        "".join(qscore_lines),
+        samples=f"{sample}\n",
+    )
+    frozen = tmp_path / "otu_frozen_members.tsv"
+    frozen.write_text("".join(frozen_lines), encoding="utf-8")
+    env = os.environ.copy()
+    env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
+    env["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
+    env["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
+    env["CONSENSUS_LOCK_ENABLED"] = "0"
+    env["CONSENSUS_PRUNE_FROZEN_POLICY"] = "never"
+    env["CONSENSUS_TAXONOMY_MODE"] = taxonomy_mode
+    if mode == "track":
+        track_active_units = tmp_path / "track_active_units.txt"
+        track_active_units.write_text(f"{sample}\n", encoding="utf-8")
+        track_identity = tmp_path / "track_identity.tsv"
+        track_identity.write_text(
+            "sample_id\tmarker_id\tunit_id_collapse\tunit_id_track\n"
+            f"voucher_track\tCOI\tSable_2\t{sample}\n",
+            encoding="utf-8",
+        )
+        env["RTBIOSCAN_EFFECTIVE_IDENTITY_MODE"] = "track"
+        env["RTBIOSCAN_TRACK_ACTIVE_UNITS"] = str(track_active_units)
+        env["RTBIOSCAN_TRACK_IDENTITY_TSV"] = str(track_identity)
+    if mix_all:
+        env["RTBIOSCAN_TEST_VSEARCH_MIX_ALL"] = "1"
+    if reverse_cluster:
+        env["RTBIOSCAN_TEST_VSEARCH_REVERSE"] = "1"
+    if hash_seed is not None:
+        env["PERL_HASH_SEED"] = str(hash_seed)
+        env["PERL_PERTURB_KEYS"] = "2"
+    if debug:
+        env["CONSENSUS_DEBUG"] = "1"
+    result = _run_consensus(
+        tmp_path,
+        env,
+        min_reads="1",
+        frozen_members=str(frozen),
+        reads_mode=reads_mode,
+    )
+    return result, sample
+
+
+def _f01a_meta(tmp_path: Path, sample: str) -> dict[str, list[str]]:
+    rows = {}
+    path = tmp_path / "Consensus" / sample / "otu_meta.tsv"
+    for line in path.read_text(encoding="utf-8").splitlines():
+        fields = line.split("\t")
+        rows[fields[0]] = fields
+    return rows
+
+
+def _f01a_public_artifacts(tmp_path: Path, sample: str) -> list[Path]:
+    paths = [
+        tmp_path / "Consensus" / sample / f"{sample}_Merged_Consensus.fasta",
+        tmp_path / "Consensus" / "consensus_otu_map.tsv",
+        tmp_path / "Consensus" / "consolidated_consensus_ids.txt",
+    ]
+    return [path for path in paths if path.exists()]
+
+
+def _f01a_reads_for_otu(tmp_path: Path, sample: str, otu: str) -> list[str]:
+    merged = tmp_path / "Consensus" / sample / f"{sample}_Merged_Consensus.fasta"
+    for line in merged.read_text(encoding="utf-8").splitlines():
+        if line.startswith(">") and f"|OTU={otu}|" in line:
+            consensus_token = line[1:].split("|")[1]
+            reads_path = tmp_path / "Consensus" / sample / "OriginalReads" / f"{consensus_token}_reads.list"
+            if not reads_path.exists():
+                return []
+            return [read for read in reads_path.read_text(encoding="utf-8").splitlines() if read]
+    raise AssertionError(f"missing final consensus for {otu}")
+
+
+def _plant_f01a_stale_linkage(
+    tmp_path: Path,
+    sample: str,
+    *,
+    consensus_tokens: tuple[str, ...],
+    internal_key: str | None = None,
+) -> None:
+    sample_dir = tmp_path / "Consensus" / sample
+    original_reads = sample_dir / "OriginalReads"
+    original_reads.mkdir(parents=True, exist_ok=True)
+    for token in consensus_tokens:
+        stale_id = f"stale-{token}"
+        (original_reads / f"{token}_reads.list").write_text(
+            f"{stale_id}|COI|hac\n",
+            encoding="utf-8",
+        )
+        (original_reads / f"{token}_reads_sup.fasta").write_text(
+            f">{stale_id}|COI|hac\nAAAA\n",
+            encoding="utf-8",
+        )
+    if internal_key is not None:
+        (sample_dir / f"{internal_key}_all_reads.list").write_text(
+            "stale-per-key|COI|hac\n",
+            encoding="utf-8",
+        )
+
+
+def test_f01a_full_demux_modes_keep_unsuffixed_public_otu_identity(tmp_path: Path) -> None:
+    for mode in ("collapse", "track"):
+        case_dir = tmp_path / mode
+        result, sample = _run_f01a_case(
+            case_dir,
+            mode=mode,
+            otu_specs=[("OTUB_7-COI", 10, 31, False)],
+            r_path=False,
+        )
+        assert result.returncode == 0, result.stderr
+        meta = _f01a_meta(case_dir, sample)
+        assert meta["OTUB_7-COI"][2:] == ["10", "31", "0", "0"]
+        merged = (case_dir / "Consensus" / sample / f"{sample}_Merged_Consensus.fasta").read_text(
+            encoding="utf-8"
+        )
+        assert "|OTU=OTUB_7-COI|n=10|minQ=31|frozen=0|consolidated=0" in merged
+        assert "OTU=OTUB_7-COI-" not in merged
+        assert F01A_PRIVATE_TAG not in merged
+
+
+def test_f01a_reads_like_primer_text_cannot_override_count_priority(tmp_path: Path) -> None:
+    stable_outputs = {}
+    for primer in ("COI_reads-7", "COI_Probe-reads-99"):
+        for reverse_cluster in (False, True):
+            for hash_seed in (0, 7):
+                case_dir = tmp_path / primer / f"reverse-{int(reverse_cluster)}" / f"seed-{hash_seed}"
+                result, sample = _run_f01a_case(
+                    case_dir,
+                    mode="primers",
+                    otu_specs=[
+                        ("OTUB_7-COI", 12, 31, False),
+                        ("OTUB_9-COI", 10, 40, False),
+                    ],
+                    r_path=True,
+                    mix_all=True,
+                    rank1_otus={"OTUB_7-COI"},
+                    primer=primer,
+                    reverse_cluster=reverse_cluster,
+                    hash_seed=hash_seed,
+                )
+                assert result.returncode == 0, result.stderr
+
+                meta = _f01a_meta(case_dir, sample)
+                assert meta[f"OTUB_7-COI-{primer}"][2:4] == ["12", "31"]
+                assert meta[f"OTUB_9-COI-{primer}"][2:4] == ["10", "40"]
+
+                merged_path = case_dir / "Consensus" / sample / f"{sample}_Merged_Consensus.fasta"
+                merged = merged_path.read_text(encoding="utf-8")
+                header = merged.splitlines()[0]
+                fields = header[1:].split("|")
+                otu_field = fields.index("OTU=OTUB_7-COI")
+                assert fields[otu_field - 1] == "reads-12"
+                assert fields[0] == primer
+                assert header.startswith(
+                    f">{primer}|Consensus0|COI|{primer.replace('-', '|')}|reads-12|"
+                )
+                assert "|OTU=OTUB_9-COI|" not in header
+                assert F01A_PRIVATE_TAG not in header
+
+                linked_reads = _f01a_reads_for_otu(case_dir, sample, "OTUB_7-COI")
+                assert len(linked_reads) == 12
+                assert all(read.startswith("f01a-01-") for read in linked_reads)
+                output_bytes = merged_path.read_bytes()
+                if primer in stable_outputs:
+                    assert output_bytes == stable_outputs[primer]
+                else:
+                    stable_outputs[primer] = output_bytes
+
+
+def test_f01a_cluster_total_unions_rank1_and_r_member_evidence(tmp_path: Path) -> None:
+    cases = (
+        (
+            "rank1-first",
+            [("OTUB_7-COI", 12, 31, False), ("OTUB_9-COI", 10, 40, False)],
+            {"OTUB_7-COI"},
+            False,
+            "OTUB_7-COI",
+        ),
+        (
+            "rank1-second-reversed",
+            [("OTUB_7-COI", 10, 40, False), ("OTUB_9-COI", 12, 31, False)],
+            {"OTUB_9-COI"},
+            True,
+            "OTUB_9-COI",
+        ),
+    )
+    for case_name, otu_specs, rank1_otus, reverse_cluster, winner in cases:
+        case_dir = tmp_path / case_name
+        result, sample = _run_f01a_case(
+            case_dir,
+            mode="primers",
+            otu_specs=otu_specs,
+            r_path=True,
+            mix_all=True,
+            rank1_otus=rank1_otus,
+            reverse_cluster=reverse_cluster,
+            hash_seed=7,
+            reads_mode="cluster_total",
+        )
+        assert result.returncode == 0, result.stderr
+
+        merged = case_dir / "Consensus" / sample / f"{sample}_Merged_Consensus.fasta"
+        header = merged.read_text(encoding="utf-8").splitlines()[0]
+        fields = header[1:].split("|")
+        otu_field = fields.index(f"OTU={winner}")
+        assert fields[otu_field - 1] == "reads-22"
+
+        linked_reads = _f01a_reads_for_otu(case_dir, sample, winner)
+        assert len(linked_reads) == 22
+        assert len(set(linked_reads)) == 22
+        assert sum(read.startswith("f01a-01-") for read in linked_reads) == otu_specs[0][1]
+        assert sum(read.startswith("f01a-02-") for read in linked_reads) == otu_specs[1][1]
+
+        provenance = case_dir / "consensus_round_provenance.tsv"
+        provenance_result = subprocess.run(
+            [
+                "perl",
+                str(EMIT_PROVENANCE),
+                "--consensus-dir",
+                str(case_dir / "Consensus"),
+                "--round-barcode",
+                "round_cluster_total",
+                "--out",
+                str(provenance),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert provenance_result.returncode == 0, provenance_result.stderr
+        provenance_rows = _read_tsv_rows(provenance)
+        assert len(provenance_rows) == 1
+        assert provenance_rows[0]["otu_key"] == winner
+        assert provenance_rows[0]["reads_used_round"] == "22"
+
+
+def test_f01a_primers_rank1_and_r_headers_recover_full_internal_metadata(tmp_path: Path) -> None:
+    for path_name, r_path in (("rank1", False), ("r", True)):
+        case_dir = tmp_path / path_name
+        result, sample = _run_f01a_case(
+            case_dir,
+            mode="primers",
+            otu_specs=[("OTUB_7-COI", 10, 31, False)],
+            r_path=r_path,
+        )
+        assert result.returncode == 0, result.stderr
+        meta = _f01a_meta(case_dir, sample)
+        assert meta["OTUB_7-COI-COI_Probe"][2:] == ["10", "31", "0", "0"]
+        merged = (case_dir / "Consensus" / sample / f"{sample}_Merged_Consensus.fasta").read_text(
+            encoding="utf-8"
+        )
+        assert "|OTU=OTUB_7-COI|n=10|minQ=31|frozen=0|consolidated=0" in merged
+        assert "OTU=OTUB_7-COI-COI_Probe" not in merged
+        assert F01A_PRIVATE_TAG not in merged
+        consensus_map = (case_dir / "Consensus" / "consensus_otu_map.tsv").read_text(
+            encoding="utf-8"
+        )
+        assert "COI_Probe|OTUB_7|COI|COI_Probe|reads-10" in consensus_map
+        assert "\tOTUB_7-COI\tCOI_Probe\t10\t31\t0\t0" in consensus_map
+        assert F01A_PRIVATE_TAG not in consensus_map
+        linked_reads = _f01a_reads_for_otu(case_dir, sample, "OTUB_7-COI")
+        assert len(linked_reads) == 10
+        assert all(read.startswith("f01a-01-") for read in linked_reads)
+
+
+def test_f01a_primer_quality_winner_is_order_independent_and_links_reads(tmp_path: Path) -> None:
+    cases = (
+        (["OTUB_7-COI", "OTUB_9-COI"], [31, 40], "OTUB_9-COI", "f01a-02-"),
+        (["OTUB_7-COI", "OTUB_9-COI"], [40, 31], "OTUB_7-COI", "f01a-01-"),
+    )
+    for case_index, (otus, qscores, winner, winner_read_prefix) in enumerate(cases, start=1):
+        case_dir = tmp_path / f"case-{case_index}"
+        result, sample = _run_f01a_case(
+            case_dir,
+            mode="primers",
+            otu_specs=[
+                (otus[0], 10, qscores[0], False),
+                (otus[1], 10, qscores[1], False),
+            ],
+            r_path=True,
+            mix_all=True,
+        )
+        assert result.returncode == 0, result.stderr
+        merged = (case_dir / "Consensus" / sample / f"{sample}_Merged_Consensus.fasta").read_text(
+            encoding="utf-8"
+        )
+        assert f"|OTU={winner}|" in merged
+        assert F01A_PRIVATE_TAG not in merged
+        read_lists = list((case_dir / "Consensus" / sample / "OriginalReads").glob("*_reads.list"))
+        assert len(read_lists) == 1
+        linked_reads = [line for line in read_lists[0].read_text(encoding="utf-8").splitlines() if line]
+        assert len(linked_reads) == 10
+        assert all(line.startswith(winner_read_prefix) for line in linked_reads)
+
+
+def test_f01a_consolidated_primer_candidate_beats_higher_read_unconsolidated_candidate(
+    tmp_path: Path,
+) -> None:
+    result, sample = _run_f01a_case(
+        tmp_path,
+        mode="primers",
+        otu_specs=[
+            ("OTUB_7-COI", 12, 40, False),
+            ("OTUB_9-COI", 10, 31, True),
+        ],
+        r_path=True,
+        mix_all=True,
+        rank1_otus={"OTUB_7-COI"},
+    )
+    assert result.returncode == 0, result.stderr
+    meta = _f01a_meta(tmp_path, sample)
+    assert meta["OTUB_7-COI-COI_Probe"][2:] == ["12", "40", "0", "0"]
+    assert meta["OTUB_9-COI-COI_Probe"][2:] == ["10", "31", "1", "1"]
+    merged = (tmp_path / "Consensus" / sample / f"{sample}_Merged_Consensus.fasta").read_text(
+        encoding="utf-8"
+    )
+    assert "|OTU=OTUB_9-COI|n=10|minQ=31|frozen=1|consolidated=1" in merged
+    read_lists = list((tmp_path / "Consensus" / sample / "OriginalReads").glob("*_reads.list"))
+    assert len(read_lists) == 1
+    linked_reads = [line for line in read_lists[0].read_text(encoding="utf-8").splitlines() if line]
+    assert len(linked_reads) == 10
+    assert all(line.startswith("f01a-02-") for line in linked_reads)
+
+
+def test_f01a_fresh_round_cache_reuse_links_current_evidence(tmp_path: Path) -> None:
+    round1 = tmp_path / "round1"
+    result1, sample = _run_f01a_case(
+        round1,
+        mode="primers",
+        otu_specs=[("OTUB_7-COI", 10, 31, False)],
+        r_path=True,
+    )
+    assert result1.returncode == 0, result1.stderr
+    round1_merged = round1 / "Consensus" / sample / f"{sample}_Merged_Consensus.fasta"
+    round1_map = round1 / "Consensus" / "consensus_otu_map.tsv"
+
+    round2 = tmp_path / "round2"
+    shutil.copytree(round1 / "Consensus" / ".cache", round2 / "Consensus" / ".cache")
+    assert not (round2 / "Consensus" / sample / "OriginalReads").exists()
+
+    result2, _sample = _run_f01a_case(
+        round2,
+        mode="primers",
+        otu_specs=[("OTUB_7-COI", 10, 31, False)],
+        r_path=True,
+        debug=True,
+    )
+    assert result2.returncode == 0, result2.stderr
+    round2_merged = round2 / "Consensus" / sample / f"{sample}_Merged_Consensus.fasta"
+    round2_map = round2 / "Consensus" / "consensus_otu_map.tsv"
+    assert round2_merged.read_bytes() == round1_merged.read_bytes()
+    assert round2_map.read_bytes() == round1_map.read_bytes()
+    assert _f01a_meta(round2, sample)["OTUB_7-COI-COI_Probe"][2:] == ["10", "31", "0", "0"]
+    debug_log = (round2 / "Consensus" / "consensus_debug.log").read_text(encoding="utf-8")
+    assert "cache_reuse count=10" in debug_log
+    linked_reads = _f01a_reads_for_otu(round2, sample, "OTUB_7-COI")
+    assert len(linked_reads) == 10
+    assert all(read.startswith("f01a-01-") for read in linked_reads)
+
+
+def test_f01a_current_evidence_replaces_stale_original_reads(tmp_path: Path) -> None:
+    internal_key = "OTUB_7-COI-COI_Probe"
+    rank1 = tmp_path / "rank1"
+    _plant_f01a_stale_linkage(
+        rank1,
+        "COI_Probe",
+        consensus_tokens=("Consensus0",),
+        internal_key=internal_key,
+    )
+    result, sample = _run_f01a_case(
+        rank1,
+        mode="primers",
+        otu_specs=[("OTUB_7-COI", 10, 31, False)],
+        r_path=False,
+    )
+    assert result.returncode == 0, result.stderr
+    linked_reads = _f01a_reads_for_otu(rank1, sample, "OTUB_7-COI")
+    assert len(linked_reads) == 10
+    assert not any(read.startswith("stale-") for read in linked_reads)
+    assert all(read.startswith("f01a-01-") for read in linked_reads)
+    assert not list((rank1 / "Consensus" / sample / "OriginalReads").glob("*_reads_sup.fasta"))
+
+    round1 = tmp_path / "cache-round1"
+    round1_result, _sample = _run_f01a_case(
+        round1,
+        mode="primers",
+        otu_specs=[("OTUB_7-COI", 10, 31, False)],
+        r_path=True,
+    )
+    assert round1_result.returncode == 0, round1_result.stderr
+    round2 = tmp_path / "cache-round2"
+    shutil.copytree(round1 / "Consensus" / ".cache", round2 / "Consensus" / ".cache")
+    _plant_f01a_stale_linkage(
+        round2,
+        "COI_Probe",
+        consensus_tokens=("Consensus0",),
+        internal_key=internal_key,
+    )
+    round2_result, sample = _run_f01a_case(
+        round2,
+        mode="primers",
+        otu_specs=[("OTUB_7-COI", 10, 31, False)],
+        r_path=True,
+        debug=True,
+    )
+    assert round2_result.returncode == 0, round2_result.stderr
+    linked_reads = _f01a_reads_for_otu(round2, sample, "OTUB_7-COI")
+    assert len(linked_reads) == 10
+    assert not any(read.startswith("stale-") for read in linked_reads)
+    assert all(read.startswith("f01a-01-") for read in linked_reads)
+    assert not list((round2 / "Consensus" / sample / "OriginalReads").glob("*_reads_sup.fasta"))
+
+
+def test_f01a_private_identity_never_reaches_public_outputs_or_provenance(tmp_path: Path) -> None:
+    result, sample = _run_f01a_case(
+        tmp_path,
+        mode="primers",
+        otu_specs=[("OTUB_7-COI", 10, 31, True)],
+        r_path=True,
+    )
+    assert result.returncode == 0, result.stderr
+    for artifact in _f01a_public_artifacts(tmp_path, sample):
+        assert F01A_PRIVATE_TAG not in artifact.read_text(encoding="utf-8")
+        assert "OTU=OTUB_7-COI-COI_Probe" not in artifact.read_text(encoding="utf-8")
+
+    provenance = tmp_path / "consensus_round_provenance.tsv"
+    provenance_result = subprocess.run(
+        [
+            "perl",
+            str(EMIT_PROVENANCE),
+            "--consensus-dir",
+            str(tmp_path / "Consensus"),
+            "--round-barcode",
+            "round_f01a",
+            "--out",
+            str(provenance),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert provenance_result.returncode == 0, provenance_result.stderr
+    provenance_text = provenance.read_text(encoding="utf-8")
+    assert "\tCOI_Probe\tOTUB_7-COI\t" in provenance_text
+    assert F01A_PRIVATE_TAG not in provenance_text
+    assert "OTUB_7-COI-COI_Probe" not in provenance_text
+
+
+def test_f01a_adjacent_primer_cache_only_metadata_loss_remains_unchanged(tmp_path: Path) -> None:
+    bindir = _install_stub_tools(tmp_path, emit_consensus=True)
+    current_blast = _make_header(
+        "current-read",
+        True,
+        barcode="COI_Probe",
+        adapter="COI_Probe",
+        otu_token="OTUB_8-COI",
+    )
+    current_fasta = _make_header(
+        "current-read",
+        False,
+        model="hac",
+        barcode="COI_Probe",
+        adapter="COI_Probe",
+    )
+    _write_common_inputs(
+        tmp_path,
+        f"{current_blast}\tOTUB_8-COI\tMetazoa\tCOI\n",
+        f">{current_fasta}\nACGTACGT\n",
+        "current-read\thac\t31\n",
+        samples="COI_Probe\n",
+    )
+    frozen = tmp_path / "otu_frozen_members.tsv"
+    frozen.write_text("", encoding="utf-8")
+    cache_dir = tmp_path / "Consensus" / ".cache" / "COI_Probe"
+    cache_dir.mkdir(parents=True)
+    cache_key = "OTUB_7-COI-COI_Probe"
+    (cache_dir / f"{cache_key}.consensus.fasta").write_text(
+        ">COI_Probe|OTUB_7|COI|reads-5|OTU=OTUB_7-COI\nACGTACGT\n",
+        encoding="utf-8",
+    )
+    (cache_dir / f"{cache_key}.meta").write_text("5\tlegacy-hash\n", encoding="utf-8")
+    (cache_dir / "lock_state.tsv").write_text(f"{cache_key}\t2\t1\n", encoding="utf-8")
+    previous_keys = tmp_path / "previous_consolidated_keys.tsv"
+    previous_keys.write_text(f"COI_Probe\t{cache_key}\n", encoding="utf-8")
+    _plant_f01a_stale_linkage(
+        tmp_path,
+        "COI_Probe",
+        consensus_tokens=("Consensus0", "Consensus1"),
+    )
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
+    env["CONSENSUS_LOCK_ENABLED"] = "1"
+    env["CONSENSUS_LOCK_KEYS_PREV"] = str(previous_keys)
+    env["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
+    env["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
+    result = _run_consensus(tmp_path, env, min_reads="1", frozen_members=str(frozen))
+    assert result.returncode == 0, result.stderr
+
+    rows = _read_tsv_rows(tmp_path / "Consensus" / "consensus_otu_map.tsv")
+    legacy_row = next(row for row in rows if row["otu_key"] == "OTUB_7-COI")
+    assert legacy_row["n_reads"] == "NA"
+    assert legacy_row["min_qscore"] == "NA"
+    assert legacy_row["frozen_flag"] == "0"
+    assert legacy_row["consolidated_flag"] == "0"
+    assert _f01a_reads_for_otu(tmp_path, "COI_Probe", "OTUB_7-COI") == []
+    original_reads = tmp_path / "Consensus" / "COI_Probe" / "OriginalReads"
+    all_linked_reads = [
+        read
+        for reads_path in original_reads.glob("*_reads.list")
+        for read in reads_path.read_text(encoding="utf-8").splitlines()
+        if read
+    ]
+    assert not any(read.startswith("stale-") for read in all_linked_reads)
+    assert not list(original_reads.glob("*_reads_sup.fasta"))
 
 
 def _build_single_otu_case(
@@ -489,16 +1086,16 @@ def test_scope_prefilter_uses_kingdom_and_marker_columns(tmp_path: Path) -> None
 
 def test_required_taxonomy_mode_matches_default_bytes(tmp_path: Path) -> None:
     blast_lines = (
-        f"{_make_header('read-1', True, barcode='sample_A_1', adapter='sample_A_1')}\tOTUB_1-COI\tMetazoa\tCOI\n"
-        f"{_make_header('read-2', True, target='ITS2', barcode='sample_A_1', adapter='sample_A_1', otu_token='OTUB_2-ITS2')}\tOTUB_2-ITS2\tViridiplantae\tITS2\n"
-        f"{_make_header('read-3', True, barcode='sample_A_1', adapter='sample_A_1', otu_token='OTUB_3-COI')}\tOTUB_3-COI\tViridiplantae\tCOI\n"
-        f"{_make_header('read-4', True, barcode='sample_A_1', adapter='sample_A_1', otu_token='OTUB_4-COI')}\tOTUB_4-COI\tUnassigned\tCOI\n"
+        f"{_make_header('read-1', True, barcode='', adapter='sample_A')}\tOTUB_1-COI\tMetazoa\tCOI\n"
+        f"{_make_header('read-2', True, target='ITS2', barcode='', adapter='sample_A', otu_token='OTUB_2-ITS2')}\tOTUB_2-ITS2\tViridiplantae\tITS2\n"
+        f"{_make_header('read-3', True, barcode='', adapter='sample_A', otu_token='OTUB_3-COI')}\tOTUB_3-COI\tViridiplantae\tCOI\n"
+        f"{_make_header('read-4', True, barcode='', adapter='sample_A', otu_token='OTUB_4-COI')}\tOTUB_4-COI\tUnassigned\tCOI\n"
     )
     fasta_lines = (
-        f">{_make_header('read-1', False, model='hac', barcode='sample_A_1', adapter='sample_A_1')}\nACGT\n"
-        f">{_make_header('read-2', False, model='hac', target='ITS2', barcode='sample_A_1', adapter='sample_A_1')}\nACGT\n"
-        f">{_make_header('read-3', False, model='hac', barcode='sample_A_1', adapter='sample_A_1')}\nACGT\n"
-        f">{_make_header('read-4', False, model='hac', barcode='sample_A_1', adapter='sample_A_1')}\nACGT\n"
+        f">{_make_header('read-1', False, model='hac', barcode='', adapter='sample_A')}\nACGT\n"
+        f">{_make_header('read-2', False, model='hac', target='ITS2', barcode='', adapter='sample_A')}\nACGT\n"
+        f">{_make_header('read-3', False, model='hac', barcode='', adapter='sample_A')}\nACGT\n"
+        f">{_make_header('read-4', False, model='hac', barcode='', adapter='sample_A')}\nACGT\n"
     )
     qscore_lines = "read-1\thac\t30\nread-2\thac\t30\nread-3\thac\t30\nread-4\thac\t30\n"
     default_dir = tmp_path / "default"
@@ -536,11 +1133,11 @@ def test_allow_unassigned_keeps_configured_markers_and_compatible_pairs(tmp_path
         ("read-6", "18S", "OTUB_6-18S", "Unassigned", "18S"),
     )
     blast_lines = "".join(
-        f"{_make_header(read_id, True, target=target, barcode='sample_A_1', adapter='sample_A_1', otu_token=otu)}\t{otu}\t{kingdom}\t{marker}\n"
+        f"{_make_header(read_id, True, target=target, barcode='', adapter='sample_A', otu_token=otu)}\t{otu}\t{kingdom}\t{marker}\n"
         for read_id, target, otu, kingdom, marker in rows
     )
     fasta_lines = "".join(
-        f">{_make_header(read_id, False, model='hac', target=target, barcode='sample_A_1', adapter='sample_A_1')}\nACGT\n"
+        f">{_make_header(read_id, False, model='hac', target=target, barcode='', adapter='sample_A')}\nACGT\n"
         for read_id, target, _otu, _kingdom, _marker in rows
     )
     qscore_lines = "".join(f"{read_id}\thac\t30\n" for read_id, *_rest in rows)
@@ -561,13 +1158,13 @@ def test_allow_unassigned_keeps_configured_markers_and_compatible_pairs(tmp_path
     sample_meta = tmp_path / "Consensus" / "sample_A" / "otu_meta.tsv"
     keys = {line.split("\t", 1)[0] for line in sample_meta.read_text(encoding="utf-8").splitlines() if line.strip()}
     assert {
-        "OTUB_1-COI-sample_A_1",
-        "OTUB_2-ITS2-sample_A_1",
-        "OTUB_3-COI-sample_A_1",
-        "OTUB_4-ITS2-sample_A_1",
+        "OTUB_1-COI",
+        "OTUB_2-ITS2",
+        "OTUB_3-COI",
+        "OTUB_4-ITS2",
     }.issubset(keys)
-    assert "OTUB_5-COI-sample_A_1" not in keys
-    assert "OTUB_6-18S-sample_A_1" not in keys
+    assert "OTUB_5-COI" not in keys
+    assert "OTUB_6-18S" not in keys
 
 
 def test_allow_unassigned_blocks_no_adapter_from_consensus_and_voucher_export(tmp_path: Path) -> None:
@@ -593,16 +1190,16 @@ def test_allow_unassigned_blocks_no_adapter_from_consensus_and_voucher_export(tm
     mapped_header = _make_header(
         "read-mapped",
         True,
-        barcode="sample_A_1",
-        adapter="sample_A_1",
+        barcode="",
+        adapter="sample_A",
         otu_token="OTUB_2-COI",
     )
     mapped_fasta_header = _make_header(
         "read-mapped",
         False,
         model="hac",
-        barcode="sample_A_1",
-        adapter="sample_A_1",
+        barcode="",
+        adapter="sample_A",
     )
     mixed_blast = (
         f"{mapped_header}\tOTUB_2-COI\tUnassigned\tCOI\n"
@@ -660,7 +1257,7 @@ def test_allow_unassigned_blocks_no_adapter_from_consensus_and_voucher_export(tm
     summary_rows = (voucher_out / "voucher_summary.tsv").read_text(encoding="utf-8").splitlines()
     assert summary_rows == [
         "sample\tmarker\treads\totu_key\tblast_suggestion",
-        "voucher_A\tCOI\t1\tOTUB_2-COI-sample_A_1-COI\t",
+        "voucher_A\tCOI\t1\tOTUB_2-COI\t",
     ]
     assert "no_adapter" not in (voucher_out / "voucher_sequences.fasta").read_text(encoding="utf-8")
 
