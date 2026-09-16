@@ -30,6 +30,41 @@ fi
 source "$validator_helper"
 identity_mode="${RTBIOSCAN_EFFECTIVE_IDENTITY_MODE:-collapse}"
 identity_mode="$(printf '%s' "$identity_mode" | tr '[:upper:]' '[:lower:]')"
+consensus_taxonomy_mode="${CONSENSUS_TAXONOMY_MODE:-required}"
+case "$consensus_taxonomy_mode" in
+	required|allow_unassigned) ;;
+	*)
+		echo "ERROR: CONSENSUS_TAXONOMY_MODE must be 'required' or 'allow_unassigned' (got '$consensus_taxonomy_mode')" 1>&2
+		exit 1
+		;;
+esac
+target_tokens_env="${RTBIOSCAN_TARGET_TOKENS:-}"
+target_taxa_env="${RTBIOSCAN_TARGET_TAXA:-}"
+if ! awk -v targets_raw="$target_tokens_env" -v target_taxa_raw="$target_taxa_env" '
+	function normalize_marker(value) {
+		value=toupper(value);
+		if (value=="ITS" || value=="ITS1" || value=="ITS2") value="ITS2";
+		return value;
+	}
+	BEGIN {
+		if (targets_raw == "" || target_taxa_raw == "") exit 1;
+		n_targets=split(targets_raw, targets, /\|/);
+		n_taxa=split(target_taxa_raw, target_taxa, /\|/);
+		if (n_targets < 1 || n_targets != n_taxa) exit 1;
+		for (i=1; i<=n_targets; i++) {
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", targets[i]);
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", target_taxa[i]);
+			if (targets[i] == "" || targets[i] !~ /^[A-Za-z0-9_.-]+$/) exit 1;
+			marker=normalize_marker(targets[i]);
+			if (marker in configured_marker) exit 1;
+			configured_marker[marker]=1;
+			if (target_taxa[i] == "" || tolower(target_taxa[i]) == "null") exit 1;
+		}
+	}
+' </dev/null; then
+	echo "ERROR: RTBIOSCAN_TARGET_TOKENS and RTBIOSCAN_TARGET_TAXA must define aligned, unique, structurally valid marker/taxon entries" 1>&2
+	exit 1
+fi
 
 # Minimum reads per OTU to attempt consensus (counted by FASTA headers)
 min_reads="${3:-5}"
@@ -675,13 +710,11 @@ prefilter_input_rows=0
 prefilter_output_rows=0
 prefilter_metazoa_coi_rows=0
 prefilter_viridiplantae_its2_rows=0
-target_tokens_env="${RTBIOSCAN_TARGET_TOKENS:-}"
-target_taxa_env="${RTBIOSCAN_TARGET_TAXA:-}"
 _t_startup_state_end=$(timing_now)
 append_timing_row "$phase_timings_raw_file" "global" "-" "startup_validation_and_state" "$_t_startup_state_start" "$_t_startup_state_end"
 _t_prefilter_partition_start=$(timing_now)
 if [ -s "$blast_report" ]; then
-	awk -v stat="$prefilter_status" -v out_hdr="tmp_clean_blast_report_full.txt" -v targets_raw="$target_tokens_env" -v target_taxa_raw="$target_taxa_env" '
+	awk -v stat="$prefilter_status" -v out_hdr="tmp_clean_blast_report_full.txt" -v targets_raw="$target_tokens_env" -v target_taxa_raw="$target_taxa_env" -v taxonomy_mode="$consensus_taxonomy_mode" '
 		BEGIN{
 			OFS="\t";
 			has_header=0;
@@ -697,6 +730,7 @@ if [ -s "$blast_report" ]; then
 				k=tolower(target_taxa[i]);
 				gsub(/^[[:space:]]+|[[:space:]]+$/, "", k);
 				if (t != "" && k != "") {
+					configured_marker[t]=1;
 					pair_key=t SUBSEP k;
 					target_pair[pair_key]=1;
 					pair_order[++pair_count]=pair_key;
@@ -708,6 +742,22 @@ if [ -s "$blast_report" ]; then
 			gsub(/^[[:space:]]+|[[:space:]]+$/, "", out);
 			if (out=="ITS" || out=="ITS1" || out=="ITS2") out="ITS2";
 			return out;
+		}
+		function is_no_adapter(v, out) {
+			out=tolower(v);
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", out);
+			return (out ~ /^no_adapter(_[0-9]+)?$/);
+		}
+		function read_adapter(read_id, fields, n, i, value) {
+			n=split(read_id, fields, /\|/);
+			for (i=1; i<=n; i++) {
+				if (fields[i] ~ /^adapter=/) {
+					value=fields[i];
+					sub(/^adapter=/, "", value);
+					return value;
+				}
+			}
+			return "";
 		}
 		function slugify(v, out) {
 			out=tolower(v);
@@ -738,7 +788,10 @@ if [ -s "$blast_report" ]; then
 				ml=marker_norm(n>=2 ? rid_fields[2] : "");
 			}
 			match_key=ml SUBSEP kl;
-			if (match_key in target_pair) {
+			compatible=(match_key in target_pair);
+			adapter=read_adapter($1);
+			unassigned=(taxonomy_mode=="allow_unassigned" && (ml in configured_marker) && kingdom=="Unassigned" && !is_no_adapter(adapter));
+			if (compatible || unassigned) {
 				print;
 				out_rows++;
 				pair_rows[match_key]++;

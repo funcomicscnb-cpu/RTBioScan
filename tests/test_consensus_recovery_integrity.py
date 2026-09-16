@@ -6,6 +6,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "bin" / "Consensus_simple.sh"
+VOUCHER_EXPORT = REPO_ROOT / "bin" / "voucher_export.sh"
 VALIDATE_PHASE1_WORKLOAD = REPO_ROOT / "bin" / "lib" / "validate_phase1_workload.sh"
 SYNC_SCRIPT = REPO_ROOT / "bin" / "sync_dir_atomic.sh"
 DROP_FILTER_AWK = REPO_ROOT / "bin" / "consensus_drop_filter.awk"
@@ -21,6 +22,7 @@ def _install_stub_tools(
     *,
     include_seqtk: bool = True,
     include_vsearch: bool = True,
+    emit_consensus: bool = False,
 ) -> Path:
     bindir = tmp_path / "stubbin"
     bindir.mkdir(parents=True, exist_ok=True)
@@ -30,14 +32,26 @@ def _install_stub_tools(
         "#!/bin/bash\n"
         "exit 0\n",
     )
-    _write_exec(
-        bindir / "Rscript",
-        "#!/bin/bash\n"
-        "if [ \"$1\" = \"-e\" ]; then\n"
-        "  exit 0\n"
-        "fi\n"
-        "exit 0\n",
-    )
+    rscript_body = "#!/bin/bash\nif [ \"$1\" = \"-e\" ]; then exit 0; fi\nexit 0\n"
+    if emit_consensus:
+        rscript_body = (
+            "#!/bin/bash\n"
+            "if [ \"$1\" = \"-e\" ]; then exit 0; fi\n"
+            "sample=$2\n"
+            "cd \"Consensus/$sample\"\n"
+            ": > \"${sample}_consensus.fasta\"\n"
+            "for input in *_reads_sup.fasta; do\n"
+            "  [ -f \"$input\" ] || continue\n"
+            "  otu=${input%_reads_sup.fasta}\n"
+            "  marker=${otu#*-}\n"
+            "  marker=${marker%%-*}\n"
+            "  reads=$(awk '/^>/{n++} END{print n+0}' \"$input\")\n"
+            "  sequence=$(awk '!/^>/{printf \"%s\", $0} END{print \"\"}' \"$input\")\n"
+            "  printf '>%s|%s|%s|reads-%s\\n%s\\n' \"$sample\" \"$otu\" \"$marker\" \"$reads\" \"$sequence\" > \"${otu}_consensus.fasta\"\n"
+            "  cat \"${otu}_consensus.fasta\" >> \"${sample}_consensus.fasta\"\n"
+            "done\n"
+        )
+    _write_exec(bindir / "Rscript", rscript_body)
     if include_vsearch:
         _write_exec(
             bindir / "vsearch",
@@ -75,8 +89,9 @@ def _write_common_inputs(
     blast_lines: str,
     fasta_lines: str,
     qscore_lines: str,
+    samples: str = "no_adapter\n",
 ) -> None:
-    (tmp_path / "samples.txt").write_text("no_adapter\n", encoding="utf-8")
+    (tmp_path / "samples.txt").write_text(samples, encoding="utf-8")
     (tmp_path / "blast_report_annotated.txt").write_text(blast_lines, encoding="utf-8")
     (tmp_path / "qced_reads_hq_accumulated.fasta").write_text(fasta_lines, encoding="utf-8")
     (tmp_path / "read_qscore.tsv").write_text(qscore_lines, encoding="utf-8")
@@ -88,11 +103,13 @@ def _run_consensus(
     min_reads: str = "1",
     frozen_members: str = "",
     script_path: Path | None = None,
+    supply_target_contract: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     if script_path is None:
         script_path = REPO_ROOT / "bin"
-    env.setdefault("RTBIOSCAN_TARGET_TOKENS", "COI|ITS2")
-    env.setdefault("RTBIOSCAN_TARGET_TAXA", "Metazoa|Viridiplantae")
+    if supply_target_contract:
+        env.setdefault("RTBIOSCAN_TARGET_TOKENS", "COI|ITS2")
+        env.setdefault("RTBIOSCAN_TARGET_TAXA", "Metazoa|Viridiplantae")
     cmd = [
         "bash",
         str(SCRIPT),
@@ -116,13 +133,14 @@ def _make_header(
     model: str = "hac2sup",
     target: str = "COI",
     barcode: str = "no_adapter_1",
+    adapter: str = "no_adapter_1",
     include_barcode: bool = True,
     otu_token: str = "OTUB_1-COI",
 ) -> str:
     parts = [uuid, target, model]
     if include_barcode:
         parts.append(f"barcode={barcode}")
-    parts.append("adapter=no_adapter_1")
+    parts.append(f"adapter={adapter}")
     base = "|".join(parts)
     if with_otu:
         return f"{base}|{otu_token}"
@@ -138,6 +156,27 @@ def _read_status(path: Path) -> dict:
         if len(parts) == 2:
             out[parts[0]] = parts[1]
     return out
+
+
+def _run_taxonomy_fixture(
+    tmp_path: Path,
+    blast_lines: str,
+    fasta_lines: str,
+    qscore_lines: str,
+    mode=None,
+    min_reads: str = "1",
+    samples: str = "no_adapter\n",
+    emit_consensus: bool = False,
+):
+    bindir = _install_stub_tools(tmp_path, emit_consensus=emit_consensus)
+    _write_common_inputs(tmp_path, blast_lines, fasta_lines, qscore_lines, samples=samples)
+    frozen = tmp_path / "otu_frozen_members.tsv"
+    frozen.write_text("", encoding="utf-8")
+    env = os.environ.copy()
+    env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
+    if mode is not None:
+        env["CONSENSUS_TAXONOMY_MODE"] = mode
+    return _run_consensus(tmp_path, env, min_reads=min_reads, frozen_members=str(frozen))
 
 
 def _read_tsv_rows(path: Path) -> list[dict[str, str]]:
@@ -446,6 +485,224 @@ def test_scope_prefilter_uses_kingdom_and_marker_columns(tmp_path: Path) -> None
     assert status.get("prefilter_input_rows") == "2"
     assert status.get("prefilter_output_rows") == "1"
     assert status.get("prefilter_metazoa_coi_rows") == "1"
+
+
+def test_required_taxonomy_mode_matches_default_bytes(tmp_path: Path) -> None:
+    blast_lines = (
+        f"{_make_header('read-1', True, barcode='sample_A_1', adapter='sample_A_1')}\tOTUB_1-COI\tMetazoa\tCOI\n"
+        f"{_make_header('read-2', True, target='ITS2', barcode='sample_A_1', adapter='sample_A_1', otu_token='OTUB_2-ITS2')}\tOTUB_2-ITS2\tViridiplantae\tITS2\n"
+        f"{_make_header('read-3', True, barcode='sample_A_1', adapter='sample_A_1', otu_token='OTUB_3-COI')}\tOTUB_3-COI\tViridiplantae\tCOI\n"
+        f"{_make_header('read-4', True, barcode='sample_A_1', adapter='sample_A_1', otu_token='OTUB_4-COI')}\tOTUB_4-COI\tUnassigned\tCOI\n"
+    )
+    fasta_lines = (
+        f">{_make_header('read-1', False, model='hac', barcode='sample_A_1', adapter='sample_A_1')}\nACGT\n"
+        f">{_make_header('read-2', False, model='hac', target='ITS2', barcode='sample_A_1', adapter='sample_A_1')}\nACGT\n"
+        f">{_make_header('read-3', False, model='hac', barcode='sample_A_1', adapter='sample_A_1')}\nACGT\n"
+        f">{_make_header('read-4', False, model='hac', barcode='sample_A_1', adapter='sample_A_1')}\nACGT\n"
+    )
+    qscore_lines = "read-1\thac\t30\nread-2\thac\t30\nread-3\thac\t30\nread-4\thac\t30\n"
+    default_dir = tmp_path / "default"
+    required_dir = tmp_path / "required"
+
+    default = _run_taxonomy_fixture(
+        default_dir, blast_lines, fasta_lines, qscore_lines, samples="sample_A\n"
+    )
+    required = _run_taxonomy_fixture(
+        required_dir,
+        blast_lines,
+        fasta_lines,
+        qscore_lines,
+        mode="required",
+        samples="sample_A\n",
+    )
+
+    assert default.returncode == 0, default.stderr
+    assert required.returncode == 0, required.stderr
+    for relative_path in (
+        Path("Consensus/prefilter_status.tsv"),
+        Path("Consensus/sample_A/otu_meta.tsv"),
+    ):
+        assert (default_dir / relative_path).read_bytes() == (required_dir / relative_path).read_bytes()
+    assert _read_status(default_dir / "Consensus" / "prefilter_status.tsv")["prefilter_output_rows"] == "2"
+
+
+def test_allow_unassigned_keeps_configured_markers_and_compatible_pairs(tmp_path: Path) -> None:
+    rows = (
+        ("read-1", "COI", "OTUB_1-COI", "Unassigned", "COI"),
+        ("read-2", "ITS2", "OTUB_2-ITS2", "Unassigned", "ITS2"),
+        ("read-3", "COI", "OTUB_3-COI", "Metazoa", "COI"),
+        ("read-4", "ITS2", "OTUB_4-ITS2", "Viridiplantae", "ITS2"),
+        ("read-5", "COI", "OTUB_5-COI", "Viridiplantae", "COI"),
+        ("read-6", "18S", "OTUB_6-18S", "Unassigned", "18S"),
+    )
+    blast_lines = "".join(
+        f"{_make_header(read_id, True, target=target, barcode='sample_A_1', adapter='sample_A_1', otu_token=otu)}\t{otu}\t{kingdom}\t{marker}\n"
+        for read_id, target, otu, kingdom, marker in rows
+    )
+    fasta_lines = "".join(
+        f">{_make_header(read_id, False, model='hac', target=target, barcode='sample_A_1', adapter='sample_A_1')}\nACGT\n"
+        for read_id, target, _otu, _kingdom, _marker in rows
+    )
+    qscore_lines = "".join(f"{read_id}\thac\t30\n" for read_id, *_rest in rows)
+
+    result = _run_taxonomy_fixture(
+        tmp_path,
+        blast_lines,
+        fasta_lines,
+        qscore_lines,
+        mode="allow_unassigned",
+        samples="sample_A\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    status = _read_status(tmp_path / "Consensus" / "prefilter_status.tsv")
+    assert status.get("prefilter_input_rows") == "6"
+    assert status.get("prefilter_output_rows") == "4"
+    sample_meta = tmp_path / "Consensus" / "sample_A" / "otu_meta.tsv"
+    keys = {line.split("\t", 1)[0] for line in sample_meta.read_text(encoding="utf-8").splitlines() if line.strip()}
+    assert {
+        "OTUB_1-COI-sample_A_1",
+        "OTUB_2-ITS2-sample_A_1",
+        "OTUB_3-COI-sample_A_1",
+        "OTUB_4-ITS2-sample_A_1",
+    }.issubset(keys)
+    assert "OTUB_5-COI-sample_A_1" not in keys
+    assert "OTUB_6-18S-sample_A_1" not in keys
+
+
+def test_allow_unassigned_blocks_no_adapter_from_consensus_and_voucher_export(tmp_path: Path) -> None:
+    pure_dir = tmp_path / "pure-no-adapter"
+    pure_blast = (
+        f"{_make_header('read-na', True)}\tOTUB_1-COI\tUnassigned\tCOI\n"
+    )
+    pure_fasta = f">{_make_header('read-na', False, model='hac')}\nACGT\n"
+    pure_result = _run_taxonomy_fixture(
+        pure_dir,
+        pure_blast,
+        pure_fasta,
+        "read-na\thac\t30\n",
+        mode="allow_unassigned",
+        emit_consensus=True,
+    )
+    assert pure_result.returncode == 0, pure_result.stderr
+    assert _read_status(pure_dir / "Consensus" / "prefilter_status.tsv")["prefilter_output_rows"] == "0"
+    pure_merged = pure_dir / "Consensus" / "no_adapter" / "no_adapter_Merged_Consensus.fasta"
+    assert not pure_merged.exists() or ">" not in pure_merged.read_text(encoding="utf-8")
+
+    mixed_dir = tmp_path / "mixed"
+    mapped_header = _make_header(
+        "read-mapped",
+        True,
+        barcode="sample_A_1",
+        adapter="sample_A_1",
+        otu_token="OTUB_2-COI",
+    )
+    mapped_fasta_header = _make_header(
+        "read-mapped",
+        False,
+        model="hac",
+        barcode="sample_A_1",
+        adapter="sample_A_1",
+    )
+    mixed_blast = (
+        f"{mapped_header}\tOTUB_2-COI\tUnassigned\tCOI\n"
+        f"{_make_header('read-na', True)}\tOTUB_1-COI\tUnassigned\tCOI\n"
+    )
+    mixed_fasta = (
+        f">{mapped_fasta_header}\nACGT\n"
+        f">{_make_header('read-na', False, model='hac')}\nTGCA\n"
+    )
+    mixed_result = _run_taxonomy_fixture(
+        mixed_dir,
+        mixed_blast,
+        mixed_fasta,
+        "read-mapped\thac\t30\nread-na\thac\t30\n",
+        mode="allow_unassigned",
+        samples="sample_A\nno_adapter\n",
+        emit_consensus=True,
+    )
+    assert mixed_result.returncode == 0, mixed_result.stderr
+    assert _read_status(mixed_dir / "Consensus" / "prefilter_status.tsv")["prefilter_output_rows"] == "1"
+    mapped_merged = mixed_dir / "Consensus" / "sample_A" / "sample_A_Merged_Consensus.fasta"
+    no_adapter_merged = mixed_dir / "Consensus" / "no_adapter" / "no_adapter_Merged_Consensus.fasta"
+    assert mapped_merged.read_text(encoding="utf-8").count(">") == 1
+    assert not no_adapter_merged.exists() or ">" not in no_adapter_merged.read_text(encoding="utf-8")
+
+    results_dir = mixed_dir / "published-results"
+    published_consensus = results_dir / "current" / "state" / "state_1" / "sequences" / "Consensus"
+    shutil.copytree(mixed_dir / "Consensus", published_consensus)
+    (results_dir / "current" / "state" / "state_1" / "tables").mkdir()
+    identity_dir = results_dir / "sample_info" / "run_1"
+    identity_dir.mkdir(parents=True)
+    (identity_dir / "track_identity.tsv").write_text(
+        "sample_id\tmarker_id\tunit_id_collapse\tunit_id_track\n"
+        "voucher_A\tCOI\tsample_A\tsample_A\n",
+        encoding="utf-8",
+    )
+    voucher_out = mixed_dir / "voucher-output"
+    voucher_result = subprocess.run(
+        [
+            "bash",
+            str(VOUCHER_EXPORT),
+            "--results",
+            str(results_dir),
+            "--out",
+            str(voucher_out),
+            "--state",
+            "state_1",
+            "--run-id",
+            "run_1",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert voucher_result.returncode == 0, voucher_result.stderr
+    summary_rows = (voucher_out / "voucher_summary.tsv").read_text(encoding="utf-8").splitlines()
+    assert summary_rows == [
+        "sample\tmarker\treads\totu_key\tblast_suggestion",
+        "voucher_A\tCOI\t1\tOTUB_2-COI-sample_A_1-COI\t",
+    ]
+    assert "no_adapter" not in (voucher_out / "voucher_sequences.fasta").read_text(encoding="utf-8")
+
+
+def test_taxonomy_mode_and_target_contract_fail_before_processing(tmp_path: Path) -> None:
+    missing_dir = tmp_path / "missing-contract"
+    missing_dir.mkdir()
+    missing_env = os.environ.copy()
+    missing_env.pop("RTBIOSCAN_TARGET_TOKENS", None)
+    missing_env.pop("RTBIOSCAN_TARGET_TAXA", None)
+    missing = _run_consensus(
+        missing_dir,
+        missing_env,
+        frozen_members="",
+        supply_target_contract=False,
+    )
+    assert missing.returncode != 0
+    assert "structurally valid marker/taxon entries" in missing.stderr
+    assert not (missing_dir / "Consensus").exists()
+
+    cases = (
+        ("invalid-mode", "unexpected", "COI|ITS2", "Metazoa|Viridiplantae", "CONSENSUS_TAXONOMY_MODE"),
+        ("uppercase-mode", "REQUIRED", "COI|ITS2", "Metazoa|Viridiplantae", "CONSENSUS_TAXONOMY_MODE"),
+        ("blank-taxa", "required", "COI|ITS2", "", "structurally valid marker/taxon entries"),
+        ("misaligned-taxa", "required", "COI|ITS2", "Metazoa", "structurally valid marker/taxon entries"),
+        ("blank-taxon-slot", "required", "COI|ITS2", "Metazoa|", "structurally valid marker/taxon entries"),
+        ("duplicate-marker", "required", "COI|coi", "Metazoa|Metazoa", "structurally valid marker/taxon entries"),
+        ("alias-duplicate-marker", "required", "ITS|ITS2", "Viridiplantae|Viridiplantae", "structurally valid marker/taxon entries"),
+        ("comma-packed-marker", "required", "COI,ITS2|ITS2", "Metazoa|Viridiplantae", "structurally valid marker/taxon entries"),
+        ("null-taxa", "required", "COI|ITS2", "null|null", "structurally valid marker/taxon entries"),
+    )
+    for name, mode, targets, target_taxa, expected_error in cases:
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        env = os.environ.copy()
+        env["CONSENSUS_TAXONOMY_MODE"] = mode
+        env["RTBIOSCAN_TARGET_TOKENS"] = targets
+        env["RTBIOSCAN_TARGET_TAXA"] = target_taxa
+        result = _run_consensus(case_dir, env, frozen_members="")
+        assert result.returncode != 0, name
+        assert expected_error in result.stderr, f"{name}: {result.stderr}"
+        assert not (case_dir / "Consensus").exists(), name
 
 
 def test_otu_falls_back_to_column2_when_missing_in_header(tmp_path: Path) -> None:

@@ -15,6 +15,14 @@ CONSENSUS_SCRIPT = REPO_ROOT / "bin" / "Consensus_simple.sh"
 POOL_MERGE_SCRIPT = REPO_ROOT / "bin" / "otu_pool_merge_prefer_new.pl"
 MEMBERS_APPEND_UNIQUE_SCRIPT = REPO_ROOT / "bin" / "otu_members_append_unique.pl"
 
+
+def consensus_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["RTBIOSCAN_TARGET_TOKENS"] = "COI|ITS2"
+    env["RTBIOSCAN_TARGET_TAXA"] = "Metazoa|Viridiplantae"
+    return env
+
+
 UNTIL_CONSOLIDATED_PRUNE_AWK = r'''
 function trim(v) {
     gsub(/\r/, "", v);
@@ -661,7 +669,7 @@ def test_consensus_cached_only_filters_prior_consolidated_to_emitted_headers(tmp
         encoding="utf-8",
     )
 
-    env = dict(os.environ)
+    env = consensus_env()
     env["PATH"] = f"{tools}:{env['PATH']}"
     subprocess.run(
         [
@@ -888,7 +896,7 @@ def test_consensus_zero_emission_keeps_previous_consolidated_ids(tmp_path: Path)
         encoding="utf-8",
     )
 
-    env = dict(os.environ)
+    env = consensus_env()
     env["PATH"] = f"{tools}:{env['PATH']}"
     subprocess.run(
         [
@@ -942,7 +950,7 @@ def test_consensus_zero_emission_with_inputs_fails_when_policy_fail(tmp_path: Pa
     cache_dir.mkdir(parents=True)
     (cache_dir / "OTUB_1-COI.consensus.fasta").write_text(">s1|Consensus7|COI|reads-10\nACGTACGT\n", encoding="utf-8")
 
-    env = dict(os.environ)
+    env = consensus_env()
     env["PATH"] = f"{tools}:{env['PATH']}"
     env["CONSENSUS_ZERO_EMIT_POLICY"] = "fail"
     with pytest.raises(subprocess.CalledProcessError):

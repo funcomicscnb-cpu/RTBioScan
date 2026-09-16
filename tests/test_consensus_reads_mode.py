@@ -9,6 +9,13 @@ SCRIPT = REPO_ROOT / "bin" / "Consensus_simple.sh"
 PRELAUNCH_GATE_HELPER = REPO_ROOT / "bin" / "lib" / "consensus_prelaunch_gate.sh"
 
 
+def _consensus_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["RTBIOSCAN_TARGET_TOKENS"] = "COI|ITS2"
+    env["RTBIOSCAN_TARGET_TAXA"] = "Metazoa|Viridiplantae"
+    return env
+
+
 def _write_exec(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
     path.chmod(0o755)
@@ -102,6 +109,7 @@ def _run_prelaunch_gate(reads_path: Path, cache_root: Path) -> subprocess.Comple
 
 
 def test_consensus_reads_mode_invalid_fails(tmp_path: Path) -> None:
+    env = _consensus_env()
     result = subprocess.run(
         [
             "bash",
@@ -118,6 +126,7 @@ def test_consensus_reads_mode_invalid_fails(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         cwd=tmp_path,
+        env=env,
     )
     assert result.returncode != 0
 
@@ -201,7 +210,7 @@ def test_cached_only_mode_emits_cached_consensus(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    env = os.environ.copy()
+    env = _consensus_env()
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     result = subprocess.run(
         [
@@ -252,7 +261,7 @@ def test_cached_only_mode_lazy_hydrates_from_state_cache(tmp_path: Path) -> None
         encoding="utf-8",
     )
 
-    env = os.environ.copy()
+    env = _consensus_env()
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["CONSENSUS_CACHE_STATE_ROOT"] = str(state_cache_root)
     env["CONSENSUS_CACHE_SYNC_SCRIPT"] = str(REPO_ROOT / "bin" / "sync_dir_atomic.sh")
@@ -308,7 +317,7 @@ def test_consensus_phase_timings_summary_keeps_header_and_merge_rows(tmp_path: P
         encoding="utf-8",
     )
 
-    env = os.environ.copy()
+    env = _consensus_env()
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     result = subprocess.run(
         [
@@ -376,7 +385,7 @@ def test_lazy_cache_hydration_only_restores_present_sample_dirs(tmp_path: Path) 
         encoding="utf-8",
     )
 
-    env = os.environ.copy()
+    env = _consensus_env()
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["CONSENSUS_CACHE_STATE_ROOT"] = str(state_cache_root)
     env["CONSENSUS_CACHE_SYNC_SCRIPT"] = str(REPO_ROOT / "bin" / "sync_dir_atomic.sh")
@@ -444,7 +453,7 @@ def test_lazy_cache_hydration_fails_closed_when_sync_script_is_missing(tmp_path:
         encoding="utf-8",
     )
 
-    env = os.environ.copy()
+    env = _consensus_env()
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["CONSENSUS_CACHE_STATE_ROOT"] = str(state_cache_root)
     env["CONSENSUS_CACHE_SYNC_SCRIPT"] = str(tmp_path / "missing_sync_dir_atomic.sh")
@@ -497,7 +506,7 @@ def test_state_only_cache_sample_is_not_hydrated_during_sample_work(tmp_path: Pa
         encoding="utf-8",
     )
 
-    env = os.environ.copy()
+    env = _consensus_env()
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["CONSENSUS_CACHE_STATE_ROOT"] = str(state_cache_root)
     env["CONSENSUS_CACHE_SYNC_SCRIPT"] = str(REPO_ROOT / "bin" / "sync_dir_atomic.sh")
@@ -609,7 +618,7 @@ def test_consensus_warns_with_exit_code_and_stderr_when_adapter_filter_fails(tmp
     frozen = tmp_path / "otu_frozen_members.tsv"
     frozen.write_text("", encoding="utf-8")
 
-    env = os.environ.copy()
+    env = _consensus_env()
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
     result = subprocess.run(

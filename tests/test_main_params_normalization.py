@@ -18,6 +18,34 @@ SUP_PATH_HELPER = REPO_ROOT / "bin" / "blast_sup_path.sh"
 METADATA_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "metadata"
 
 
+def _extract_braced_source(text: str, anchor: str) -> str:
+    start = text.index(anchor)
+    brace = text.index("{", start)
+    depth = 0
+    for idx in range(brace, len(text)):
+        if text[idx] == "{":
+            depth += 1
+        elif text[idx] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+    raise AssertionError(f"unterminated Groovy block: {anchor}")
+
+
+def _run_nextflow_groovy(tmp_path: Path, source: str) -> subprocess.CompletedProcess[str]:
+    nxf_home = Path(os.environ.get("NXF_HOME", Path.home() / ".nextflow"))
+    jar = nxf_home / "capsule" / "apps" / "nextflow-all_22.10.8" / "groovy-3.0.13.jar"
+    assert jar.is_file(), f"Nextflow 22.10.8 runtime is unavailable: {jar}"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    script = tmp_path / "validation_harness.groovy"
+    script.write_text(source, encoding="utf-8")
+    return subprocess.run(
+        ["java", "-cp", str(jar), "groovy.ui.GroovyMain", str(script)],
+        capture_output=True,
+        text=True,
+    )
+
+
 def _mask_quoted_shell_text(text: str) -> str:
     """Mask quoted shell text while preserving string length and quote positions."""
     def is_escaped(idx: int) -> bool:
@@ -2740,6 +2768,154 @@ def test_main_nf_validates_round_lock_scope_and_cpu_maxfork_params() -> None:
     assert "Invalid --prune_unassigned_keep_top '${params.prune_unassigned_keep_top}'. Provide an integer >= 0." in text
     assert 'prune_cumulative_pool_all = true' in config_text
     assert "def pruneCumulativePoolAll = parseBoolStrict(params.prune_cumulative_pool_all, true, 'prune_cumulative_pool_all')" in text
+
+
+def test_consensus_taxonomy_mode_default_validation_and_production_wiring() -> None:
+    text = MAIN_NF.read_text(encoding="utf-8")
+    config_path = REPO_ROOT / "nextflow.config"
+    config_text = config_path.read_text(encoding="utf-8")
+    consensus_block = text.split(
+        "# -- §3: Consensus_simple.sh execution (reads or cache-only mode) --", 1
+    )[1].split(
+        'echo "INFO: No sup_reads and no consensus cache; skipping Consensus_simple.sh this round" 1>&2',
+        1,
+    )[0]
+
+    assert 'consensus_taxonomy_mode = "required"' in config_text
+    configured = [
+        path
+        for path in [config_path, *sorted((REPO_ROOT / "conf").rglob("*.config"))]
+        if "consensus_taxonomy_mode" in path.read_text(encoding="utf-8")
+    ]
+    assert configured == [config_path]
+    profiles_block = _extract_braced_source(config_text, "profiles {")
+    assert "consensus_taxonomy_mode" not in profiles_block
+    assert "allow_unassigned" not in profiles_block
+    assert "def consensusTaxonomyModeCanonical = params.consensus_taxonomy_mode.toString().trim()" in text
+    assert "consensusTaxonomyModeCanonical in ['required', 'allow_unassigned']" in text
+    assert "[name: 'target_taxa', markerMode: false, allowEmptyEntries: false]" in text
+    assert "duplicate configured marker" in text
+    assert "equalsIgnoreCase('null')" in text
+    mode_wire = 'CONSENSUS_TAXONOMY_MODE="${consensusTaxonomyModeCanonical}" \\'
+    wrapper_call = "bash ${baseDir}/bin/Consensus_simple.sh"
+    assert consensus_block.count(mode_wire) == 1
+    assert consensus_block.count(wrapper_call) == 1
+    assert consensus_block.index(mode_wire) < consensus_block.index(wrapper_call)
+
+
+def test_consensus_taxonomy_and_marker_validation_execute_fail_closed(tmp_path: Path) -> None:
+    text = MAIN_NF.read_text(encoding="utf-8")
+    consensus_method = _extract_braced_source(text, "def validateConsensusAssignParams()")
+    marker_methods = "\n".join(
+        _extract_braced_source(text, anchor)
+        for anchor in (
+            "String canonicalizeConfiguredMarkerToken(",
+            "Map parseCanonicalPipeList(",
+            "void validateIntegerPipeList(",
+            "void validatePercentPipeList(",
+            "Map validateAndCanonicalizeMarkerParams()",
+        )
+    )
+    common = """
+class ExitSignal extends RuntimeException {
+    ExitSignal(String message) { super(message) }
+}
+"""
+    mode_cases = (
+        ("required", "required", "ACCEPTED"),
+        ("allow-unassigned", "allow_unassigned", "ACCEPTED"),
+        (
+            "uppercase-required",
+            "REQUIRED",
+            "REJECTED:Invalid --consensus_taxonomy_mode 'REQUIRED'.",
+        ),
+    )
+    for case_name, mode, expected_prefix in mode_cases:
+        mode_harness = common + f"""
+class ModeHarness {{
+    def params = [
+        consensus_taxonomy_mode: {mode!r},
+        consensus_reads_mode: 'representative',
+        consensus_keep_original_reads: false,
+        consensus_selector_ranking: 'qscore_first',
+        consensus_enforce_max_reads: false,
+        consensus_zero_emit_policy: 'warn',
+        consensus_id_mismatch_policy: 'warn',
+        consensus_cache_below_min_policy: 'keep',
+        assign_protection_level: 'genus',
+        prune_cumulative_pool_all: true,
+    ]
+    def exit(int code, Object message) {{ throw new ExitSignal(message.toString()) }}
+    def parseBoolStrict(Object value, Object fallback, Object name) {{ return fallback }}
+{consensus_method}
+}}
+try {{
+    new ModeHarness().validateConsensusAssignParams()
+    println 'ACCEPTED'
+}} catch (ExitSignal error) {{
+    println 'REJECTED:' + error.message
+}}
+"""
+        mode_result = _run_nextflow_groovy(tmp_path / case_name, mode_harness)
+        assert mode_result.returncode == 0, mode_result.stderr
+        assert mode_result.stdout.startswith(expected_prefix), case_name
+
+    marker_cases = (
+        ("valid", "COI|ITS2", "Metazoa|Viridiplantae", "ACCEPTED"),
+        (
+            "duplicate",
+            "COI|coi",
+            "Metazoa|Metazoa",
+            "REJECTED:Invalid --targets: duplicate configured marker 'COI' after canonicalization.",
+        ),
+        (
+            "malformed-marker",
+            "COI,ITS2|ITS2",
+            "Metazoa|Viridiplantae",
+            "REJECTED:Invalid --targets token 'COI,ITS2'. Marker tokens may contain only",
+        ),
+        (
+            "null-taxa",
+            "COI|ITS2",
+            "null|null",
+            "REJECTED:Invalid --target_taxa: entry 1 must name a taxon; received 'null'.",
+        ),
+        (
+            "empty-taxa-slot",
+            "COI|ITS2",
+            "Metazoa|",
+            "REJECTED:Invalid --target_taxa: empty element found at position 2.",
+        ),
+    )
+    for case_name, targets, target_taxa, expected_prefix in marker_cases:
+        marker_harness = common + f"""
+class MarkerHarness {{
+    def params = [
+        targets: {targets!r},
+        target_taxa: {target_taxa!r},
+        min_read_lengths: '350|350',
+        max_read_lengths: '532|532',
+        blast_db_specs: 'db/a|db/b',
+        blast_id_family: '85|85',
+        blast_id_genus: '90|90',
+        blast_id_spec: '97|97',
+        nonncbi_memtax: '|',
+    ]
+    def exit(int code, Object message) {{ throw new ExitSignal(message.toString()) }}
+{marker_methods}
+}}
+try {{
+    new MarkerHarness().validateAndCanonicalizeMarkerParams()
+    println 'ACCEPTED'
+}} catch (ExitSignal error) {{
+    println 'REJECTED:' + error.message
+}}
+"""
+        case_dir = tmp_path / case_name
+        case_dir.mkdir()
+        marker_result = _run_nextflow_groovy(case_dir, marker_harness)
+        assert marker_result.returncode == 0, marker_result.stderr
+        assert marker_result.stdout.startswith(expected_prefix), case_name
 
 
 def test_main_nf_wires_unassigned_cluster_prune_flow() -> None:

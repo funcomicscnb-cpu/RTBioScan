@@ -1202,11 +1202,11 @@ Pipe-separated list of marker names processed in this run. All per-marker parame
 #### `--target_taxa`
 [back to Top](#rtbioscan-usage)
 
-Pipe-separated list of taxon filters for the fast on-target detection pass, in the same order as `--targets`. A read is classified as on-target only if its fast BLAST hit matches both the marker and the taxon. Leave an entry empty to accept any taxon for that marker.
+Pipe-separated list of non-empty taxon filters for the fast on-target detection pass, in the same order as `--targets`. A read is classified as on-target only if its fast BLAST hit matches both the marker and the taxon.
 
 - Default: `Metazoa|Viridiplantae`.
-- Empty entries still count toward the required 1:1 alignment with `--targets`.
-- Example with a third marker that accepts any taxon: `--target_taxa "Metazoa|Viridiplantae|"`
+- Every configured marker requires one non-empty taxon entry; blank, missing, or extra entries fail validation.
+- Marker tokens must be structurally valid and unique after canonicalization (`ITS`, `ITS1`, and `ITS2` canonicalize to `ITS2`).
 
 #### `--fast_filter_shadow`
 [back to Top](#rtbioscan-usage)
@@ -1800,6 +1800,16 @@ Controls what `reads-N` represents in consensus headers and downstream reports:
 
 Per-round HTML report metrics do not rely on `reads-N` for read-fate attribution.
 Public v1 read-fate reporting no longer exposes `read_fate.consensus_used_reads`.
+
+#### `--consensus_taxonomy_mode`
+[back to Top](#rtbioscan-usage)
+
+Controls taxonomy admission into consensus generation. Values are exact and case-sensitive:
+
+- `required` (default): admit only rows whose configured marker and assigned kingdom match the corresponding `--targets` / `--target_taxa` pair.
+- `allow_unassigned`: additionally admit rows whose kingdom is exactly `Unassigned` for a configured marker and an identity-bearing sample unit. Identity-less `no_adapter` Unassigned rows remain excluded.
+
+The permissive mode is dormant by default and no bundled profile enables it. Both modes require an explicit, valid, aligned marker/taxon contract; missing, blank, malformed, duplicate-marker, or count-mismatched contracts fail before consensus processing.
 
 #### `--consensus_min_reads` / `--consensus_max_reads`
 [back to Top](#rtbioscan-usage)

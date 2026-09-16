@@ -332,6 +332,7 @@ def otuConsolidatedKeysMixedPolicyCanonical  = otuRecoveryCfg.otuConsolidatedKey
 
 def consensusCfg = validateConsensusAssignParams()
 def consensusKeepOriginalReads           = consensusCfg.consensusKeepOriginalReads
+def consensusTaxonomyModeCanonical       = consensusCfg.consensusTaxonomyModeCanonical
 def consensusZeroEmitPolicyCanonical     = consensusCfg.consensusZeroEmitPolicyCanonical
 def consensusIdMismatchPolicyCanonical   = consensusCfg.consensusIdMismatchPolicyCanonical
 def consensusCacheBelowMinPolicyCanonical = consensusCfg.consensusCacheBelowMinPolicyCanonical
@@ -4791,6 +4792,7 @@ process consensus {
 			RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${replicateModeCanonical}" \
 			RTBIOSCAN_TARGET_TOKENS="${params.targets}" \
 			RTBIOSCAN_TARGET_TAXA="${params.target_taxa}" \
+			CONSENSUS_TAXONOMY_MODE="${consensusTaxonomyModeCanonical}" \
 			RTBIOSCAN_TRACK_ACTIVE_UNITS="${sampleInfoDir}/track_active_units.txt" \
 			RTBIOSCAN_TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv" \
 			CONSENSUS_CACHE_STATE_ROOT="\$CONSENSUS_CACHE_STATE_ROOT" \
@@ -7916,6 +7918,11 @@ def validateOtuRecoveryPruneParams() {
 
 def validateConsensusAssignParams() {
     // Consensus generation: minimum reads per OTU to attempt consensus.
+    def consensusTaxonomyModeCanonical = params.consensus_taxonomy_mode.toString().trim()
+    if (!(consensusTaxonomyModeCanonical in ['required', 'allow_unassigned'])) {
+        exit 1, "Invalid --consensus_taxonomy_mode '${params.consensus_taxonomy_mode}'. Allowed values: required, allow_unassigned"
+    }
+    params.consensus_taxonomy_mode = consensusTaxonomyModeCanonical
     def consensusReadsModeCanonical = params.consensus_reads_mode.toString().trim().toLowerCase()
     if (!(consensusReadsModeCanonical in ['representative', 'cluster_total'])) {
         exit 1, "Invalid --consensus_reads_mode '${params.consensus_reads_mode}'. Allowed values: representative, cluster_total"
@@ -7964,7 +7971,8 @@ def validateConsensusAssignParams() {
     }
     params.assign_protection_level = assignProtLevelCanonical
     def pruneCumulativePoolAll = parseBoolStrict(params.prune_cumulative_pool_all, true, 'prune_cumulative_pool_all')
-    return [consensusKeepOriginalReads: consensusKeepOriginalReads,
+    return [consensusTaxonomyModeCanonical: consensusTaxonomyModeCanonical,
+            consensusKeepOriginalReads: consensusKeepOriginalReads,
             consensusSelectorRankingCanonical: consensusSelectorRankingCanonical,
             consensusEnforceMaxReads: consensusEnforceMaxReads,
             consensusZeroEmitPolicyCanonical: consensusZeroEmitPolicyCanonical,
@@ -8355,6 +8363,9 @@ String canonicalizeConfiguredMarkerToken(String rawValue, String paramName) {
     if (value =~ /\s/) {
         exit 1, "Invalid --${paramName} token '${rawValue}'. Marker tokens must not contain whitespace; use pipe-separated marker names such as COI|ITS2."
     }
+    if (!(value ==~ /[A-Za-z0-9_.-]+/)) {
+        exit 1, "Invalid --${paramName} token '${rawValue}'. Marker tokens may contain only letters, digits, underscore, period, and hyphen."
+    }
     def canonical = value.toUpperCase()
     if (canonical in ['ITS', 'ITS1', 'ITS2']) {
         return 'ITS2'
@@ -8413,7 +8424,7 @@ void validatePercentPipeList(List values, String paramName) {
 Map validateAndCanonicalizeMarkerParams() {
     def alignedSpecs = [
         [name: 'targets', markerMode: true, allowEmptyEntries: false],
-        [name: 'target_taxa', markerMode: false, allowEmptyEntries: true],
+        [name: 'target_taxa', markerMode: false, allowEmptyEntries: false],
         [name: 'min_read_lengths', markerMode: false, allowEmptyEntries: false],
         [name: 'max_read_lengths', markerMode: false, allowEmptyEntries: false],
         [name: 'blast_db_specs', markerMode: false, allowEmptyEntries: false],
@@ -8431,9 +8442,20 @@ Map validateAndCanonicalizeMarkerParams() {
         parsed[spec.name] = parseCanonicalPipeList(rawValue.toString(), spec.name.toString(), spec.markerMode as boolean, spec.allowEmptyEntries as boolean)
     }
     def targetsCount = parsed.targets.values.size()
+    def configuredMarkers = [] as Set
+    for (def marker in parsed.targets.values) {
+        if (!configuredMarkers.add(marker)) {
+            exit 1, "Invalid --targets: duplicate configured marker '${marker}' after canonicalization."
+        }
+    }
     for (def spec in alignedSpecs) {
         if (parsed[spec.name].values.size() != targetsCount) {
             exit 1, "Invalid --${spec.name}: received ${parsed[spec.name].values.size()} value(s) for ${targetsCount} target(s). Provide one pipe-separated ${spec.name} entry per target."
+        }
+    }
+    for (def idx = 0; idx < parsed.target_taxa.values.size(); idx++) {
+        if (parsed.target_taxa.values[idx].toString().equalsIgnoreCase('null')) {
+            exit 1, "Invalid --target_taxa: entry ${idx + 1} must name a taxon; received '${parsed.target_taxa.values[idx]}'."
         }
     }
 
