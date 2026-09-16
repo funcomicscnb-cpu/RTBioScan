@@ -489,6 +489,8 @@ Within each biological-sample+marker key, greatest `reads-N` support wins. Ties 
 
 The BLAST taxonomy is joined by the report's named consensus identifier, sample, marker, and OTU fields and attached as `|BLAST:Genus_species` when a compatible match exists. When no match is found (for example, a new species), the field is omitted. Conflicting identity or taxonomy mappings and missing or ambiguous authoritative states fail without replacing existing exports.
 
+If the selected current state contains `sequences/Consensus/consensus_taxonomy_admission.tsv`, voucher export validates that evidence against the selected state, `live_round/tables/round_index.tsv`, the source merged FASTA SHA-256, and the source unit, OTU key, and consensus ID. Valid evidence is diagnostic only: it does not change voucher eligibility, reads-first ranking, filenames, FASTA headers, or summary columns. Missing evidence remains unknown; invalid or stale evidence is warned and treated as unknown. States without the sidecar retain the historical output and diagnostic behavior. As for the Slice 3B producer, downgrading to `required` mode while reusing the same `state_id` still requires a state reset.
+
 A valid selected state with no matching records, including an empty `--sample` or `--marker` selection, exits successfully and replaces any stale export with an empty FASTA plus a header-only summary.
 
 > `main_barcoding.nf` — the earlier standalone pipeline for this use case — is retained under `extras/` and historical snapshots under `extras/versions/` for reference. The voucher profile supersedes it, using the same robust infrastructure as the main pipeline (state management, round locking, SUP consensus, HTML reports).

@@ -1,12 +1,20 @@
 from pathlib import Path
+import hashlib
 import os
 import shutil
 import subprocess
+import tempfile
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = Path(os.environ.get("RTBIOSCAN_VOUCHER_EXPORT_SCRIPT", ROOT / "bin" / "voucher_export.sh"))
 SUMMARY_HEADER = "sample\tmarker\treads\totu_key\tblast_suggestion\n"
+ADMISSION_HEADER = (
+    "round_barcode\tsample\totu_key\tconsensus_id\t"
+    "taxonomy_admission_status\tmerged_fasta_sha256"
+)
 TAX_COLUMNS = [
     "consensus_id",
     "otu_key",
@@ -90,13 +98,15 @@ def write_taxonomy(tables, rows, name="round_blast_consensus_tax_rpt.txt"):
     return path
 
 
-def run_export(results, out, *args, cwd=None):
+def run_export(results, out, *args, cwd=None, script=None, env=None, timeout=None):
     return subprocess.run(
-        ["bash", str(SCRIPT), "--results", str(results), "--out", str(out), *args],
+        ["bash", str(script or SCRIPT), "--results", str(results), "--out", str(out), *args],
         text=True,
         capture_output=True,
         check=False,
         cwd=cwd,
+        env=None if env is None else {**os.environ, **env},
+        timeout=timeout,
     )
 
 
@@ -110,6 +120,89 @@ def write_stale_outputs(out):
     out.mkdir(parents=True, exist_ok=True)
     (out / "voucher_sequences.fasta").write_text("stale fasta\n", encoding="utf-8")
     (out / "voucher_summary.tsv").write_text("stale summary\n", encoding="utf-8")
+
+
+def write_round_index(state_dir, text="round_barcode\tround_index\nround-2\t2\n"):
+    path = state_dir / "live_round" / "tables" / "round_index.tsv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def fasta_sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def admission_row(round_barcode, unit, otu, consensus_id, digest, status="unassigned"):
+    return (round_barcode, unit, otu, consensus_id, status, digest)
+
+
+def write_admission(consensus, rows=(), header=ADMISSION_HEADER, raw_lines=None):
+    path = consensus / "consensus_taxonomy_admission.tsv"
+    if raw_lines is None:
+        lines = [header, *("\t".join(row) for row in rows)]
+    else:
+        lines = raw_lines
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def make_head_script(tmp_path):
+    data = subprocess.check_output(
+        ["git", "show", "HEAD:bin/voucher_export.sh"], cwd=ROOT
+    )
+    path = tmp_path / "immutable-head-voucher-export.sh"
+    path.write_bytes(data)
+    path.chmod(0o755)
+    return path
+
+
+def output_snapshot(out):
+    if not out.exists():
+        return ()
+    snapshot = []
+    for path in sorted(out.iterdir(), key=lambda item: item.name):
+        if path.is_symlink():
+            value = ("symlink", os.readlink(path))
+        elif path.is_file():
+            value = ("file", path.read_bytes())
+        elif path.is_dir():
+            value = ("directory", None)
+        else:
+            value = ("other", None)
+        snapshot.append((path.name, value))
+    return tuple(snapshot)
+
+
+def admission_info(stderr):
+    return [line for line in stderr.splitlines() if line.startswith("INFO: Admission provenance:")]
+
+
+def admission_warnings(stderr):
+    return [line for line in stderr.splitlines() if line.startswith("WARN: Admission provenance ignored:")]
+
+
+def make_admission_fixture(tmp_path, candidates, taxonomy=()):
+    results, state_dir, consensus, tables = make_state(tmp_path)
+    identity_rows = []
+    fasta_paths = {}
+    for item in candidates:
+        unit = item["unit"]
+        identity_rows.append((item.get("sample", unit), item.get("marker", "ITS2"), unit, unit))
+        fasta_paths[unit] = write_fasta(
+            consensus,
+            unit,
+            [
+                (
+                    f"{unit}|{item['name']}|{item.get('marker', 'ITS2')}|reads-{item['reads']}|OTU={item['otu']}",
+                    item["sequence"],
+                )
+            ],
+        )
+    write_identity(results, "run-one", identity_rows)
+    write_taxonomy(tables, list(taxonomy))
+    write_round_index(state_dir)
+    return results, state_dir, consensus, tables, fasta_paths
 
 
 def test_positional_markers_filter_taxonomy_and_explicit_marker_compatibility(tmp_path):
@@ -941,3 +1034,1021 @@ def test_identity_discovery_is_direct_depth_not_recursive(tmp_path):
     assert deep_only.stdout == ""
     assert "No direct identity root" in deep_only.stderr
     assert read_outputs(out) == prior_outputs
+
+
+def test_admission_absent_is_exact_head_control_and_touches_no_round_or_digest(tmp_path):
+    results, state_dir, consensus, tables = make_state(tmp_path)
+    write_identity(results, "run-one", [("alpha", "ITS2", "alpha_ITS2", "unit_ITS2")])
+    write_fasta(
+        consensus,
+        "unit_ITS2",
+        [("unit_ITS2|C1|ITS2|reads-7|OTU=OTU-1", "AAAA")],
+    )
+    write_taxonomy(tables, [])
+    round_path = state_dir / "live_round" / "tables" / "round_index.tsv"
+    round_path.parent.mkdir(parents=True)
+    os.mkfifo(round_path)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_perl = fake_bin / "perl"
+    fake_perl.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
+    fake_perl.chmod(0o755)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    out = tmp_path / "out"
+
+    candidate = run_export(results, out, env=env, timeout=5)
+    candidate_outputs = read_outputs(out)
+    candidate_paths = sorted(path.name for path in out.iterdir())
+    head = run_export(results, out, script=make_head_script(tmp_path), env=env, timeout=5)
+
+    assert (candidate.returncode, candidate.stdout, candidate.stderr) == (
+        head.returncode,
+        head.stdout,
+        head.stderr,
+    )
+    assert candidate_outputs == read_outputs(out)
+    assert candidate_paths == sorted(path.name for path in out.iterdir()) == [
+        "voucher_sequences.fasta",
+        "voucher_summary.tsv",
+    ]
+    assert "Admission provenance" not in candidate.stderr
+
+
+def make_publication_fixture(tmp_path):
+    results, _, consensus, tables = make_state(tmp_path)
+    write_identity(results, "run-one", [("alpha", "ITS2", "alpha_ITS2", "unit_ITS2")])
+    write_fasta(
+        consensus,
+        "unit_ITS2",
+        [("unit_ITS2|C1|ITS2|reads-7|OTU=OTU-1", "AAAA")],
+    )
+    write_taxonomy(tables, [])
+    return results
+
+
+def configure_prior_publication(out, prior, symlink_targets):
+    if out.exists():
+        shutil.rmtree(out)
+    symlink_targets.mkdir(parents=True, exist_ok=True)
+    fasta_target = symlink_targets / "prior-fasta"
+    summary_target = symlink_targets / "prior-summary"
+    fasta_target.write_text("stale fasta\n", encoding="utf-8")
+    summary_target.write_text("stale summary\n", encoding="utf-8")
+    if prior == "neither":
+        return
+    out.mkdir(parents=True)
+    if prior in {"fasta", "both"}:
+        (out / "voucher_sequences.fasta").write_text("stale fasta\n", encoding="utf-8")
+    if prior in {"summary", "both"}:
+        (out / "voucher_summary.tsv").write_text("stale summary\n", encoding="utf-8")
+    if prior == "symlinks":
+        (out / "voucher_sequences.fasta").symlink_to(fasta_target)
+        (out / "voucher_summary.tsv").symlink_to(summary_target)
+
+
+@pytest.mark.parametrize("prior", ["neither", "fasta", "summary", "both", "symlinks"])
+def test_sidecar_absent_publication_matches_head_without_hard_links(tmp_path, prior):
+    results = make_publication_fixture(tmp_path)
+    out = tmp_path / "output = publication control"
+    symlink_targets = tmp_path / "symlink targets"
+    fake_bin = tmp_path / "no-hard-links"
+    fake_bin.mkdir()
+    ln_called = tmp_path / "ln-called"
+    fake_ln = fake_bin / "ln"
+    fake_ln.write_text(
+        f"#!/bin/sh\nprintf called > '{ln_called}'\nexit 97\n",
+        encoding="utf-8",
+    )
+    fake_ln.chmod(0o755)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    configure_prior_publication(out, prior, symlink_targets)
+    candidate = run_export(results, out, env=env)
+    candidate_snapshot = output_snapshot(out)
+    candidate_targets = (
+        (symlink_targets / "prior-fasta").read_bytes(),
+        (symlink_targets / "prior-summary").read_bytes(),
+    )
+
+    configure_prior_publication(out, prior, symlink_targets)
+    head = run_export(results, out, script=make_head_script(tmp_path), env=env)
+    head_snapshot = output_snapshot(out)
+    head_targets = (
+        (symlink_targets / "prior-fasta").read_bytes(),
+        (symlink_targets / "prior-summary").read_bytes(),
+    )
+
+    assert (candidate.returncode, candidate.stdout, candidate.stderr) == (
+        head.returncode,
+        head.stdout,
+        head.stderr,
+    )
+    assert candidate_snapshot == head_snapshot
+    assert candidate_targets == head_targets == (b"stale fasta\n", b"stale summary\n")
+    assert [name for name, _value in candidate_snapshot] == [
+        "voucher_sequences.fasta",
+        "voucher_summary.tsv",
+    ]
+    assert not ln_called.exists()
+
+
+@pytest.mark.parametrize("failed_output", ["fasta", "summary"])
+def test_sidecar_absent_publication_failure_matches_head(tmp_path, failed_output):
+    results = make_publication_fixture(tmp_path)
+    out = tmp_path / "out"
+    symlink_targets = tmp_path / "unused-targets"
+    fake_bin = tmp_path / "fake-publication"
+    fake_bin.mkdir()
+    ln_called = tmp_path / "ln-called"
+    fake_ln = fake_bin / "ln"
+    fake_ln.write_text(
+        f"#!/bin/sh\nprintf called > '{ln_called}'\nexit 97\n",
+        encoding="utf-8",
+    )
+    fake_ln.chmod(0o755)
+    fake_mv = fake_bin / "mv"
+    failure_pattern = ".voucher_sequences.fasta." if failed_output == "fasta" else ".voucher_summary.tsv."
+    fake_mv.write_text(
+        "#!/bin/sh\n"
+        "case \"$1\" in -f) source=$2;; *) source=$1;; esac\n"
+        f"case \"$source\" in *{failure_pattern}*) exit 94;; esac\n"
+        "exec /bin/mv \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_mv.chmod(0o755)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    configure_prior_publication(out, "both", symlink_targets)
+    candidate = run_export(results, out, env=env)
+    candidate_snapshot = output_snapshot(out)
+    configure_prior_publication(out, "both", symlink_targets)
+    head = run_export(results, out, script=make_head_script(tmp_path), env=env)
+    head_snapshot = output_snapshot(out)
+
+    assert (candidate.returncode, candidate.stdout, candidate.stderr) == (
+        head.returncode,
+        head.stdout,
+        head.stderr,
+    )
+    assert candidate.returncode == 94
+    assert candidate_snapshot == head_snapshot
+    if failed_output == "fasta":
+        assert candidate_snapshot == (
+            ("voucher_sequences.fasta", ("file", b"stale fasta\n")),
+            ("voucher_summary.tsv", ("file", b"stale summary\n")),
+        )
+    else:
+        assert candidate_snapshot == (
+            ("voucher_sequences.fasta", ("file", b">alpha|ITS2|reads-7\nAAAA\n")),
+            ("voucher_summary.tsv", ("file", b"stale summary\n")),
+        )
+    assert not ln_called.exists()
+
+
+def test_sidecar_absent_cross_device_symlink_targets_match_head_when_available(tmp_path):
+    cross_device_parent = next(
+        (
+            Path(candidate)
+            for candidate in ("/dev/shm", "/run/shm")
+            if Path(candidate).is_dir()
+            and os.access(candidate, os.W_OK)
+            and os.stat(candidate).st_dev != os.stat(tmp_path).st_dev
+        ),
+        None,
+    )
+    if cross_device_parent is None:
+        pytest.skip("no writable cross-device scratch filesystem available")
+
+    results = make_publication_fixture(tmp_path)
+    out = tmp_path / "out"
+    cross_device_dir = Path(tempfile.mkdtemp(prefix="rtbioscan-voucher-", dir=cross_device_parent))
+    try:
+        configure_prior_publication(out, "symlinks", cross_device_dir)
+        candidate = run_export(results, out)
+        candidate_snapshot = output_snapshot(out)
+        configure_prior_publication(out, "symlinks", cross_device_dir)
+        head = run_export(results, out, script=make_head_script(tmp_path))
+
+        assert (candidate.returncode, candidate.stdout, candidate.stderr) == (
+            head.returncode,
+            head.stdout,
+            head.stderr,
+        )
+        assert candidate_snapshot == output_snapshot(out)
+    finally:
+        shutil.rmtree(cross_device_dir)
+
+
+def assert_invalid_private_evidence(result, out, expected_outputs, reason):
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert read_outputs(out) == expected_outputs
+    assert admission_info(result.stderr) == [
+        "INFO: Admission provenance: invalid; classified=0 admitted_unassigned=0 unknown=1"
+    ]
+    warnings = admission_warnings(result.stderr)
+    assert len(warnings) == 1
+    assert f"reason={reason}" in warnings[0]
+    assert "line=- unit=- otu_key=- consensus_id=-" in warnings[0]
+    assert not list(out.glob(".voucher_*"))
+
+
+@pytest.mark.parametrize("shape", ["directory", "dangling", "fifo"])
+def test_invalid_sidecar_shapes_are_nonfatal_unknown_and_never_opened(tmp_path, shape):
+    candidates = [
+        {"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}
+    ]
+    results, _, consensus, _, _ = make_admission_fixture(tmp_path, candidates)
+    sidecar = consensus / "consensus_taxonomy_admission.tsv"
+    if shape == "directory":
+        sidecar.mkdir()
+    elif shape == "dangling":
+        sidecar.symlink_to("missing-admission.tsv")
+    else:
+        os.mkfifo(sidecar)
+    out = tmp_path / "out"
+
+    head = run_export(results, out, script=make_head_script(tmp_path), timeout=5)
+    expected_outputs = read_outputs(out)
+    result = run_export(results, out, timeout=5)
+
+    assert head.returncode == 0, head.stderr
+    assert_invalid_private_evidence(result, out, expected_outputs, "sidecar_unavailable")
+
+
+def test_unreadable_sidecar_is_nonfatal_unknown(tmp_path):
+    candidates = [
+        {"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}
+    ]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates)
+    sidecar = write_admission(
+        consensus,
+        [admission_row("round-2", "unit-one", "OTU-1", "Only_unit-one", fasta_sha256(fastas["unit-one"]))],
+    )
+    sidecar.chmod(0)
+    if os.access(sidecar, os.R_OK):
+        sidecar.chmod(0o600)
+        pytest.skip("runtime privileges bypass unreadable-file permissions")
+    out = tmp_path / "out"
+    try:
+        head = run_export(results, out, script=make_head_script(tmp_path))
+        expected_outputs = read_outputs(out)
+        result = run_export(results, out)
+        assert head.returncode == 0, head.stderr
+        assert_invalid_private_evidence(result, out, expected_outputs, "sidecar_unavailable")
+    finally:
+        sidecar.chmod(0o600)
+
+
+def test_exact_header_only_admission_is_diagnostic_only(tmp_path):
+    results, state_dir, consensus, tables = make_state(tmp_path)
+    write_identity(results, "run-one", [("alpha", "ITS2", "alpha_ITS2", "unit_ITS2")])
+    write_fasta(consensus, "unit_ITS2", [("unit_ITS2|C1|ITS2|reads-7|OTU=OTU-1", "AAAA")])
+    write_taxonomy(tables, [])
+    write_round_index(state_dir)
+    write_admission(consensus)
+    out = tmp_path / "out"
+
+    head = run_export(results, out, script=make_head_script(tmp_path))
+    head_outputs = read_outputs(out)
+    candidate = run_export(results, out)
+
+    assert candidate.returncode == head.returncode == 0
+    assert candidate.stdout == head.stdout == ""
+    assert read_outputs(out) == head_outputs
+    assert admission_info(candidate.stderr) == [
+        "INFO: Admission provenance: header_only; classified=0 admitted_unassigned=0 unknown=1"
+    ]
+    assert admission_warnings(candidate.stderr) == []
+
+
+def test_admission_states_are_counted_without_changing_reads_first_output(tmp_path):
+    candidates = [
+        {"unit": "unit-class", "sample": "alpha", "name": "Class", "otu": "OTU-C", "reads": 9, "sequence": "CCCC"},
+        {"unit": "unit-admit", "sample": "alpha", "name": "Admit", "otu": "OTU-A", "reads": 15, "sequence": "AAAA"},
+        {"unit": "unit-unknown", "sample": "alpha", "name": "Unknown", "otu": "OTU-U", "reads": 12, "sequence": "UUUU"},
+    ]
+    taxonomy = [tax_row("Class_unit-class", "OTU-C", "ITS2", "unit-class", "Exact", "species")]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates, taxonomy)
+    write_admission(
+        consensus,
+        [admission_row("round-2", "unit-admit", "OTU-A", "Admit_unit-admit", fasta_sha256(fastas["unit-admit"]))],
+    )
+    out = tmp_path / "out"
+
+    head = run_export(results, out, script=make_head_script(tmp_path))
+    head_outputs = read_outputs(out)
+    candidate = run_export(results, out)
+
+    assert candidate.returncode == head.returncode == 0
+    assert read_outputs(out) == head_outputs
+    assert head_outputs == (
+        ">alpha|ITS2|reads-15\nAAAA\n",
+        SUMMARY_HEADER + "alpha\tITS2\t15\tOTU-A\t\n",
+    )
+    assert admission_info(candidate.stderr) == [
+        "INFO: Admission provenance: loaded; classified=1 admitted_unassigned=1 unknown=1"
+    ]
+    assert admission_warnings(candidate.stderr) == []
+
+
+@pytest.mark.parametrize(
+    ("classified_reads", "admitted_reads", "expected_header", "expected_sequence"),
+    [
+        (9, 15, ">alpha|ITS2|reads-15", "AAAA"),
+        (15, 9, ">alpha|ITS2|reads-15|BLAST:Exact_species", "CCCC"),
+    ],
+)
+def test_classified_and_admitted_competition_remains_reads_first(
+    tmp_path, classified_reads, admitted_reads, expected_header, expected_sequence
+):
+    candidates = [
+        {"unit": "class-unit", "sample": "alpha", "name": "Class", "otu": "OTU-C", "reads": classified_reads, "sequence": "CCCC"},
+        {"unit": "admit-unit", "sample": "alpha", "name": "Admit", "otu": "OTU-A", "reads": admitted_reads, "sequence": "AAAA"},
+    ]
+    taxonomy = [tax_row("Class_class-unit", "OTU-C", "ITS2", "class-unit", "Exact", "species")]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates, taxonomy)
+    write_admission(
+        consensus,
+        [admission_row("round-2", "admit-unit", "OTU-A", "Admit_admit-unit", fasta_sha256(fastas["admit-unit"]))],
+    )
+
+    result = run_export(results, tmp_path / "out")
+    assert result.returncode == 0, result.stderr
+    fasta, _summary = read_outputs(tmp_path / "out")
+    assert fasta == f"{expected_header}\n{expected_sequence}\n"
+    assert "classified=1 admitted_unassigned=1 unknown=0" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("kind", "taxonomy", "with_row", "expected_info"),
+    [
+        ("admitted", (), True, "classified=0 admitted_unassigned=1 unknown=0"),
+        ("legacy-unknown", (), False, "classified=0 admitted_unassigned=0 unknown=1"),
+    ],
+)
+def test_single_admitted_or_legacy_unknown_candidate_exports_normally(
+    tmp_path, kind, taxonomy, with_row, expected_info
+):
+    candidates = [{"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 6, "sequence": "ACGT"}]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates, taxonomy)
+    rows = []
+    if with_row:
+        rows.append(admission_row("round-2", "unit-one", "OTU-1", "Only_unit-one", fasta_sha256(fastas["unit-one"])))
+    write_admission(consensus, rows)
+    out = tmp_path / f"out-{kind}"
+
+    head = run_export(results, out, script=make_head_script(tmp_path))
+    head_outputs = read_outputs(out)
+    result = run_export(results, out)
+    assert result.returncode == head.returncode == 0
+    assert read_outputs(out) == head_outputs == (
+        ">alpha|ITS2|reads-6\nACGT\n",
+        SUMMARY_HEADER + "alpha\tITS2\t6\tOTU-1\t\n",
+    )
+    assert expected_info in result.stderr
+
+
+def test_unknown_higher_read_candidate_still_beats_classified(tmp_path):
+    candidates = [
+        {"unit": "class-unit", "sample": "alpha", "name": "Class", "otu": "OTU-C", "reads": 8, "sequence": "CCCC"},
+        {"unit": "unknown-unit", "sample": "alpha", "name": "Unknown", "otu": "OTU-U", "reads": 20, "sequence": "UUUU"},
+    ]
+    taxonomy = [tax_row("Class_class-unit", "OTU-C", "ITS2", "class-unit", "Exact", "species")]
+    results, _, consensus, _, _ = make_admission_fixture(tmp_path, candidates, taxonomy)
+    write_admission(consensus)
+
+    result = run_export(results, tmp_path / "out")
+    assert result.returncode == 0, result.stderr
+    assert read_outputs(tmp_path / "out")[0] == ">alpha|ITS2|reads-20\nUUUU\n"
+    assert "classified=1 admitted_unassigned=0 unknown=1" in result.stderr
+
+
+def test_classified_taxonomy_silently_precedes_valid_admission_row(tmp_path):
+    candidates = [{"unit": "unit-one", "sample": "alpha", "name": "Both", "otu": "OTU-1", "reads": 10, "sequence": "ACGT"}]
+    taxonomy = [tax_row("Both_unit-one", "OTU-1", "ITS2", "unit-one", "Exact", "species")]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates, taxonomy)
+    write_admission(
+        consensus,
+        [admission_row("round-2", "unit-one", "OTU-1", "Both_unit-one", fasta_sha256(fastas["unit-one"]))],
+    )
+
+    result = run_export(results, tmp_path / "out")
+    assert result.returncode == 0, result.stderr
+    assert "classified=1 admitted_unassigned=0 unknown=0" in result.stderr
+    assert admission_warnings(result.stderr) == []
+    assert "|BLAST:Exact_species" in read_outputs(tmp_path / "out")[0]
+
+
+@pytest.mark.parametrize(
+    ("authority_case", "reason"),
+    [
+        ("missing", "round_authority_unavailable"),
+        ("dangling", "round_authority_unavailable"),
+        ("dangling-live-round", "round_authority_unavailable"),
+        ("directory", "round_authority_unavailable"),
+        ("unreadable", "round_authority_unavailable"),
+        ("fifo", "round_authority_unavailable"),
+        ("malformed", "round_authority_malformed"),
+        ("multi-row", "round_authority_malformed"),
+        ("wrong-header", "round_authority_malformed"),
+    ],
+)
+def test_invalid_round_authority_is_unknown_nonfatal_and_output_compatible(
+    tmp_path, authority_case, reason
+):
+    candidates = [{"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}]
+    results, state_dir, consensus, _, fastas = make_admission_fixture(tmp_path, candidates)
+    round_path = state_dir / "live_round" / "tables" / "round_index.tsv"
+    round_path.unlink()
+    if authority_case == "dangling":
+        round_path.symlink_to("missing-round-index.tsv")
+    elif authority_case == "dangling-live-round":
+        shutil.rmtree(state_dir / "live_round")
+        (state_dir / "live_round").symlink_to("missing-live-round")
+    elif authority_case == "directory":
+        round_path.mkdir()
+    elif authority_case == "unreadable":
+        round_path.write_text("round_barcode\tround_index\nround-2\t2\n", encoding="utf-8")
+        round_path.chmod(0)
+        if os.access(round_path, os.R_OK):
+            round_path.chmod(0o600)
+            pytest.skip("runtime privileges bypass unreadable-file permissions")
+    elif authority_case == "fifo":
+        os.mkfifo(round_path)
+    elif authority_case == "malformed":
+        round_path.write_text("round_barcode\tround_index\n", encoding="utf-8")
+    elif authority_case == "multi-row":
+        round_path.write_text("round_barcode\tround_index\nround-1\t1\nround-2\t2\n", encoding="utf-8")
+    elif authority_case == "wrong-header":
+        round_path.write_text("round_index\tround_barcode\n2\tround-2\n", encoding="utf-8")
+    write_admission(
+        consensus,
+        [admission_row("round-2", "unit-one", "OTU-1", "Only_unit-one", fasta_sha256(fastas["unit-one"]))],
+    )
+    out = tmp_path / "out"
+
+    try:
+        head = run_export(results, out, script=make_head_script(tmp_path), timeout=5)
+        head_outputs = read_outputs(out)
+        result = run_export(results, out, timeout=5)
+    finally:
+        if authority_case == "unreadable":
+            round_path.chmod(0o600)
+
+    assert result.returncode == head.returncode == 0
+    assert read_outputs(out) == head_outputs
+    assert admission_info(result.stderr) == [
+        "INFO: Admission provenance: invalid; classified=0 admitted_unassigned=0 unknown=1"
+    ]
+    warnings = admission_warnings(result.stderr)
+    assert len(warnings) == 1
+    assert f"reason={reason}" in warnings[0]
+    assert "line=- unit=- otu_key=- consensus_id=-" in warnings[0]
+
+
+@pytest.mark.parametrize("round_barcode", ["round-1", "round-3"])
+def test_stale_or_future_round_evidence_warns_and_stays_unknown(tmp_path, round_barcode):
+    candidates = [{"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates)
+    write_admission(
+        consensus,
+        [admission_row(round_barcode, "unit-one", "OTU-1", "Only_unit-one", fasta_sha256(fastas["unit-one"]))],
+    )
+
+    result = run_export(results, tmp_path / "out")
+    assert result.returncode == 0, result.stderr
+    assert "loaded; classified=0 admitted_unassigned=0 unknown=1" in result.stderr
+    assert len(admission_warnings(result.stderr)) == 1
+    assert "reason=stale_round" in admission_warnings(result.stderr)[0]
+
+
+def test_digest_mismatch_warns_and_stays_unknown_without_output_change(tmp_path):
+    candidates = [{"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}]
+    results, _, consensus, _, _ = make_admission_fixture(tmp_path, candidates)
+    write_admission(consensus, [admission_row("round-2", "unit-one", "OTU-1", "Only_unit-one", "0" * 64)])
+    out = tmp_path / "out"
+
+    head = run_export(results, out, script=make_head_script(tmp_path))
+    expected = read_outputs(out)
+    result = run_export(results, out)
+    assert result.returncode == 0, result.stderr
+    assert read_outputs(out) == expected
+    assert "admitted_unassigned=0 unknown=1" in result.stderr
+    assert "reason=digest_mismatch" in admission_warnings(result.stderr)[0]
+
+
+def test_cross_sample_digest_cannot_validate_another_source_unit(tmp_path):
+    candidates = [
+        {"unit": "unit-a", "sample": "alpha", "name": "A", "otu": "OTU-A", "reads": 4, "sequence": "AAAA"},
+        {"unit": "unit-b", "sample": "beta", "name": "B", "otu": "OTU-B", "reads": 5, "sequence": "BBBB"},
+    ]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates)
+    write_admission(
+        consensus,
+        [admission_row("round-2", "unit-b", "OTU-B", "B_unit-b", fasta_sha256(fastas["unit-a"]))],
+    )
+
+    result = run_export(results, tmp_path / "out", "--sample", "beta")
+    assert result.returncode == 0, result.stderr
+    assert "classified=0 admitted_unassigned=0 unknown=1" in result.stderr
+    assert "reason=digest_mismatch" in admission_warnings(result.stderr)[0]
+    assert read_outputs(tmp_path / "out")[0] == ">beta|ITS2|reads-5\nBBBB\n"
+
+
+@pytest.mark.parametrize(
+    ("case", "header", "row_builder", "status", "reason"),
+    [
+        ("extra-header", ADMISSION_HEADER + "\textra", None, "invalid", "invalid_header"),
+        ("missing-header", "\t".join(ADMISSION_HEADER.split("\t")[:-1]), None, "invalid", "invalid_header"),
+        ("reordered-header", "sample\tround_barcode\totu_key\tconsensus_id\ttaxonomy_admission_status\tmerged_fasta_sha256", None, "invalid", "invalid_header"),
+        ("short-row", ADMISSION_HEADER, lambda digest: "round-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned", "loaded", "malformed_row"),
+        ("long-row", ADMISSION_HEADER, lambda digest: f"round-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned\t{digest}\textra", "loaded", "malformed_row"),
+        ("uppercase-digest", ADMISSION_HEADER, lambda digest: f"round-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned\t{digest.upper()}", "loaded", "bad_digest"),
+        ("mixed-case-digest", ADMISSION_HEADER, lambda digest: f"round-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned\t{digest[:32]}{digest[32:].upper()}", "loaded", "bad_digest"),
+        ("short-digest", ADMISSION_HEADER, lambda digest: f"round-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned\t{digest[:-1]}", "loaded", "bad_digest"),
+        ("long-digest", ADMISSION_HEADER, lambda digest: f"round-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned\t{digest}0", "loaded", "bad_digest"),
+        ("leading-space-digest", ADMISSION_HEADER, lambda digest: f"round-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned\t {digest}", "loaded", "bad_digest"),
+        ("trailing-space-digest", ADMISSION_HEADER, lambda digest: f"round-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned\t{digest} ", "loaded", "bad_digest"),
+        ("empty-digest", ADMISSION_HEADER, lambda _digest: "round-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned\t", "loaded", "bad_digest"),
+        ("nonhex-digest", ADMISSION_HEADER, lambda digest: "round-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned\t" + "g" * 64, "loaded", "bad_digest"),
+        ("unknown-status", ADMISSION_HEADER, lambda digest: f"round-2\tunit-one\tOTU-1\tOnly_unit-one\tclassified\t{digest}", "loaded", "unknown_status"),
+    ],
+)
+def test_malformed_sidecar_schema_and_rows_are_unknown_with_stable_warning(
+    tmp_path, case, header, row_builder, status, reason
+):
+    candidates = [{"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates)
+    digest = fasta_sha256(fastas["unit-one"])
+    raw_lines = [header]
+    if row_builder is not None:
+        raw_lines.append(row_builder(digest))
+    else:
+        raw_lines.append(f"round-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned\t{digest}")
+    write_admission(consensus, raw_lines=raw_lines)
+
+    result = run_export(results, tmp_path / f"out-{case}")
+    assert result.returncode == 0, result.stderr
+    assert f"Admission provenance: {status}; classified=0 admitted_unassigned=0 unknown=1" in result.stderr
+    warnings = admission_warnings(result.stderr)
+    assert any(f"reason={reason}" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize(
+    "digest_value",
+    [
+        "a" * 63,
+        "a" * 65,
+        "A" * 64,
+        "a" * 32 + "A" * 32,
+        "g" * 64,
+        " " + "a" * 64,
+        "a" * 64 + " ",
+        "",
+    ],
+)
+def test_normalized_digest_table_rejects_noncanonical_sha256(tmp_path, digest_value):
+    candidates = [
+        {"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}
+    ]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates)
+    write_admission(
+        consensus,
+        [admission_row("round-2", "unit-one", "OTU-1", "Only_unit-one", fasta_sha256(fastas["unit-one"]))],
+    )
+    out = tmp_path / "out"
+    write_stale_outputs(out)
+    fake_bin = tmp_path / "fake-perl"
+    fake_bin.mkdir()
+    fake_perl = fake_bin / "perl"
+    fake_perl.write_text(
+        "#!/bin/sh\n"
+        "for argument do path=$argument; done\n"
+        f"printf '%s\\t%s\\n' \"$path\" '{digest_value}'\n",
+        encoding="utf-8",
+    )
+    fake_perl.chmod(0o755)
+
+    result = run_export(results, out, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "malformed digest table" in result.stderr
+    assert read_outputs(out) == ("stale fasta\n", "stale summary\n")
+    assert not list(out.glob(".voucher_*"))
+
+
+def test_provenance_digest_validation_does_not_use_awk_intervals():
+    source = SCRIPT.read_text(encoding="utf-8")
+    provenance_digest_logic = source[
+        source.index("function load_digests") : source.index("function parse_marker")
+    ]
+    assert "{64}" not in provenance_digest_logic
+    assert "length(fields[2]) == 64" in provenance_digest_logic
+    assert "fields[2] !~ /[^0-9a-f]/" in provenance_digest_logic
+    assert "length(fields[6]) == 64" in provenance_digest_logic
+    assert "fields[6] !~ /[^0-9a-f]/" in provenance_digest_logic
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_duplicate_admission_keys_are_ambiguous_even_when_identical(tmp_path, conflicting):
+    candidates = [{"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates)
+    digest = fasta_sha256(fastas["unit-one"])
+    row = admission_row("round-2", "unit-one", "OTU-1", "Only_unit-one", digest)
+    second = admission_row("round-2", "unit-one", "OTU-1", "Only_unit-one", "0" * 64) if conflicting else row
+    write_admission(consensus, [row, second])
+
+    result = run_export(results, tmp_path / "out")
+    assert result.returncode == 0, result.stderr
+    assert "admitted_unassigned=0 unknown=1" in result.stderr
+    reason = "conflicting_duplicate_key" if conflicting else "duplicate_key"
+    duplicate_warnings = [warning for warning in admission_warnings(result.stderr) if f"reason={reason}" in warning]
+    assert len(duplicate_warnings) == 2
+    assert "line=2" in duplicate_warnings[0]
+    assert "line=3" in duplicate_warnings[1]
+
+
+def test_orphan_admission_warns_without_inventing_a_candidate(tmp_path):
+    candidates = [{"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates)
+    write_admission(
+        consensus,
+        [admission_row("round-2", "ghost-unit", "OTU-G", "Ghost_ghost-unit", fasta_sha256(fastas["unit-one"]))],
+    )
+
+    result = run_export(results, tmp_path / "out")
+    assert result.returncode == 0, result.stderr
+    assert "admitted_unassigned=0 unknown=1" in result.stderr
+    warning = admission_warnings(result.stderr)[0]
+    assert "reason=orphan_evidence" in warning
+    assert "unit=ghost-unit otu_key=OTU-G consensus_id=Ghost_ghost-unit" in warning
+    assert "ghost-unit" not in read_outputs(tmp_path / "out")[0]
+
+
+def test_primers_only_provenance_joins_source_unit_not_collapsed_sample(tmp_path):
+    results, state_dir, consensus, tables = make_state(tmp_path)
+    identity = results / "sample_info" / "run-one" / "track_identity.tsv"
+    identity.parent.mkdir(parents=True)
+    identity.write_text(
+        "sample_id\ttrack_id\treplicate_number\tmarker_id\tmatched_general_fasta_header\t"
+        "matched_general_fasta_record_index\tsuffix_resolution_mode\tunit_suffix_current\t"
+        "unit_id_collapse\tunit_id_track\tdemult_id_metadata\tlookup_key_primary\t"
+        "lookup_key_fallback\tlookup_grammar_used\tmetadata_line_no\ttrack_duplicate_status\t"
+        "track_duplicate_detail\ttrack_duplicate_source_metadata_lines\n"
+        "alpha\tsource\t1\tITS2\t>source\t1\tmarker\tITS2\talpha_ITS2\tsource-unit\t"
+        ">source\tsource\t\tGENERAL_FASTA_HEADER\t2\tunique\t\t2\n",
+        encoding="utf-8",
+    )
+    fasta = write_fasta(
+        consensus,
+        "source-unit",
+        [("source-unit|Only|ITS2|reads-7|OTU=OTU-1", "ACGT")],
+    )
+    write_taxonomy(tables, [])
+    write_round_index(state_dir)
+    public_bytes = (
+        ">alpha|ITS2|reads-7\nACGT\n",
+        SUMMARY_HEADER + "alpha\tITS2\t7\tOTU-1\t\n",
+    )
+
+    write_admission(
+        consensus,
+        [admission_row("round-2", "source-unit", "OTU-1", "Only_source-unit", fasta_sha256(fasta))],
+    )
+    head = run_export(results, tmp_path / "head", script=make_head_script(tmp_path))
+    source_join = run_export(results, tmp_path / "source-join")
+
+    assert source_join.returncode == head.returncode == 0
+    assert read_outputs(tmp_path / "head") == read_outputs(tmp_path / "source-join") == public_bytes
+    assert admission_info(source_join.stderr) == [
+        "INFO: Admission provenance: loaded; classified=0 admitted_unassigned=1 unknown=0"
+    ]
+    assert admission_warnings(source_join.stderr) == []
+    assert "source-unit" not in public_bytes[0] + public_bytes[1]
+
+    for collapsed_unit in ("alpha", "alpha_ITS2"):
+        write_admission(
+            consensus,
+            [admission_row("round-2", collapsed_unit, "OTU-1", "Only_source-unit", fasta_sha256(fasta))],
+        )
+        collapsed_join = run_export(results, tmp_path / f"collapsed-{collapsed_unit}")
+        assert collapsed_join.returncode == 0, collapsed_join.stderr
+        assert read_outputs(tmp_path / f"collapsed-{collapsed_unit}") == public_bytes
+        assert admission_info(collapsed_join.stderr) == [
+            "INFO: Admission provenance: loaded; classified=0 admitted_unassigned=0 unknown=1"
+        ]
+        assert len(admission_warnings(collapsed_join.stderr)) == 1
+        assert "reason=orphan_evidence" in admission_warnings(collapsed_join.stderr)[0]
+
+
+def test_admission_decoys_outside_authoritative_consensus_root_are_ignored(tmp_path):
+    results, state_dir, consensus, tables = make_state(tmp_path, state="state-one")
+    write_identity(results, "run-one", [("alpha", "ITS2", "alpha_ITS2", "unit-one")])
+    write_fasta(consensus, "unit-one", [("unit-one|Only|ITS2|reads-7|OTU=OTU-1", "ACGT")])
+    write_taxonomy(tables, [])
+    decoy_text = ADMISSION_HEADER + "\nround-2\tunit-one\tOTU-1\tOnly_unit-one\tunassigned\t" + "0" * 64 + "\n"
+    decoys = [
+        state_dir / "sequences" / "single_exp" / "Consensus" / "consensus_taxonomy_admission.tsv",
+        results / "temp" / "consensus_taxonomy_admission.tsv",
+        state_dir / "round-2" / "consensus_taxonomy_admission.tsv",
+        results / "current" / "_state" / "consensus_taxonomy_admission.tsv",
+    ]
+    _, _, other_consensus, _ = make_state(tmp_path, state="state-two")
+    decoys.append(other_consensus / "consensus_taxonomy_admission.tsv")
+    for decoy in decoys:
+        decoy.parent.mkdir(parents=True, exist_ok=True)
+        decoy.write_text(decoy_text, encoding="utf-8")
+    out = tmp_path / "out"
+
+    head = run_export(results, out, "--state", "state-one", script=make_head_script(tmp_path))
+    expected = read_outputs(out)
+    result = run_export(results, out, "--state", "state-one")
+
+    assert (result.returncode, result.stdout, result.stderr) == (
+        head.returncode,
+        head.stdout,
+        head.stderr,
+    )
+    assert read_outputs(out) == expected
+    assert "Admission provenance" not in result.stderr
+
+
+def test_admission_cannot_restore_marker_discordant_candidate(tmp_path):
+    results, state_dir, consensus, tables = make_state(tmp_path)
+    write_identity(results, "run-one", [("alpha", "ITS2", "alpha_ITS2", "bad-unit")])
+    fasta = write_fasta(
+        consensus,
+        "bad-unit",
+        [("bad-unit|Bad|COI|reads-99|OTU=OTU-X", "XXXX")],
+    )
+    write_taxonomy(tables, [])
+    write_round_index(state_dir)
+    write_admission(
+        consensus,
+        [admission_row("round-2", "bad-unit", "OTU-X", "Bad_bad-unit", fasta_sha256(fasta))],
+    )
+
+    result = run_export(results, tmp_path / "out")
+    assert result.returncode == 0, result.stderr
+    assert read_outputs(tmp_path / "out") == ("", SUMMARY_HEADER)
+    assert "marker-discordant FASTA candidate" in result.stderr
+    assert admission_info(result.stderr) == [
+        "INFO: Admission provenance: loaded; classified=0 admitted_unassigned=0 unknown=0"
+    ]
+    assert admission_warnings(result.stderr) == []
+
+
+def test_valid_empty_with_admission_replaces_stale_outputs(tmp_path):
+    candidates = [{"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates)
+    write_admission(
+        consensus,
+        [admission_row("round-2", "unit-one", "OTU-1", "Only_unit-one", fasta_sha256(fastas["unit-one"]))],
+    )
+    out = tmp_path / "out"
+    write_stale_outputs(out)
+
+    result = run_export(results, out, "--sample", "missing")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert read_outputs(out) == ("", SUMMARY_HEADER)
+    assert "classified=0 admitted_unassigned=0 unknown=0" in result.stderr
+    assert "No voucher sequences matched" in result.stderr
+    assert admission_warnings(result.stderr) == []
+
+
+@pytest.mark.parametrize("conflict", ["taxonomy", "identity"])
+def test_existing_fatal_conflicts_with_admission_preserve_both_outputs(tmp_path, conflict):
+    results, state_dir, consensus, tables = make_state(tmp_path)
+    if conflict == "identity":
+        write_identity(
+            results,
+            "run-one",
+            [
+                ("alpha", "ITS2", "same-unit", "same-unit"),
+                ("beta", "ITS2", "same-unit", "other-unit"),
+            ],
+        )
+        unit = "same-unit"
+    else:
+        write_identity(results, "run-one", [("alpha", "ITS2", "alpha_ITS2", "unit-one")])
+        unit = "unit-one"
+    fasta = write_fasta(consensus, unit, [(f"{unit}|Only|ITS2|reads-7|OTU=OTU-1", "ACGT")])
+    taxonomy = []
+    if conflict == "taxonomy":
+        taxonomy = [
+            tax_row(f"Only_{unit}", "OTU-1", "ITS2", unit, "First", "species"),
+            tax_row(f"Only_{unit}", "OTU-1", "ITS2", unit, "Second", "species"),
+        ]
+    write_taxonomy(tables, taxonomy)
+    write_round_index(state_dir)
+    write_admission(
+        consensus,
+        [admission_row("round-2", unit, "OTU-1", f"Only_{unit}", fasta_sha256(fasta))],
+    )
+    out = tmp_path / "out"
+    write_stale_outputs(out)
+
+    result = run_export(results, out)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert read_outputs(out) == ("stale fasta\n", "stale summary\n")
+    assert "conflicting taxonomy" in result.stderr or "conflicting identity mapping" in result.stderr
+    assert not list(out.glob(".voucher_*"))
+
+
+def _make_order_fixture(root, reverse=False):
+    results, state_dir, consensus, tables = make_state(root)
+    write_identity(
+        results,
+        "run-one",
+        [
+            ("alpha", "ITS2", "unit-a", "unit-a"),
+            ("alpha", "ITS2", "unit-b", "unit-b"),
+        ],
+    )
+    unit_a_records = [
+        ("unit-a|A|ITS2|reads-10|OTU=OTU-A", "AAAA"),
+        ("unit-a|C|ITS2|reads-10|OTU=OTU-C", "CCCC"),
+    ]
+    if reverse:
+        unit_a_records.reverse()
+    paths = {
+        "unit-a": write_fasta(
+            consensus,
+            "unit-a",
+            unit_a_records,
+            directory_name="z-dir" if reverse else "a-dir",
+        ),
+        "unit-b": write_fasta(
+            consensus,
+            "unit-b",
+            [("unit-b|B|ITS2|reads-10|OTU=OTU-B", "BBBB")],
+            directory_name="a-dir" if reverse else "z-dir",
+        ),
+    }
+    tax_rows = [
+        tax_row("A_unit-a", "OTU-A", "ITS2", "unit-a", "Alpha", "one"),
+        tax_row("B_unit-b", "OTU-B", "ITS2", "unit-b", "Beta", "two"),
+        tax_row("C_unit-a", "OTU-C", "ITS2", "unit-a", "Gamma", "three"),
+    ]
+    write_taxonomy(tables, list(reversed(tax_rows)) if reverse else tax_rows)
+    write_round_index(state_dir)
+    rows = [
+        admission_row("round-2", "unit-a", "OTU-A", "A_unit-a", fasta_sha256(paths["unit-a"])),
+        admission_row("round-2", "unit-b", "OTU-B", "B_unit-b", fasta_sha256(paths["unit-b"])),
+        admission_row("round-2", "unit-a", "OTU-C", "C_unit-a", fasta_sha256(paths["unit-a"])),
+    ]
+    write_admission(consensus, list(reversed(rows)) if reverse else rows)
+    return results
+
+
+def test_input_order_file_discovery_and_locale_do_not_change_outputs_or_diagnostics(tmp_path):
+    first_results = _make_order_fixture(tmp_path / "first", reverse=False)
+    second_results = _make_order_fixture(tmp_path / "second", reverse=True)
+    locale_output = subprocess.run(["locale", "-a"], text=True, capture_output=True, check=False).stdout.splitlines()
+    alternate_locale = next((value for value in locale_output if value not in {"C", "POSIX"}), "C")
+
+    first = run_export(first_results, tmp_path / "out-first", env={"LC_ALL": "C"})
+    second = run_export(second_results, tmp_path / "out-second", env={"LC_ALL": alternate_locale})
+    assert first.returncode == second.returncode == 0
+    assert first.stdout == second.stdout == ""
+    assert read_outputs(tmp_path / "out-first") == read_outputs(tmp_path / "out-second") == (
+        ">alpha|ITS2|reads-10|BLAST:Alpha_one\nAAAA\n",
+        SUMMARY_HEADER + "alpha\tITS2\t10\tOTU-A\tAlpha_one\n",
+    )
+    assert admission_info(first.stderr) == admission_info(second.stderr) == [
+        "INFO: Admission provenance: loaded; classified=3 admitted_unassigned=0 unknown=0"
+    ]
+    assert admission_warnings(first.stderr) == admission_warnings(second.stderr) == []
+
+
+def test_admission_preserves_spaces_and_assignment_shaped_relative_results(tmp_path):
+    results, state_dir, consensus, tables = make_state(tmp_path / "run=1")
+    write_identity(results, "run-one", [("sample alpha", "ITS2", "alpha_ITS2", "unit one")])
+    fasta = write_fasta(consensus, "unit one", [("unit one|Only|ITS2|reads-7|OTU=OTU-1", "ACGT")])
+    write_taxonomy(tables, [])
+    write_round_index(state_dir)
+    write_admission(
+        consensus,
+        [admission_row("round-2", "unit one", "OTU-1", "Only_unit one", fasta_sha256(fasta))],
+    )
+    out = tmp_path / "output with spaces"
+
+    plain = run_export("run=1/results with spaces", out, cwd=tmp_path)
+    plain_outputs = read_outputs(out)
+    controlled = run_export("./run=1/results with spaces", out, cwd=tmp_path)
+
+    assert plain.returncode == controlled.returncode == 0
+    assert plain.stdout == controlled.stdout == ""
+    assert plain.stderr == controlled.stderr
+    assert read_outputs(out) == plain_outputs == (
+        ">sample alpha|ITS2|reads-7\nACGT\n",
+        SUMMARY_HEADER + "sample alpha\tITS2\t7\tOTU-1\t\n",
+    )
+    assert "admitted_unassigned=1" in plain.stderr
+
+
+@pytest.mark.parametrize("failure", ["digest", "normalization", "admission-mktemp"])
+def test_private_provenance_tool_failures_preserve_outputs_and_clean_temporaries(tmp_path, failure):
+    candidates = [{"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates)
+    write_admission(
+        consensus,
+        [admission_row("round-2", "unit-one", "OTU-1", "Only_unit-one", fasta_sha256(fastas["unit-one"]))],
+    )
+    out = tmp_path / "out"
+    write_stale_outputs(out)
+    fake_bin = tmp_path / f"fake-{failure}"
+    fake_bin.mkdir()
+    if failure == "digest":
+        wrapper = fake_bin / "perl"
+        wrapper.write_text("#!/bin/sh\nexit 91\n", encoding="utf-8")
+    elif failure == "normalization":
+        wrapper = fake_bin / "awk"
+        wrapper.write_text(
+            "#!/bin/sh\ncase \"$*\" in *round_file=*) exit 92;; esac\nexec /usr/bin/awk \"$@\"\n",
+            encoding="utf-8",
+        )
+    else:
+        wrapper = fake_bin / "mktemp"
+        wrapper.write_text(
+            "#!/bin/sh\ncase \"$1\" in *.voucher_admission.*) exit 93;; esac\nexec /usr/bin/mktemp \"$@\"\n",
+            encoding="utf-8",
+        )
+    wrapper.chmod(0o755)
+
+    result = run_export(results, out, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert read_outputs(out) == ("stale fasta\n", "stale summary\n")
+    assert not list(out.glob(".voucher_*"))
+
+
+def test_invalid_evidence_temporary_write_failure_is_fatal_before_publication(tmp_path):
+    candidates = [
+        {"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}
+    ]
+    results, _, consensus, _, _ = make_admission_fixture(tmp_path, candidates)
+    (consensus / "consensus_taxonomy_admission.tsv").mkdir()
+    out = tmp_path / "out"
+    write_stale_outputs(out)
+    fake_bin = tmp_path / "fake-write"
+    fake_bin.mkdir()
+    fake_mktemp = fake_bin / "mktemp"
+    fake_mktemp.write_text(
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        "  *.voucher_admission.*) blocked=${1%XXXXXX}blocked; /bin/ln -s . \"$blocked\"; printf '%s\\n' \"$blocked\"; exit 0;;\n"
+        "esac\n"
+        "exec /usr/bin/mktemp \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_mktemp.chmod(0o755)
+
+    result = run_export(results, out, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "Could not normalize admission provenance" in result.stderr
+    assert read_outputs(out) == ("stale fasta\n", "stale summary\n")
+    assert not list(out.glob(".voucher_*"))
+
+
+def test_second_publication_failure_with_admission_matches_head_partial_publication(tmp_path):
+    candidates = [{"unit": "unit-one", "sample": "alpha", "name": "Only", "otu": "OTU-1", "reads": 7, "sequence": "ACGT"}]
+    results, _, consensus, _, fastas = make_admission_fixture(tmp_path, candidates)
+    write_admission(
+        consensus,
+        [admission_row("round-2", "unit-one", "OTU-1", "Only_unit-one", fasta_sha256(fastas["unit-one"]))],
+    )
+    out = tmp_path / "out"
+    write_stale_outputs(out)
+    fake_bin = tmp_path / "fake-mv"
+    fake_bin.mkdir()
+    wrapper = fake_bin / "mv"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "case \"$1\" in -f) source=$2;; *) source=$1;; esac\n"
+        "case \"$source\" in *.voucher_summary.tsv.*) exit 94;; esac\n"
+        "exec /bin/mv \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    result = run_export(results, out, env=env)
+    candidate_snapshot = output_snapshot(out)
+    write_stale_outputs(out)
+    head = run_export(results, out, script=make_head_script(tmp_path), env=env)
+
+    assert (result.returncode, result.stdout, result.stderr) == (
+        head.returncode,
+        head.stdout,
+        head.stderr,
+    )
+    assert result.returncode == 94
+    assert candidate_snapshot == output_snapshot(out) == (
+        ("voucher_sequences.fasta", ("file", b">alpha|ITS2|reads-7\nACGT\n")),
+        ("voucher_summary.tsv", ("file", b"stale summary\n")),
+    )

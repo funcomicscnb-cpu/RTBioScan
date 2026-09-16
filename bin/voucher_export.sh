@@ -110,6 +110,7 @@ fi
 STATE_ID=$(basename "$STATE_DIR")
 CONSENSUS_DIR="$STATE_DIR/sequences/Consensus"
 TABLES_DIR="$STATE_DIR/tables"
+ADMISSION_SIDECAR="$CONSENSUS_DIR/consensus_taxonomy_admission.tsv"
 
 # main.nf renders workflow.runName (the execution name) and state ID into the
 # published README. The execution name is diagnostic only: it is not authority
@@ -230,17 +231,120 @@ OUT_TSV="$OUTPUT_DIR/voucher_summary.tsv"
 TMP_FASTA=""
 TMP_TSV=""
 TMP_STATS=""
+TMP_PROVENANCE=""
+TMP_DIGESTS=""
 
 cleanup() {
     [ -z "$TMP_FASTA" ] || rm -f "$TMP_FASTA"
     [ -z "$TMP_TSV" ] || rm -f "$TMP_TSV"
     [ -z "$TMP_STATS" ] || rm -f "$TMP_STATS"
+    [ -z "$TMP_PROVENANCE" ] || rm -f "$TMP_PROVENANCE"
+    [ -z "$TMP_DIGESTS" ] || rm -f "$TMP_DIGESTS"
 }
 trap cleanup EXIT HUP INT TERM
 
 TMP_FASTA=$(mktemp "$OUTPUT_DIR/.voucher_sequences.fasta.XXXXXX")
 TMP_TSV=$(mktemp "$OUTPUT_DIR/.voucher_summary.tsv.XXXXXX")
 TMP_STATS=$(mktemp "$OUTPUT_DIR/.voucher_stats.XXXXXX")
+
+is_readable_regular_file() {
+    [ -f "$1" ] && [ -r "$1" ] && ( : < "$1" ) 2>/dev/null
+}
+
+PROVENANCE_PRESENT=0
+if [ -e "$ADMISSION_SIDECAR" ] || [ -L "$ADMISSION_SIDECAR" ]; then
+    PROVENANCE_PRESENT=1
+    TMP_PROVENANCE=$(mktemp "$OUTPUT_DIR/.voucher_admission.XXXXXX") || {
+        printf 'ERROR: Could not create temporary admission-provenance file.\n' >&2
+        exit 2
+    }
+    TMP_DIGESTS=$(mktemp "$OUTPUT_DIR/.voucher_digests.XXXXXX") || {
+        printf 'ERROR: Could not create temporary admission-digest file.\n' >&2
+        exit 2
+    }
+
+    if ! is_readable_regular_file "$ADMISSION_SIDECAR"; then
+        if ! printf 'AUTH\tinvalid\tsidecar_unavailable\t\n' > "$TMP_PROVENANCE"; then
+            printf 'ERROR: Could not normalize admission provenance from %s.\n' "$ADMISSION_SIDECAR" >&2
+            exit 2
+        fi
+    else
+        ROUND_AUTHORITY="$STATE_DIR/live_round/tables/round_index.tsv"
+        AUTHORITY_SHAPE_REASON=""
+        if ! is_readable_regular_file "$ROUND_AUTHORITY"; then
+            AUTHORITY_SHAPE_REASON="round_authority_unavailable"
+        fi
+
+        # Normalize the exact authority inputs without discovering alternate copies.
+        # File-level validity is interpreted by the main exporter AWK pass below.
+        if awk \
+            -v round_file="$ROUND_AUTHORITY" \
+            -v sidecar_file="$ADMISSION_SIDECAR" \
+            -v authority_shape_reason="$AUTHORITY_SHAPE_REASON" \
+            '
+        function trim_cr(value) { sub(/\r$/, "", value); return value }
+        BEGIN {
+            authority_status = "invalid"
+            authority_reason = "round_authority_unavailable"
+            authority_barcode = ""
+            if (authority_shape_reason != "") {
+                authority_reason = authority_shape_reason
+            } else {
+                round_lines = 0
+                while ((round_result = getline round_line < round_file) > 0) {
+                    round_lines++
+                    saved_round_line[round_lines] = trim_cr(round_line)
+                }
+                close(round_file)
+                if (round_result >= 0) {
+                    authority_reason = "round_authority_malformed"
+                    if (round_lines == 2 && saved_round_line[1] == "round_barcode\tround_index") {
+                        round_fields = split(saved_round_line[2], round_value, "\t")
+                        if (round_fields == 2 && round_value[1] != "" && round_value[2] ~ /^[0-9]+$/) {
+                            authority_status = "valid"
+                            authority_reason = "-"
+                            authority_barcode = round_value[1]
+                        }
+                    }
+                }
+            }
+            print "AUTH\t" authority_status "\t" authority_reason "\t" authority_barcode
+
+            sidecar_lines = 0
+            while ((sidecar_result = getline sidecar_line < sidecar_file) > 0) {
+                sidecar_lines++
+                print "SIDE\t" sidecar_lines "\t" trim_cr(sidecar_line)
+            }
+            close(sidecar_file)
+            if (sidecar_result < 0) exit 2
+        }
+            ' > "$TMP_PROVENANCE"
+        then
+            :
+        else
+            printf 'ERROR: Could not normalize admission provenance from %s.\n' "$ADMISSION_SIDECAR" >&2
+            exit 2
+        fi
+
+        # One Digest::SHA process hashes every already-selected authoritative FASTA.
+        if perl -MDigest::SHA -e '
+        for my $path (@ARGV) {
+            open my $handle, "<", $path or die "$path: $!\n";
+            binmode $handle;
+            my $digest = Digest::SHA->new(256);
+            $digest->addfile($handle);
+            close $handle or die "$path: $!\n";
+            print $path, "\t", $digest->hexdigest, "\n";
+        }
+        ' -- ${fasta_files[@]+"${fasta_files[@]}"} > "$TMP_DIGESTS"
+        then
+            :
+        else
+            printf 'ERROR: Could not compute authoritative merged-FASTA digests.\n' >&2
+            exit 2
+        fi
+    fi
+fi
 
 # Taxonomy tables are the first tax_count ARGV entries. They and the identity
 # bridge are loaded by named columns, leaving only authoritative FASTAs as input.
@@ -252,9 +356,16 @@ if awk \
     -v out_fasta="$TMP_FASTA" \
     -v out_tsv="$TMP_TSV" \
     -v stats_out="$TMP_STATS" \
+    -v provenance_present="$PROVENANCE_PRESENT" \
+    -v provenance_file="$TMP_PROVENANCE" \
+    -v provenance_source="$ADMISSION_SIDECAR" \
+    -v digest_file="$TMP_DIGESTS" \
     '
     function fail(message) {
-        if (!failed) print "ERROR: " message > "/dev/stderr"
+        if (!failed) {
+            print "ERROR: " message | stderr_command
+            close(stderr_command)
+        }
         failed = 1
         exit 2
     }
@@ -271,26 +382,141 @@ if awk \
     function biological_sample(unit) {
         return (unit in identity_sample) ? identity_sample[unit] : unit
     }
+    function add_warning(message) {
+        warning[++warning_count] = message
+    }
     function marker_is_compatible(record_type, context, unit, sample, observed, expected, message) {
         if (!(unit in identity_marker) || identity_marker[unit] == observed) return 1
         expected = identity_marker[unit]
         message = "WARN: Skipping marker-discordant " record_type ": source=" context \
             " unit=" unit " biological_sample=" sample \
             " expected_identity_marker=" expected " observed_consensus_marker=" observed
-        marker_warning[++marker_warning_count] = message
+        add_warning(message)
         return 0
     }
-    function emit_marker_warnings(    i, j, value) {
-        for (i = 2; i <= marker_warning_count; i++) {
-            value = marker_warning[i]
+    function emit_warnings(    i, j, value) {
+        for (i = 2; i <= warning_count; i++) {
+            value = warning[i]
             j = i - 1
-            while (j >= 1 && marker_warning[j] > value) {
-                marker_warning[j + 1] = marker_warning[j]
+            while (j >= 1 && warning[j] > value) {
+                warning[j + 1] = warning[j]
                 j--
             }
-            marker_warning[j + 1] = value
+            warning[j + 1] = value
         }
-        for (i = 1; i <= marker_warning_count; i++) print marker_warning[i] > "/dev/stderr"
+        for (i = 1; i <= warning_count; i++) print warning[i] | stderr_command
+        if (warning_count) close(stderr_command)
+    }
+    function display_field(value) {
+        return value == "" ? "-" : value
+    }
+    function add_provenance_warning(reason, line_no, unit, otu, consensus_id) {
+        add_warning("WARN: Admission provenance ignored: reason=" reason \
+            " source=" provenance_source " line=" display_field(line_no) \
+            " unit=" display_field(unit) " otu_key=" display_field(otu) \
+            " consensus_id=" display_field(consensus_id))
+    }
+    function load_digests(    line, count, fields, path, digest) {
+        while ((getline line < digest_file) > 0) {
+            line = trim_cr(line)
+            count = split(line, fields, "\t")
+            if (count != 2 || fields[1] == "" || !(length(fields[2]) == 64 && fields[2] !~ /[^0-9a-f]/)) {
+                fail(digest_file ": malformed digest table")
+            }
+            path = fields[1]
+            digest = fields[2]
+            if ((path in fasta_digest) && fasta_digest[path] != digest) {
+                fail(digest_file ": conflicting digest for " path)
+            }
+            fasta_digest[path] = digest
+        }
+        close(digest_file)
+    }
+    function load_provenance(    line, count, fields, kind, line_no, raw, i, key, signature, reason) {
+        provenance_status = "invalid"
+        while ((getline line < provenance_file) > 0) {
+            line = trim_cr(line)
+            count = split(line, fields, "\t")
+            kind = fields[1]
+            if (kind == "AUTH") {
+                authority_status = fields[2]
+                authority_reason = fields[3]
+                authority_barcode = fields[4]
+                continue
+            }
+            if (kind != "SIDE" || count < 2) fail(provenance_file ": malformed normalized provenance")
+            line_no = fields[2]
+            raw = line
+            sub(/^[^\t]*\t[^\t]*\t/, "", raw)
+            sidecar_line[++sidecar_line_count] = line_no
+            sidecar_raw[sidecar_line_count] = raw
+        }
+        close(provenance_file)
+
+        if (authority_status != "valid") {
+            add_provenance_warning(authority_reason, "-", "-", "-", "-")
+            return
+        }
+        if (sidecar_line_count == 0 || sidecar_raw[1] != "round_barcode\tsample\totu_key\tconsensus_id\ttaxonomy_admission_status\tmerged_fasta_sha256") {
+            add_provenance_warning("invalid_header", sidecar_line_count ? sidecar_line[1] : 1, "-", "-", "-")
+            return
+        }
+        if (sidecar_line_count == 1) {
+            provenance_status = "header_only"
+            return
+        }
+        provenance_status = "loaded"
+
+        for (i = 2; i <= sidecar_line_count; i++) {
+            count = split(sidecar_raw[i], fields, "\t")
+            provenance_row_line[i] = sidecar_line[i]
+            provenance_row_unit[i] = count >= 2 ? fields[2] : "-"
+            provenance_row_otu[i] = count >= 3 ? fields[3] : "-"
+            provenance_row_consensus[i] = count >= 4 ? fields[4] : "-"
+            if (count != 6) {
+                provenance_row_invalid[i] = 1
+                add_provenance_warning("malformed_row", provenance_row_line[i], provenance_row_unit[i], provenance_row_otu[i], provenance_row_consensus[i])
+                continue
+            }
+            provenance_row_round[i] = fields[1]
+            provenance_row_status[i] = fields[5]
+            provenance_row_digest[i] = fields[6]
+            key = fields[2] SUBSEP fields[3] SUBSEP fields[4]
+            provenance_row_key[i] = key
+            provenance_key_count[key]++
+            signature = fields[1] SUBSEP fields[5] SUBSEP fields[6]
+            if ((key in provenance_key_signature) && provenance_key_signature[key] != signature) {
+                provenance_key_conflict[key] = 1
+            } else {
+                provenance_key_signature[key] = signature
+            }
+            if (fields[2] == "" || fields[3] == "" || fields[4] == "") {
+                provenance_row_invalid[i] = 1
+                add_provenance_warning("empty_join_field", provenance_row_line[i], fields[2], fields[3], fields[4])
+            }
+            if (fields[5] != "unassigned") {
+                provenance_row_invalid[i] = 1
+                add_provenance_warning("unknown_status", provenance_row_line[i], fields[2], fields[3], fields[4])
+            }
+            if (!(length(fields[6]) == 64 && fields[6] !~ /[^0-9a-f]/)) {
+                provenance_row_invalid[i] = 1
+                add_provenance_warning("bad_digest", provenance_row_line[i], fields[2], fields[3], fields[4])
+            }
+            if (fields[1] != authority_barcode) {
+                provenance_row_invalid[i] = 1
+                add_provenance_warning("stale_round", provenance_row_line[i], fields[2], fields[3], fields[4])
+            }
+        }
+        for (i = 2; i <= sidecar_line_count; i++) {
+            key = provenance_row_key[i]
+            if (key == "") continue
+            if (provenance_key_count[key] > 1) {
+                provenance_row_invalid[i] = 1
+                reason = provenance_key_conflict[key] ? "conflicting_duplicate_key" : "duplicate_key"
+                add_provenance_warning(reason, provenance_row_line[i], provenance_row_unit[i], provenance_row_otu[i], provenance_row_consensus[i])
+            }
+            if (!provenance_row_invalid[i]) provenance_usable_row[key] = i
+        }
     }
     function parse_marker(header, context, fields, count, i, field, candidate, chosen) {
         count = split(header, fields, /\|/)
@@ -357,7 +583,7 @@ if awk \
         if (sequence != best_sequence[key]) return sequence < best_sequence[key]
         return 0
     }
-    function flush_record(context, sample_unit, marker, reads, otu, consensus_id, sample, key) {
+    function flush_record(context, sample_unit, marker, reads, otu, consensus_id, sample, key, tax_key, suggestion, provenance_key, provenance_index, record_provenance_valid, evidence_state) {
         if (record_header == "" || failed) return
         context = record_file
         sample_unit = record_header
@@ -368,11 +594,31 @@ if awk \
         reads = parse_reads(record_header, context)
         otu = parse_otu(record_header, context)
         consensus_id = parse_consensus_id(record_header, context)
+        provenance_key = sample_unit SUBSEP otu SUBSEP consensus_id
+        provenance_index = (provenance_key in provenance_usable_row) ? provenance_usable_row[provenance_key] : 0
+        record_provenance_valid = 0
+        if (provenance_index) {
+            provenance_join_seen[provenance_index] = 1
+            if ((record_file in fasta_digest) && fasta_digest[record_file] == provenance_row_digest[provenance_index]) {
+                provenance_digest_matched[provenance_index] = 1
+                record_provenance_valid = 1
+            }
+        }
         sample = biological_sample(sample_unit)
         if (index(sample, "\t") || index(sample, "|")) fail(context ": unsupported biological sample label " sample)
         if (!marker_is_compatible("FASTA candidate", context, sample_unit, sample, marker)) return
         if (filter_sample != "" && sample != filter_sample) return
         if (normalized_filter_marker != "" && marker != normalized_filter_marker) return
+        tax_key = sample SUBSEP marker SUBSEP otu SUBSEP consensus_id
+        suggestion = (tax_key in taxonomy_value) ? taxonomy_value[tax_key] : ""
+        if (suggestion != "") {
+            evidence_state = "classified"
+        } else if (record_provenance_valid) {
+            evidence_state = "admitted_unassigned"
+        } else {
+            evidence_state = "unknown"
+        }
+        evidence_count[evidence_state]++
         key = sample SUBSEP marker
         if (is_better(key, reads, otu, record_header, record_sequence)) {
             best_present[key] = 1
@@ -497,7 +743,10 @@ if awk \
                 sample_count++
             }
         }
-        print key_count "\t" sample_count > stats_out
+        print key_count "\t" sample_count "\t" provenance_status "\t" \
+            (evidence_count["classified"] + 0) "\t" \
+            (evidence_count["admitted_unassigned"] + 0) "\t" \
+            (evidence_count["unknown"] + 0) > stats_out
         close(out_fasta)
         close(out_tsv)
         close(stats_out)
@@ -509,9 +758,14 @@ if awk \
         close(out_tsv)
         configured_marker["COI"] = 1
         configured_marker["ITS2"] = 1
+        stderr_command = "cat >&2"
         normalized_filter_marker = toupper(filter_marker)
         if (normalized_filter_marker != "") configured_marker[normalized_filter_marker] = 1
         load_identity()
+        if (provenance_present) {
+            load_digests()
+            load_provenance()
+        }
         for (tax_index = 1; tax_index <= tax_count; tax_index++) {
             load_taxonomy(ARGV[tax_index])
             delete ARGV[tax_index]
@@ -539,7 +793,17 @@ if awk \
     END {
         if (!failed) flush_record()
         if (!failed) {
-            emit_marker_warnings()
+            if (provenance_present && provenance_status == "loaded") {
+                for (provenance_index = 2; provenance_index <= sidecar_line_count; provenance_index++) {
+                    if (provenance_row_invalid[provenance_index]) continue
+                    if (!(provenance_index in provenance_join_seen)) {
+                        add_provenance_warning("orphan_evidence", provenance_row_line[provenance_index], provenance_row_unit[provenance_index], provenance_row_otu[provenance_index], provenance_row_consensus[provenance_index])
+                    } else if (!(provenance_index in provenance_digest_matched)) {
+                        add_provenance_warning("digest_mismatch", provenance_row_line[provenance_index], provenance_row_unit[provenance_index], provenance_row_otu[provenance_index], provenance_row_consensus[provenance_index])
+                    }
+                }
+            }
+            emit_warnings()
             emit_results()
         }
     }
@@ -551,7 +815,7 @@ else
     exit "$parse_status"
 fi
 
-IFS=$'\t' read -r seq_count sample_count < "$TMP_STATS"
+IFS=$'\t' read -r seq_count sample_count provenance_status classified_count admitted_unassigned_count unknown_count < "$TMP_STATS"
 
 # Both complete outputs are built before either public filename is replaced.
 mv -f "$TMP_FASTA" "$OUT_FASTA"
@@ -560,6 +824,13 @@ mv -f "$TMP_TSV" "$OUT_TSV"
 TMP_TSV=""
 rm -f "$TMP_STATS"
 TMP_STATS=""
+if [ "$PROVENANCE_PRESENT" -eq 1 ]; then
+    rm -f "$TMP_PROVENANCE" "$TMP_DIGESTS"
+    TMP_PROVENANCE=""
+    TMP_DIGESTS=""
+    printf 'INFO: Admission provenance: %s; classified=%d admitted_unassigned=%d unknown=%d\n' \
+        "$provenance_status" "$classified_count" "$admitted_unassigned_count" "$unknown_count" >&2
+fi
 
 if [ "$seq_count" -eq 0 ]; then
     printf 'INFO: No voucher sequences matched the selected state and filters; wrote empty FASTA and header-only summary.\n' >&2
