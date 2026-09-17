@@ -6258,8 +6258,8 @@ process getting_run_summary {
 		REPORT_TRACK_IDENTITY_ARG=""
 		REPORT_IDENTITY_MODE_ARG=""
 		if [ "${replicateModeCanonical}" = "track" ]; then
-			_TRACK_ROSTER="${outdirResolved}/sample_info/${run_name}/track_roster.tsv"
-			_TRACK_IDENTITY="${outdirResolved}/sample_info/${run_name}/track_identity.tsv"
+			_TRACK_ROSTER="${sampleInfoDir}/track_roster.tsv"
+			_TRACK_IDENTITY="${sampleInfoDir}/track_identity.tsv"
 			if [ ! -r "\$_TRACK_ROSTER" ]; then
 				echo "ERROR: identity-mode=track requires track_roster.tsv but it is missing or unreadable: \$_TRACK_ROSTER" >&2
 				exit 1
@@ -6271,8 +6271,8 @@ process getting_run_summary {
 			REPORT_SAMPLE_ROSTER_ARG="--sample-roster \$_TRACK_ROSTER"
 			REPORT_TRACK_IDENTITY_ARG="--track-identity \$_TRACK_IDENTITY"
 			REPORT_IDENTITY_MODE_ARG="--identity-mode track"
-		elif [ -s "${outdirResolved}/sample_info/${run_name}/samples.txt" ]; then
-			REPORT_SAMPLE_ROSTER_ARG="--sample-roster ${outdirResolved}/sample_info/${run_name}/samples.txt"
+		elif [ -s "${sampleInfoDir}/samples.txt" ]; then
+			REPORT_SAMPLE_ROSTER_ARG="--sample-roster ${sampleInfoDir}/samples.txt"
 			REPORT_IDENTITY_MODE_ARG="--identity-mode collapse"
 		fi
 		_CONS_IDS_ARG=""

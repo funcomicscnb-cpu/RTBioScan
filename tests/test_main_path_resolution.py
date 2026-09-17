@@ -19,7 +19,7 @@ PROCESSES = ("fast_on_target_detection", "_reporting_hq_demultiplexing",
 INTERPOLATION = re.compile(r"(?<!\\)\$\{([^{}]+)\}")
 PATH_NAMES = {"outdirResolved", "params.outdir", "ongoingStateDir", "currentStateDir",
               "currentResultsStateDir", "ongoingResultsStateDir", "workflow.launchDir",
-              "otuPruneSamplesFileValue", "params.ori_dir", "podBaseDir", "baseDir"}
+              "otuPruneSamplesFileValue", "params.ori_dir", "podBaseDir", "sampleInfoDir", "baseDir"}
 
 
 def _runtime():
@@ -69,10 +69,13 @@ def _preamble(main):
     restart = re.search(r'(?m)^\s*env.OUTDIR = [^\n]+', main)[0]
     trim = re.search(r'(?m)^\s*def otuPruneSamplesFileValue = params.otu_prune_samples_file[^\n]+', main)[0]
     binding = main[main.index("def otuPruneSamplesFileRaw") if "def otuPruneSamplesFileRaw" in main else main.index("def otuPruneSamplesFileValue                 ="):main.index("def otuLockForcePruneMaxFastaMbStr           =")]
+    run_id = re.search(r'(?m)^def _runId\s*=.*$', main)[0]
+    sample_info = re.search(r'(?m)^def sampleInfoDir\s*=.*$', main)[0]
     # Preserve the existing validator's trim, then evaluate its top-level binding.
     return ("def stateId = 'STATE'\n" + rolling + "\ndef stateVerificationCacheDir\n" + cache
             + "\ndef env = [:]\n" + restart + "\ndef otuRecoveryCfg = {\n" + trim
-            + "\n[otuPruneSamplesFileValue: otuPruneSamplesFileValue]\n}()\n" + binding)
+            + "\n[otuPruneSamplesFileValue: otuPruneSamplesFileValue]\n}()\n" + binding
+            + "\n" + run_id + "\n" + sample_info + "\n")
 
 
 def _prepare(tmp_path, main, config, raw=None, prune="", delete=False, ready=False, launch_name="launch-dir"):
@@ -157,7 +160,7 @@ def _prepare(tmp_path, main, config, raw=None, prune="", delete=False, ready=Fal
     (project / "probe.nf").write_text(source)
     args = ["-C", str(project / "nextflow.config"), "run", str(project / "probe.nf"),
             "-ansi-log", "false", "-work-dir", str(launch / "work"),
-            "--ori_dir", str(launch / "spool")]
+            "--ori_dir", str(launch / "spool"), "--run_id", "1"]
     if prune:
         args += ["--otu_prune_samples_file", prune]
     if raw is not None:
@@ -192,12 +195,19 @@ def _assert_paths(launch, pre, lines, raw):
             assert text.count(raw) == text.count(expected), f"{process}: unresolved task path"
     for process, suffix in [("fast_on_target_detection", "/ongoing/"),
                             ("_reporting_hq_demultiplexing", "/ongoing"),
-                            ("getting_run_summary", "/sample_info/1/track_roster.tsv"),
                             ("backup_update_and_clean", "/report_html/runs/1"),
                             ("async_report_render", "/.report_root_render.lock")]:
         text = (launch / f"artifacts/{process}.sh").read_text()
         assert expected + suffix in text, process
         assert not re.search(r'(?<!/)\bwork/[^\n]*results_params_A', text)
+    summary = (launch / "artifacts/getting_run_summary.sh").read_text()
+    assert f"{launch}/results/sample_info/1/track_roster.tsv" in summary
+    if expected != f"{launch}/results":
+        assert f"{expected}/sample_info/" not in summary
+    backup = (launch / "artifacts/backup_update_and_clean.sh").read_text()
+    assert f'RUN_REPORT_DIR="{expected}/report_html/runs/1"' in backup
+    async_render = (launch / "artifacts/async_report_render.sh").read_text()
+    assert f'REPORT_ROOT_RENDER_LOCK="{expected}/.report_root_render.lock"' in async_render
 
 
 @pytest.mark.parametrize("shape", ["default", "relative", "dotdot", "assignment", "symlink"])
@@ -278,6 +288,18 @@ def test_head_candidate_generated_command_equivalence(tmp_path, default):
     head_config = subprocess.check_output(['git', 'show', f'{HEAD}:nextflow.config'], cwd=ROOT, text=True)
     # Isolate exactly the intentional promoter/dead-variable deletion in HEAD.
     head_main = _without_promoter(head_main)
+    if not default:
+        replacements = [
+            ('${params.outdir}/sample_info/${run_name}/track_roster.tsv',
+             '${sampleInfoDir}/track_roster.tsv', 1),
+            ('${params.outdir}/sample_info/${run_name}/track_identity.tsv',
+             '${sampleInfoDir}/track_identity.tsv', 1),
+            ('${params.outdir}/sample_info/${run_name}/samples.txt',
+             '${sampleInfoDir}/samples.txt', 2),
+        ]
+        for old, new, count in replacements:
+            assert head_main.count(old) == count, old
+            head_main = head_main.replace(old, new)
     raw = None if default else str(tmp_path / 'absolute-link') + '/./results/'
     (tmp_path / 'target').mkdir()
     (tmp_path / 'absolute-link').symlink_to(tmp_path / 'target', target_is_directory=True)

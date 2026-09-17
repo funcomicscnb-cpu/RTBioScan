@@ -46,6 +46,58 @@ def _run_nextflow_groovy(tmp_path: Path, source: str) -> subprocess.CompletedPro
     )
 
 
+def _getting_run_summary_identity_block(source: str | None = None) -> str:
+    text = source if source is not None else MAIN_NF.read_text(encoding="utf-8")
+    summary_block = text.split("process getting_run_summary {", 1)[1].split(
+        "process backup_update_and_clean {", 1
+    )[0]
+    start = summary_block.index('\t\tREPORT_SAMPLE_ROSTER_ARG=""')
+    end = summary_block.index('\t\t_CONS_IDS_ARG=""', start)
+    return summary_block[start:end]
+
+
+def _exercise_getting_run_summary_identity_block(
+    *,
+    mode: str,
+    sample_info_dir: Path,
+    outdir_resolved: Path,
+    launch_dir: Path,
+    run_name: str,
+    run_id: str,
+    state_id: str = "state-under-test",
+    source: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    block = _getting_run_summary_identity_block(source)
+    substitutions = {
+        "${replicateModeCanonical}": mode,
+        "${sampleInfoDir}": str(sample_info_dir),
+        "${outdirResolved}": str(outdir_resolved),
+        "${workflow.launchDir}": str(launch_dir),
+        "${run_name}": run_name,
+        "${run_id}": run_id,
+        "${stateId}": state_id,
+    }
+    for placeholder, value in substitutions.items():
+        block = block.replace(placeholder, value)
+    block = block.replace("\\$", "$")
+    block += (
+        "printf 'sample_roster=%s\\ntrack_identity=%s\\nidentity_mode=%s\\n' "
+        '"$REPORT_SAMPLE_ROSTER_ARG" "$REPORT_TRACK_IDENTITY_ARG" '
+        '"$REPORT_IDENTITY_MODE_ARG"\n'
+    )
+    return subprocess.run(
+        ["bash", "-c", block],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _summary_identity_args(result: subprocess.CompletedProcess[str]) -> tuple[str, str, str]:
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    return values["sample_roster"], values["track_identity"], values["identity_mode"]
+
+
 def _mask_quoted_shell_text(text: str) -> str:
     """Mask quoted shell text while preserving string length and quote positions."""
     def is_escaped(idx: int) -> bool:
@@ -2964,6 +3016,189 @@ def test_main_nf_wires_run_started_utc_file() -> None:
     assert 'set -C; date -u \'+%Y-%m-%dT%H:%M:%SZ\' > "${ongoingStateDir}/_state/run_started_utc.txt"' in fast_block
     # --run-started-utc-file is now wired in backup_update_and_clean → report_run_json.pl call.
     assert '--run-started-utc-file "${ongoingStateDir}/_state/run_started_utc.txt"' in backup_block
+
+
+def test_getting_run_summary_identity_track_default_shape_is_head_equivalent(tmp_path: Path) -> None:
+    launch_dir = tmp_path / "launch"
+    run_name = run_id = "matched-run"
+    outdir = launch_dir / "results"
+    sample_info_dir = outdir / "sample_info" / run_id
+    sample_info_dir.mkdir(parents=True)
+    (sample_info_dir / "track_roster.tsv").write_text("roster\n", encoding="utf-8")
+    (sample_info_dir / "track_identity.tsv").write_text("identity\n", encoding="utf-8")
+
+    candidate_args = _summary_identity_args(
+        _exercise_getting_run_summary_identity_block(
+            mode="track",
+            sample_info_dir=sample_info_dir,
+            outdir_resolved=outdir,
+            launch_dir=launch_dir,
+            run_name=run_name,
+            run_id=run_id,
+        )
+    )
+    head_root = outdir / "sample_info" / run_name
+    head_args = (
+        f"--sample-roster {head_root / 'track_roster.tsv'}",
+        f"--track-identity {head_root / 'track_identity.tsv'}",
+        "--identity-mode track",
+    )
+    assert candidate_args == head_args
+
+
+def test_getting_run_summary_identity_track_follows_run_id_not_run_name(tmp_path: Path) -> None:
+    launch_dir = tmp_path / "launch"
+    outdir = launch_dir / "results"
+    sample_info_dir = launch_dir / "results" / "sample_info" / "stable-run-id"
+    old_decoy_dir = outdir / "sample_info" / "new-resume-name"
+    sample_info_dir.mkdir(parents=True)
+    old_decoy_dir.mkdir(parents=True)
+    for directory in (sample_info_dir, old_decoy_dir):
+        (directory / "track_roster.tsv").write_text(f"{directory}\n", encoding="utf-8")
+        (directory / "track_identity.tsv").write_text(f"{directory}\n", encoding="utf-8")
+
+    assert _summary_identity_args(
+        _exercise_getting_run_summary_identity_block(
+            mode="track",
+            sample_info_dir=sample_info_dir,
+            outdir_resolved=outdir,
+            launch_dir=launch_dir,
+            run_name="new-resume-name",
+            run_id="stable-run-id",
+        )
+    ) == (
+        f"--sample-roster {sample_info_dir / 'track_roster.tsv'}",
+        f"--track-identity {sample_info_dir / 'track_identity.tsv'}",
+        "--identity-mode track",
+    )
+
+
+def test_getting_run_summary_identity_track_ignores_nondefault_outdir(tmp_path: Path) -> None:
+    launch_dir = tmp_path / "launch"
+    outdir = tmp_path / "custom-output"
+    sample_info_dir = launch_dir / "results" / "sample_info" / "stable-run-id"
+    sample_info_dir.mkdir(parents=True)
+    (sample_info_dir / "track_roster.tsv").write_text("roster\n", encoding="utf-8")
+    (sample_info_dir / "track_identity.tsv").write_text("identity\n", encoding="utf-8")
+
+    args = _summary_identity_args(
+        _exercise_getting_run_summary_identity_block(
+            mode="track",
+            sample_info_dir=sample_info_dir,
+            outdir_resolved=outdir,
+            launch_dir=launch_dir,
+            run_name="display-run-name",
+            run_id="stable-run-id",
+        )
+    )
+    assert args[:2] == (
+        f"--sample-roster {sample_info_dir / 'track_roster.tsv'}",
+        f"--track-identity {sample_info_dir / 'track_identity.tsv'}",
+    )
+    summary_block = MAIN_NF.read_text(encoding="utf-8").split("process getting_run_summary {", 1)[1].split(
+        "process backup_update_and_clean {", 1
+    )[0]
+    assert 'ROUND_DIR="${ongoingStateDir}/${round_barcode}"' in summary_block
+    assert 'mkdir -p "\\$ROUND_DIR" "\\$STATE_DIR" "${outdirResolved}"' in summary_block
+    assert 'REPORT_FIG_URL_PREFIX="runs/${run_name}/report_assets/live_round"' in summary_block
+
+
+@pytest.mark.parametrize("missing_name", ["track_roster.tsv", "track_identity.tsv"])
+def test_getting_run_summary_identity_track_missing_authoritative_file_is_fatal(
+    tmp_path: Path, missing_name: str
+) -> None:
+    launch_dir = tmp_path / "launch"
+    outdir = launch_dir / "results"
+    sample_info_dir = outdir / "sample_info" / "stable-run-id"
+    sample_info_dir.mkdir(parents=True)
+    present_name = "track_identity.tsv" if missing_name == "track_roster.tsv" else "track_roster.tsv"
+    (sample_info_dir / present_name).write_text("present\n", encoding="utf-8")
+    (sample_info_dir / "samples.txt").write_text("collapse-must-not-be-used\n", encoding="utf-8")
+
+    result = _exercise_getting_run_summary_identity_block(
+        mode="track",
+        sample_info_dir=sample_info_dir,
+        outdir_resolved=outdir,
+        launch_dir=launch_dir,
+        run_name="different-run-name",
+        run_id="stable-run-id",
+    )
+    missing_path = sample_info_dir / missing_name
+    assert result.returncode == 1
+    assert str(missing_path) in result.stderr
+    assert "identity-mode=track requires" in result.stderr
+    assert result.stdout == ""
+
+
+def test_getting_run_summary_identity_collapse_uses_authoritative_roster(tmp_path: Path) -> None:
+    launch_dir = tmp_path / "launch"
+    outdir = tmp_path / "custom-output"
+    sample_info_dir = launch_dir / "results" / "sample_info" / "stable-run-id"
+    old_decoy_dir = outdir / "sample_info" / "new-resume-name"
+    sample_info_dir.mkdir(parents=True)
+    old_decoy_dir.mkdir(parents=True)
+    (sample_info_dir / "samples.txt").write_text("authoritative\n", encoding="utf-8")
+    (old_decoy_dir / "samples.txt").write_text("decoy\n", encoding="utf-8")
+
+    assert _summary_identity_args(
+        _exercise_getting_run_summary_identity_block(
+            mode="collapse",
+            sample_info_dir=sample_info_dir,
+            outdir_resolved=outdir,
+            launch_dir=launch_dir,
+            run_name="new-resume-name",
+            run_id="stable-run-id",
+        )
+    ) == (
+        f"--sample-roster {sample_info_dir / 'samples.txt'}",
+        "",
+        "--identity-mode collapse",
+    )
+
+
+@pytest.mark.parametrize("create_empty", [False, True])
+def test_getting_run_summary_identity_collapse_omits_empty_or_missing_roster(
+    tmp_path: Path, create_empty: bool
+) -> None:
+    launch_dir = tmp_path / "launch"
+    outdir = launch_dir / "results"
+    sample_info_dir = outdir / "sample_info" / "stable-run-id"
+    sample_info_dir.mkdir(parents=True)
+    if create_empty:
+        (sample_info_dir / "samples.txt").write_bytes(b"")
+
+    assert _summary_identity_args(
+        _exercise_getting_run_summary_identity_block(
+            mode="collapse",
+            sample_info_dir=sample_info_dir,
+            outdir_resolved=outdir,
+            launch_dir=launch_dir,
+            run_name="different-run-name",
+            run_id="stable-run-id",
+        )
+    ) == ("", "", "")
+
+
+def test_getting_run_summary_identity_direct_invocation_uses_root_sample_info(tmp_path: Path) -> None:
+    launch_dir = tmp_path / "launch"
+    outdir = tmp_path / "custom-output"
+    sample_info_dir = launch_dir / "results" / "sample_info"
+    run_name_decoy = sample_info_dir / "direct-run-name"
+    sample_info_dir.mkdir(parents=True)
+    run_name_decoy.mkdir()
+    (sample_info_dir / "samples.txt").write_text("root-authoritative\n", encoding="utf-8")
+    (run_name_decoy / "samples.txt").write_text("decoy\n", encoding="utf-8")
+
+    assert _summary_identity_args(
+        _exercise_getting_run_summary_identity_block(
+            mode="collapse",
+            sample_info_dir=sample_info_dir,
+            outdir_resolved=outdir,
+            launch_dir=launch_dir,
+            run_name="direct-run-name",
+            run_id="",
+        )
+    ) == (f"--sample-roster {sample_info_dir / 'samples.txt'}", "", "--identity-mode collapse")
 
 
 def test_main_nf_getting_run_summary_conditional_consensus_consolidated_ids() -> None:
