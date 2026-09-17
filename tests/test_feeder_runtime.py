@@ -88,11 +88,13 @@ def make_pod5_stub_env(tmp_path: Path, *, inspect_counts: dict[str, int], view_r
     stub_path.write_text(
         "#!/usr/bin/env python3\n"
         "import json\n"
+        "import os, time\n"
         "import sys\n"
         "from pathlib import Path\n"
         f"INSPECT_COUNTS = {json.dumps(inspect_counts)}\n"
         f"VIEW_ROWS = {json.dumps(view_rows)}\n"
-        "args = sys.argv[1:]\n"
+        + _POD5_TWO_OPEN_CONTRACT
+        + "args = sys.argv[1:]\n"
         "if not args:\n"
         "    raise SystemExit(99)\n"
         "def key_for(path):\n"
@@ -100,9 +102,9 @@ def make_pod5_stub_env(tmp_path: Path, *, inspect_counts: dict[str, int], view_r
         "if args[:2] == ['inspect', 'summary']:\n"
         "    key = key_for(args[2])\n"
         "    if key not in INSPECT_COUNTS:\n"
-        "        print(f'missing inspect count for {key}', file=sys.stderr)\n"
-        "        raise SystemExit(2)\n"
-        "    count = int(INSPECT_COUNTS[key])\n"
+        "        count = inspect_filtered(Path(args[2]))\n"
+        "    else:\n"
+        "        count = int(INSPECT_COUNTS[key])\n"
         "    batches = (count + 999) // 1000\n"
         "    if batches == 0:\n"
         "        batches = 1\n"
@@ -162,7 +164,7 @@ def make_pod5_stub_env(tmp_path: Path, *, inspect_counts: dict[str, int], view_r
         "    if ids_path:\n"
         "        count = sum(1 for line in Path(ids_path).read_text(encoding='utf-8').splitlines() if line.strip())\n"
         "    if output_path:\n"
-        "        Path(output_path).write_text('filtered\\n', encoding='utf-8')\n"
+        "        write_filtered(Path(output_path), Path(ids_path))\n"
         "    print(f'Found {count} read_ids from 1 inputs')\n"
         "    print(f'Calculated {count} transfers')\n"
         "    raise SystemExit(0)\n"
@@ -495,6 +497,9 @@ def test_startup_orphan_cleanup(tmp_path: Path) -> None:
     try:
         wait_for(lock_meta.exists, timeout=10)
         wait_for(lambda: not orphan_ori.exists() and not orphan_rt.exists(), timeout=5)
+        # File removal precedes its log/ledger records. Let startup finish before
+        # SIGTERM, especially now that it also reclaims publication temporaries.
+        wait_for((meta_dir / "round_commit_ledger.tsv").exists, timeout=5)
         assert proc.poll() is None
     finally:
         stop_process(proc)
@@ -1107,3 +1112,383 @@ def test_rtbioscan_do_metadata_refuses_live_feeder_lock(tmp_path: Path) -> None:
         stop_process(proc)
         shutil.rmtree(REPO_ROOT / "results" / "pod5" / run_id, ignore_errors=True)
         shutil.rmtree(sample_info_dir, ignore_errors=True)
+
+
+# Synthetic, non-biological payload. Like pod5 0.3.10, the writer closes the
+# signal stream and then reopens the SAME pathname in append mode for the footer.
+_POD5_TWO_OPEN_CONTRACT = r'''
+def event(phase, path):
+    control = os.environ.get('S1F_CONTROL')
+    if not control:
+        return
+    control = Path(control)
+    with (control / 'events').open('a') as stream:
+        stream.write(json.dumps([phase, str(path)]) + '\n')
+    if os.environ.get('S1F_PAUSE') == phase:
+        (control / phase).write_text(str(path))
+        deadline = time.monotonic() + 30
+        while not (control / ('release_' + phase)).exists():
+            if time.monotonic() > deadline:
+                raise SystemExit(97)
+            time.sleep(.01)
+
+def write_filtered(path, ids_path):
+    event('output', path)
+    if path.suffix != '.pod5':
+        raise SystemExit('writer requires a .pod5 suffix')
+    ids = ids_path.read_text().splitlines()
+    if os.environ.get('S1F_MODE') == 'mismatch':
+        ids = ids[:1]
+    if os.environ.get('S1F_MODE') == 'zero':
+        ids = []
+    signals = {rid: [idx, -idx, 17] for idx, rid in enumerate(ids, 1)}
+    with path.open('w') as stream:
+        stream.write(json.dumps({'signals': signals}) + '\n')
+        stream.flush()
+        event('writing', path)
+    event('signal_closed', path)
+    if os.environ.get('S1F_MODE') == 'filter_fail':
+        raise SystemExit(2)
+    with path.open('a') as stream:
+        stream.write(json.dumps({'ids': ids, 'footer': 'complete'}) + '\n')
+    event('closed', path)
+
+def inspect_filtered(path):
+    event('inspect', path)
+    mode = os.environ.get('S1F_MODE')
+    if mode == 'validation_fail':
+        # Valid-looking stdout must not override unsuccessful command status.
+        print('Found 1 batches, 2 reads')
+        raise SystemExit(2)
+    if mode == 'malformed':
+        print('Found 1 batches, unknown reads')
+        raise SystemExit(0)
+    try:
+        signal_part, footer = map(json.loads, path.read_text().splitlines())
+        assert footer['footer'] == 'complete'
+        assert set(footer['ids']) == set(signal_part['signals'])
+    except (ValueError, KeyError, AssertionError):
+        raise SystemExit(2)
+    event('validated', path)
+    return len(footer['ids'])
+'''
+
+
+_S1F_BASE = 'fce55e8af19051e6f1f90fa2260fe0821db3e35f'
+
+
+def _s1f_setup(root: Path, *, mode: str = '', pause: str = '') -> dict[str, str]:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'input').mkdir()
+    (root / 'control').mkdir()
+    source = root / 'input' / 'sample.pod5'
+    source.write_bytes(b'synthetic-source')
+    os.utime(source, (1700000000, 1700000000))
+    env = make_pod5_stub_env(root, inspect_counts={'sample.pod5': 2},
+                             view_rows={'sample.pod5': ['r1\tfile1', 'r2\tfile1']})
+    env.update(S1F_CONTROL=str(root / 'control'), S1F_MODE=mode, S1F_PAUSE=pause)
+    # Freeze only epoch timestamps so equal inputs give byte-identical records.
+    date = root / 'fake-bin' / 'date'
+    date.write_text('#!/bin/bash\nif [ "$*" = "+%s" ]; then echo 1700000000; else exec /bin/date "$@"; fi\n')
+    date.chmod(0o755)
+    mv = root / 'fake-bin' / 'mv'
+    mv.write_text(
+        '#!/usr/bin/env python3\nimport os, sys, time, json, subprocess\nfrom pathlib import Path\n'
+        + _POD5_TWO_OPEN_CONTRACT + r'''
+args = sys.argv[1:]
+source, dest = map(Path, args[-2:])
+publication = source.parent.name == 'ori_round_pod5' and dest.parent == source.parent
+if publication:
+    event('before_rename', source)
+    if os.environ.get('S1F_MODE') == 'rename_fail':
+        raise SystemExit(2)
+status = subprocess.call(['/bin/mv'] + args)
+if publication and status == 0:
+    event('after_rename', dest)
+raise SystemExit(status)
+''')
+    mv.chmod(0o755)
+    return env
+
+
+def _s1f_paths(root: Path) -> tuple[Path, Path, Path]:
+    base = root / 'results' / 'pod5' / 'S1F_Run'
+    return base / 'ori_round_pod5', base / 'reads_rt_round_pod5', base / 'metadata'
+
+
+def _s1f_start(root: Path, env: dict[str, str], script: Path | None = None):
+    script = script or Path(os.environ.get('S1F_FEEDER', str(FEEDER)))
+    log = (root / 'feeder-output').open('a')
+    try:
+        return subprocess.Popen(
+            ['/bin/bash', str(script), '--run_id', 'S1F_Run', '--input_folder', str(root / 'input'),
+             '--sleep_time', '1', '--num_reads', '2', '--targets', 'COI|ITS2'],
+            cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    finally:
+        log.close()
+
+
+def _s1f_kill(proc) -> None:
+    # Kill the whole isolated process group, including a writer/rename at a gate.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=5)
+
+
+def _s1f_gate(root: Path, phase: str) -> Path:
+    marker = root / 'control' / phase
+    wait_for(marker.exists, timeout=15)
+    path = Path(marker.read_text())
+    return path if path.is_absolute() else root / path
+
+
+def _s1f_no_commit(root: Path) -> None:
+    _, _, meta = _s1f_paths(root)
+    assert not list(meta.glob('*_slice.tsv')), 'sidecar advanced before publication'
+    assert not list(meta.glob('progress_reads_*.count')), 'progress advanced before publication'
+    assert not list(meta.glob('*_read_info_rpt.txt')), 'metadata advanced before publication'
+    ledger = meta / 'round_commit_ledger.tsv'
+    assert not ledger.exists() or not ledger.read_text().strip(), 'ledger advanced before publication'
+
+
+def _s1f_payload(path: Path, expected_ids=('r1', 'r2')) -> None:
+    # Independent oracle: both serialized sections and exact signal vectors,
+    # rather than trusting the fake's summary/count alone.
+    signals, footer = [json.loads(line) for line in path.read_text().splitlines()]
+    assert footer == {'ids': list(expected_ids), 'footer': 'complete'}
+    assert signals == {'signals': {rid: [idx, -idx, 17] for idx, rid in enumerate(expected_ids, 1)}}
+
+
+def _s1f_committed(root: Path, env: dict[str, str]) -> Path:
+    spool, ready, meta = _s1f_paths(root)
+    wait_for(lambda: len(list(ready.glob('S1F_Run_*.pod5'))) == 1, timeout=15)
+    final = next(ready.glob('S1F_Run_*.pod5'))
+    assert not list(spool.iterdir()), 'publication left a temporary or duplicate spool file'
+    assert (meta / 'progress_reads_sample.pod5.count').read_text() == '2\n'
+    ledger = (meta / 'round_commit_ledger.tsv').read_text().splitlines()
+    assert len(ledger) == 1 and ledger[0].endswith('\t' + final.stem)
+    result = subprocess.run(['pod5', 'inspect', 'summary', str(final)], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    count = len(json.loads(final.read_text().splitlines()[1])['ids'])
+    assert result.stdout.rstrip().endswith(f', {count} reads')
+    return final
+
+
+def _s1f_function(script: Path, name: str) -> str:
+    return name + '() {' + script.read_text().split(name + '() {', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
+
+
+def test_s1f_atomic_visibility_and_order(tmp_path: Path) -> None:
+    env = _s1f_setup(tmp_path, pause='writing')
+    proc = _s1f_start(tmp_path, env)
+    spool, ready, _ = _s1f_paths(tmp_path)
+    try:
+        partial = _s1f_gate(tmp_path, 'writing')
+        assert partial.name == '.S1F_Run_0.partial.pod5', 'writer output must be hidden and POD5-suffixed'
+        assert partial.parent == spool
+        assert list(spool.iterdir()) == [partial]
+        assert not (spool / 'S1F_Run_0.pod5').exists(), 'incomplete final became visible'
+        _s1f_no_commit(tmp_path)
+        # Execute the existing feeder scanner/publisher and the pipeline's shell
+        # glob discovery while the writer is paused; neither may select partial.
+        code = ''.join(_s1f_function(FEEDER, name) for name in
+                       ('count_pod5_files', 'pod5_mtime_epoch', 'publish_pending_round'))
+        code += '\noutput_folder=$1; output_rt=$2; count_pod5_files "$1"; publish_pending_round\n'
+        code += 'for f in "$1"/*.pod5; do [ ! -f "$f" ] || printf "VISIBLE:%s\\n" "$f"; done\n'
+        result = subprocess.run(['/bin/bash', '-c', code, 'scan', str(spool), str(ready)], capture_output=True, text=True)
+        assert result.stdout.strip() == '0', 'ready discovery selected incomplete output'
+        assert not list(ready.iterdir())
+        (tmp_path / 'control' / 'release_writing').touch()
+        final = _s1f_committed(tmp_path, env)
+        _s1f_payload(final)
+        events = [json.loads(line)[0] for line in (tmp_path / 'control' / 'events').read_text().splitlines()]
+        assert events.index('closed') < events.index('validated') < events.index('before_rename') < events.index('after_rename')
+    finally:
+        _s1f_kill(proc)
+
+
+@pytest.mark.parametrize('mode', ['filter_fail', 'validation_fail', 'malformed', 'zero', 'rename_fail'])
+def test_s1f_failures_remain_retryable(tmp_path: Path, mode: str) -> None:
+    env = _s1f_setup(tmp_path, mode=mode)
+    proc = _s1f_start(tmp_path, env)
+    spool, ready, _ = _s1f_paths(tmp_path)
+    try:
+        wait_for(lambda: 'round emission aborted.' in (tmp_path / 'feeder-output').read_text()
+                 or list(spool.glob('S1F_Run_*.pod5')) or list(ready.glob('*.pod5')), timeout=15)
+        assert not list(spool.glob('S1F_Run_*.pod5')), 'failed output was published'
+        assert not list(ready.glob('*.pod5')), 'failed output reached ready queue'
+        _s1f_no_commit(tmp_path)
+        wait_for(lambda: not list(spool.glob('.*.partial.pod5')))
+    finally:
+        _s1f_kill(proc)
+    env['S1F_MODE'] = ''
+    proc = _s1f_start(tmp_path, env)
+    try:
+        _s1f_payload(_s1f_committed(tmp_path, env))
+    finally:
+        _s1f_kill(proc)
+
+
+@pytest.mark.parametrize('phase', ['writing', 'before_rename', 'after_rename'])
+def test_s1f_interruption_reconciles(tmp_path: Path, phase: str) -> None:
+    env = _s1f_setup(tmp_path, pause=phase)
+    proc = _s1f_start(tmp_path, env)
+    spool, ready, meta = _s1f_paths(tmp_path)
+    try:
+        paused = _s1f_gate(tmp_path, phase)
+        _s1f_no_commit(tmp_path)
+        if phase == 'after_rename':
+            assert paused == spool / 'S1F_Run_0.pod5'
+            _s1f_payload(paused)
+        else:
+            assert not list(spool.glob('S1F_Run_*.pod5')), 'final visible before validated rename'
+        assert not list(ready.iterdir())
+    finally:
+        _s1f_kill(proc)
+    env['S1F_PAUSE'] = ''
+    proc = _s1f_start(tmp_path, env)
+    try:
+        final = _s1f_committed(tmp_path, env)
+        _s1f_payload(final)
+        assert final.stem == 'S1F_Run_1', 'existing round reservation semantics changed'
+        assert not paused.exists()
+        if phase == 'after_rename':
+            assert 'startup_orphan_cleanup' in (meta / 'S1F_Run_feeder.log').read_text()
+        # One slice remains consumed across a further restart; no duplicate ledger.
+    finally:
+        _s1f_kill(proc)
+    (tmp_path / 'feeder-output').write_text('')
+    proc = _s1f_start(tmp_path, env)
+    try:
+        wait_for(lambda: 'Buffered unread reads=0' in (tmp_path / 'feeder-output').read_text(), timeout=15)
+        assert _s1f_committed(tmp_path, env) == final
+    finally:
+        _s1f_kill(proc)
+
+
+def test_s1f_count_mismatch_warns_once(tmp_path: Path) -> None:
+    env = _s1f_setup(tmp_path, mode='mismatch')
+    proc = _s1f_start(tmp_path, env)
+    try:
+        final = _s1f_committed(tmp_path, env)
+        _s1f_payload(final, ('r1',))
+        warning = 'WARNING: round S1F_Run_0 authoritative read count (1) differs from selected ID count (2); publishing validated output.'
+        assert (tmp_path / 'feeder-output').read_text().count(warning) == 1
+        # The pre-existing ledger is a selected-slice contract; validation must
+        # not change its read_count or its progress ranges to the output count.
+        _, _, meta = _s1f_paths(tmp_path)
+        sidecar = (meta / 'S1F_Run_0_slice.tsv').read_text()
+        assert int(sidecar.split('# read_count=', 1)[1].splitlines()[0]) == 2
+    finally:
+        _s1f_kill(proc)
+
+
+def test_s1f_startup_sweep_boundaries(tmp_path: Path) -> None:
+    spool = tmp_path / 'spool'
+    ready = tmp_path / 'ready'
+    meta = tmp_path / 'metadata'
+    for directory in (spool, ready, meta):
+        directory.mkdir()
+    stale = spool / '.S1F_Run_4.partial.pod5'
+    keep = [spool / 'S1F_Run_3.pod5', spool / '.unrelated',
+            spool / '.S1F_Run_other_4.partial.pod5', spool / '.S1F_Run_4x.partial.pod5',
+            spool / '.S1F_Run_.partial.pod5', spool / '.S1F_Run_4.partial.pod5.extra',
+            ready / '.S1F_Run_4.partial.pod5', tmp_path / '.S1F_Run_4.partial.pod5']
+    for path in [stale, *keep]:
+        path.write_text('keep')
+    symlink = spool / '.S1F_Run_5.partial.pod5'
+    symlink.symlink_to(keep[-1])
+    # Preserve a completed round under the existing orphan-reconciliation rules.
+    (meta / 'S1F_Run_3_slice.tsv').write_text('# committed\n')
+    script = Path(os.environ.get('S1F_FEEDER', str(FEEDER)))
+    code = _s1f_function(script, 'startup_cleanup_orphan_rounds')
+    code += '\nslice_sidecar_path_for_round() { printf "%s/%s_slice.tsv" "$metadata" "$1"; }\n'
+    code += 'feeder_log_event() { :; }\nrun_id=S1F_Run; output_folder=$1; output_rt=$2; metadata=$3\nstartup_cleanup_orphan_rounds\n'
+    result = subprocess.run(['/bin/bash', '-c', code, 'cleanup', str(spool), str(ready), str(meta)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert not stale.exists()
+    assert all(path.read_text() == 'keep' for path in keep)
+    assert symlink.is_symlink()
+
+
+def _s1f_baseline(tmp_path: Path) -> Path:
+    script = tmp_path / 'baseline.sh'
+    script.write_bytes(subprocess.check_output(['git', 'show', f'{_S1F_BASE}:bin/Metadata_pod5_processing.sh'], cwd=REPO_ROOT))
+    return script
+
+
+def test_s1f_success_matches_immutable_base(tmp_path: Path) -> None:
+    baseline = _s1f_baseline(tmp_path)
+    records = []
+    for label, script in [('before', baseline), ('after', None)]:
+        root = tmp_path / label
+        env = _s1f_setup(root)
+        proc = _s1f_start(root, env, script)
+        try:
+            final = _s1f_committed(root, env)
+            assert final.name == 'S1F_Run_0.pod5'
+            _s1f_payload(final)
+            _, _, meta = _s1f_paths(root)
+            names = ['S1F_Run_0_slice.tsv', 'progress_reads_sample.pod5.count',
+                     'S1F_Run_0_read_info_rpt.txt', 'round_commit_ledger.tsv',
+                     'S1F_Run_reads_time_rpt.txt', 'next_round_id.count']
+            records.append({name: (meta / name).read_bytes() for name in names})
+        finally:
+            _s1f_kill(proc)
+    assert records[0] == records[1], 'successful commit records changed'
+
+
+def test_s1f_baseline_race_splits_writer_and_advances_progress(tmp_path: Path) -> None:
+    baseline = _s1f_baseline(tmp_path)
+    root = tmp_path / 'race'
+    env = _s1f_setup(root, pause='writing')
+    proc = _s1f_start(root, env, baseline)
+    try:
+        visible = _s1f_gate(root, 'writing')
+        assert visible.name == 'S1F_Run_0.pod5'
+        assert len(visible.read_text().splitlines()) == 1
+        # Concurrent promotion between the two opens leaves permanent fragments.
+        moved = root / 'consumer.pod5'
+        visible.rename(moved)
+        (root / 'control' / 'release_writing').touch()
+        _, ready, meta = _s1f_paths(root)
+        wait_for(lambda: (meta / 'progress_reads_sample.pod5.count').exists(), timeout=15)
+        wait_for(lambda: (ready / 'S1F_Run_0.pod5').exists())
+        assert (meta / 'progress_reads_sample.pod5.count').read_text() == '2\n'
+        for fragment in [moved, ready / 'S1F_Run_0.pod5']:
+            result = subprocess.run(['pod5', 'inspect', 'summary', str(fragment)], env=env, capture_output=True)
+            assert result.returncode != 0, 'split fragment unexpectedly validates'
+    finally:
+        _s1f_kill(proc)
+
+
+def test_s1f_writer_requires_pod5_suffix(tmp_path: Path) -> None:
+    env = _s1f_setup(tmp_path, pause='output')
+    proc = _s1f_start(tmp_path, env)
+    try:
+        output = _s1f_gate(tmp_path, 'output')
+        assert output.suffix == '.pod5', 'writer output lost required .pod5 suffix'
+        (tmp_path / 'control' / 'release_output').touch()
+        _s1f_payload(_s1f_committed(tmp_path, env))
+    finally:
+        _s1f_kill(proc)
+
+
+def test_s1f_does_not_replace_existing_final(tmp_path: Path) -> None:
+    env = _s1f_setup(tmp_path, pause='writing')
+    proc = _s1f_start(tmp_path, env)
+    spool, _, _ = _s1f_paths(tmp_path)
+    try:
+        _s1f_gate(tmp_path, 'writing')
+        final = spool / 'S1F_Run_0.pod5'
+        final.write_bytes(b'existing final must survive')
+        (tmp_path / 'control' / 'release_writing').touch()
+        wait_for(lambda: 'failed to publish pod5' in (tmp_path / 'feeder-output').read_text(), timeout=15)
+        assert final.read_bytes() == b'existing final must survive'
+        _s1f_no_commit(tmp_path)
+        wait_for(lambda: not list(spool.glob('.*.partial.pod5')))
+    finally:
+        _s1f_kill(proc)

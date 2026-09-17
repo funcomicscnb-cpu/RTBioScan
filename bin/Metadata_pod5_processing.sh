@@ -2133,6 +2133,19 @@ EOF
 
 startup_cleanup_orphan_rounds() {
   local pod5_path round_id sidecar_path rpt_path rpt_round_id rpt_sidecar rpt_num
+  local partial_path partial_num
+
+  # Only this run's numeric round temporaries in the feeder spool are ours.
+  for partial_path in "$output_folder"/".${run_id}_"*.partial.pod5; do
+    [ -f "$partial_path" ] && [ ! -L "$partial_path" ] || continue
+    partial_num="${partial_path##*/}"
+    partial_num="${partial_num#.${run_id}_}"
+    partial_num="${partial_num%.partial.pod5}"
+    case "$partial_num" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    rm -f "$partial_path"
+  done
 
   for pod5_path in \
     "$output_folder"/"${run_id}"_*.pod5 \
@@ -3128,11 +3141,23 @@ for ((;;));do
 						out_id=$(next_round_output_id)
 						round_id="${run_id}_${out_id}"
 						round_output="${output_folder}/${round_id}.pod5"
-						rm -f "$round_output"
-						if ! pod5 filter "${round_inputs[@]}" --ids "$tmp_round_ids" --output "$round_output"; then
+						round_partial="${output_folder}/.${round_id}.partial.pod5"
+						rm -f "$round_partial"
+						if ! pod5 filter "${round_inputs[@]}" --ids "$tmp_round_ids" --output "$round_partial"; then
 							echo "WARNING: pod5 filter failed for round ${round_id}; round emission aborted."
-							rm -f "$round_output"
+							rm -f "$round_partial"
+						elif ! round_read_count="$(pod5_authoritative_read_count "$round_partial")" || [ "$round_read_count" -eq 0 ]; then
+							echo "WARNING: invalid or empty pod5 output for round ${round_id}; round emission aborted."
+							rm -f "$round_partial"
 						else
+							if [ "$round_read_count" -ne "$id_count" ]; then
+								printf 'WARNING: round %s authoritative read count (%s) differs from selected ID count (%d); publishing validated output.\n' "$round_id" "$round_read_count" "$id_count"
+							fi
+							# The writer has closed and validation passed; publish on the same filesystem.
+							if [ -e "$round_output" ] || [ -L "$round_output" ] || ! mv "$round_partial" "$round_output"; then
+								echo "WARNING: failed to publish pod5 for round ${round_id}; round emission aborted."
+								rm -f "$round_partial"
+							else
 							metadata_output="${metadata}/${round_id}_read_info_rpt.txt"
 							metadata_tmp="${metadata_output}.tmp.$$"
 							sidecar_output="$(slice_sidecar_path_for_round "$round_id")"
@@ -3215,6 +3240,7 @@ for ((;;));do
 									rm -f "${progress_backups[$progress_idx]}"
 								done
 								fi
+							fi
 							fi
 						fi
 							fi

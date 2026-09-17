@@ -459,7 +459,7 @@ def test_feeder_accumulates_reads_across_multiple_full_pod5_files() -> None:
     assert "archived_files=$(list_visible_pod5_files \"$output_full_pod5\")" in text
     assert "needed_reads=$(( num_reads - collected_reads ))" in text
     assert "if [ \"$collected_reads\" -ge \"$num_reads\" ]; then" in text
-    assert "pod5 filter \"${round_inputs[@]}\" --ids \"$tmp_round_ids\" --output \"$round_output\"" in text
+    assert "pod5 filter \"${round_inputs[@]}\" --ids \"$tmp_round_ids\" --output \"$round_partial\"" in text
     assert "Buffered unread reads=${collected_reads}; waiting until ${num_reads} reads are available before emitting next round" in text
 
 
