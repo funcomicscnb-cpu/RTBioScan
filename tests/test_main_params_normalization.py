@@ -3113,11 +3113,11 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'REPORT_RENDER_LOCK="\\$STATE_TMP/.report_render.lock"' in backup_block
     assert 'REPORT_LIVE_PUBLISH_LOCK="\\$STATE_TMP/.report_live_publish.lock"' in backup_block
     assert 'RUN_REPORT_JSON="\\$ROUND_TMP/run_report.json"' in backup_block
-    assert 'RUN_INDEX_JSONL="${params.outdir}/report_html/runs_index.jsonl"' in backup_block
-    assert 'RUN_INDEX_LOCK="${params.outdir}/.runs_index.lock"' in backup_block
-    assert 'RUN_REPORT_DIR="${params.outdir}/report_html/runs/${run_name}"' in backup_block
+    assert 'RUN_INDEX_JSONL="${outdirResolved}/report_html/runs_index.jsonl"' in backup_block
+    assert 'RUN_INDEX_LOCK="${outdirResolved}/.runs_index.lock"' in backup_block
+    assert 'RUN_REPORT_DIR="${outdirResolved}/report_html/runs/${run_name}"' in backup_block
     assert 'RUN_REPORT_PENDING="\\$RUN_REPORT_DIR/.report_render_pending"' in backup_block
-    assert 'REPORT_ASSET_DIR="${params.outdir}/report_html/runs/${run_name}/report_assets"' in backup_block
+    assert 'REPORT_ASSET_DIR="${outdirResolved}/report_html/runs/${run_name}/report_assets"' in backup_block
     assert 'history_lock_acquired=0' in backup_block
     assert 'release_report_history_lock() {' in backup_block
     assert 'acquire_report_history_lock() {' in backup_block
@@ -3163,7 +3163,7 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert '--skip-root-report \\' in async_block
     assert 'python3 ${baseDir}/bin/report_publication_check.py \\' in async_block
     assert 'clear_run_report_pending' in async_block
-    assert 'REPORT_ROOT_RENDER_LOCK="${params.outdir}/.report_root_render.lock"' in async_block
+    assert 'REPORT_ROOT_RENDER_LOCK="${outdirResolved}/.report_root_render.lock"' in async_block
     assert "blst_rpt_summary = preferRealRoundRows(blst_rpt_summary, failed_blst_rpt_summary, 'blst_rpt_summary')" in text
     assert "blast_agg_ch = preferRealRoundRows(blast_agg_ch, failed_blast_agg_ch, 'blast_agg_ch')" in text
     assert "cons_agg_ch = preferRealRoundRows(cons_agg_ch, failed_cons_agg_ch, 'cons_agg_ch')" in text

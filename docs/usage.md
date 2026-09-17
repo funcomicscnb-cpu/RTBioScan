@@ -140,7 +140,7 @@ Use this pattern only when you intentionally want to reuse the same `results/pod
 | `--skip_pod5` | off | Skip the POD5 splitting loop in the feeder (metadata setup only). |
 | `--delete-full-pod5` | off | Delete each file from `full_pod5/` as soon as all its reads have been sliced into round chunks. See [Disk management](#disk-management-pruning-pod5-files-during-a-run). |
 | `--delete_input_pod5` | off | Delete the processed intake POD5 from `reads_rt_round_pod5/` immediately after each round completes, instead of archiving it to `done_round_pod5/`. Shorthand for passing `--delete_input_pod5 true` to Nextflow. See [Disk management](#disk-management-pruning-pod5-files-during-a-run). |
-| `--delete_from_ori_dir` | off | Delete the source POD5 from `ori_round_pod5/` after it has been staged into the intake queue. Shorthand for passing `--delete_from_ori_dir true` to Nextflow. See [Disk management](#disk-management-pruning-pod5-files-during-a-run). |
+| `--delete_from_ori_dir` | off | Compatibility flag passed to Nextflow. The current feeder moves spool chunks into intake independently of this flag. See [Disk management](#disk-management-pruning-pod5-files-during-a-run). |
 
 **Report server options:**
 
@@ -237,7 +237,7 @@ full_pod5/             ← staging copy; sliced repeatedly until all reads are c
        │  pod5 filter  (feeder: once per round, num_reads reads at a time)
        ▼
 ori_round_pod5/        ← sized round chunk waiting to be promoted
-       │  mv / ln -s   (feeder: when the intake queue is empty)
+       │  mv           (feeder: when the intake queue is empty)
        ▼
 reads_rt_round_pod5/   ← active intake for the Nextflow pipeline
        │  backup_update_and_clean  (pipeline: after the round is fully processed)
@@ -245,25 +245,25 @@ reads_rt_round_pod5/   ← active intake for the Nextflow pipeline
 done_round_pod5/       ← archive of processed rounds (default final destination)
 ```
 
-Without any pruning option, all four directories accumulate files for the entire run. On a multi-day run with 200 000-read chunks, this can reach tens to hundreds of gigabytes depending on the sequencer yield.
+Without pruning, `full_pod5/` and `done_round_pod5/` accumulate files for the entire run; spool and intake hold pending chunks. On a multi-day run with 200 000-read chunks, this can reach tens to hundreds of gigabytes depending on the sequencer yield.
 
-#### The three pruning options
+#### Pruning and compatibility options
 
 | Option (RTBioScan.sh) | Nextflow param | Removes | When |
 | --- | --- | --- | --- |
 | `--delete-full-pod5` | *(feeder-only, not a Nextflow param)* | `full_pod5/<file>.pod5` | Immediately after every read in that file has been sliced into round chunks |
 | `--delete_input_pod5` | `--delete_input_pod5 true` | `reads_rt_round_pod5/<file>.pod5` (or the `done_round_pod5/` copy) | After `backup_update_and_clean` completes for that round |
-| `--delete_from_ori_dir` | `--delete_from_ori_dir true` | `ori_round_pod5/<file>.pod5` | When the feeder moves it from `ori_round_pod5/` into `reads_rt_round_pod5/` |
+| `--delete_from_ori_dir` | `--delete_from_ori_dir true` | Compatibility flag; no additional deletion | The feeder always moves spool chunks into empty intake, independently of this flag |
 
 #### Consequences and irreversibility
 
-> **Warning — all three options are irreversible.** Files removed during the run cannot be recovered unless you retain the original MinKNOW output folder. Do not enable these options if you may need to replay a round or inspect the raw signal data later.
+> **Warning — file deletion is irreversible.** Files removed during the run cannot be recovered unless you retain the original MinKNOW output folder. Do not enable these options if you may need to replay a round or inspect the raw signal data later.
 
 **`--delete-full-pod5`** removes the staging copy from `full_pod5/` once every read in that file has been assigned to a round chunk. This is the largest category of data: a full POD5 from MinKNOW is typically several gigabytes, and `full_pod5/` retains all of them permanently by default. After deletion, the feeder writes a `metadata/deleted_<file>.flag` sentinel so the file is never re-imported from `input_folder` in subsequent loop iterations. Consequence: the original read-level signal is no longer accessible on the pipeline host; FAST5/POD5 replay is impossible unless `input_folder` is on a separate volume that you control.
 
-**`--delete_input_pod5`** removes each round chunk from `reads_rt_round_pod5/` immediately after `backup_update_and_clean` finishes. In the default case (symlink-based feeder), `reads_rt_round_pod5/` holds only symlinks, so only the symlink is removed — the actual file in `ori_round_pod5/` is untouched. In copy-based setups, the actual chunk file is deleted. Either way, `done_round_pod5/` is skipped entirely and the chunk is not archived. The `done_pod5.txt` tracking file is still updated, so the feeder's deduplication logic continues to work correctly. Consequence: per-round POD5 chunks cannot be inspected after the run; re-running a specific round from its chunk requires keeping `ori_round_pod5/` or `full_pod5/`.
+**`--delete_input_pod5`** removes each round chunk from `reads_rt_round_pod5/` immediately after `backup_update_and_clean` finishes. The current feeder moves the actual chunk into intake, so that chunk is deleted. For a manually supplied symlink, only the symlink is removed. Either way, `done_round_pod5/` is skipped entirely and the chunk is not archived. The `done_pod5.txt` tracking file is still updated, so the feeder's deduplication logic continues to work correctly. Consequence: per-round POD5 chunks cannot be inspected after the run; re-running a specific round from its chunk requires keeping `ori_round_pod5/` or `full_pod5/`.
 
-**`--delete_from_ori_dir`** removes the round chunk from `ori_round_pod5/` at the moment the feeder moves it into `reads_rt_round_pod5/`. This option is primarily useful when the feeder uses `mv` (destructive staging, enabled automatically when `delete_from_ori_dir = true`), draining the spool directory aggressively. Consequence: `ori_round_pod5/` is empty except for the one chunk currently in-flight; no spool copy exists for the round that has just started.
+**`--delete_from_ori_dir`** is retained for compatibility. The current feeder always moves the completed round chunk from `ori_round_pod5/` into `reads_rt_round_pod5/` when intake is empty, independently of this flag. The pipeline no longer scans or promotes spool files, and its backup process does not use this flag.
 
 #### Recommended combinations
 
@@ -920,7 +920,7 @@ Optional ID-to-lineage mapping table used during reporting and taxonomy consolid
 #### `--outdir`
 [back to Top](#rtbioscan-usage)
 
-Output directory for all results. Default: `$launchDir/results`.
+Output directory for all results. Default: `$launchDir/results`. Relative values resolve from the Nextflow launch directory; absolute values keep their spelling.
 
 #### `--run_mode`
 [back to Top](#rtbioscan-usage)
@@ -946,10 +946,11 @@ Controls whether new files are watched for in realtime mode.
 #### `--ori_dir`
 [back to Top](#rtbioscan-usage)
 
-Origin POD5 spool directory used by feeder-style deployments and cleanup logic.
+Origin POD5 spool parameter retained for feeder/wrapper compatibility.
 
 - Default: `$launchDir/results/pod5/ori_round_pod5/`.
-- Mainly used by `backup_update_and_clean` when `--delete_from_ori_dir` is enabled.
+- The pipeline does not scan or promote from `ori_round_pod5`; the feeder owns spool-to-intake publication.
+- Direct Nextflow runs without the feeder must place completed chunks in the intake path configured by `--reads`.
 - `RTBioScan.sh --run_id` auto-injects `results/pod5/<run_id>/ori_round_pod5/` unless you override it.
 
 #### `--state_id`
@@ -1106,15 +1107,15 @@ Delete or detach the processed intake POD5 after a round completes.
 
 - Default: `false`.
 - If the intake file is a symlink, only the symlink is removed.
-- The processed POD5 is still moved into `results/pod5/<run_id>/done_round_pod5/` before this cleanup logic.
+- When enabled, deletion replaces archival to `results/pod5/<run_id>/done_round_pod5/`.
 
 #### `--delete_from_ori_dir`
 [back to Top](#rtbioscan-usage)
 
-Also remove the source POD5 from `--ori_dir` after processing.
+Compatibility parameter accepted by the wrapper and Nextflow. The current feeder always moves a completed chunk from spool to intake when intake is empty, independently of this flag; the pipeline backup process does not consume it.
 
 - Default: `false`.
-- Intended for tightly controlled feeder deployments where the origin spool should be drained aggressively.
+- Does not change the current feeder's spool-to-intake move behavior.
 
 #### `--make_round_tar`
 [back to Top](#rtbioscan-usage)
@@ -1459,7 +1460,7 @@ Consensus lock carry-forward guardrails:
 #### `--otu_prune_samples_file`
 [back to Top](#rtbioscan-usage)
 
-Optional path to the samples list used by C1 `until_consolidated` archiving.
+Optional path to the samples list used by C1 `until_consolidated` archiving. Relative values resolve from the Nextflow launch directory; absolute values keep their spelling after the existing whitespace trimming.
 
 - Default: `${workflow.launchDir}/results/sample_info/<run_id>/samples.txt` when not provided and `--run_id` is set.
 - If the file is missing, archiving falls back to header-derived keys and constrained normalization rules.

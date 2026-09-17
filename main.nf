@@ -135,10 +135,15 @@ def stateId = stateIdRaw.replaceAll(/[^A-Za-z0-9_.-]+/, "_")
 if (!stateId || stateId in ['.', '..']) {
     exit 1, "Invalid --state_id '${stateIdRaw}': provide one non-dot filesystem component."
 }
-def ongoingStateDir = params.outdir ? "${params.outdir}/temp/ongoing/state/${stateId}" : null
-def currentStateDir = params.outdir ? "${params.outdir}/temp/current/state/${stateId}" : null
-def currentResultsStateDir = params.outdir ? "${params.outdir}/current/state/${stateId}" : null
-def ongoingResultsStateDir = params.outdir ? "${params.outdir}/ongoing/state/${stateId}" : null
+// Resolve output paths from the launch directory without changing their spelling.
+def outdirRaw = params.outdir?.toString()
+def outdirResolved = !outdirRaw || outdirRaw.startsWith('/')
+    ? outdirRaw
+    : "${workflow.launchDir}/${outdirRaw}"
+def ongoingStateDir = outdirResolved ? "${outdirResolved}/temp/ongoing/state/${stateId}" : null
+def currentStateDir = outdirResolved ? "${outdirResolved}/temp/current/state/${stateId}" : null
+def currentResultsStateDir = outdirResolved ? "${outdirResolved}/current/state/${stateId}" : null
+def ongoingResultsStateDir = outdirResolved ? "${outdirResolved}/ongoing/state/${stateId}" : null
 def failedRoundPlaceholderRoot = file("${baseDir}/bin/report_placeholders/failed_round", checkIfExists: true)
 def resolveFailedRoundPlaceholderAssets = { context ->
 	def resolvedContext = context?.toString()
@@ -325,7 +330,10 @@ def pruneUnassignedDropReads                 = otuRecoveryCfg.pruneUnassignedDro
 def pruneUnassignedGraceRoundsStr            = otuRecoveryCfg.pruneUnassignedGraceRoundsStr
 def pruneUnassignedKeepTopStr                = otuRecoveryCfg.pruneUnassignedKeepTopStr
 def otuPruneFrozenPolicyCanonical            = otuRecoveryCfg.otuPruneFrozenPolicyCanonical
-def otuPruneSamplesFileValue                 = otuRecoveryCfg.otuPruneSamplesFileValue
+def otuPruneSamplesFileRaw                   = otuRecoveryCfg.otuPruneSamplesFileValue
+def otuPruneSamplesFileValue                 = !otuPruneSamplesFileRaw || otuPruneSamplesFileRaw.startsWith('/')
+    ? otuPruneSamplesFileRaw
+    : "${workflow.launchDir}/${otuPruneSamplesFileRaw}"
 def otuLockForcePruneMaxFastaMbStr           = otuRecoveryCfg.otuLockForcePruneMaxFastaMbStr
 def otuForcePruneOverride                    = otuRecoveryCfg.otuForcePruneOverride
 def otuConsolidatedKeysMixedPolicyCanonical  = otuRecoveryCfg.otuConsolidatedKeysMixedPolicyCanonical
@@ -602,7 +610,7 @@ if (stateVerificationCacheRaw) {
         ? stateVerificationCacheRaw
         : "${workflow.launchDir}/${stateVerificationCacheRaw}"
 } else {
-    stateVerificationCacheDir = "${params.outdir}/temp/_compatibility_cache"
+    stateVerificationCacheDir = "${outdirResolved}/temp/_compatibility_cache"
 }
 for (def versionParam : ['state_classifier_policy_version', 'state_scoring_policy_version']) {
     if (!params."${versionParam}"?.toString()?.trim()) {
@@ -631,7 +639,7 @@ if (!effectiveRestartMode || effectiveRestartMode == 'null') {
 	if (effectiveRestartMode in ['restore', 'reset']) {
 	    def env = new HashMap(System.getenv())
 	    env.MODE = effectiveRestartMode
-	    env.OUTDIR = params.outdir?.toString() ?: ''
+	    env.OUTDIR = outdirResolved?.toString() ?: ''
 	    env.LOCK_WAIT = (params.lock_wait_seconds ?: 300).toString()
     env.RUN_NAME = (custom_runName ?: workflow.runName)?.toString() ?: ''
     env.STATE_ID = (stateId ?: '') as String
@@ -677,9 +685,9 @@ if (!effectiveRestartMode || effectiveRestartMode == 'null') {
 // `-resume`). A legacy two-line sentinel remains readable through an exact-byte
 // digest; an interrupted schema-2 operation fails closed until it is replayed.
 def persistedRestartEpoch = 'none'
-if (params.outdir) {
+if (outdirResolved) {
     def restartSentinelPath = java.nio.file.Paths.get(
-        params.outdir.toString(),
+        outdirResolved.toString(),
         'temp',
         ".restart_applied.${stateId}",
     )
@@ -1040,9 +1048,9 @@ process fast_on_target_detection {
 	then
 		mkdir -p ${ongoingStateDir}/
 	fi
-	if [ ! -d ${params.outdir}/ongoing/ ];
+	if [ ! -d ${outdirResolved}/ongoing/ ];
 	then
-		mkdir -p ${params.outdir}/ongoing/
+		mkdir -p ${outdirResolved}/ongoing/
 	fi
 
 	# Restart logic is applied once per pipeline invocation, not once per POD5.
@@ -2208,7 +2216,7 @@ process _reporting_hq_demultiplexing {
 
 	export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
 	export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
-	if ! perl ${baseDir}/bin/reporting_demultiplexing.pl ${hac_sup_annotated_clean_fastq} ${params.outdir}/ongoing ${round_barcode} ${barcode}; then
+	if ! perl ${baseDir}/bin/reporting_demultiplexing.pl ${hac_sup_annotated_clean_fastq} ${outdirResolved}/ongoing ${round_barcode} ${barcode}; then
 		if [ "\$ROUND_FAILED" -eq 1 ]; then
 			cp "${failedRoundPlaceholderAssets.demultRpt}" ${barcode}_demult_rpt.txt
 			cp "${failedRoundPlaceholderAssets.demultSidecar}" ${barcode}_demult_rpt.contract.tsv
@@ -6186,7 +6194,7 @@ process getting_run_summary {
 		ACTIVE_PRUNE_ALL_OUT="\$ROUND_DIR/active_prune_candidates_all.list"
 		ACTIVE_PRUNE_COUNTS_OUT="\$ROUND_DIR/active_prune_candidates_counts.tsv"
 		OTU_SIZE_STREAK_IDS_LAST="\$STATE_DIR/${barcode}_otu_size_streak_prune_ids_last.txt"
-		mkdir -p "\$ROUND_DIR" "\$STATE_DIR" "${params.outdir}"
+		mkdir -p "\$ROUND_DIR" "\$STATE_DIR" "${outdirResolved}"
 		rm -rf "\$ROUND_LIVE_STAGE"
 		mkdir -p "\$REPORT_SAMPLE_STAGE_DIR"
 		ROUND_TIMESTAMP_UTC="\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -6216,8 +6224,8 @@ process getting_run_summary {
 		REPORT_TRACK_IDENTITY_ARG=""
 		REPORT_IDENTITY_MODE_ARG=""
 		if [ "${replicateModeCanonical}" = "track" ]; then
-			_TRACK_ROSTER="${params.outdir}/sample_info/${run_name}/track_roster.tsv"
-			_TRACK_IDENTITY="${params.outdir}/sample_info/${run_name}/track_identity.tsv"
+			_TRACK_ROSTER="${outdirResolved}/sample_info/${run_name}/track_roster.tsv"
+			_TRACK_IDENTITY="${outdirResolved}/sample_info/${run_name}/track_identity.tsv"
 			if [ ! -r "\$_TRACK_ROSTER" ]; then
 				echo "ERROR: identity-mode=track requires track_roster.tsv but it is missing or unreadable: \$_TRACK_ROSTER" >&2
 				exit 1
@@ -6229,8 +6237,8 @@ process getting_run_summary {
 			REPORT_SAMPLE_ROSTER_ARG="--sample-roster \$_TRACK_ROSTER"
 			REPORT_TRACK_IDENTITY_ARG="--track-identity \$_TRACK_IDENTITY"
 			REPORT_IDENTITY_MODE_ARG="--identity-mode track"
-		elif [ -s "${params.outdir}/sample_info/${run_name}/samples.txt" ]; then
-			REPORT_SAMPLE_ROSTER_ARG="--sample-roster ${params.outdir}/sample_info/${run_name}/samples.txt"
+		elif [ -s "${outdirResolved}/sample_info/${run_name}/samples.txt" ]; then
+			REPORT_SAMPLE_ROSTER_ARG="--sample-roster ${outdirResolved}/sample_info/${run_name}/samples.txt"
 			REPORT_IDENTITY_MODE_ARG="--identity-mode collapse"
 		fi
 		_CONS_IDS_ARG=""
@@ -6645,7 +6653,7 @@ process getting_run_summary {
 							--summary ${barcode}_summary_demult_rpt.txt \
 						--out-dir "\$REPORT_SAMPLE_STAGE_DIR" \
 						--max "\$HTML_REPORT_SAMPLE_PLOT_MAX" \
-						--sig-dir "${params.outdir}/runs/${run_name}/report_assets/.private_signatures/read_counts"; then
+						--sig-dir "${outdirResolved}/runs/${run_name}/report_assets/.private_signatures/read_counts"; then
 							echo "WARN: sample Read_counts figure generation failed" 1>&2
 						fi
 					fi
@@ -6787,7 +6795,6 @@ process backup_update_and_clean {
 
 		READ_PATH="${read_path ?: ''}"
 
-	wait_minutes=${params.file_wait_minutes ?: 30}
 		
 			ROUND_TMP="${ongoingStateDir}/${round_barcode}"
 			
@@ -6812,14 +6819,14 @@ process backup_update_and_clean {
 			REPORT_RENDER_LOCK="\$STATE_TMP/.report_render.lock"
 			REPORT_LIVE_PUBLISH_LOCK="\$STATE_TMP/.report_live_publish.lock"
 			RUN_REPORT_JSON="\$ROUND_TMP/run_report.json"
-			RUN_INDEX_JSONL="${params.outdir}/report_html/runs_index.jsonl"
-			RUN_INDEX_LOCK="${params.outdir}/.runs_index.lock"
-			RUN_REPORT_DIR="${params.outdir}/report_html/runs/${run_name}"
+			RUN_INDEX_JSONL="${outdirResolved}/report_html/runs_index.jsonl"
+			RUN_INDEX_LOCK="${outdirResolved}/.runs_index.lock"
+			RUN_REPORT_DIR="${outdirResolved}/report_html/runs/${run_name}"
 			RUN_REPORT_HTML="\$RUN_REPORT_DIR/report.html"
 			RUN_REPORT_STATE="\$RUN_REPORT_DIR/report_state.json"
 			RUN_REPORT_PENDING="\$RUN_REPORT_DIR/.report_render_pending"
 			RUN_REPORT_REL_PATH="runs/${run_name}/report.html"
-			REPORT_ASSET_DIR="${params.outdir}/report_html/runs/${run_name}/report_assets"
+			REPORT_ASSET_DIR="${outdirResolved}/report_html/runs/${run_name}/report_assets"
 			REPORT_SAMPLE_ASSET_DIR="\$REPORT_ASSET_DIR/samples"
 			RENDER_REQUEST_FILE="report_render.request"
 			FEEDER_METADATA_DIR="${podBaseDir}/metadata"
@@ -6949,117 +6956,6 @@ process backup_update_and_clean {
 				cp \$STATE_TMP/done_pod5.txt "\$CURRENT_TEMP_ROOT"/
 			fi
 		
-
-		# Derive pod5_dir only if 'READ_PATH' is meaningful and exists
-		pod5_dir=""
-		if [[ -n "\$READ_PATH" && "\$READ_PATH" != "null" ]]; then
-			pod5_dir="\$(dirname -- "\$READ_PATH")"
-		fi
-
-			DELETE_ORI_RAW="${params.delete_from_ori_dir}"
-			DELETE_ORI="\$(printf '%s' "\${DELETE_ORI_RAW:-false}" | tr '[:upper:]' '[:lower:]')"
-			DELETE_ORI_FLAG=0
-			if [ "\$DELETE_ORI" = "true" ] || [ "\$DELETE_ORI" = "1" ]; then
-				DELETE_ORI_FLAG=1
-			fi
-
-			WATCH_RAW="${params.watch}"
-			WATCH="\$(printf '%s' "\${WATCH_RAW:-true}" | tr '[:upper:]' '[:lower:]')"
-			WATCH_FLAG=0
-			if [ "\$WATCH" = "true" ] || [ "\$WATCH" = "1" ]; then
-				WATCH_FLAG=1
-			fi
-			RUN_MODE="${runMode}"
-
-		# -- §5: Staging helpers + realtime watch loop (stage next POD5) --
-		DONE_POD5_PATH="\$STATE_TMP/done_pod5.txt"
-		pod5_key() {
-			perl -MCwd -e 'my \$p=shift; my \$abs=Cwd::abs_path(\$p)||\$p; my @st=stat(\$abs); my \$size=\$st[7]//0; my \$mtime=\$st[9]//0; my \$ino=\$st[1]//0; print "\$abs\\t\$size\\t\$mtime\\t\$ino";' "\$1" 2>/dev/null || true
-		}
-		done_contains() {
-			local f="\$1"
-			[ -f "\$DONE_POD5_PATH" ] || return 1
-			local key
-			key="\$(pod5_key "\$f")"
-			if [ -n "\$key" ]; then
-				if awk -v k="\$key" 'BEGIN{FS="\\t"} NF>=4 && (\$1"\\t"\$2"\\t"\$3"\\t"\$4)==k {found=1} END{exit !found}' "\$DONE_POD5_PATH"; then
-					return 0
-				fi
-				if awk -v k="\$key" 'BEGIN{FS="\\t"} NF>=3 && (\$1"\\t"\$2"\\t"\$3)==k {found=1} END{exit !found}' "\$DONE_POD5_PATH"; then
-					return 0
-				fi
-			fi
-			local base
-			base="\$(basename -- "\$f" 2>/dev/null || echo "\$f")"
-			if grep -Fxq "\$base" "\$DONE_POD5_PATH" 2>/dev/null; then
-				return 0
-			fi
-			return 1
-		}
-
-			# Proceed only for realtime mode when both origin and destination dirs exist.
-			if [ "\$RUN_MODE" = "realtime" ] && [ "\$WATCH_FLAG" -eq 1 ] && [[ -d "${params.ori_dir}" && -n "\$pod5_dir" && -d "\$pod5_dir" ]]; then
-			shopt -s nullglob
-			for (( ; ; )); do
-				# Use a nullglob+array check instead of compgen -G to avoid "option requires an argument"
-				pods=( "\$pod5_dir"/*.pod5 )
-				if (( \${#pods[@]} > 0 )); then
-					# Clean up stale symlinks (broken or already-done) so intake doesn't stay non-empty.
-					for p in "\${pods[@]}"; do
-						if [ -L "\$p" ]; then
-							if [ ! -e "\$p" ]; then
-								rm -f "\$p"
-								continue
-							fi
-							if done_contains "\$p"; then
-								rm -f "\$p"
-								continue
-							fi
-						fi
-					done
-					pods=( "\$pod5_dir"/*.pod5 )
-					if (( \${#pods[@]} > 0 )); then
-						break
-					fi
-				fi
-
-			    oldest=""
-			    while IFS= read -r cand; do
-			    	[ -f "\$cand" ] || continue
-			    	[ -r "\$cand" ] || continue
-			    	if done_contains "\$cand"; then
-			    		continue
-			    	fi
-			    	oldest="\$cand"
-			    	break
-			    done < <(ls -1tr "${params.ori_dir}"/*.pod5 2>/dev/null)
-    			if [[ -n "\$oldest" && -f "\$oldest" && -r "\$oldest" ]]; then
-					dst="\$pod5_dir/\$(basename -- "\$oldest")"
-					# Always mv from ori_round_pod5 to reads_rt (never symlink).
-					# Symlinking left the source in ori_round_pod5, which the feeder counted
-					# as spool=1. With ready=1 (active symlink) the feeder's throttle
-					# (ready>=1 AND spool>=1) prevented pre-staging the next round, causing
-					# a full sleep_time (~5 min) delay at every round boundary.
-						# Moving empties ori_round_pod5 so the feeder pre-stages the next round
-						# while this one is still processing. Pod5 is preserved in done_round_pod5.
-						if ! mv -f -- "\$oldest" "\$dst" 2> cp_new_pod5.err; then
-							if cp -p -- "\$oldest" "\$dst" 2> cp_new_pod5.err; then
-								rm -f -- "\$oldest" 2>/dev/null || { echo "ERROR: Failed to remove \$oldest from ori_round_pod5; file exists in both ori_dir and reads_rt" >&2; exit 1; }
-							elif [ -e "\$dst" ]; then
-								:
-							else
-								echo "WARNING: Failed to stage new pod5 file; source preserved at \$oldest" >&2
-								cat cp_new_pod5.err >&2
-							fi
-						fi
-						break
-					fi
-
-				 sleep 10
-			done
-		fi
-
-
 
 		# -- §6: State-tables snapshot + round-lock release --
 		# ---- Snapshot rolling state tables before the release boundary ----
@@ -7252,7 +7148,7 @@ process backup_update_and_clean {
 					--targets "${params.targets}" \
 					--target-taxa "${params.target_taxa}" \
 					--blast-unassigned-min-level "${assignProtLevelCanonical}" \
-					--outdir "${params.outdir}"
+					--outdir "${outdirResolved}"
 				publish_rc=\$?
 			else
 				LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_history_append.sh --no-lock "\$ROUND_REPORT_JSON" "\$REPORT_HISTORY_JSONL" "\$REPORT_HISTORY_LOCK"
@@ -7294,7 +7190,7 @@ process backup_update_and_clean {
 				--run-id "${run_name}" \
 				--barcode "${barcode}" \
 				--state-id "${stateId}" \
-				--outdir "${params.outdir}" \
+				--outdir "${outdirResolved}" \
 				--schema-version "2.0" \
 				--report-rel-path "\$RUN_REPORT_REL_PATH" \
 				--run-started-utc-file "${ongoingStateDir}/_state/run_started_utc.txt"
@@ -7321,7 +7217,7 @@ process backup_update_and_clean {
 				exit "\$run_index_rc"
 			fi
 			write_report_metadata_files() {
-					RUN_CONF_FILE="${params.outdir}/config/${run_name}/${run_name}.conf"
+					RUN_CONF_FILE="${outdirResolved}/config/${run_name}/${run_name}.conf"
 					mkdir -p "\$(dirname "\$RUN_CONF_FILE")"
 					cat > "\$RUN_CONF_FILE" << 'RTBCONF'
 // Auto-generated run configuration: ${run_name}
@@ -7336,13 +7232,13 @@ RTBCONF
 						mkdir -p "\$(dirname "\$dst")"
 						sed "s|{{RUN_NAME}}|${run_name}|g; s|{{STATE_ID}}|${stateId}|g" "\$tmpl" > "\$dst"
 					}
-					_render_readme "${params.outdir}/pod5/${run_name}/README.html"         "${baseDir}/assets/readme/pod5.html"
+					_render_readme "${outdirResolved}/pod5/${run_name}/README.html"         "${baseDir}/assets/readme/pod5.html"
 					_render_readme "${currentResultsStateDir}/README.html"                 "${baseDir}/assets/readme/state.html"
-					_render_readme "${params.outdir}/sample_info/${run_name}/README.html"   "${baseDir}/assets/readme/sample_info.html"
+					_render_readme "${outdirResolved}/sample_info/${run_name}/README.html"   "${baseDir}/assets/readme/sample_info.html"
 					python3 ${baseDir}/bin/render_run_config_readme.py \
 						--template "${baseDir}/assets/readme/run_config.html" \
-						--conf "${params.outdir}/config/${run_name}/${run_name}.conf" \
-						--out "${params.outdir}/config/${run_name}/README.html" \
+						--conf "${outdirResolved}/config/${run_name}/${run_name}.conf" \
+						--out "${outdirResolved}/config/${run_name}/README.html" \
 					--run-name "${run_name}" \
 					--state-id "${stateId}" \
 					--cmd-line "${workflow.commandLine}" || true
@@ -7394,8 +7290,8 @@ process async_report_render {
 			REPORT_HISTORY_JSONL="\$STATE_TMP/report_history.jsonl"
 			REPORT_HISTORY_LOCK="\$STATE_TMP/.report_history.lock"
 			REPORT_RENDER_LOCK="\$STATE_TMP/.report_render.lock"
-			REPORT_ROOT_RENDER_LOCK="${params.outdir}/.report_root_render.lock"
-			RUN_REPORT_DIR="${params.outdir}/report_html/runs/${run_name}"
+			REPORT_ROOT_RENDER_LOCK="${outdirResolved}/.report_root_render.lock"
+			RUN_REPORT_DIR="${outdirResolved}/report_html/runs/${run_name}"
 			RUN_REPORT_HTML="\$RUN_REPORT_DIR/report.html"
 			RUN_REPORT_STATE="\$RUN_REPORT_DIR/report_state.json"
 			RUN_REPORT_REPLICATES_HTML="\$RUN_REPORT_DIR/report_replicates.html"
@@ -7403,9 +7299,9 @@ process async_report_render {
 			RUN_REPORT_PRIMERS_HTML="\$RUN_REPORT_DIR/report_replicates_primers.html"
 			RUN_REPORT_PRIMERS_STATE="\$RUN_REPORT_DIR/report_replicates_primers_state.json"
 			RUN_REPORT_PENDING="\$RUN_REPORT_DIR/.report_render_pending"
-			REPORT_ASSET_DIR="${params.outdir}/report_html/runs/${run_name}/report_assets"
-			REPORT_ASSET_DIR_REPLICATES="${params.outdir}/report_html/runs/${run_name}/report_assets_replicates"
-			REPORT_ASSET_DIR_PRIMERS="${params.outdir}/report_html/runs/${run_name}/report_assets_replicates_primers"
+			REPORT_ASSET_DIR="${outdirResolved}/report_html/runs/${run_name}/report_assets"
+			REPORT_ASSET_DIR_REPLICATES="${outdirResolved}/report_html/runs/${run_name}/report_assets_replicates"
+			REPORT_ASSET_DIR_PRIMERS="${outdirResolved}/report_html/runs/${run_name}/report_assets_replicates_primers"
 			REPORT_SAMPLE_ASSET_DIR="\$REPORT_ASSET_DIR/samples"
 			REPORT_IDENTITY_MODE="${replicateModeCanonical}"
 			HTML_REPORT_AUTO_REFRESH=${htmlReportAutoRefresh ? 1 : 0}
@@ -7614,7 +7510,7 @@ PY
 
 				if [ "\$REPORT_IDENTITY_MODE" = "track" ]; then
 					LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
-						--outdir "${params.outdir}" \
+						--outdir "${outdirResolved}" \
 						--state-id "${stateId}" \
 						--history "\$SNAPSHOT_PATH" \
 						--run-id "${run_name}" \
@@ -7631,7 +7527,7 @@ PY
 						--sample-plot-max "\$HTML_REPORT_SAMPLE_PLOT_MAX" &
 					sample_render_pid=\$!
 					LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
-						--outdir "${params.outdir}" \
+						--outdir "${outdirResolved}" \
 						--state-id "${stateId}" \
 						--history "\$SNAPSHOT_PATH" \
 						--run-id "${run_name}" \
@@ -7648,7 +7544,7 @@ PY
 						--sample-plot-max "\$HTML_REPORT_SAMPLE_PLOT_MAX" &
 					replicate_render_pid=\$!
 					LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
-						--outdir "${params.outdir}" \
+						--outdir "${outdirResolved}" \
 						--state-id "${stateId}" \
 						--history "\$SNAPSHOT_PATH" \
 						--run-id "${run_name}" \
@@ -7697,7 +7593,7 @@ PY
 					fi
 				else
 					if ! LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
-						--outdir "${params.outdir}" \
+						--outdir "${outdirResolved}" \
 						--state-id "${stateId}" \
 						--history "\$SNAPSHOT_PATH" \
 						--run-id "${run_name}" \
@@ -7748,7 +7644,7 @@ PY
 
 			if acquire_lock_dir_wait "\$REPORT_ROOT_RENDER_LOCK" "\$ROOT_LOCK_WAIT"; then
 				if ! LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
-					--outdir "${params.outdir}" \
+					--outdir "${outdirResolved}" \
 					--state-id "${stateId}" \
 					--history "\$SNAPSHOT_PATH" \
 					--url-prefix "\$HTML_REPORT_URL_PREFIX" \

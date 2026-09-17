@@ -34,7 +34,7 @@ def _render_async_shell(tmp_path: Path) -> tuple[str, dict[str, Path]]:
         "${htmlReportUrlPrefix}": "",
         "${ongoingStateDir}": str(ongoing_state),
         "${params.lock_wait_seconds}": "2",
-        "${params.outdir}": str(outdir),
+        "${outdirResolved}": str(outdir),
         "${render_request_file}": str(request),
         "${replicateModeCanonical}": "track",
         "${round_barcode}": "round-001",
