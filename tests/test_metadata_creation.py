@@ -333,6 +333,117 @@ def test_whitespace_in_canonical_samples_field_fails_validation(tmp_path: Path) 
     assert "Sample_ID must not contain whitespace" in result.stderr
 
 
+@pytest.mark.parametrize("field", ["Sample_ID", "Pipeline_ID"])
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ("Sam|pleA", "must not contain |"),
+        ("Sam/pleA", "must not contain /"),
+        ("no_adapter", "must not use reserved no_adapter identity"),
+        ("NO_ADAPTER", "must not use reserved no_adapter identity"),
+        ("No_Adapter_1", "must not use reserved no_adapter identity"),
+        ("no_adapter_01", "must not use reserved no_adapter identity"),
+    ],
+)
+def test_metadata_identity_grammar_rejects_unsafe_or_reserved_values_without_publication(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    reason: str,
+) -> None:
+    metadata = tmp_path / "invalid_identity.tsv"
+    row = {
+        "Sample_ID": "SampleA",
+        "Pipeline_ID": "SampleA_r1",
+        "Replicate": "1",
+        "Well": "A1",
+        "Plate": "TestPlate",
+        "Run": "TestRun",
+        "demult_id": ">A1_TestPlate",
+    }
+    row[field] = value
+    columns = list(row)
+    metadata.write_text(
+        "\t".join(columns) + "\n" + "\t".join(row[column] for column in columns) + "\n",
+        encoding="utf-8",
+    )
+
+    result = _run_metadata(tmp_path, metadata_file=metadata)
+
+    assert result.returncode != 0
+    assert f"{field} {reason}" in result.stderr
+    assert "line 2" in result.stderr
+    run_sample_info = tmp_path / "results" / "sample_info" / "TestRun"
+    assert not run_sample_info.exists()
+    for name in [
+        "samples.txt",
+        "TestRun_metadata.txt",
+        "demult.fasta",
+        "replicate_identity.tsv",
+        "track_identity.tsv",
+    ]:
+        assert not (run_sample_info / name).exists()
+
+
+@pytest.mark.parametrize("field", ["Sample_ID", "Pipeline_ID"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "SampleA",
+        "Sam=pleA",
+        "Sam:pleA",
+        "Sam;pleA",
+        "Sam-pleA",
+        "sample_no_adapter",
+        "no_adapterX",
+        "no_adapter_1a",
+        "no_adapter_",
+        "no_adapter-1",
+        "MuestraÑ",
+    ],
+)
+def test_metadata_identity_grammar_preserves_accepted_values_exactly(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    metadata = tmp_path / "accepted_identity.tsv"
+    row = {
+        "Sample_ID": "SampleA",
+        "Pipeline_ID": "SampleA_r1",
+        "Replicate": "1",
+        "Well": "A1",
+        "Plate": "TestPlate",
+        "Run": "TestRun",
+        "demult_id": ">A1_TestPlate",
+    }
+    row[field] = value
+    columns = list(row)
+    raw_row = "\t".join(row[column] for column in columns)
+    metadata.write_text("\t".join(columns) + "\n" + raw_row + "\n", encoding="utf-8")
+
+    result = _run_metadata(tmp_path, metadata_file=metadata)
+
+    assert result.returncode == 0, f"Script failed:\n{result.stdout}\n{result.stderr}"
+    sample_info = tmp_path / "results" / "sample_info" / "TestRun"
+    assert (sample_info / "TestRun_metadata.txt").read_bytes() == (raw_row + "\n").encode()
+    expected_samples = " ".join(row[column] for column in columns) + "\n"
+    assert (sample_info / "samples.txt").read_bytes() == expected_samples.encode()
+    demult_headers = [
+        line
+        for line in (sample_info / "demult.fasta").read_text(encoding="utf-8").splitlines()
+        if line.startswith(">")
+    ]
+    assert demult_headers == [f">{row['Sample_ID']}_COI", f">{row['Sample_ID']}_ITS2"]
+    identity = (sample_info / "replicate_identity.tsv").read_text(encoding="utf-8")
+    assert row["Sample_ID"] in identity
+    assert row["Pipeline_ID"] in identity
+    assert (sample_info / "track_active_units.txt").read_text(encoding="utf-8").splitlines() == [
+        f"{row['Pipeline_ID']}_COI",
+        f"{row['Pipeline_ID']}_ITS2",
+    ]
+
+
 def test_reordered_metadata_headers_preserve_canonical_samples_contract(tmp_path: Path) -> None:
     original = _run_metadata(tmp_path / "original")
     assert original.returncode == 0, f"Script failed:\n{original.stdout}\n{original.stderr}"

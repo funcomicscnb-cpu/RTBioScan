@@ -573,6 +573,7 @@ Validation rules enforced by `bin/Metadata_pod5_processing.sh`:
 - `Run` must equal the `--run_id` you are preparing.
 - `demult_id` must exactly equal `>{Well}_{Plate}`.
 - `Sample_ID`, `Pipeline_ID`, `Run`, and `demult_id` must not contain whitespace.
+- `Sample_ID` and `Pipeline_ID` must not contain `|` or `/`, and must not equal `no_adapter` or `no_adapter_<digits>` (case-insensitive). Names that merely contain `no_adapter` remain valid.
 - `Replicate`, `Well`, and `Plate` must not contain whitespace or `_`.
 - Extra columns are allowed and are preserved in the filtered `{run_id}_metadata.txt`, but they are ignored by the metadata-preparation logic.
 

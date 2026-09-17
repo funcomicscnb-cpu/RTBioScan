@@ -1880,6 +1880,40 @@ process demultiplexing_hq_reads {
 				"\$label"
 		}
 
+		# S2_NO_ADAPTER_ROUTER_BEGIN
+		partition_full_demux_fastq() {
+			local annotated_fastq="\$1"
+			local with_adapter_list="\$2"
+			local no_adapter_fastq="\$3"
+			: > "\$with_adapter_list"
+			: > "\$no_adapter_fastq"
+			awk -v with_adapter_list="\$with_adapter_list" -v no_adapter_fastq="\$no_adapter_fastq" '
+				function header_is_no_adapter(header,    fields, count, i, token, value, lower) {
+					count = split(header, fields, /\\|/)
+					for (i = 1; i <= count; i++) {
+						token = fields[i]
+						if (token ~ /^adapter=/) {
+							value = substr(token, 9)
+							sub(/[[:space:]].*\$/, "", value)
+							lower = tolower(value)
+							return (lower == "no_adapter" || lower ~ /^no_adapter_[0-9]+\$/)
+						}
+					}
+					return 0
+				}
+				NR % 4 == 1 {
+					record_is_no_adapter = header_is_no_adapter(\$0)
+					if (!record_is_no_adapter) {
+						header = \$0
+						sub(/^@/, "", header)
+						print header > with_adapter_list
+					}
+				}
+				record_is_no_adapter { print \$0 > no_adapter_fastq }
+			' "\$annotated_fastq"
+		}
+		# S2_NO_ADAPTER_ROUTER_END
+
 	_PRIMERS_PATH_FILTERED=""
 	if [ -f "\$PRIMERS_PATH" ]; then
 		awk '/^>/{p=(\$0 != ">NA_NA"); if(p) print; next} p{print}' "\$PRIMERS_PATH" > _filtered_primers.fasta
@@ -1912,9 +1946,11 @@ process demultiplexing_hq_reads {
 						  --rename '{id}|sup|barcode={cut_prefix}|adapter={adapter_name}' \
 						  -o ${barcode}_sup_annotated_\${_t}.fastq _tmp_reads_sup_\${_t}.fastq \
 						  > output_cutadapt_stringent_sup_\${_t}.out
-						if grep adapter ${barcode}_sup_annotated_\${_t}.fastq | grep -F -v no_adapter | sed 's/^@//;' \
-							> ${barcode}_sup_annotated_with_adapter_\${_t}.list;
-						then
+						partition_full_demux_fastq \
+							${barcode}_sup_annotated_\${_t}.fastq \
+							${barcode}_sup_annotated_with_adapter_\${_t}.list \
+							_tmp_noadapter_sup_\${_t}.fastq
+						if [ -s ${barcode}_sup_annotated_with_adapter_\${_t}.list ]; then
 							samtools faidx ${barcode}_sup_annotated_\${_t}.fastq \
 								-r ${barcode}_sup_annotated_with_adapter_\${_t}.list -f \
 								> ${barcode}_sup_annotated_with_adapter_\${_t}.fastq
@@ -1924,8 +1960,6 @@ process demultiplexing_hq_reads {
 								"${barcode}_sup_annotated_with_adapter_\${_t}.fastq"
 							echo "${barcode}_sup_annotated_with_adapter_\${_t}.fastq is successfully generated" 1>&2
 						fi
-						grep -F -A3 no_adapter ${barcode}_sup_annotated_\${_t}.fastq | grep -v "^--\$" \
-							> _tmp_noadapter_sup_\${_t}.fastq || true
 						if [ -s _tmp_noadapter_sup_\${_t}.fastq ]; then
 							cutadapt -g file:"\$_PRIMERS_PATH_FILTERED" -j ${task.cpus} --action=trim --rc \
 							  --discard-untrimmed -e 0.3 -m "\${_ml}" --rename "{id}|\${_t}" \
@@ -1961,9 +1995,11 @@ process demultiplexing_hq_reads {
 					  --rename '{id}|hac|barcode={cut_prefix}|adapter={adapter_name}' \
 					  -o ${barcode}_hac_annotated_\${_t}.fastq _tmp_reads_hac_\${_t}.fastq \
 					  > output_cutadapt_stringent_\${_t}.out
-					if grep -F adapter ${barcode}_hac_annotated_\${_t}.fastq | grep -F -v no_adapter | sed 's/^@//;' \
-						> ${barcode}_hac_annotated_with_adapter_\${_t}.list;
-					then
+					partition_full_demux_fastq \
+						${barcode}_hac_annotated_\${_t}.fastq \
+						${barcode}_hac_annotated_with_adapter_\${_t}.list \
+						_tmp_noadapter_hac_\${_t}.fastq
+					if [ -s ${barcode}_hac_annotated_with_adapter_\${_t}.list ]; then
 						samtools faidx ${barcode}_hac_annotated_\${_t}.fastq \
 							-r ${barcode}_hac_annotated_with_adapter_\${_t}.list -f \
 							> ${barcode}_hac_annotated_with_adapter_\${_t}.fastq
@@ -1973,8 +2009,6 @@ process demultiplexing_hq_reads {
 							"${barcode}_hac_annotated_with_adapter_\${_t}.fastq"
 						echo "${barcode}_hac_annotated_with_adapter_\${_t}.fastq is successfully generated" 1>&2
 					fi
-					grep -F -A3 no_adapter ${barcode}_hac_annotated_\${_t}.fastq | grep -v "^--\$" \
-						> _tmp_noadapter_hac_\${_t}.fastq || true
 					if [ -s _tmp_noadapter_hac_\${_t}.fastq ]; then
 						cutadapt -g file:"\$_PRIMERS_PATH_FILTERED" -j ${task.cpus} --action=trim --rc \
 						  --discard-untrimmed -e 0.3 -m "\${_ml}" --rename "{id}|\${_t}" \
