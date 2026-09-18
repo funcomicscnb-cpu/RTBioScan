@@ -2414,6 +2414,7 @@ process OTU_definition {
 	FROZEN_MEMBERS="\${STATE_DIR}/otu_frozen_members.tsv"
 	FROZEN_MEMBERS_SEEN="\${STATE_DIR}/otu_frozen_members_seen.tsv"
 	ACTIVE_POOL="\${STATE_DIR}/otu_active_pool.fasta"
+	ACTIVE_MEMBERS_STATE="\${STATE_DIR}/${barcode}_otu_active_members.tsv"
 	if [ -s "\$ACTIVE_POOL" ] && [ -s "\$PRUNED_BARRIER" ]; then
 		perl ${baseDir}/bin/reads_apply_prune_ids.pl \
 			"\$ACTIVE_POOL" "\$PRUNED_BARRIER" \
@@ -2486,7 +2487,7 @@ process OTU_definition {
 				awk -F'\t' 'BEGIN{OFS=FS} \$1=="status"{\$2="skipped_missing_cdhit"} {print}' "\$ARCHIVE_RECOVERY_STATS" > "\${ARCHIVE_RECOVERY_STATS}.tmp" && mv "\${ARCHIVE_RECOVERY_STATS}.tmp" "\$ARCHIVE_RECOVERY_STATS"
 			else
 				ARCHIVE_CLSTR=""
-				if cd-hit-est-2d -i "\$PRUNED_ARCHIVE" -i2 "\$FROZEN_REPS" -c "\$OTU_PRUNED_RECOVERY_ID" -d 0 -T "\$THREADS" -o ${barcode}_archive_vs_frozen; then
+				if cd-hit-est-2d -i "\$FROZEN_REPS" -i2 "\$PRUNED_ARCHIVE" -s2 0 -S2 99999999 -c "\$OTU_PRUNED_RECOVERY_ID" -d 0 -T "\$THREADS" -o ${barcode}_archive_vs_frozen; then
 					if [ -s ${barcode}_archive_vs_frozen.clstr ]; then
 						ARCHIVE_CLSTR="${barcode}_archive_vs_frozen.clstr"
 					elif [ -s ${barcode}_archive_vs_frozen.fasta.clstr ]; then
@@ -2501,7 +2502,7 @@ process OTU_definition {
 					awk -F'\t' 'BEGIN{OFS=FS} \$1=="status"{\$2="skipped_cdhit_failed"} {print}' "\$ARCHIVE_RECOVERY_STATS" > "\${ARCHIVE_RECOVERY_STATS}.tmp" && mv "\${ARCHIVE_RECOVERY_STATS}.tmp" "\$ARCHIVE_RECOVERY_STATS"
 				fi
 				if [ -n "\$ARCHIVE_CLSTR" ]; then
-					if ! ${baseDir}/bin/otu_frozen_members_from_clstr.pl "\$ARCHIVE_CLSTR" "\$ARCHIVE_RECOVERY_MEMBERS_RAW" "\$ARCHIVE_RECOVERY_UNASSIGNED" "\$OTU_ID_MODE" "\$FROZEN_DB_ONLY_POLICY"; then
+					if ! ${baseDir}/bin/otu_frozen_members_from_clstr.pl "\$ARCHIVE_CLSTR" "\$ARCHIVE_RECOVERY_MEMBERS_RAW" "\$ARCHIVE_RECOVERY_UNASSIGNED" "\$OTU_ID_MODE" "warn_skip"; then
 						if [ "\$OTU_PRUNED_RECOVERY_FAILURE_POLICY" = "fail" ]; then
 							echo "ERROR: failed to parse pruned-read recovery assignments" 1>&2
 							exit 1
@@ -2511,6 +2512,8 @@ process OTU_definition {
 						: > "\$ARCHIVE_RECOVERY_UNASSIGNED"
 						awk -F'\t' 'BEGIN{OFS=FS} \$1=="status"{\$2="skipped_parse_failed"} {print}' "\$ARCHIVE_RECOVERY_STATS" > "\${ARCHIVE_RECOVERY_STATS}.tmp" && mv "\${ARCHIVE_RECOVERY_STATS}.tmp" "\$ARCHIVE_RECOVERY_STATS"
 					fi
+					# 2d output FASTA contains unmatched queries; reference-only clusters are valid.
+					awk '/^>/{print substr(\$0,2)}' ${barcode}_archive_vs_frozen > "\$ARCHIVE_RECOVERY_UNASSIGNED"
 					_raw_recovered=0
 					_filtered_recovered=0
 					if [ -s "\$ARCHIVE_RECOVERY_MEMBERS_RAW" ]; then
@@ -2716,23 +2719,16 @@ process OTU_definition {
 
 
 		# -- §5: Active pool merge decisions --
-		# Always create the expected cluster output so downstream processes don't fail.
-		: > ${barcode}_qced_reads_nr.fasta.clstr
 		if [ ! -s ${barcode}_qced_reads_hq_accumulated.fasta ]; then
-			echo "WARN: No HQ reads available for OTU definition; creating empty OTU clusters and continuing" 1>&2
-			mkdir -p ${ongoingStateDir}/${round_barcode}/
-			cp -f ${barcode}_qced_reads_nr.fasta.clstr ${ongoingStateDir}/${round_barcode}/qced_reads_nr.fasta.clstr 2>/dev/null || true
-			cp -f ${barcode}_qced_reads_nr.fasta.clstr "\${STATE_DIR}/qced_reads_nr.fasta.clstr" 2>/dev/null || true
-		else
-		
+			echo "WARN: No HQ reads available for OTU definition; rebuilding membership from state" 1>&2
+		fi
+		mkdir -p ${ongoingStateDir}/${round_barcode}/
+
 		SKIP_CLUSTER=0
 		SKIP_CLUSTER_REASON=""
 		POOL_CHANGED=0
 		if [ ! -s "\$NEW_FASTA" ]; then
-			echo "WARN: No new unique reads for OTU clustering; reusing previous clusters" 1>&2
-			if [ -f "\${STATE_DIR}/qced_reads_nr.fasta.clstr" ]; then
-				cp "\${STATE_DIR}/qced_reads_nr.fasta.clstr" ${barcode}_qced_reads_nr.fasta.clstr
-			fi
+			echo "INFO: No new unique reads for OTU clustering; rebuilding membership from state" 1>&2
 			SKIP_CLUSTER=1
 			SKIP_CLUSTER_REASON="no_new_unique_reads"
 		fi
@@ -2765,7 +2761,7 @@ process OTU_definition {
 			fi
 			if [ "\$FROZEN_ENABLED" -eq 1 ] && [ -s "\$FROZEN_REPS" ] && [ -s "\$NEW_FASTA" ]; then
 				if command -v cd-hit-est-2d >/dev/null 2>&1; then
-					if cd-hit-est-2d -i "\$NEW_FASTA" -i2 "\$FROZEN_REPS" -c ${cdHitIdentity} -d 0 -T "\$THREADS" -o ${barcode}_new_vs_frozen; then
+					if cd-hit-est-2d -i "\$FROZEN_REPS" -i2 "\$NEW_FASTA" -s2 0 -S2 99999999 -c ${cdHitIdentity} -d 0 -T "\$THREADS" -o ${barcode}_new_vs_frozen; then
 						FROZEN_2D_OK=1
 					else
 						echo "ERROR: cd-hit-est-2d failed during frozen assignment for ${barcode}/${round_barcode}" 1>&2
@@ -2785,7 +2781,11 @@ process OTU_definition {
 
 			NEW_UNASSIGNED_READY=0
 			if [ "\$FROZEN_2D_OK" -eq 1 ] && [ -n "\$FROZEN_CLSTR" ]; then
-				${baseDir}/bin/otu_frozen_members_from_clstr.pl "\$FROZEN_CLSTR" ${barcode}_frozen_members_new.tsv ${barcode}_new_unassigned.list "\$OTU_ID_MODE" "\$FROZEN_DB_ONLY_POLICY"
+				${baseDir}/bin/otu_frozen_members_from_clstr.pl "\$FROZEN_CLSTR" ${barcode}_frozen_members_new.tsv ${barcode}_new_unassigned.list "\$OTU_ID_MODE" "warn_skip"
+				# 2d emits unmatched queries in its FASTA, not in its reference-oriented .clstr.
+				cp ${barcode}_new_vs_frozen ${barcode}_new_unassigned.fasta
+				awk '/^>/{print substr(\$0,2)}' ${barcode}_new_unassigned.fasta > ${barcode}_new_unassigned.list
+				NEW_UNASSIGNED_READY=1
 			else
 				: > ${barcode}_new_unassigned.list
 				cp "\$NEW_FASTA" ${barcode}_new_unassigned.fasta
@@ -2840,6 +2840,12 @@ process OTU_definition {
 						awk 'NR==FNR{cand[\$1]=1; next} (\$1 in cand){print \$1}' "\$NEW_HASHES_CAND" "\${NEW_HASHES_DROPPED}.raw" | LC_ALL=C sort -u > "\$NEW_HASHES_DROPPED"
 						rm -f "\${NEW_HASHES_TO_COMMIT}.raw" "\${NEW_HASHES_DROPPED}.raw"
 					fi
+					# Frozen assignments are also decided hashes in mixed frozen/active rounds.
+					if [ -s ${barcode}_frozen_members_new.tsv ]; then
+						awk -F '\t' 'FILENAME==ARGV[1]{h[\$1]=\$2; next} {id=\$2; sub(/[|].*/,"",id); if(id in h) print h[id]}' "\$NEW_BASE_HASH" ${barcode}_frozen_members_new.tsv \
+							| awk 'FILENAME==ARGV[1]{cand[\$1]=1; next} (\$1 in cand){print \$1}' "\$NEW_HASHES_CAND" - >> "\$NEW_HASHES_TO_COMMIT"
+						LC_ALL=C sort -u -o "\$NEW_HASHES_TO_COMMIT" "\$NEW_HASHES_TO_COMMIT"
+					fi
 					if [ "${params.otu_commit_dropped_hashes}" = "true" ] && [ -s "\$NEW_HASHES_DROPPED" ]; then
 						cat "\$NEW_HASHES_DROPPED" >> "\$NEW_HASHES_TO_COMMIT"
 						LC_ALL=C sort -u -o "\$NEW_HASHES_TO_COMMIT" "\$NEW_HASHES_TO_COMMIT"
@@ -2876,16 +2882,20 @@ process OTU_definition {
 			SKIP_CLUSTER_REASON="pool_unchanged"
 			echo "INFO: skipping cd-hit-est due to unchanged active pool" 1>&2
 		fi
-		if [ "\$SKIP_CLUSTER" -eq 1 ]; then
-			if [ -f "\${STATE_DIR}/qced_reads_nr.fasta.clstr" ]; then
-				echo "INFO: reusing previous cluster file due to skip reason=\$SKIP_CLUSTER_REASON" 1>&2
-				cp "\${STATE_DIR}/qced_reads_nr.fasta.clstr" ${barcode}_qced_reads_nr.fasta.clstr
-			elif [ "\$SKIP_CLUSTER_REASON" = "pool_unchanged" ]; then
-				echo "ERROR: active pool unchanged but previous cluster file is missing at \${STATE_DIR}/qced_reads_nr.fasta.clstr" 1>&2
-				exit 1
-			else
-				echo "WARN: skipping clustering with no previous cluster file (reason=\$SKIP_CLUSTER_REASON)" 1>&2
+		# The fourth TSV column binds membership to the post-promotion active pool.
+		# Detect changed pools on retry as well as normal rounds, including barrier pruning.
+		[ -f "\$ACTIVE_POOL" ] || : > "\$ACTIVE_POOL"
+		ACTIVE_POOL_HASH=\$(perl -MDigest::SHA -e 'print Digest::SHA->new(256)->addfile(\$ARGV[0])->hexdigest' "\$ACTIVE_POOL")
+		if [ ! -f "\$ACTIVE_MEMBERS_STATE" ]; then
+			echo "INFO: bootstrapping active membership state for ${barcode}; rebuilding from active pool" 1>&2
+			SKIP_CLUSTER=0
+		elif [ -s "\$ACTIVE_POOL" ]; then
+			ACTIVE_MEMBERS_POOL_HASH=\$(awk -F'\t' 'NR==1{print \$4; exit}' "\$ACTIVE_MEMBERS_STATE")
+			if [ "\$ACTIVE_MEMBERS_POOL_HASH" != "\$ACTIVE_POOL_HASH" ]; then
+				SKIP_CLUSTER=0
 			fi
+		elif [ -s "\$ACTIVE_MEMBERS_STATE" ]; then
+			SKIP_CLUSTER=0
 		fi
 
 			if [ "\$SKIP_CLUSTER" -eq 0 ]; then
@@ -2900,6 +2910,9 @@ process OTU_definition {
 			if [ -s "\$ACTIVE_POOL_LOCAL" ]; then
 				if cd-hit-est -i "\$ACTIVE_POOL_LOCAL" -c ${cdHitIdentity} -d 0 -o ${barcode}_active_nr.fasta -T "\$THREADS"; then
 					echo "INFO: cd-hit-est clustering complete" 1>&2
+				else
+					echo "ERROR: active clustering failed; refusing stale membership" 1>&2
+					exit 1
 				fi
 							${baseDir}/bin/otu_parse_clstr.pl ${barcode}_active_nr.fasta.clstr ${barcode}_active_members.tsv ${barcode}_active_counts.tsv
 							ACTIVE_COUNTS_INST="${barcode}_active_counts_instances.tsv"
@@ -2924,7 +2937,11 @@ process OTU_definition {
 						echo "ERROR: otu_counts_by_hash produced 0 rows for non-empty active_members; aborting to protect OTU frozen-state integrity" 1>&2
 						exit 1
 					fi
+					if [ "\$NEW_COUNT" -gt 0 ]; then
 						${baseDir}/bin/otu_update_frozen.pl "\$ACTIVE_COUNTS_INST" ${barcode}_active_nr.fasta "\$FROZEN_META" "\$FROZEN_REPS" "\$FROZEN_HIST" "\$FROZEN_MEMBERS" ${barcode}_promoted_clusters.tsv "\$ROUND_ID" ${params.otu_frozen_min_rounds} ${params.otu_frozen_min_reads} ${params.otu_frozen_growth_window} ${params.otu_frozen_drop_ratio} ${params.otu_frozen_min_frac}
+					else
+						: > ${barcode}_promoted_clusters.tsv
+					fi
 						gzip -f "\$FROZEN_REPS" 2>/dev/null || true
 						# otu_update_frozen.pl writes representative rows directly to FROZEN_MEMBERS,
 						# bypassing the seen-index. Invalidate it so the snapshot append step
@@ -2977,14 +2994,27 @@ process OTU_definition {
 				cp "\$NR_HASH_MAP_FILE" "\${STATE_DIR}/${barcode}_otu_nr_hash_map.tsv.tmp" 2>/dev/null \
 					&& mv "\${STATE_DIR}/${barcode}_otu_nr_hash_map.tsv.tmp" "\${STATE_DIR}/${barcode}_otu_nr_hash_map.tsv" || true
 
-				[ -f "\$FROZEN_MEMBERS" ] || : > "\$FROZEN_MEMBERS"
-				[ -f ${barcode}_active_members.tsv ] || : > ${barcode}_active_members.tsv
-				${baseDir}/bin/otu_merge_clstr.pl "\$FROZEN_MEMBERS" ${barcode}_active_members.tsv ${barcode}_qced_reads_nr.fasta.clstr
-				if [ "\$NEW_HASHES_COMMIT_OK" -eq 1 ] && [ -s "\$NEW_HASHES_TO_COMMIT" ]; then
-					cat "\$NEW_HASHES_TO_COMMIT" >> "\$SEEN_HASHES"
-					awk 'NF' "\$SEEN_HASHES" | LC_ALL=C sort -u > "\${SEEN_HASHES}.tmp" && mv "\${SEEN_HASHES}.tmp" "\$SEEN_HASHES"
-				fi
+			# Future F-02 boundary: filter promoted cluster IDs before publishing this relation.
+			# Columns: active cluster ID, annotated read ID, representative flag, pool SHA-256.
+			ACTIVE_POOL_HASH=\$(perl -MDigest::SHA -e 'print Digest::SHA->new(256)->addfile(\$ARGV[0])->hexdigest' "\$ACTIVE_POOL")
+			if ! ACTIVE_MEMBERS_TMP=\$(mktemp "\${ACTIVE_MEMBERS_STATE}.tmp.XXXXXX"); then
+				echo "ERROR: cannot create active membership temporary file" 1>&2
+				exit 1
 			fi
+			if ! awk -v pool_hash="\$ACTIVE_POOL_HASH" 'BEGIN{OFS="\t"} {print \$0, pool_hash}' ${barcode}_active_members.tsv > "\$ACTIVE_MEMBERS_TMP" \
+				|| ! mv -f "\$ACTIVE_MEMBERS_TMP" "\$ACTIVE_MEMBERS_STATE"; then
+				rm -f "\$ACTIVE_MEMBERS_TMP"
+				echo "ERROR: cannot publish active membership state" 1>&2
+				exit 1
+			fi
+		fi
+
+		# Regenerate every round: cumulative frozen rows plus the last successful active relation.
+		${baseDir}/bin/otu_merge_clstr.pl "\$FROZEN_MEMBERS" "\$ACTIVE_MEMBERS_STATE" ${barcode}_qced_reads_nr.fasta.clstr
+		if [ "\$NEW_HASHES_COMMIT_OK" -eq 1 ] && [ -s "\$NEW_HASHES_TO_COMMIT" ]; then
+			cat "\$NEW_HASHES_TO_COMMIT" >> "\$SEEN_HASHES"
+			awk 'NF' "\$SEEN_HASHES" | LC_ALL=C sort -u > "\${SEEN_HASHES}.tmp" && mv "\${SEEN_HASHES}.tmp" "\$SEEN_HASHES"
+		fi
 
 	# -- §7: State persistence and cleanup --
 	rm -f "\${STATE_DIR}/accumulated_qced_reads.fasta"
@@ -3001,7 +3031,6 @@ process OTU_definition {
 
 		set -- ${barcode}_qced_reads_*normal*
 		[ -f "\${1:-}" ] && rm ${barcode}_qced_reads_*normal* || true
-			fi  # HQ reads non-empty
 		rtbioscan_round_lock_unpin
 		
 		"""
