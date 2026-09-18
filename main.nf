@@ -1661,10 +1661,12 @@ process hac_basecalling {
 				exit 1
 			fi
 
-		samtools fastq -@ ${task.cpus} ${barcode}_hac.sam > ${barcode}_hac.fastq || : > ${barcode}_hac.fastq
+		if ! samtools fastq -@ ${task.cpus} ${barcode}_hac.sam > ${barcode}_hac.fastq; then
+			echo "ERROR: Failed to convert successful HAC basecalling output to FASTQ" 1>&2
+			exit 1
+		fi
 			if [ ! -s ${barcode}_hac.fastq ]; then
-				echo "ERROR: No HAC reads recovered after successful HAC basecalling" 1>&2
-				exit 1
+				echo "WARN: Successful HAC basecalling yielded no reads; round will continue with an empty HAC contribution" 1>&2
 			fi
 	perl ${baseDir}/bin/fastq_add_annotations2ids.pl ${target_reads_list} ${barcode}_hac.fastq > ${barcode}_hac_annotated.fastq
 	_p_targets="${params.targets}"

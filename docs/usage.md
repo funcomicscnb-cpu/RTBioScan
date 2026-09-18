@@ -1237,6 +1237,7 @@ Minimum FAST-basecall qscore used during the initial on-target detection pass.
 Minimum HAC basecall qscore required for reads to enter the HQ rolling pool.
 
 - Default: `10`.
+- A successful HAC pass with no reads meeting this threshold is a valid empty HAC contribution, and the round continues. Dorado/retry failures and SAM-to-FASTQ conversion failures remain fatal; legacy zero-byte basecaller output remains subject to the existing retry/failure contract.
 
 #### `--hq_quality_score`
 [back to Top](#rtbioscan-usage)
