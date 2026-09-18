@@ -381,6 +381,8 @@ def _rtbioscan_serve_command(outdir: Path, run_id: str, port: int) -> list[str]:
         "COI|ITS2",
         "--outdir",
         str(outdir),
+        "-name",
+        run_id,
         "-resume",
     ]
 

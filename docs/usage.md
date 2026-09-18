@@ -71,6 +71,8 @@ NXF_OPTS='-Xms1g -Xmx4g'
 ./RTBioScan.sh --run_id MY_RUN -resume
 ```
 
+The wrapper resolves execution name `MY_RUN` to its exact session UUID in the wrapper launch directory’s `.nextflow/history`, then passes `-resume <session-UUID>`. It omits automatic `-name` so Nextflow allocates a fresh execution/report name, and supplies `--state_id MY_RUN` unless explicit. Missing, malformed or ambiguous history fails before feeder, server or pipeline startup; there is no fallback to the latest session.
+
 **Pipeline + live report in browser** — resume with auto-refreshing report:
 ```bash
 ./RTBioScan.sh --run_id MY_RUN --serve --serve-open -resume
@@ -129,7 +131,7 @@ Use this pattern only when you intentionally want to reuse the same `results/pod
 | Option | Default | Description |
 |---|---|---|
 | `--feeder` | off | Enable the POD5 feeder alongside the pipeline. |
-| `--run_id <id>` | required with `--feeder` / `--do_metadata`; optional otherwise | Run ID — used to filter the metadata TSV and name POD5 chunks. Automatically sets the Nextflow `-name` to the same value unless `-name` is passed explicitly. |
+| `--run_id <id>` | required with `--feeder` / `--do_metadata`; optional otherwise | Run ID — used to filter the metadata TSV and name POD5 chunks. For non-resume launches, defaults Nextflow `-name` to this value unless explicit. Resumes preserve this input identity and default `--state_id` to it while allowing a fresh execution name. |
 | `--input_folder <dir>` | required with `--feeder` (unless `--skip_pod5`) | MinKNOW output folder, searched recursively for `.pod5` files. |
 | `--num_reads <n>` | `200000` | Reads per POD5 chunk. |
 | `--sleep_time <s>` | `300` | Feeder poll interval in seconds. |
@@ -509,7 +511,8 @@ The recommended way to launch the pipeline is via `RTBioScan.sh` (see [Quick sta
 Direct Nextflow invocation (when the feeder and server are managed separately):
 
 ```bash
-NXF_VER=22.10.8 nextflow run main.nf -name 'my_run' -resume
+# Set SESSION_UUID to the full session UUID from .nextflow/history.
+NXF_VER=22.10.8 nextflow run main.nf -resume "${SESSION_UUID:?Set SESSION_UUID first}" --run_id 'my_run' --state_id 'my_run'
 ```
 
 When you launch through `RTBioScan.sh` and provide `--run_id`, the wrapper auto-injects `--run_id`, `--reads`, `--ori_dir`, `--indexes`, and `--primer_indexes` if you did not pass them explicitly. Raw `nextflow run` does not do this.
@@ -762,7 +765,7 @@ Nextflow execution name.
 
 - Used for per-run reports under `results/report_html/runs/<name>/`.
 - Used as the default rolling-state namespace unless `--state_id` is set explicitly.
-- Under `RTBioScan.sh`, this defaults to `--run_id` unless you pass `-name` yourself.
+- Under `RTBioScan.sh`, non-resume launches default this to `--run_id`. Implicit-name resumes do not reuse that name; Nextflow allocates a fresh execution/report name. Explicit `-name` is preserved (use a new name for a resumed execution).
 - Change this when you want multiple analysis executions against the same prepared inputs.
 
 ### `-profile`
@@ -1085,6 +1088,15 @@ Force re-applying `--restart_mode` even if a sentinel file indicates it was alre
 [back to Top](#rtbioscan-usage)
 
 Resume a stopped or interrupted run. Nextflow restores completed processes from cache and re-runs only what is needed.
+
+- Bare Nextflow `-resume` means the latest session. For deterministic selection, Nextflow 22.10.8 requires a full session UUID. A positional execution name is unsafe: this runtime can treat it as latest-session resume instead.
+- With `--run_id X` and no explicit `-name`, the wrapper resolves X from field 3 (execution name) to field 6 (session UUID) of `${SCRIPT_DIR}/.nextflow/history`, then emits `-resume <resolved-session-UUID>`. It omits automatic `-name`, allowing a fresh execution/report name.
+- Explicit `-resume TARGET` preserves a full session UUID or literal `last`. Other targets are resolved as exact execution names in the same history, even if they differ from `--run_id`. Empty session fields are ignored; repeated rows with the same UUID are accepted. Missing names, malformed UUIDs and multiple distinct UUIDs fail before startup. Resolution never falls back to the latest session.
+- For every canonical resumed wrapper launch with `--run_id X`, the wrapper supplies `--state_id X` unless `--state_id STATE` or `--state_id=STATE` is explicit. This controls rolling state only; it does not select the Nextflow session. `--run_id` continues to identify biological/prepared inputs.
+- Explicit `-name NEW` is preserved and controls the new execution/report identity only. With that explicit name, bare `-resume` remains bare and selects the latest session. Use `-name NEW -resume <UUID-or-resolvable-name>` for deterministic selection.
+- Attached `-resume=...` is unsupported and rejected for launches with `--run_id`; use separate tokens. `--resume` is a pipeline parameter, not a resume alias, and receives ordinary non-resume wrapper behavior.
+- Without wrapper `--run_id`, arguments retain direct-forwarding behavior. Use a full UUID yourself for deterministic selection. Direct Nextflow launches should also supply `--state_id` when rolling-state continuity is intended.
+- With `--serve`, an implicit-name resume waits for the actual execution to publish its report; the wrapper does not seed a guessed report under X. Explicitly named executions can still receive an initial report seed.
 
 #### `--max_memory`
 [back to Top](#rtbioscan-usage)

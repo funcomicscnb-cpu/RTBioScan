@@ -77,12 +77,8 @@ remove_feeder_lock_if_stale() {
 
 preflight_run_name_or_die() {
   local _run="$1"
-  local _a
-
-  # Skip if the user is resuming — name reuse is intentional then.
-  for _a in ${nf_args[@]+"${nf_args[@]}"}; do
-    [[ "$_a" == "-resume" || "$_a" == "--resume" || "$_a" == -resume=* ]] && return 0
-  done
+  # Only canonical -resume skips the new-execution name check.
+  [[ ${_is_resume:-0} -eq 1 ]] && return 0
 
   # Pipeline always runs from SCRIPT_DIR, so history lives there.
   if history_contains_run "$SCRIPT_DIR" "$_run"; then
@@ -374,7 +370,7 @@ Examples:
   ./RTBioScan.sh -profile test --reads "pod5/reads_rt_round_pod5/*pod5"
 
   # Resume with live report in browser:
-  ./RTBioScan.sh --serve --serve-open -resume MyRun -profile test
+  ./RTBioScan.sh --run_id MyRun --serve --serve-open -resume -profile test
 
   # Pipeline + feeder + live report:
   ./RTBioScan.sh --feeder --serve --serve-open \
@@ -503,14 +499,89 @@ sanitize_state_id() {
   ' "${1:-}"
 }
 
+# Nextflow 22.10.8 does not reliably accept execution names as resume targets.
+# Read its existing launch history; never substitute the latest session.
+resolve_resume_session_uuid() {
+  perl -e '
+    use strict;
+    use warnings;
+    my ($name, $history) = @ARGV;
+    open(my $fh, "<", $history)
+      or die "ERROR: cannot resolve resume name [$name]: cannot read $history: $!\n";
+    my %sessions;
+    while (my $line = <$fh>) {
+      chomp $line;
+      $line =~ s/\r$//;
+      my @fields = split /\t/, $line, -1;
+      next unless (@fields >= 3 && $fields[2] eq $name);
+      my $session = $fields[5] // "";
+      next if $session eq "";
+      die "ERROR: malformed session UUID for resume name [$name] in $history\n"
+        unless $session =~ /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/;
+      $sessions{$session} = 1;
+    }
+    close $fh;
+    my @sessions = keys %sessions;
+    die "ERROR: no session UUID for resume name [$name] in $history\n" unless @sessions;
+    die "ERROR: ambiguous resume name [$name] in $history\n" if @sessions > 1;
+    print "$sessions[0]\n";
+  ' "$1" "${SCRIPT_DIR}/.nextflow/history"
+}
+
+normalize_wrapper_resume_args() {
+  local _name_present=0 _state_present=0 _attached=0 _i _arg _next _target
+  local _uuid_pattern='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  local _normalized=()
+  _is_resume=0
+  for _arg in ${nf_args[@]+"${nf_args[@]}"}; do
+    case "$_arg" in
+      -resume) _is_resume=1 ;;
+      -resume=*) _attached=1 ;;
+      -name|-name=*) _name_present=1 ;;
+      --state_id|--state_id=*) _state_present=1 ;;
+    esac
+  done
+  # Without wrapper input identity, retain the direct-forwarding interface.
+  [[ -n "$run_id" && $view_only -eq 0 ]] || return 0
+  if [[ $_attached -eq 1 ]]; then
+    echo "ERROR: use the separate-token form: -resume TARGET" >&2
+    return 1
+  fi
+  if [[ $_is_resume -eq 0 ]]; then
+    [[ $_name_present -eq 1 ]] || nf_args+=(-name "$run_id")
+    return 0
+  fi
+  for (( _i=0; _i<${#nf_args[@]}; _i++ )); do
+    _arg="${nf_args[$_i]}"
+    _normalized+=("$_arg")
+    [[ "$_arg" == "-resume" ]] || continue
+    _next="${nf_args[$((_i+1))]-}"
+    if [[ -n "$_next" && "$_next" != -* ]]; then
+      _target="$_next"
+      _i=$((_i+1))
+      if [[ "$_target" != "last" && ! "$_target" =~ $_uuid_pattern ]]; then
+        _target="$(resolve_resume_session_uuid "$_target")" || return 1
+      fi
+      _normalized+=("$_target")
+    elif [[ $_name_present -eq 0 ]]; then
+      _target="$(resolve_resume_session_uuid "$run_id")" || return 1
+      _normalized+=("$_target")
+    fi
+  done
+  nf_args=("${_normalized[@]}")
+  [[ $_state_present -eq 1 ]] || nf_args+=(--state_id "$run_id")
+  return 0
+}
+
 effective_nextflow_run_name() {
   local _name=""
   _name="$(nextflow_arg_value "-name" || true)"
   if [[ -n "$_name" ]]; then
     printf '%s\n' "$_name"
-  else
+  elif [[ "${_is_resume:-0}" -eq 0 ]]; then
     printf '%s\n' "${run_id:-}"
   fi
+  # An implicit resumed execution gets its name from Nextflow at launch.
 }
 
 seed_initial_run_status_if_needed() {
@@ -1639,22 +1710,21 @@ if [[ $targets_explicit -eq 1 ]]; then
   validate_explicit_targets_or_die
   resolved_targets="$targets"
 fi
+normalize_wrapper_resume_args
 if [[ $do_metadata -eq 1 || $feeder -eq 1 ]]; then
   if [[ $targets_explicit -eq 0 ]]; then
     resolve_targets_from_config_or_die
   fi
 fi
 
-# Auto-inject -name and pipeline path params derived from --run_id
+# Normalize resume identity and inject pipeline path params derived from --run_id
 if [[ -n "$run_id" && $view_only -eq 0 ]]; then
-  name_present=0; reads_set=0; ori_dir_set=0; indexes_set=0; primer_indexes_set=0; watch_set=0
-  nextflow_arg_present "-name" && name_present=1
+  reads_set=0; ori_dir_set=0; indexes_set=0; primer_indexes_set=0; watch_set=0
   nextflow_arg_present "--reads" && reads_set=1
   nextflow_arg_present "--ori_dir" && ori_dir_set=1
   nextflow_arg_present "--indexes" && indexes_set=1
   nextflow_arg_present "--primer_indexes" && primer_indexes_set=1
   nextflow_arg_present "--watch" && watch_set=1
-  [[ $name_present      -eq 0 ]] && nf_args+=(-name "$run_id")
   nf_args+=(--run_id "$run_id")
   [[ $reads_set          -eq 0 ]] && nf_args+=(--reads          "results/pod5/$run_id/reads_rt_round_pod5/*pod5")
   [[ $ori_dir_set        -eq 0 ]] && nf_args+=(--ori_dir        "results/pod5/$run_id/ori_round_pod5/")
@@ -2191,12 +2261,6 @@ fi
 # ── pin Nextflow version (DSL1 requires <23.0) ────────────────────────────────
 # Override by setting NXF_VER in your environment before calling this script.
 export NXF_VER="${NXF_VER:-22.10.8}"
-
-# Detect resume/restart so new runs can clear single_exp workspace
-_is_resume=0
-for _a in ${nf_args[@]+"${nf_args[@]}"}; do
-  [[ "$_a" == "-resume" || "$_a" == "--resume" || "$_a" == -resume=* ]] && _is_resume=1 && break
-done
 
 # ── run the pipeline (tracked child) ──────────────────────────────────────────
 
