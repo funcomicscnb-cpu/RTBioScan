@@ -1094,7 +1094,7 @@ Upper limit for memory allocation per process. Default: `32.GB`. Individual proc
 #### `--max_time`
 [back to Top](#rtbioscan-usage)
 
-Upper limit for execution time per process. Default: `240.h`.
+Maximum cap used by `check_max` for process time requests. It does not assign this duration to every process; individual process directives can request less. Default: `240.h`.
 
 #### `--max_cpus`
 [back to Top](#rtbioscan-usage)
@@ -1140,6 +1140,7 @@ Timeout for waiting on a newly discovered POD5 to become readable before failing
 
 - Default: `30`.
 - Used in both FAST on-target screening and HAC/SUP basecalling intake.
+- The FAST scheduler request includes this bounded wait together with the per-state round-lock wait and the existing attempt-scaled work allowance. This does not change the HAC/SUP time directives.
 
 #### `--monochrome_logs`
 [back to Top](#rtbioscan-usage)
@@ -2235,6 +2236,11 @@ Stale-age threshold for the startup state-contract and reference-attestation-cac
 Maximum time to wait for the per-state round lock before failing the run.
 
 - Default: `360`.
+- FAST requests this wait plus `file_wait_minutes` plus `4.h * task.attempt`, capped by `max_time`.
+- With defaults on attempt 1, the request is 360 min + 30 min + 240 min = 630 min (10 h 30 min).
+- `stale_lock_ttl_minutes` is a reclaim threshold, not an additional sequential wait budget.
+- Scheduler timeouts remain terminal under the existing error strategy.
+- This scheduler-time correction does not change any internal wait value.
 
 #### `--stale_lock_ttl_minutes`
 [back to Top](#rtbioscan-usage)
