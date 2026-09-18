@@ -282,6 +282,18 @@ def _without_promoter(main):
     return (main[:start] + main[end:]).replace('\twait_minutes=${params.file_wait_minutes ?: 30}\n', '')
 
 
+def _without_fast_split_child_partition(artifact):
+    lines = artifact.splitlines(keepends=True)
+    start_marker = b'# FAST split-child partition start'
+    end_marker = b'# FAST split-child partition end'
+    starts = [index for index, line in enumerate(lines) if line.strip() == start_marker]
+    ends = [index for index, line in enumerate(lines) if line.strip() == end_marker]
+    assert len(starts) == 1, f'expected exactly one FAST split-child start marker, found {len(starts)}'
+    assert len(ends) == 1, f'expected exactly one FAST split-child end marker, found {len(ends)}'
+    assert starts[0] < ends[0], 'FAST split-child end marker must follow start marker'
+    return b''.join(lines[:starts[0]] + lines[ends[0] + 1:])
+
+
 @pytest.mark.parametrize('default', [False, True])
 def test_head_candidate_generated_command_equivalence(tmp_path, default):
     head_main = subprocess.check_output(['git', 'show', f'{HEAD}:main.nf'], cwd=ROOT, text=True)
@@ -312,7 +324,10 @@ def test_head_candidate_generated_command_equivalence(tmp_path, default):
     assert (launch / "artifacts/beforeScript.txt").read_bytes() == head_before
     assert lines[0] == head_lines[0]
     for name, expected in head_artifacts.items():
-        assert (launch / f'artifacts/{name}.sh').read_bytes() == expected, name
+        actual = (launch / f'artifacts/{name}.sh').read_bytes()
+        if name == 'fast_on_target_detection':
+            actual = _without_fast_split_child_partition(actual)
+        assert actual == expected, name
 
 
 def test_dorado_lock_launch_directory_with_spaces(tmp_path):

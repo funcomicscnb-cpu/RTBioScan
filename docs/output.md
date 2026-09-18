@@ -127,6 +127,14 @@ results/temp/ongoing/state/<state_id>/
 
 Additional audit and diagnostic files may also be present in the round directory. Those are mainly intended for troubleshooting and are not the primary public interface of the pipeline.
 
+### Split-child diagnostics
+
+Dorado split children have their own SAM QNAMEs; the `pi:Z:` tag identifies the raw parent read. Raw POD5 contains the parent identity, so a child QNAME cannot be requested from it by exact ID. RTBioScan explicitly excludes FAST split-child target relations before HAC, without expanding to parents or siblings. Excluded children retain the existing `OFF_TARGET` value in the on-target report.
+
+When exclusions occur, `results/temp/ongoing/state/<state_id>/<round_barcode>/<barcode>_split_children_excluded.list` records headerless tab-separated `child_read_id`, `parent_read_id`, and `marker` columns, in original target-relation order (including duplicates). This is troubleshooting provenance, not a stable public schema or taxonomic result. The file is absent when no targeted split children were excluded. If all targets are excluded, the existing no-target failed-round route applies.
+
+HAC and newly generated SUP SAMs can independently contain split children. Their warnings count unique child QNAMEs and are diagnostic only: exact-ID membership remains unchanged, with no parent or sibling admission. SUP cache-only paths do not generate this warning.
+
 ### `round_report.json`
 [back to Top](#rtbioscan-output)
 

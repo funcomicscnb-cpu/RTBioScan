@@ -1408,6 +1408,65 @@ ROUND_LOCK_ACQUIRE_FIELDS
 			grep -F "\t\${_ft}|" \$barcode\\_qced_reads_kingdom.txt | cut -f1 -d"|" | sed 's/\t/|/;' >> \$barcode\\_reads_target.list || true
 		fi
 	done
+    # FAST split-child partition start
+    _split_sidecar="\${barcode}_split_children_excluded.list"
+    _split_state="${ongoingStateDir}/\${round_barcode}/\${_split_sidecar}"
+    _split_state_tmp="\${_split_state}.tmp.\$\$"
+    _split_targets_tmp="\${barcode}_reads_target.list.tmp.\$\$"
+    rm -f "\$_split_sidecar" "\$_split_state" "\$_split_state_tmp" "\$_split_targets_tmp"
+    # Validate all SAM identities before writing either partition. Keep raw target bytes.
+    if ! _split_count=\$(perl -e '
+        use strict;
+        use warnings;
+        my (\$sam, \$targets, \$retained, \$excluded) = @ARGV;
+        open my \$sf, "<", \$sam or die "Cannot read FAST SAM: \$!\\n";
+        my %parent;
+        while (<\$sf>) {
+            next if /^@/;
+            chomp;
+            my @f = split /\\t/, \$_, -1;
+            next unless @f >= 11;
+            for my \$tag (@f[11 .. \$#f]) {
+                next unless \$tag =~ /^pi:Z:(.+)\$/;
+                my \$raw_parent = \$1;
+                die "ERROR: conflicting FAST split-child parents for \$f[0]\\n"
+                    if exists \$parent{\$f[0]} && \$parent{\$f[0]} ne \$raw_parent;
+                \$parent{\$f[0]} = \$raw_parent;
+            }
+        }
+        close \$sf or die "Cannot close FAST SAM: \$!\\n";
+        open my \$tf, "<", \$targets or die "Cannot read FAST targets: \$!\\n";
+        open my \$keep, ">", \$retained or die "Cannot write retained targets: \$!\\n";
+        open my \$drop, ">", \$excluded or die "Cannot write split diagnostics: \$!\\n";
+        my \$count = 0;
+        while (<\$tf>) {
+            # Only generated read_id|marker relations are classified; preserve other lines.
+            if (/\\A([^|\\s]+)\\|([^|\\s]+)\\n?\\z/ && exists \$parent{\$1}) {
+                print {\$drop} "\$1\\t\$parent{\$1}\\t\$2\\n" or die "Cannot write split diagnostics: \$!\\n";
+                ++\$count;
+            } else {
+                print {\$keep} \$_ or die "Cannot write retained targets: \$!\\n";
+            }
+        }
+        close \$tf or die "Cannot close FAST targets: \$!\\n";
+        close \$keep or die "Cannot close retained targets: \$!\\n";
+        close \$drop or die "Cannot close split diagnostics: \$!\\n";
+        print \$count;
+    ' "\${barcode}_fast.sam" "\${barcode}_reads_target.list" "\$_split_targets_tmp" "\$_split_sidecar"); then
+        rm -f "\$_split_targets_tmp" "\$_split_sidecar"
+        exit 1
+    fi
+    if [ "\$_split_count" -gt 0 ]; then
+        if ! { cp "\$_split_sidecar" "\$_split_state_tmp" && mv -f "\$_split_state_tmp" "\$_split_state"; }; then
+            rm -f "\$_split_state_tmp" "\$_split_targets_tmp"
+            exit 1
+        fi
+        printf 'WARN: FAST excluded %s split-child target relations; barcode=%s round=%s\\n' "\$_split_count" "\$barcode" "\$round_barcode" >&2
+    else
+        rm -f "\$_split_sidecar"
+    fi
+    mv -f "\$_split_targets_tmp" "\${barcode}_reads_target.list"
+    # FAST split-child partition end
 	if [ -s \$barcode\\_reads_target.list ]; then
 		echo "\$barcode\\_reads_target.list created" 1>&2
 	fi
@@ -1661,6 +1720,15 @@ process hac_basecalling {
 				exit 1
 			fi
 
+    # HAC split-child diagnostic start
+    _split_child_count=\$(awk -F '\\t' '
+        !/^@/ { for (i=12; i<=NF; i++) if (\$i ~ /^pi:Z:.+/) { children[\$1]=1; break } }
+        END { for (child in children) count++; print count+0 }
+    ' "${barcode}_hac.sam")
+    if [ "\$_split_child_count" -gt 0 ]; then
+        printf 'WARN: HAC emitted %s unique split-child QNAMEs; barcode=%s round=%s\\n' "\$_split_child_count" "${barcode}" "\$round_barcode" >&2
+    fi
+    # HAC split-child diagnostic end
 		if ! samtools fastq -@ ${task.cpus} ${barcode}_hac.sam > ${barcode}_hac.fastq; then
 			echo "ERROR: Failed to convert successful HAC basecalling output to FASTQ" 1>&2
 			exit 1
@@ -3920,6 +3988,15 @@ process blast_OTU_pretax {
 								exit 1
 							fi
 						
+    # SUP split-child diagnostic start
+    _split_child_count=\$(awk -F '\\t' '
+        !/^@/ { for (i=12; i<=NF; i++) if (\$i ~ /^pi:Z:.+/) { children[\$1]=1; break } }
+        END { for (child in children) count++; print count+0 }
+    ' "${barcode}_blastreport_sup.sam")
+    if [ "\$_split_child_count" -gt 0 ]; then
+        printf 'WARN: SUP emitted %s unique split-child QNAMEs; barcode=%s round=%s\\n' "\$_split_child_count" "${barcode}" "\$round_barcode" >&2
+    fi
+    # SUP split-child diagnostic end
 							_t_sup_fastq_recover_start=\$(now_ms)
 							samtools fastq -@ ${task.cpus} ${barcode}_blastreport_sup.sam > ${barcode}_blastreport_sup_new.fastq
 							_t_sup_fastq_recover_end=\$(now_ms)
