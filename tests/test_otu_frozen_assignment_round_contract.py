@@ -727,7 +727,20 @@ def frozen_hash_block(source=SOURCE):
 
 
 def reviewed_candidate():
-    source = SOURCE.replace(frozen_hash_block(), "", 1)
+    # This negative control is R3-C1 before F-C1-01, not the evolving candidate.
+    historical = subprocess.check_output([
+        "git", "-C", str(ROOT), "show",
+        "842881dfa1e99e9dc8ac20658e88d1da7976c4a6:main.nf",
+    ])
+    assert hashlib.sha256(historical).hexdigest() == "a4fb19020bc244d3ddd55caee7ec1e6517c0aaa0e4038475b065169e572afefc", "immutable R3-C1 source hash"
+    source = historical.decode("utf-8")
+    start = '\t\t\t\t\t# Frozen assignments are also decided hashes'
+    end = '\t\t\t\t\tif [ "${params.otu_commit_dropped_hashes}"'
+    assert source.count(start) == source.count(end) == 1, "historical F-C1-01 anchors must be unique"
+    assert source.index(start) < source.index(end), "historical F-C1-01 anchor order"
+    block = frozen_hash_block(source)
+    assert len(block.splitlines()) == 6, "historical F-C1-01 block must contain six lines"
+    source = source.replace(block, "", 1)
     assert hashlib.sha256(source.encode()).hexdigest() == "88c6df06975c2b3aac9773d9e9457b6b8826e9363de10ad1f05477ace3e77de3"
     return source
 

@@ -2975,6 +2975,7 @@ process OTU_definition {
 				fi
 			else
 				: > ${barcode}_active_members.tsv
+				: > ${barcode}_promoted_clusters.tsv
 			fi
 
 				# Build NR-only hash map: active cluster reps (active_nr.fasta) + frozen rep hashes (frozen_meta.tsv).
@@ -2994,14 +2995,31 @@ process OTU_definition {
 				cp "\$NR_HASH_MAP_FILE" "\${STATE_DIR}/${barcode}_otu_nr_hash_map.tsv.tmp" 2>/dev/null \
 					&& mv "\${STATE_DIR}/${barcode}_otu_nr_hash_map.tsv.tmp" "\${STATE_DIR}/${barcode}_otu_nr_hash_map.tsv" || true
 
-			# Future F-02 boundary: filter promoted cluster IDs before publishing this relation.
+			# Promotion transfers whole active clusters to frozen membership before publication.
 			# Columns: active cluster ID, annotated read ID, representative flag, pool SHA-256.
 			ACTIVE_POOL_HASH=\$(perl -MDigest::SHA -e 'print Digest::SHA->new(256)->addfile(\$ARGV[0])->hexdigest' "\$ACTIVE_POOL")
 			if ! ACTIVE_MEMBERS_TMP=\$(mktemp "\${ACTIVE_MEMBERS_STATE}.tmp.XXXXXX"); then
 				echo "ERROR: cannot create active membership temporary file" 1>&2
 				exit 1
 			fi
-			if ! awk -v pool_hash="\$ACTIVE_POOL_HASH" 'BEGIN{OFS="\t"} {print \$0, pool_hash}' ${barcode}_active_members.tsv > "\$ACTIVE_MEMBERS_TMP" \
+			if ! awk -v pool_hash="\$ACTIVE_POOL_HASH" -v promoted="${barcode}_promoted_clusters.tsv" '
+				BEGIN {
+					FS=OFS="\t"
+					while ((status=(getline id < promoted)) > 0) {
+						if (id !~ /^CLUST_[0-9]+\$/) exit 1
+						p[id]=1
+					}
+					if (status < 0) exit 1
+					close(promoted)
+				}
+				{
+					if (NF != 3 || \$1 == "" || \$2 == "" || \$3 !~ /^[01]\$/) exit 1
+					if (seen[\$1 SUBSEP \$2]++) exit 1
+					if (\$1 in p) {found[\$1]++; reps[\$1]+=\$3; next}
+					print \$0, pool_hash
+				}
+				END {for (id in p) if (!found[id] || reps[id] != 1) exit 1}
+			' ${barcode}_active_members.tsv > "\$ACTIVE_MEMBERS_TMP" \
 				|| ! mv -f "\$ACTIVE_MEMBERS_TMP" "\$ACTIVE_MEMBERS_STATE"; then
 				rm -f "\$ACTIVE_MEMBERS_TMP"
 				echo "ERROR: cannot publish active membership state" 1>&2
