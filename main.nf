@@ -3884,18 +3884,16 @@ process blast_OTU_pretax {
 	    _t_blocked_otu_build_start=\$(now_ms)
 	    CONSOLIDATED_OTU="${barcode}_consolidated_otu.tsv"
     : > "\$CONSOLIDATED_OTU"
-    if [ -s "\$CONSENSUS_DIR/consensus_otu_map.tsv" ]; then
-        awk 'BEGIN{FS=OFS="\t"} NR==1{next}
-            {
-                otu_key=\$2; sample=\$3; cons=\$7+0;
-                if (otu_key=="" || sample=="") next;
-                key=sample "\t" otu_key;
-                seen[key]=1;
-                if (cons==0) any_non[key]=1;
-            }
-            END{
-                for (k in seen) if (!any_non[k]) print k;
-            }' "\$CONSENSUS_DIR/consensus_otu_map.tsv" > "\$CONSOLIDATED_OTU"
+    # Prior report labels are display only. Resolve proven owners into this round's labels.
+    if [ -s "\$CONSENSUS_DIR/consensus_ownership.tsv" ]; then
+        CONSOLIDATED_CURRENT_IDENTITY="${barcode}_consolidated_current_identity.tsv"
+        perl "\$BIN_DIR/consensus_otu_identity.pl" map --clstr "\$STATE_DIR/qced_reads_nr.fasta.clstr" \
+            --hash-map "\$OTU_HASH_MAP_STATE" --targets "${params.targets}" --out "\$CONSOLIDATED_CURRENT_IDENTITY"
+        perl "\$BIN_DIR/consensus_otu_identity.pl" consolidated-display \
+            --map "\$CONSOLIDATED_CURRENT_IDENTITY" --prior "\$CONSENSUS_DIR/consensus_ownership.tsv" --out "\$CONSOLIDATED_OTU"
+        rm -f "\$CONSOLIDATED_CURRENT_IDENTITY"
+    elif [ -s "\$CONSENSUS_DIR/consensus_otu_map.tsv" ]; then
+        echo "WARN: consensus identity: ignored unproven legacy consensus report for SUP blocking" 1>&2
     fi
     FROZEN_READS="${barcode}_frozen_read_ids.list"
     : > "\$FROZEN_READS"
@@ -4270,15 +4268,27 @@ process blast_OTU_pretax {
 							if [ ! -f "\$C1_SAMPLES_FILE" ]; then
 								C1_SAMPLES_FILE=""
 							fi
+							C1_STABLE_KEYS="\${DEDUP_TMP}.consolidated.stable.tsv"
+							C1_IDENTITY_MAP="\${DEDUP_TMP}.identity.tsv"
+							C1_DISPLAY_KEYS="\${DEDUP_TMP}.consolidated.display.tsv"
+							C1_DISPLAY_HEADERS="\${DEDUP_TMP}.current_headers.fasta"
+							perl "\$BIN_DIR/consensus_otu_identity.pl" keys --column 2 \
+								--input "\${STATE_DIR}/otu_consolidated_keys.tsv" --legacy "\${STATE_DIR}/consensus_legacy_ownership.tsv" --out "\$C1_STABLE_KEYS"
+							perl "\$BIN_DIR/consensus_otu_identity.pl" map --clstr "\${STATE_DIR}/qced_reads_nr.fasta.clstr" \
+								--hash-map "\$OTU_HASH_MAP_STATE" --targets "${params.targets}" --out "\$C1_IDENTITY_MAP"
+							perl "\$BIN_DIR/consensus_otu_identity.pl" display-keys --map "\$C1_IDENTITY_MAP" \
+								--input "\$C1_STABLE_KEYS" --out "\$C1_DISPLAY_KEYS"
+							perl "\$BIN_DIR/consensus_otu_identity.pl" prune-view --map "\$C1_IDENTITY_MAP" \
+								--clstr "\${STATE_DIR}/qced_reads_nr.fasta.clstr" --input "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" --out "\$C1_DISPLAY_HEADERS"
 							RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${replicateModeCanonical}" \
 							RTBIOSCAN_TRACK_ACTIVE_UNITS="${sampleInfoDir}/track_active_units.txt" \
 							RTBIOSCAN_TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv" \
 							"\$BIN_DIR/otu_c1_prune_ids.sh" \
 								"until_consolidated" \
-								"\${STATE_DIR}/qced_reads_hq_accumulated.fasta" \
+								"\$C1_DISPLAY_HEADERS" \
 								"\${DEDUP_TMP}.active_ids" \
 								"" \
-								"\${STATE_DIR}/otu_consolidated_keys.tsv" \
+								"\$C1_DISPLAY_KEYS" \
 								"\$C1_SAMPLES_FILE" \
 								"${otuConsolidatedKeysMixedPolicyCanonical}" \
 								"\$OBSERVED_NO_ADAPTER"
@@ -4286,6 +4296,7 @@ process blast_OTU_pretax {
 							awk '{split(\$0,a,"|"); if (a[1]!="") print a[1]}' "\${DEDUP_TMP}.active_ids" | LC_ALL=C sort -u > "\${DEDUP_TMP}.active_base_ids"
 							comm -23 "\${DEDUP_TMP}.all_ids" "\${DEDUP_TMP}.active_base_ids" > "\$C1_PRUNE_IDS" || : > "\$C1_PRUNE_IDS"
 							rm -f "\${DEDUP_TMP}.active_ids" "\${DEDUP_TMP}.all_ids" "\${DEDUP_TMP}.active_base_ids"
+							rm -f "\$C1_STABLE_KEYS" "\$C1_IDENTITY_MAP" "\$C1_DISPLAY_KEYS" "\$C1_DISPLAY_HEADERS"
 						fi
 					fi
 
@@ -4927,6 +4938,9 @@ process consensus {
 				mkdir -p Consensus
 				cp ${ongoingStateDir}/Consensus/consolidated_consensus_ids.txt Consensus/consolidated_consensus_ids.txt 2>/dev/null || true
 			fi
+			if [ -f "${ongoingStateDir}/Consensus/consensus_ownership.tsv" ]; then
+				cp "${ongoingStateDir}/Consensus/consensus_ownership.tsv" Consensus/consensus_ownership.tsv
+			fi
 			_t_prelaunch_consensus_ids_restore_end=\$(timing_now_ms)
 			append_process_timing "prelaunch_consensus_ids_restore" "\$_t_prelaunch_consensus_ids_restore_start" "\$_t_prelaunch_consensus_ids_restore_end"
 			_t_prelaunch_qscore_prepare_start=\$(timing_now_ms)
@@ -4984,6 +4998,9 @@ process consensus {
 			CONSENSUS_SIG_TOP2_MIN_RATIO="${otuSigTop2MinRatioStr}" \
 			CONSENSUS_SIG_TOP2_MIN_DELTA_READS="${otuSigTop2MinDeltaReadsStr}" \
 			CONSENSUS_SIG_MIN_STABLE_ROUNDS="${otuSigMinStableRoundsStr}" \
+			CONSENSUS_OTU_CLSTR="${ongoingStateDir}/_state/qced_reads_nr.fasta.clstr" \
+			CONSENSUS_OTU_HASH_MAP="${ongoingStateDir}/_state/${barcode}_otu_nr_hash_map.tsv" \
+			CONSENSUS_LEGACY_IDENTITY="${ongoingStateDir}/_state/consensus_legacy_ownership.tsv" \
 			CONSENSUS_LOCK_KEYS_PREV="${ongoingStateDir}/_state/otu_consolidated_keys.tsv" \
 			CONSENSUS_LOCK_RESET_KEYS="${params.otu_lock_reset_keys}" \
 			CONSENSUS_PRUNE_FROZEN_POLICY="${otuPruneFrozenPolicyCanonical}" \
@@ -4997,7 +5014,7 @@ process consensus {
 			CONSENSUS_KEEP_ORIGINAL_READS="${consensusKeepOriginalReads ? 1 : 0}" \
 			CONSENSUS_CPU_BUDGET="${params.consensus_cpu_budget}" \
 			CONSENSUS_RSCRIPT_WORKERS="${params.consensus_workers}" \
-			bash ${baseDir}/bin/Consensus_simple.sh ${baseDir}/bin/ ${params.consensus_id} ${params.consensus_min_reads} ${params.consensus_max_reads} ${params.consensus_min_qscore} ${params.consensus_consolidated_min_qscore} ${ongoingStateDir}/_state/otu_frozen_members.tsv "${params.consensus_reads_mode}" ${params.consensus_max_N}
+			bash "${baseDir}/bin/Consensus_simple.sh" "${baseDir}/bin/" ${params.consensus_id} ${params.consensus_min_reads} ${params.consensus_max_reads} ${params.consensus_min_qscore} ${params.consensus_consolidated_min_qscore} "${ongoingStateDir}/_state/otu_frozen_members.tsv" "${params.consensus_reads_mode}" ${params.consensus_max_N}
 		else
 			echo "INFO: No sup_reads and no consensus cache; skipping Consensus_simple.sh this round" 1>&2
 		fi
@@ -5336,6 +5353,16 @@ process consensus {
 							echo "ERROR: failed to expand current consensus-assigned OTU keys into member reads" 1>&2
 							exit 1
 						fi
+						perl "${baseDir}/bin/consensus_otu_identity.pl" current-keys \
+							--map Consensus/otu_identity_current.tsv --input "\$CONSENSUS_ASSIGNED_OTU_KEYS_ROUND" \
+							--out "\${CONSENSUS_ASSIGNED_OTU_KEYS_ROUND}.stable"
+						mv "\${CONSENSUS_ASSIGNED_OTU_KEYS_ROUND}.stable" "\$CONSENSUS_ASSIGNED_OTU_KEYS_ROUND"
+						perl "${baseDir}/bin/consensus_otu_identity.pl" keys \
+							--input "\$ASSIGNED_OTU_KEYS_EVER" --legacy "\${STATE_DIR}/consensus_legacy_ownership.tsv" \
+							--out "\${ASSIGNED_OTU_KEYS_EVER}.stable"
+						perl "${baseDir}/bin/consensus_otu_identity.pl" publish-keys \
+							--input "\${ASSIGNED_OTU_KEYS_EVER}.stable" --out "\$ASSIGNED_OTU_KEYS_EVER"
+						rm -f "\${ASSIGNED_OTU_KEYS_EVER}.stable"
 						if ! materialize_round_grace_ids \
 							"\$CONSENSUS_ASSIGNED_MEMBER_IDS_GRACE_STATE" \
 							"\$CONSENSUS_ASSIGNED_MEMBERS_CURRENT_RAW" \
@@ -5422,6 +5449,13 @@ process consensus {
 				mkdir -p ${ongoingStateDir}/Consensus
 				cp Consensus/consolidated_ids_status.tsv ${ongoingStateDir}/Consensus/consolidated_ids_status.tsv || true
 			fi
+			# Stable ownership and its display projection also advance on zero-emission rounds.
+			for identity_state in consensus_ownership.tsv consolidated_consensus_ids.txt; do
+				if [ -f "Consensus/\$identity_state" ]; then
+					cp "Consensus/\$identity_state" "${ongoingStateDir}/Consensus/\$identity_state.tmp" && \
+						mv "${ongoingStateDir}/Consensus/\$identity_state.tmp" "${ongoingStateDir}/Consensus/\$identity_state" || exit 1
+				fi
+			done
 		fi
 		_t_consensus_persist_end=\$(timing_now_ms)
 		append_process_timing "cache_persist" "\$_t_consensus_persist_start" "\$_t_consensus_persist_end"
@@ -5514,7 +5548,8 @@ process consensus {
 				fi
 			fi
 			if [ -f Consensus/otu_consolidated_keys.tsv ]; then
-			cp Consensus/otu_consolidated_keys.tsv ${ongoingStateDir}/_state/otu_consolidated_keys.tsv 2>/dev/null || true
+			perl "${baseDir}/bin/consensus_otu_identity.pl" publish-keys --column 2 \
+				--input Consensus/otu_consolidated_keys.tsv --out "${ongoingStateDir}/_state/otu_consolidated_keys.tsv"
 			mkdir -p ${ongoingStateDir}/${round_barcode}
 			cp Consensus/otu_consolidated_keys.tsv ${ongoingStateDir}/${round_barcode}/${barcode}_otu_consolidated_keys.tsv 2>/dev/null || true
 		fi

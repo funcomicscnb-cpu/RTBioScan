@@ -28,6 +28,9 @@ if [ ! -f "$validator_helper" ] && [ -n "${1:-}" ]; then
 	validator_helper="${1%/}/lib/validate_phase1_workload.sh"
 fi
 source "$validator_helper"
+identity_helper="$script_dir/consensus_otu_identity.pl"
+if [ ! -f "$identity_helper" ]; then identity_helper="${1%/}/consensus_otu_identity.pl"; fi
+legacy_identity="${CONSENSUS_LEGACY_IDENTITY:-}"
 identity_mode="${RTBIOSCAN_EFFECTIVE_IDENTITY_MODE:-collapse}"
 identity_mode="$(printf '%s' "$identity_mode" | tr '[:upper:]' '[:lower:]')"
 consensus_taxonomy_mode="${CONSENSUS_TAXONOMY_MODE:-required}"
@@ -111,6 +114,12 @@ fi
 if [ ! -f "$eligible_size_streak_file" ]; then
 	printf "sample\totu_key\tread_id\tround_barcode\n" > "$eligible_size_streak_file"
 fi
+ownership_state="$out_dir/consensus_ownership.tsv"
+ownership_prev="$out_dir/consensus_ownership.prev.tsv"
+ownership_next="$out_dir/consensus_ownership.next.tsv"
+ownership_emitted="$out_dir/consensus_ownership.emitted.tsv"
+if [ -f "$ownership_state" ]; then cp "$ownership_state" "$ownership_prev"; else : > "$ownership_prev"; fi
+: > "$ownership_emitted"
 consolidated_ids_current="$out_dir/consolidated_consensus_ids.current"
 consolidated_status="$out_dir/consolidated_ids_status.tsv"
 consolidated_otu_keys_global="$out_dir/otu_consolidated_keys.tsv"
@@ -243,7 +252,7 @@ if [ "$selector_enforce_max_reads" -eq 1 ]; then
 	fi
 fi
 if [ -n "$lock_prev_keys_src" ] && [ -s "$lock_prev_keys_src" ]; then
-	cp "$lock_prev_keys_src" "$consolidated_otu_keys_prev"
+	perl "$identity_helper" keys --input "$lock_prev_keys_src" --column 2 --legacy "$legacy_identity" --out "$consolidated_otu_keys_prev"
 else
 	: > "$consolidated_otu_keys_prev"
 fi
@@ -253,6 +262,8 @@ if [ -n "$lock_reset_keys" ]; then
 else
 	: > "$lock_reset_list"
 fi
+perl "$identity_helper" keys --input "$lock_reset_list" --legacy "$legacy_identity" --out "${lock_reset_list}.stable"
+mv "${lock_reset_list}.stable" "$lock_reset_list"
 if [ -s "$lock_reset_list" ] && [ -s "$consolidated_otu_keys_prev" ]; then
 	awk 'BEGIN{FS=OFS="\t"}
 		FNR==NR { r[$1]=1; next }
@@ -444,6 +455,19 @@ filter_consolidated_ids_by_dropped_keys() {
 		return 0
 	fi
 	awk -v MODE="ids" -v DROP="$drop_file" -v ID_GLOBAL_SUFFIX_MODE="$id_drop_global_suffix_mode" -f "$drop_filter_awk" "$drop_file" "$in_file" "$in_file" > "$out_file"
+}
+filter_stable_consolidated_keys() {
+	perl "$identity_helper" drop-keys --input "$1" --drop "$consolidated_otu_keys_drop" --out "${1}.stable"
+	mv "${1}.stable" "$1"
+}
+filter_stable_consolidated_ids() {
+	local in_file="$1" out_file="$2" drop_file="$3"
+	if [ "$in_file" = "$consolidated_ids_current" ]; then
+		# Current IDs have already been selected by stable ownership and drop keys.
+		cp "$in_file" "${out_file}.tmp" && mv "${out_file}.tmp" "$out_file"
+	else
+		perl "$identity_helper" filter-ids --input "$in_file" --prior "$ownership_prev" --drop "$drop_file" --out "$out_file"
+	fi
 }
 build_consolidation_policy_signature() {
 	if [ "$consolidation_mode" = "significant_clusters" ]; then
@@ -665,6 +689,14 @@ if [ ! -s "$sup_reads" ] && [ "$cache_has_files" -eq 1 ]; then
 	echo "INFO: cache-only mode (sup_reads empty; using cached consensus)" 1>&2
 fi
 _t_startup_state_start=$(timing_now)
+identity_map="$out_dir/otu_identity_current.tsv"
+if [ -n "${CONSENSUS_OTU_CLSTR:-}" ] || [ -n "${CONSENSUS_OTU_HASH_MAP:-}" ]; then
+	perl "$identity_helper" map --clstr "${CONSENSUS_OTU_CLSTR:-}" --hash-map "${CONSENSUS_OTU_HASH_MAP:-}" \
+		--targets "$target_tokens_env" --out "$identity_map"
+else
+	# A true no-op or unproven legacy-only round has no current identity to adopt.
+	: > "$identity_map"
+fi
 sup_index="$out_dir/sup_reads_header_index.tsv"
 awk '
 	/^>/{
@@ -1128,6 +1160,8 @@ while IFS= read -r sample; do
 	: > "$sample_timing_file"
 	_t_sample_total_start=$(timing_now)
 	consolidated_ids_current="$out_dir/$sample/_consolidated_ids.tmp"
+	ownership_emitted_sample="$out_dir/$sample/_emitted_ownership.tmp"
+	: > "$ownership_emitted_sample"
 	consolidated_otu_keys_current="$out_dir/$sample/_otu_keys_current.tmp"
 	eligible_counts_file="$out_dir/$sample/_eligible_counts.tmp"
 	eligible_size_streak_file="$out_dir/$sample/_eligible_size_streak.tmp"
@@ -1198,7 +1232,7 @@ while IFS= read -r sample; do
 		cons_log "sample=$sample consolidation_policy_reset reason=${policy_reset_reason:-unknown} previous='${previous_policy_signature:-NA}' current='$current_policy_signature'"
 	fi
 	if [ -s "$lock_state_file" ]; then
-		cp "$lock_state_file" "$lock_state_prev"
+		perl "$identity_helper" keys --input "$lock_state_file" --sample "$sample" --legacy "$legacy_identity" --out "$lock_state_prev"
 	else
 		: > "$lock_state_prev"
 	fi
@@ -1311,6 +1345,17 @@ while IFS= read -r sample; do
 		}
 	' "$sample_blast" > "$sample_parsed"
 	sample_parsed_rows=$(awk 'NF{c++} END{print c+0}' "$sample_parsed")
+	sample_identity_map="$out_dir/$sample/otu_identity_current.tsv"
+	cache_identity_valid="$out_dir/$sample/_cache_identity_valid.tsv"
+	perl "$identity_helper" bind --map "$identity_map" --parsed "$sample_parsed" --out "$sample_identity_map"
+	perl "$identity_helper" cache --map "$identity_map" --cache "$sample_cache_dir" --sample "$sample" \
+		--legacy "$legacy_identity" --out "$cache_identity_valid"
+	if [ -s "$lock_reset_list" ]; then
+		awk 'BEGIN{FS=OFS="\t"} FILENAME==ARGV[1]{reset[$1]=1;next} !($1 in reset)' \
+			"$lock_reset_list" "$cache_identity_valid" > "${cache_identity_valid}.tmp"
+		mv "${cache_identity_valid}.tmp" "$cache_identity_valid"
+	fi
+	: > "$otu_list"
 	_t_filter_parse_end=$(timing_now)
 	append_timing_row "$sample_timing_file" "sample" "$sample" "blast_filter_parse" "$_t_filter_parse_start" "$_t_filter_parse_end"
 	if [ "$CONS_DEBUG" = "1" ]; then
@@ -1395,37 +1440,9 @@ while IFS= read -r sample; do
 					print m[req], $1, $2, $3, $4, $5 > (dir "/" k ".tsv");
 				}
 			' "$sample_resolved_map" "$sample_parsed"
-			awk -v lockf="$lock_state_prev" -v lockedf="$locked_keys_sample" -v otuf="$otu_list" 'BEGIN{FS=OFS="\t"}
-				FILENAME==lockf {
-					if (NF>=3) {
-						st[$1]=($2 ~ /^[0-9]+$/ ? $2 : 0);
-						ps[$1]=($3 ~ /^[0-9]+$/ ? $3 : 0);
-					}
-					next
-				}
-				FILENAME==lockedf {
-					if (NF>=1 && $1!="") lk[$1]=1;
-					next
-				}
-				FILENAME==otuf {
-					if (NF<1 || $1=="") next;
-					k=$1;
-					print k, ((k in st)?st[k]:0), ((k in ps)?ps[k]:0), ((k in lk)?1:0);
-				}
-			' "$lock_state_prev" "$locked_keys_sample" "$otu_list" > "$otu_runtime_plan"
-			awk -v lockf="$lock_state_prev" -v lockedf="$locked_keys_sample" 'BEGIN{FS=OFS="\t"}
-				FILENAME==lockf {
-					if (NF>=3) {
-						st[$1]=($2 ~ /^[0-9]+$/ ? $2 : 0);
-						ps[$1]=($3 ~ /^[0-9]+$/ ? $3 : 0);
-					}
-					next
-				}
-				FILENAME==lockedf && NF>=1 && $1!="" {
-					k=$1;
-					print k, ((k in st)?st[k]:0), ((k in ps)?ps[k]:0);
-				}
-			' "$lock_state_prev" "$locked_keys_sample" > "$carry_forward_state"
+			perl "$identity_helper" plan --map "$sample_identity_map" --input "$otu_list" \
+				--lock-state "$lock_state_prev" --locked-keys "$locked_keys_sample" --valid "$cache_identity_valid" \
+				--out "$otu_runtime_plan" --carry "$carry_forward_state"
 			MAX_SELECTOR_JOBS=$RSCRIPT_WORKERS
 		_sel_pids=()
 	# O1b: accumulation files for batch pool extraction (defer per-OTU seqtk to post-loop samtools call)
@@ -1438,7 +1455,7 @@ while IFS= read -r sample; do
 		: > "$_union_pool_map"
 		: > "$_phase1_workload"
 		: > "$_selector_queue"
-			while IFS=$'\t' read -r otu_key prev_stable_count prev_lock_pass locked_this_otu; do
+			while IFS=$'\t' read -r otu_key prev_stable_count prev_lock_pass locked_this_otu stable_otu_key cache_identity_ok representative_id public_display_key; do
 					[ -n "$otu_key" ] || continue
 					raw_otu_rows="$sample_otu_dir/${otu_key}.tsv"
 					otu_rows="$sample_otu_resolved_dir/${otu_key}.tsv"
@@ -1450,18 +1467,9 @@ while IFS= read -r sample; do
 			#echo "Processing OTU $otu_key"
 			eligible_list="$out_dir/$sample/${otu_key}_eligible.list"
 				candidate_list="$out_dir/$sample/${otu_key}_candidate.list"
-				cache_meta="$sample_cache_dir/${otu_key}.meta"
-				cache_cons="$sample_cache_dir/${otu_key}.consensus.fasta"
-				# Fallback: if barcode-specific cache is missing, try barcode-less cache name.
-					if [ ! -s "$cache_cons" ]; then
-						otu_key_nobc="${otu_key%-*}"
-						if [ "$otu_key_nobc" != "$otu_key" ]; then
-							cache_cons_alt="$sample_cache_dir/${otu_key_nobc}.consensus.fasta"
-							if [ -s "$cache_cons_alt" ]; then
-								cache_cons="$cache_cons_alt"
-							fi
-						fi
-					fi
+				cache_meta="$sample_cache_dir/${stable_otu_key}.meta"
+				cache_cons="$sample_cache_dir/${stable_otu_key}.consensus.fasta"
+				if [ "$cache_identity_ok" -ne 1 ]; then cache_cons="${cache_cons}.unvalidated"; fi
 						stable_count=0
 						lock_rule_pass=0
 						revalidate_this_otu=0
@@ -1477,11 +1485,11 @@ while IFS= read -r sample; do
 						if [ "$prev_stable_count" -lt "$lock_min_stable_rounds" ]; then
 							prev_stable_count="$lock_min_stable_rounds"
 						fi
-						printf "%s\t%s\t%s\n" "$otu_key" "$prev_stable_count" "1" >> "$lock_state_current"
+						printf "%s\t%s\t%s\n" "$stable_otu_key" "$prev_stable_count" "1" >> "$lock_state_current"
 						IFS=$'\t' read -r cache_n cache_minq cache_frozen < <(read_cache_consensus_meta "$cache_cons")
 						printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$otu_key" "$sample" "$cache_n" "$cache_minq" "$cache_frozen" "1" >> "$sample_meta"
 						echo "$otu_key" >> "$consolidated_keys"
-						printf "%s\t%s\n" "$sample" "$otu_key" >> "$consolidated_otu_keys_current"
+						printf "%s\t%s\n" "$sample" "$stable_otu_key" >> "$consolidated_otu_keys_current"
 						echo "$cache_cons" >> "$cached_list"
 						continue
 					elif [ "$locked_this_otu" -eq 1 ]; then
@@ -1490,7 +1498,7 @@ while IFS= read -r sample; do
 					# When the accumulated FASTA is empty (all reads C1-pruned), no new reads can
 					# be extracted. Carry forward the cached consensus if it exists; skip this OTU.
 					if ! [ -s "$sup_reads" ]; then
-						printf "%s\t%s\t%s\n" "$otu_key" "$prev_stable_count" "$prev_lock_pass" >> "$lock_state_current"
+						printf "%s\t%s\t%s\n" "$stable_otu_key" "$prev_stable_count" "$prev_lock_pass" >> "$lock_state_current"
 						[ -s "$cache_cons" ] && echo "$cache_cons" >> "$cached_list"
 						continue
 					fi
@@ -1609,11 +1617,14 @@ while IFS= read -r sample; do
 				fi
 				[ "$CONS_DEBUG" = "1" ] && cons_log "OTU=$otu_key elig_final=$n_elig"
 			# Accumulate eligible reads across rounds (per OTU/sample), storing best model rank and qscore per read.
-			pool_file="$sample_cache_dir/${otu_key}.pool.tsv"
-			pool_new="$sample_cache_dir/${otu_key}.pool_new.tsv"
+			pool_file="$sample_cache_dir/${stable_otu_key}.pool.tsv"
+			pool_new="$sample_cache_dir/${stable_otu_key}.pool_new.tsv"
 			pool_ids=""
 			pool_ids_count=0
 			pool_size_streak_id=""
+			if [ ! -f "$cache_meta" ]; then
+				perl "$identity_helper" meta --representative "$representative_id" --public-display "$public_display_key" --cache "$sample_cache_dir" --display "$otu_key" --key "$stable_otu_key"
+			fi
 			[ -f "$pool_file" ] || : > "$pool_file"
 				if [ -s "$eligible_list" ] && [ -s "$sample_qscore_map" ]; then
 					pool_file_tmp="${pool_file}.tmp"
@@ -1827,9 +1838,10 @@ while IFS= read -r sample; do
 		fi
 		# O1b: spawn deferred selectors now that pool_reads files are in place
 		if [ -s "$_selector_queue" ]; then
-			while IFS=$'\t' read -r _p1_otu_key _p1_sel_prefix _p1_pool_count _p1_selector_skip_reason; do
+			perl "$identity_helper" join --map "$sample_identity_map" --input "$_selector_queue" --valid "$cache_identity_valid" --out "${_selector_queue}.identity"
+			while IFS=$'\t' read -r _p1_otu_key _p1_sel_prefix _p1_pool_count _p1_selector_skip_reason _p1_stable_otu_key _p1_cache_ok _p1_representative _p1_public; do
 				[ -n "$_p1_sel_prefix" ] || continue
-				_p1_pool_file="$sample_cache_dir/${_p1_otu_key}.pool.tsv"
+				_p1_pool_file="$sample_cache_dir/${_p1_stable_otu_key}.pool.tsv"
 				_p1_pool_reads="${_p1_sel_prefix}.pool_reads.fasta"
 				_p1_sel_prune_stats="${_p1_sel_prefix}.prune_stats.tsv"
 				_p1_sel_drop_ids=""
@@ -1884,7 +1896,7 @@ while IFS= read -r sample; do
 					fi
 					"${_p1_selector_cmd[@]}" &
 				_sel_pids+=($!)
-			done < "$_selector_queue"
+			done < "${_selector_queue}.identity"
 			fi
 			# Wait for all background selectors to complete
 			for _p in "${_sel_pids[@]+"${_sel_pids[@]}"}"; do
@@ -1899,10 +1911,11 @@ while IFS= read -r sample; do
 			done
 			_sel_pids=()
 			# Phase 2: process selector results and compute consolidation decisions from the phase-1 workload table.
-			while IFS=$'\t' read -r otu_key prev_stable_count prev_lock_pass locked_this_otu is_frozen selector_skip_reason eligible_count pool_ids_count pool_size_streak_id phase1_mode sel_prefix; do
+			perl "$identity_helper" join --map "$sample_identity_map" --input "$_phase1_workload" --valid "$cache_identity_valid" --out "${_phase1_workload}.identity"
+			while IFS=$'\t' read -r otu_key prev_stable_count prev_lock_pass locked_this_otu is_frozen selector_skip_reason eligible_count pool_ids_count pool_size_streak_id phase1_mode sel_prefix stable_otu_key cache_identity_ok representative_id public_display_key; do
 				[ -n "$otu_key" ] || continue
 			# Reconstruct per-OTU paths (same formulas as phase 1)
-			pool_file="$sample_cache_dir/${otu_key}.pool.tsv"
+			pool_file="$sample_cache_dir/${stable_otu_key}.pool.tsv"
 			sel_meta="$sel_prefix.meta.tsv"
 			sel_rank1="$sel_prefix.rank1.fasta"
 			cand_reps="$sel_prefix.selected_reps.tsv"
@@ -1911,20 +1924,10 @@ while IFS= read -r sample; do
 			sel_drop_ids=""
 			[ "$prune_unassigned_drop_reads" -eq 1 ] && sel_drop_ids="$sel_prefix.dropped_ids.list"
 			eligible_list="$out_dir/$sample/${otu_key}_eligible.list"
-			cache_meta="$sample_cache_dir/${otu_key}.meta"
-			cache_cons="$sample_cache_dir/${otu_key}.consensus.fasta"
-			# Barcode fallback (mirrors phase 1)
-			if [ ! -s "$cache_cons" ]; then
-				_p2_nobc="${otu_key%-*}"
-				if [ "$_p2_nobc" != "$otu_key" ]; then
-					_p2_cons_nobc="$sample_cache_dir/${_p2_nobc}.consensus.fasta"
-					_p2_meta_nobc="$sample_cache_dir/${_p2_nobc}.meta"
-					if [ -s "$_p2_cons_nobc" ]; then
-						cache_cons="$_p2_cons_nobc"
-						cache_meta="$_p2_meta_nobc"
-					fi
-				fi
-			fi
+			cache_meta="$sample_cache_dir/${stable_otu_key}.meta"
+			cache_cons="$sample_cache_dir/${stable_otu_key}.consensus.fasta"
+			if [ "$cache_identity_ok" -ne 1 ]; then cache_cons="${cache_cons}.unvalidated"; fi
+			if [ "$locked_this_otu" -eq 1 ] && [ "$revalidate_due_sample" -eq 1 ]; then cache_cons="${cache_cons}.revalidate"; fi
 			if [ "$phase1_mode" = "pool_select" ]; then
 				candidate_list="$sel_prefix.selected_ids.list"
 						if [ "$prune_unassigned_drop_reads" -eq 1 ] && [ -n "$sel_drop_ids" ] && [ -s "$sel_drop_ids" ]; then
@@ -1982,7 +1985,7 @@ while IFS= read -r sample; do
 				min_cand_use="$min_cand"
 			fi
 				if [ "$n_cand" -lt "$min_reads" ]; then
-					printf "%s\t%s\t%s\n" "$otu_key" "0" "0" >> "$lock_state_current"
+					printf "%s\t%s\t%s\n" "$stable_otu_key" "0" "0" >> "$lock_state_current"
 					[ "$CONS_DEBUG" = "1" ] && cons_log "OTU=$otu_key skip_consensus n_cand<$min_reads (n_cand=$n_cand min_cand=${min_cand_use:-$min_cand})"
 					# Not enough pooled reads: keep cache by default to preserve recoverability.
 				if [ "$cache_below_min_policy" = "drop" ]; then
@@ -2206,7 +2209,7 @@ while IFS= read -r sample; do
 					stable_count=0
 					lock_rule_pass=0
 				fi
-				printf "%s\t%s\t%s\n" "$otu_key" "$stable_count" "$lock_rule_pass" >> "$lock_state_current"
+				printf "%s\t%s\t%s\n" "$stable_otu_key" "$stable_count" "$lock_rule_pass" >> "$lock_state_current"
 				[ "$CONS_DEBUG" = "1" ] && cons_log "OTU=$otu_key consolidate_decision=$should_consolidate n_cand=$n_cand min_cand=${min_cand_use:-$min_cand} min_cand_ok=$min_cand_ok cluster_cons_count=$cluster_cons_count cluster_cons_min=${cluster_cons_min:-NA} cluster_noncons_max=$cluster_noncons_max cluster_rule_ok=$cluster_rule_ok lock_rule_pass=$lock_rule_pass stable_count=$stable_count min_stable_rounds=$decision_min_stable_rounds qfiltered_pool_count=$qfiltered_pool_count floor_cluster_count=$floor_cluster_count top_floor_size=$top_floor_size significant_cluster_count=$significant_cluster_count sig_rule=$sig_rule top1_cluster_size=$top1_cluster_size top1_cluster_qscore=${top1_cluster_qscore:-NA} top2_cluster_size=$top2_cluster_size top2_cluster_qscore=${top2_cluster_qscore:-NA} top2_ratio=${top2_ratio:-NA} top2_delta_reads=${top2_delta_reads:-NA}"
 
 			# If a cached consensus is already marked consolidated, reuse it even if
@@ -2280,7 +2283,7 @@ while IFS= read -r sample; do
 				"$lock_summary_sig_rule" "${top1_cluster_size:-0}" "${top1_cluster_qscore:-NA}" "${top2_cluster_size:-0}" "${top2_cluster_qscore:-NA}" "${top2_ratio:-NA}" "${top2_delta_reads:-NA}" >> "$lock_summary"
 			if [ "$effective_consolidated" -eq 1 ]; then
 				echo "$otu_key" >> "$consolidated_keys"
-				printf "%s\t%s\n" "$sample" "$otu_key" >> "$consolidated_otu_keys_current"
+				printf "%s\t%s\n" "$sample" "$stable_otu_key" >> "$consolidated_otu_keys_current"
 			fi
 			printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$otu_key" "$sample" "$n_cand" "${min_cand_use:-$min_cand}" "$is_frozen" "$effective_consolidated" >> "$sample_meta"
 			# Expose current selected-read evidence under the complete internal key
@@ -2326,9 +2329,9 @@ while IFS= read -r sample; do
 				if [ -n "$rank1_seq" ]; then
 					if [ "$n_count" -lt "$max_N" ]; then
 						printf ">%s|%s|reads-%s\n%s\n" "$sample" "$otu_name" "$n_cand" "$rank1_seq" > "$otu_cons"
-						cp "$otu_cons" "$sample_cache_dir/${otu_key}.consensus.fasta"
-						printf "%s\t%s\n" "$n_cand" "$cand_hash" > "$sample_cache_dir/${otu_key}.meta"
-						echo "$sample_cache_dir/${otu_key}.consensus.fasta" >> "$cached_list"
+						cp "$otu_cons" "$sample_cache_dir/${stable_otu_key}.consensus.fasta"
+						perl "$identity_helper" meta --representative "$representative_id" --public-display "$public_display_key" --cache "$sample_cache_dir" --display "$otu_key" --key "$stable_otu_key" --count "$n_cand" --candidate-hash "$cand_hash"
+						echo "$sample_cache_dir/${stable_otu_key}.consensus.fasta" >> "$cached_list"
 					fi
 				fi
 				continue
@@ -2341,8 +2344,8 @@ while IFS= read -r sample; do
 					cat "$candidate_list" >> "$union_cand_ids"
 					awk -v k="$otu_key" '{print $0 "\t" k}' "$candidate_list" >> "$cand_id_otu_map"
 				fi
-				echo -e "${otu_key}\t${n_cand}\t${cand_hash}" >> "$recompute_list"
-			done < "$_phase1_workload"
+				printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$otu_key" "$n_cand" "$cand_hash" "$stable_otu_key" "$representative_id" "$public_display_key" >> "$recompute_list"
+			done < "${_phase1_workload}.identity"
 			# ── Batch seqtk #2: one extraction per sample (PR5) ─────────────────────────
 			if [ -s "$union_cand_ids" ]; then
 				sort -u "$union_cand_ids" -o "$union_cand_ids"
@@ -2398,7 +2401,7 @@ while IFS= read -r sample; do
 					awk -F'\t' 'NR==FNR{cnt[$1]=$2; next} {print $0"\t"(($1 in cnt)?cnt[$1]:0)}' \
 						"$out_dir/$sample/_rotu_counts.tmp" "$recompute_list" \
 						> "$out_dir/$sample/_recompute_with_counts.tmp"
-					while IFS=$'\t' read -r _rotu _rn _rh _rids; do
+					while IFS=$'\t' read -r _rotu _rn _rh _rstable _rrep _rpublic _rids; do
 						_rfasta="$out_dir/$sample/${_rotu}_reads_sup.fasta"
 						if [ -f "$_rfasta" ]; then
 							_rreads=$(awk '/^>/{c++} END{print c+0}' "$_rfasta")
@@ -2421,27 +2424,19 @@ while IFS= read -r sample; do
 					# Carry forward locked OTUs missing from this round's OTU list so
 					# consolidated consensuses do not disappear in sparse rounds.
 					if [ "$lock_enabled" -eq 1 ] && [ -s "$carry_forward_state" ]; then
-						while IFS=$'\t' read -r locked_key prev_stable_count prev_lock_pass; do
+						while IFS=$'\t' read -r locked_key prev_stable_count prev_lock_pass locked_stable_key cache_identity_ok; do
 							[ -n "$locked_key" ] || continue
 							if grep -Fxq "$locked_key" "$processed_otu_keys"; then
 								continue
 						fi
-						cache_cons="$sample_cache_dir/${locked_key}.consensus.fasta"
-						if [ ! -s "$cache_cons" ]; then
-							locked_key_nobc="${locked_key%-*}"
-							if [ "$locked_key_nobc" != "$locked_key" ]; then
-								cache_cons_alt="$sample_cache_dir/${locked_key_nobc}.consensus.fasta"
-								if [ -s "$cache_cons_alt" ]; then
-									cache_cons="$cache_cons_alt"
-								fi
-							fi
-						fi
+						cache_cons="$sample_cache_dir/${locked_stable_key}.consensus.fasta"
+						if [ "$cache_identity_ok" -ne 1 ]; then cache_cons="${cache_cons}.unvalidated"; fi
 							prev_stable_count=${prev_stable_count:-0}
 							prev_lock_pass=${prev_lock_pass:-0}
-							printf "%s\t%s\t%s\n" "$locked_key" "$prev_stable_count" "$prev_lock_pass" >> "$lock_state_current"
+							printf "%s\t%s\t%s\n" "$locked_stable_key" "$prev_stable_count" "$prev_lock_pass" >> "$lock_state_current"
 						if [ -s "$cache_cons" ]; then
 							echo "$locked_key" >> "$consolidated_keys"
-							printf "%s\t%s\n" "$sample" "$locked_key" >> "$consolidated_otu_keys_current"
+							printf "%s\t%s\n" "$sample" "$locked_stable_key" >> "$consolidated_otu_keys_current"
 							IFS=$'\t' read -r cache_n cache_minq cache_frozen < <(read_cache_consensus_meta "$cache_cons")
 							printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$locked_key" "$sample" "$cache_n" "$cache_minq" "$cache_frozen" "1" >> "$sample_meta"
 							lock_summary_sig_rule_cf="NA"
@@ -2458,7 +2453,7 @@ while IFS= read -r sample; do
 						else
 							echo "WARN: OTU=$locked_key locked but cache missing during carry-forward; metadata placeholder emitted" 1>&2
 							printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$locked_key" "$sample" "0" "NA" "1" "0" >> "$sample_meta"
-							printf "%s\t%s\n" "$sample" "$locked_key" >> "$consolidated_otu_keys_drop"
+							printf "%s\t%s\n" "$sample" "$locked_stable_key" >> "$consolidated_otu_keys_drop"
 							lock_summary_sig_rule_cf="NA"
 							if [ "$consolidation_mode" = "significant_clusters" ]; then
 								lock_summary_sig_rule_cf="$sig_rule"
@@ -2481,10 +2476,28 @@ while IFS= read -r sample; do
 				cached_count=$(ls "$cache_root/$sample"/*.consensus.fasta 2>/dev/null | wc -l | tr -d ' ')
 			cons_log "Sample=$sample no_current_reads cached_consensus_files=$cached_count (carrying cached consensus)"
 		fi
-			for cf in "$cache_root/$sample"/*.consensus.fasta; do
-				[ -s "$cf" ] || continue
-				echo "$cf" >> "$cached_list"
-			done
+			while IFS=$'\t' read -r stable_otu_key cache_kind; do
+				[ "$cache_kind" = "consensus.fasta" ] || continue
+				printf '%s/%s.consensus.fasta\n' "$sample_cache_dir" "$stable_otu_key" >> "$cached_list"
+			done < "$cache_identity_valid"
+			perl "$identity_helper" plan --map "$sample_identity_map" --input "$otu_list" \
+				--lock-state "$lock_state_prev" --locked-keys "$locked_keys_sample" --valid "$cache_identity_valid" \
+				--out "$otu_runtime_plan" --carry "$carry_forward_state"
+			if [ "$lock_enabled" -eq 1 ]; then
+				while IFS=$'\t' read -r locked_key prev_stable_count prev_lock_pass locked_stable_key cache_identity_ok; do
+					[ -n "$locked_stable_key" ] || continue
+					printf '%s\t%s\t%s\n' "$locked_stable_key" "$prev_stable_count" "$prev_lock_pass" >> "$lock_state_current"
+					if [ "$cache_identity_ok" -eq 1 ]; then
+						printf '%s\t%s\n' "$sample" "$locked_stable_key" >> "$consolidated_otu_keys_current"
+						IFS=$'\t' read -r cache_n cache_minq cache_frozen < <(read_cache_consensus_meta "$sample_cache_dir/${locked_stable_key}.consensus.fasta")
+						printf '%s\t%s\t%s\t%s\t%s\t1\n' "$locked_key" "$sample" "$cache_n" "$cache_minq" "$cache_frozen" >> "$sample_meta"
+					else
+						echo "WARN: OTU=$locked_key locked but cache missing during carry-forward; metadata placeholder emitted" >&2
+						printf '%s\t%s\t0\tNA\t1\t0\n' "$locked_key" "$sample" >> "$sample_meta"
+						printf '%s\t%s\n' "$sample" "$locked_stable_key" >> "$consolidated_otu_keys_drop"
+					fi
+				done < "$carry_forward_state"
+			fi
 				[ "$sample_blast_cleanup" -eq 1 ] && rm -f "$sample_blast"
 				rm -f "$sample_parsed" "$otu_list" "$processed_otu_keys"
 			fi
@@ -2540,15 +2553,15 @@ while IFS= read -r sample; do
 							recompute_with_reval="$out_dir/$sample/recompute_with_reval.tsv"
 							awk -v revalf="$revalidate_before" -v recomputef="$recompute_list" 'BEGIN{FS=OFS="\t"}
 								FILENAME==revalf { h[$1]=$2; next }
-								FILENAME==recomputef { print $1, $2, $3, (($1 in h) ? h[$1] : "") }
+								FILENAME==recomputef { print $1, $2, $3, (($1 in h) ? h[$1] : "NA"), $4, $5, $6 }
 							' "$revalidate_before" "$recompute_list" > "$recompute_with_reval"
-						while IFS=$'\t' read -r otu_key n_cand cand_hash old_reval_hash; do
+						while IFS=$'\t' read -r otu_key n_cand cand_hash old_reval_hash stable_otu_key representative_id public_display_key; do
 							otu_cons="$out_dir/$sample/${otu_key}_consensus.fasta"
 							if [ -s "$otu_cons" ]; then
-								cp "$otu_cons" "$sample_cache_dir/${otu_key}.consensus.fasta"
-								printf "%s\t%s\n" "$n_cand" "$cand_hash" > "$sample_cache_dir/${otu_key}.meta"
-							if [ -n "$old_reval_hash" ]; then
-								new_reval_hash=$(cons_seq_hash "$sample_cache_dir/${otu_key}.consensus.fasta")
+								cp "$otu_cons" "$sample_cache_dir/${stable_otu_key}.consensus.fasta"
+								perl "$identity_helper" meta --representative "$representative_id" --public-display "$public_display_key" --cache "$sample_cache_dir" --display "$otu_key" --key "$stable_otu_key" --count "$n_cand" --candidate-hash "$cand_hash"
+							if [ "$old_reval_hash" != "NA" ]; then
+								new_reval_hash=$(cons_seq_hash "$sample_cache_dir/${stable_otu_key}.consensus.fasta")
 								if [ -n "$new_reval_hash" ]; then
 									if [ "$new_reval_hash" = "$old_reval_hash" ]; then
 										cons_log "OTU=$otu_key lock_revalidation_result=unchanged hash=$new_reval_hash"
@@ -2558,8 +2571,8 @@ while IFS= read -r sample; do
 								fi
 							fi
 						else
-							rm -f "$sample_cache_dir/${otu_key}.consensus.fasta" "$sample_cache_dir/${otu_key}.meta"
-							if [ -n "$old_reval_hash" ]; then
+							rm -f "$sample_cache_dir/${stable_otu_key}.consensus.fasta" "$sample_cache_dir/${stable_otu_key}.meta"
+							if [ "$old_reval_hash" != "NA" ]; then
 									cons_log "OTU=$otu_key lock_revalidation_result=missing_recompute_output old_hash=$old_reval_hash"
 								fi
 							fi
@@ -2572,30 +2585,7 @@ while IFS= read -r sample; do
 			cached_fasta="$out_dir/$sample/${sample}_cached_consensus.fasta"
 			: > "$cached_fasta"
 			if [ -s "$cached_list" ]; then
-					while IFS= read -r cf; do
-						[ -s "$cf" ] || continue
-						otu_key_from_file="$(basename "$cf" .consensus.fasta)"
-						awk -v ok="$otu_key_from_file" 'BEGIN{RS=">"; ORS=""} NR>1{
-							h=$1; sub(/\n.*/, "", h);
-							body=$0; sub(/^[^\n]*\n/, "", body);
-							if (h ~ /\|OTU=/ || h ~ /\|OTUB_/) { print ">"$0; next }
-							otu=ok; marker="";
-							dash=index(ok, "-");
-							if (dash > 0) {
-								otu=substr(ok, 1, dash-1);
-								marker=substr(ok, dash+1);
-							}
-							reads="reads-0";
-							if (match(h, /reads-[0-9]+/)) { reads=substr(h, RSTART, RLENGTH); }
-							sample="";
-							split(h, b, /\|/); sample=b[1];
-							if (sample=="") sample="unknown";
-						newh=sample "|" otu;
-						if (marker != "") { newh=newh "|" marker; }
-						newh=newh "|" reads;
-						print ">" newh "\n" body;
-					}' "$cf" >> "$cached_fasta"
-				done < "$cached_list"
+				perl "$identity_helper" project-cache --map "$sample_identity_map" --cache "$sample_cache_dir" --input "$cached_list" --out "$cached_fasta"
 			fi
 				merged="$out_dir/$sample/${sample}_consensus_all.fasta"
 				sample_consensus_fasta="$out_dir/$sample/${sample}_consensus.fasta"
@@ -2836,14 +2826,10 @@ while IFS= read -r sample; do
 									fi
 								fi
 								# RTBIOSCAN_TAXONOMY_ADMISSION_END winner_join
+								# Accumulated ownership is joined by stable identity after worker merge.
+								printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+									"$sample" "$otu_key" "$consensus_id" "$cons_header" "$consolidated_hit" "$policy_reset_sample" >> "$ownership_emitted_sample"
 								prior_keep=0
-								if [ "$policy_reset_sample" -eq 0 ] && [ -n "$_cons_ids_prev_file" ]; then
-									if grep -Fxq "$cons_header" "$_cons_ids_prev_file"; then
-										prior_keep=1
-									elif [ -n "$consensus_id" ] && grep -Fxq "$consensus_id" "$_cons_ids_prev_file"; then
-										prior_keep=1
-									fi
-								fi
 								if [ "$consolidated_hit" -eq 1 ] || [ "$prior_keep" -eq 1 ]; then
 									echo "$cons_header" >> "$consolidated_ids_current"
 									if [ -n "$consensus_id" ]; then
@@ -2915,16 +2901,21 @@ while IFS= read -r sample; do
 						if (k in row) print row[k];
 					}
 				}
-			' "$lock_state_current" > "${lock_state_file}.tmp" && mv "${lock_state_file}.tmp" "$lock_state_file"
+			' "$lock_state_current" > "${lock_state_file}.tmp"
+			perl "$identity_helper" publish-keys --input "${lock_state_file}.tmp" --out "$lock_state_file"
+			rm -f "${lock_state_file}.tmp"
 		elif [ -s "$lock_state_prev" ]; then
-			cp "$lock_state_prev" "$lock_state_file"
+			perl "$identity_helper" publish-keys --input "$lock_state_prev" --out "$lock_state_file"
 		else
-			: > "$lock_state_file"
+			: > "${lock_state_file}.tmp"
+			perl "$identity_helper" publish-keys --input "${lock_state_file}.tmp" --out "$lock_state_file"
+			rm -f "${lock_state_file}.tmp"
 		fi
 		if [ "$lock_enabled" -eq 1 ]; then
 			printf "%s\n" "$current_policy_signature" > "$policy_signature_file"
 		fi
 		rm -f "$lock_state_prev" "$lock_state_current"
+		rm -f "$out_dir/$sample/_phase1_workload.tsv.identity" "$out_dir/$sample/_selector_queue.tsv.identity"
 	printf "emitted\t%d\nmerged\t%d\nmismatches\t%d\nselector_failures\t%d\nfallback_empty_sample_blast_count\t%d\n" \
 		"$emitted_consensus_count" "$merged_input_headers_total" "$id_mismatch_events" "$worker_failures_selector" "$fallback_empty_sample_blast_count" \
 		> "$out_dir/$sample/_counters.tmp"
@@ -3022,6 +3013,7 @@ _t_counter_merge_end=$(timing_now)
 append_timing_row "$phase_timings_raw_file" "global" "-" "counter_and_tmp_merge" "$_t_counter_merge_start" "$_t_counter_merge_end"
 
 _t_sample_output_merge_start=$(timing_now)
+for _f in "$out_dir"/*/_emitted_ownership.tmp; do [ -f "$_f" ] && cat "$_f" >> "$ownership_emitted"; done
 for _f in "$out_dir"/*/_consolidated_ids.tmp;     do [ -f "$_f" ] && cat "$_f" >> "$consolidated_ids_current";      done
 for _f in "$out_dir"/*/_otu_keys_current.tmp;     do [ -f "$_f" ] && cat "$_f" >> "$consolidated_otu_keys_current"; done
 for _f in "$out_dir"/*/_eligible_counts.tmp;      do [ -f "$_f" ] && cat "$_f" >> "$eligible_counts_file";          done
@@ -3060,10 +3052,17 @@ if [ -s "$policy_reset_samples_list" ]; then
 	fi
 fi
 if [ -s "$policy_reset_prev_keys" ] && [ -s "$consolidated_ids_prev" ]; then
-	filter_consolidated_ids_by_dropped_keys "$consolidated_ids_prev" "$consolidated_ids_prev_effective" "$policy_reset_prev_keys"
+	filter_stable_consolidated_ids "$consolidated_ids_prev" "$consolidated_ids_prev_effective" "$policy_reset_prev_keys"
 else
 	cp "$consolidated_ids_prev" "$consolidated_ids_prev_effective" 2>/dev/null || : > "$consolidated_ids_prev_effective"
 fi
+if [ -s "$policy_reset_prev_keys" ]; then
+	cat "$policy_reset_prev_keys" >> "$consolidated_otu_keys_drop"
+fi
+perl "$identity_helper" owners --map "$identity_map" --input "$ownership_emitted" --prior "$ownership_prev" \
+	--drop "$consolidated_otu_keys_drop" --reset "$lock_reset_list" --out "$ownership_next" --ids "$consolidated_ids_current" \
+	--previous-ids "$consolidated_ids_prev_effective" --projected-ids "${consolidated_ids_prev_effective}.projected"
+mv "${consolidated_ids_prev_effective}.projected" "$consolidated_ids_prev_effective"
 cons_ids_source=""
 cons_ids_kept_previous=0
 cons_ids_reason=""
@@ -3094,7 +3093,7 @@ else
 	cons_log "CONS_IDS: no consensus emitted and no previous IDs"
 fi
 if [ -n "$cons_ids_source" ]; then
-	filter_consolidated_ids_by_dropped_keys "$cons_ids_source" "$consolidated_ids_global" "$consolidated_otu_keys_drop"
+	filter_stable_consolidated_ids "$cons_ids_source" "$consolidated_ids_global" "$consolidated_otu_keys_drop"
 	if [ -s "$consolidated_otu_keys_drop" ]; then
 		cons_log "CONS_IDS: filtered dropped OTU keys from consolidated IDs"
 	fi
@@ -3111,13 +3110,16 @@ if [ -n "$cons_ids_source" ] && [ -s "$cons_ids_source" ] && [ ! -s "$consolidat
 	fi
 fi
 if [ -s "$consolidated_otu_keys_prev" ] || [ -s "$consolidated_otu_keys_current" ]; then
-	filter_consolidated_key_tsv_inplace "$consolidated_otu_keys_prev"
-	filter_consolidated_key_tsv_inplace "$consolidated_otu_keys_current"
+	filter_stable_consolidated_keys "$consolidated_otu_keys_prev"
+	filter_stable_consolidated_keys "$consolidated_otu_keys_current"
 	cat "$consolidated_otu_keys_prev" "$consolidated_otu_keys_current" > "${consolidated_otu_keys_global}.tmp"
-	LC_ALL=C sort -u -o "$consolidated_otu_keys_global" "${consolidated_otu_keys_global}.tmp"
+	LC_ALL=C sort -u -o "${consolidated_otu_keys_global}.tmp" "${consolidated_otu_keys_global}.tmp"
+	perl "$identity_helper" publish-keys --column 2 --input "${consolidated_otu_keys_global}.tmp" --out "$consolidated_otu_keys_global"
 	rm -f "${consolidated_otu_keys_global}.tmp"
 else
-	: > "$consolidated_otu_keys_global"
+	: > "${consolidated_otu_keys_global}.tmp"
+	perl "$identity_helper" publish-keys --column 2 --input "${consolidated_otu_keys_global}.tmp" --out "$consolidated_otu_keys_global"
+	rm -f "${consolidated_otu_keys_global}.tmp"
 fi
 {
 	printf "emitted_consensus_count\t%s\n" "$emitted_consensus_count"
@@ -3182,6 +3184,8 @@ if [ "$emitted_consensus_count" -eq 0 ] && [ "$merged_input_headers_total" -gt 0
 	echo "ERROR: No consensus emitted despite merged inputs (merged_input_headers_total=$merged_input_headers_total)" 1>&2
 	exit 1
 fi
+mv "$ownership_next" "$ownership_state"
+rm -f "$ownership_prev" "$ownership_emitted"
 rm -f "$consolidated_ids_prev"
 rm -f "$consolidated_ids_prev_effective"
 rm -f "$consolidated_ids_current"

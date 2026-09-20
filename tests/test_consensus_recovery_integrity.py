@@ -2,6 +2,10 @@ import hashlib
 import os
 import shutil
 import subprocess
+from tests.test_consensus_stable_otu_identity_contract import (
+    CEDAR, FIR, FIXTURE_BIOLOGY, prepare_proven_fixture, write_current_evidence,
+    write_prior_owners,
+)
 from pathlib import Path
 
 
@@ -129,6 +133,10 @@ def _run_consensus(
         env.setdefault("RTBIOSCAN_TARGET_TAXA", "Metazoa|Viridiplantae")
     if consensus_script is None:
         consensus_script = SCRIPT
+    # Current fixture evidence is independent of historical artifact ownership.
+    from tests.test_consensus_stable_otu_identity_contract import add_current_fixture_evidence
+    if "CONSENSUS_OTU_CLSTR" not in env and "CONSENSUS_OTU_HASH_MAP" not in env:
+        add_current_fixture_evidence(tmp_path, env, frozen_members)
     cmd = [
         "bash",
         str(consensus_script),
@@ -881,6 +889,10 @@ def test_f01a_adjacent_primer_cache_only_metadata_loss_remains_unchanged(tmp_pat
     env["CONSENSUS_LOCK_KEYS_PREV"] = str(previous_keys)
     env["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
     env["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
+    stable_key = prepare_proven_fixture(
+        tmp_path, env, "COI_Probe", "OTUB_7-COI-COI_Probe", "OTUB_7-COI",
+        FIXTURE_BIOLOGY["OTUB_7-COI"].representative.replace("no_adapter_1", "COI_Probe"), FIXTURE_BIOLOGY["OTUB_7-COI"].sequence, [cache_dir / f"{cache_key}.consensus.fasta", cache_dir / f"{cache_key}.meta", cache_dir / "lock_state.tsv", previous_keys], frozen_members=str(frozen),
+    )
     result = _run_consensus(tmp_path, env, min_reads="1", frozen_members=str(frozen))
     assert result.returncode == 0, result.stderr
 
@@ -965,6 +977,10 @@ def test_otub_suffix_normalization_recovers_consensus(tmp_path: Path) -> None:
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
     env["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
+    stable_key = prepare_proven_fixture(
+        tmp_path, env, "no_adapter", "OTUB_1-COI", "OTUB_1-COI",
+        f"{uuids[0]}|COI|hac|barcode=no_adapter_1|adapter=no_adapter_1", "ACGTACGTACGT", [cache_dir / "OTUB_1-COI.consensus.fasta"], frozen_members=str(frozen),
+    )
     result = _run_consensus(tmp_path, env, min_reads="1", frozen_members=str(frozen))
     assert result.returncode == 0, result.stderr
 
@@ -1088,10 +1104,14 @@ def test_pool_merge_preserves_prior_rows_and_best_rank_qscore(tmp_path: Path) ->
     env = os.environ.copy()
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
+    stable_key = prepare_proven_fixture(
+        tmp_path, env, "no_adapter", "OTUB_1-COI-no_adapter_1", "OTUB_1-COI",
+        CEDAR.representative, CEDAR.sequence, [cache_dir / pool_name], frozen_members=str(frozen),
+    )
     result = _run_consensus(tmp_path, env, min_reads="2", frozen_members=str(frozen))
     assert result.returncode == 0, result.stderr
 
-    pool_file = tmp_path / "Consensus" / ".cache" / "no_adapter" / pool_name
+    pool_file = tmp_path / "Consensus" / ".cache" / "no_adapter" / f"{stable_key}.pool.tsv"
     rows = [
         ln.strip().split("\t")
         for ln in pool_file.read_text(encoding="utf-8").splitlines()
@@ -1699,10 +1719,14 @@ def test_taxonomy_admission_current_cache_and_frozen_evidence_but_not_carry_forw
     carry_dir = tmp_path / "carry-forward"
     shutil.copytree(cache_round1 / "Consensus" / ".cache", carry_dir / "Consensus" / ".cache")
     previous_keys = carry_dir / "previous_keys.tsv"
-    previous_keys.write_text("sample_A\tOTUB_1-COI\n", encoding="utf-8")
+    previous_keys.write_text(f"sample_A\t{CEDAR.stable}\n", encoding="utf-8")
     carry_blast, carry_fasta, carry_qscores, _carry_header = _taxonomy_fixture_text(
         [("OTUB_2-COI", "Metazoa", "COI", ["TTTT", "TTTA"], 35)]
     )
+    carry_identity_env = write_current_evidence(carry_dir, {
+        "OTUB_1-COI": (CEDAR.representative, CEDAR.sequence),
+        "OTUB_2-COI": (FIR.representative, FIR.sequence),
+    })
     carry_result = _run_taxonomy_fixture(
         carry_dir,
         carry_blast,
@@ -1715,6 +1739,7 @@ def test_taxonomy_admission_current_cache_and_frozen_evidence_but_not_carry_forw
         extra_env={
             "CONSENSUS_LOCK_ENABLED": "1",
             "CONSENSUS_LOCK_KEYS_PREV": str(previous_keys),
+            **carry_identity_env,
         },
     )
     assert carry_result.returncode == 0, carry_result.stderr
@@ -2325,13 +2350,14 @@ def test_consolidated_keys_written_by_cluster_rule(tmp_path: Path) -> None:
     env["CONSENSUS_LOCK_RATIO"] = "0.1"
     env["CONSENSUS_LOCK_MIN_CONS_READS"] = "10"
     env["CONSENSUS_PRUNE_FROZEN_POLICY"] = "until_consolidated"
+    stable_key = "COI|" + hashlib.md5(b"AAAA").hexdigest()
     result = _run_consensus(tmp_path, env, min_reads="1", frozen_members=str(frozen))
     assert result.returncode == 0, result.stderr
 
     consolidated_keys = (tmp_path / "Consensus" / "otu_consolidated_keys.tsv").read_text(encoding="utf-8")
-    assert "no_adapter\tOTUB_1-COI-no_adapter_1" in consolidated_keys
+    assert f"no_adapter\t{stable_key}" in consolidated_keys
     lock_state = (tmp_path / "Consensus" / ".cache" / "no_adapter" / "lock_state.tsv").read_text(encoding="utf-8")
-    assert "OTUB_1-COI-no_adapter_1\t1\t1" in lock_state
+    assert f"{stable_key}\t1\t1" in lock_state
 
 
 def test_lock_min_stable_rounds_requires_two_consecutive_passes(tmp_path: Path) -> None:
@@ -2364,19 +2390,20 @@ def test_lock_min_stable_rounds_requires_two_consecutive_passes(tmp_path: Path) 
     env["CONSENSUS_LOCK_MIN_STABLE_ROUNDS"] = "2"
     env["CONSENSUS_PRUNE_FROZEN_POLICY"] = "until_consolidated"
 
+    stable_key = "COI|" + hashlib.md5(b"AAAA").hexdigest()
     # Round 1: lock rule passes but should not consolidate yet (needs 2 consecutive rounds).
     result1 = _run_consensus(tmp_path, env, min_reads="1", frozen_members=str(frozen))
     assert result1.returncode == 0, result1.stderr
     consolidated_round1 = (tmp_path / "Consensus" / "otu_consolidated_keys.tsv").read_text(encoding="utf-8")
-    assert "OTUB_1-COI-no_adapter_1" not in consolidated_round1
+    assert f"{stable_key}" not in consolidated_round1
     lock_state_round1 = (tmp_path / "Consensus" / ".cache" / "no_adapter" / "lock_state.tsv").read_text(encoding="utf-8")
-    assert "OTUB_1-COI-no_adapter_1\t1\t1" in lock_state_round1
+    assert f"{stable_key}\t1\t1" in lock_state_round1
 
     # Round 2: consecutive pass should now consolidate.
     result2 = _run_consensus(tmp_path, env, min_reads="1", frozen_members=str(frozen))
     assert result2.returncode == 0, result2.stderr
     consolidated_round2 = (tmp_path / "Consensus" / "otu_consolidated_keys.tsv").read_text(encoding="utf-8")
-    assert "no_adapter\tOTUB_1-COI-no_adapter_1" in consolidated_round2
+    assert f"no_adapter\t{stable_key}" in consolidated_round2
 
 
 def test_significant_clusters_fraction_signature_compatibility_keeps_prior_state(tmp_path: Path) -> None:
@@ -2392,13 +2419,17 @@ def test_significant_clusters_fraction_signature_compatibility_keeps_prior_state
     env = _base_sig_env(bindir)
     env["CONSENSUS_SIG_MIN_STABLE_ROUNDS"] = "2"
 
+    stable_key = prepare_proven_fixture(
+        tmp_path, env, "no_adapter", "OTUB_1-COI-no_adapter_1", "OTUB_1-COI",
+        _make_header("read-01", False), "AAAA", [cache_dir / "lock_state.tsv"], frozen_members=str(frozen),
+    )
     result = _run_consensus(tmp_path, env, min_reads="1", frozen_members=str(frozen))
     assert result.returncode == 0, result.stderr
 
     consolidated_keys = (tmp_path / "Consensus" / "otu_consolidated_keys.tsv").read_text(encoding="utf-8")
-    assert "no_adapter\tOTUB_1-COI-no_adapter_1" in consolidated_keys
+    assert f"no_adapter\t{stable_key}" in consolidated_keys
     lock_state = (cache_dir / "lock_state.tsv").read_text(encoding="utf-8")
-    assert "OTUB_1-COI-no_adapter_1\t2\t1" in lock_state
+    assert f"{stable_key}\t2\t1" in lock_state
 
 
 def test_top_two_gap_signature_ignores_fraction_only_threshold_changes(tmp_path: Path) -> None:
@@ -2419,6 +2450,10 @@ def test_top_two_gap_signature_ignores_fraction_only_threshold_changes(tmp_path:
     env["CONSENSUS_SIG_MIN_POOL_FRACTION"] = "0.05"
     env["CONSENSUS_SIG_MIN_TOP_FRACTION"] = "0.10"
 
+    stable_key = prepare_proven_fixture(
+        tmp_path, env, "no_adapter", "OTUB_1-COI-no_adapter_1", "OTUB_1-COI",
+        _make_header("read-01", False), "AAAA", [cache_dir / "lock_state.tsv"], frozen_members=str(frozen),
+    )
     result = _run_consensus(tmp_path, env, min_reads="1", frozen_members=str(frozen))
     assert result.returncode == 0, result.stderr
 
@@ -2426,7 +2461,7 @@ def test_top_two_gap_signature_ignores_fraction_only_threshold_changes(tmp_path:
     row = next(row for row in rows if row["otu_key"] == "OTUB_1-COI-no_adapter_1")
     assert row["reason"] == "consolidated"
     lock_state = (cache_dir / "lock_state.tsv").read_text(encoding="utf-8")
-    assert "OTUB_1-COI-no_adapter_1\t2\t1" in lock_state
+    assert f"{stable_key}\t2\t1" in lock_state
 
 
 def test_top_two_gap_requires_two_consecutive_passes(tmp_path: Path) -> None:
@@ -2569,9 +2604,13 @@ def test_lock_reset_keys_clears_prior_lock_and_forces_recompute_path(tmp_path: P
     env_a["CONSENSUS_LOCK_KEYS_PREV"] = str(lock_prev_a)
     env_a["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
     env_a["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
+    stable_key = prepare_proven_fixture(
+        case_a, env_a, "no_adapter", "OTUB_1-COI-no_adapter_1", "OTUB_1-COI",
+        CEDAR.representative, CEDAR.sequence, [lock_prev_a, case_a / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.consensus.fasta", case_a / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.meta"], frozen_members=str(case_a / "otu_frozen_members.tsv"),
+    )
     res_a = _run_consensus(case_a, env_a, min_reads="1", frozen_members=str(case_a / "otu_frozen_members.tsv"))
     assert res_a.returncode == 0, res_a.stderr
-    cache_cons_a = case_a / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.consensus.fasta"
+    cache_cons_a = case_a / "Consensus" / ".cache" / "no_adapter" / f"{CEDAR.stable}.consensus.fasta"
     assert cache_cons_a.exists()
 
     # Case B: reset key provided -> lock is removed, recompute path runs, stale cache is not kept.
@@ -2581,15 +2620,19 @@ def test_lock_reset_keys_clears_prior_lock_and_forces_recompute_path(tmp_path: P
     env_b["PATH"] = f"{bindir_b}:{env_b.get('PATH', '')}"
     env_b["CONSENSUS_LOCK_ENABLED"] = "1"
     env_b["CONSENSUS_LOCK_KEYS_PREV"] = str(lock_prev_b)
-    env_b["CONSENSUS_LOCK_RESET_KEYS"] = "OTUB_1-COI-no_adapter_1"
+    env_b["CONSENSUS_LOCK_RESET_KEYS"] = CEDAR.stable
     env_b["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
     env_b["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
+    stable_key = prepare_proven_fixture(
+        case_b, env_b, "no_adapter", "OTUB_1-COI-no_adapter_1", "OTUB_1-COI",
+        CEDAR.representative, CEDAR.sequence, [lock_prev_b, case_b / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.consensus.fasta", case_b / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.meta"], frozen_members=str(case_b / "otu_frozen_members.tsv"),
+    )
     res_b = _run_consensus(case_b, env_b, min_reads="1", frozen_members=str(case_b / "otu_frozen_members.tsv"))
     assert res_b.returncode == 0, res_b.stderr
-    cache_cons_b = case_b / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.consensus.fasta"
+    cache_cons_b = case_b / "Consensus" / ".cache" / "no_adapter" / f"{CEDAR.stable}.consensus.fasta"
     assert not cache_cons_b.exists()
     consolidated_keys_b = (case_b / "Consensus" / "otu_consolidated_keys.tsv").read_text(encoding="utf-8")
-    assert "OTUB_1-COI-no_adapter_1" not in consolidated_keys_b
+    assert f"{stable_key}" not in consolidated_keys_b
 
 
 def test_locked_otu_missing_from_current_round_is_carried_forward(tmp_path: Path) -> None:
@@ -2624,13 +2667,17 @@ def test_locked_otu_missing_from_current_round_is_carried_forward(tmp_path: Path
     env["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
     env["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
 
+    stable_key = prepare_proven_fixture(
+        tmp_path, env, "no_adapter", "OTUB_2-COI-no_adapter_1", "OTUB_2-COI",
+        FIR.representative, FIR.sequence, [lock_prev, cache_dir / "lock_state.tsv", cache_dir / "OTUB_2-COI-no_adapter_1.consensus.fasta", cache_dir / "OTUB_2-COI-no_adapter_1.meta"], frozen_members=str(tmp_path / "otu_frozen_members.tsv"),
+    )
     res = _run_consensus(tmp_path, env, min_reads="1", frozen_members=str(tmp_path / "otu_frozen_members.tsv"))
     assert res.returncode == 0, res.stderr
 
     consolidated_keys = (tmp_path / "Consensus" / "otu_consolidated_keys.tsv").read_text(encoding="utf-8")
-    assert "no_adapter\tOTUB_2-COI-no_adapter_1" in consolidated_keys
+    assert f"no_adapter\t{stable_key}" in consolidated_keys
     lock_state = (tmp_path / "Consensus" / ".cache" / "no_adapter" / "lock_state.tsv").read_text(encoding="utf-8")
-    assert "OTUB_2-COI-no_adapter_1\t3\t1" in lock_state
+    assert f"{stable_key}\t3\t1" in lock_state
     sample_meta = (tmp_path / "Consensus" / "no_adapter" / "otu_meta.tsv").read_text(encoding="utf-8")
     assert "OTUB_2-COI-no_adapter_1\tno_adapter\t5\t25\t1\t1" in sample_meta
 
@@ -2660,13 +2707,17 @@ def test_locked_otu_missing_cache_is_not_marked_consolidated_and_state_defaults_
     env["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
     env["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
 
+    stable_key = prepare_proven_fixture(
+        tmp_path, env, "no_adapter", "OTUB_2-COI-no_adapter_1", "OTUB_2-COI",
+        FIR.representative, FIR.sequence, [lock_prev], frozen_members=str(tmp_path / "otu_frozen_members.tsv"),
+    )
     res = _run_consensus(tmp_path, env, min_reads="1", frozen_members=str(tmp_path / "otu_frozen_members.tsv"))
     assert res.returncode == 0, res.stderr
 
     consolidated_keys = (tmp_path / "Consensus" / "otu_consolidated_keys.tsv").read_text(encoding="utf-8")
-    assert "OTUB_2-COI-no_adapter_1" not in consolidated_keys
+    assert f"{stable_key}" not in consolidated_keys
     lock_state = (tmp_path / "Consensus" / ".cache" / "no_adapter" / "lock_state.tsv").read_text(encoding="utf-8")
-    assert "OTUB_2-COI-no_adapter_1\t0\t0" in lock_state
+    assert f"{stable_key}\t0\t0" in lock_state
     sample_meta = (tmp_path / "Consensus" / "no_adapter" / "otu_meta.tsv").read_text(encoding="utf-8")
     assert "OTUB_2-COI-no_adapter_1\tno_adapter\t0\tNA\t1\t0" in sample_meta
 
@@ -2704,17 +2755,24 @@ def test_zero_emit_drops_removed_keys_from_consolidated_ids(tmp_path: Path) -> N
 
     # Force a zero-emission round (n_cand < min_reads), while lock carry-forward
     # adds OTUB_2 to drop list due to missing cache.
+    stable_key = prepare_proven_fixture(
+        tmp_path, env, "no_adapter", "OTUB_2-COI-no_adapter_1", "OTUB_2-COI",
+        FIR.representative, FIR.sequence, [lock_prev], frozen_members=str(tmp_path / "otu_frozen_members.tsv"),
+    )
+    prior_lines = (out_dir / "consolidated_consensus_ids.txt").read_text().splitlines()
+    write_prior_owners(tmp_path, [("no_adapter", FIR, "OTUB_2-COI", [[prior_lines[1], prior_lines[0]]]),
+                                 ("no_adapter", FIXTURE_BIOLOGY["OTUB_9-COI"], "OTUB_9-COI", [[prior_lines[3], prior_lines[2]]])])
     res = _run_consensus(tmp_path, env, min_reads="5", frozen_members=str(tmp_path / "otu_frozen_members.tsv"))
     assert res.returncode == 0, res.stderr
 
     consolidated_ids = (out_dir / "consolidated_consensus_ids.txt").read_text(encoding="utf-8")
-    assert "OTUB_2-COI-no_adapter_1" not in consolidated_ids
+    assert f"{stable_key}" not in consolidated_ids
     assert "OTUB_2_no_adapter" not in consolidated_ids
     assert "OTUB_9-COI-no_adapter_1" in consolidated_ids
     assert "OTUB_9_no_adapter" in consolidated_ids
 
     consolidated_keys = (out_dir / "otu_consolidated_keys.tsv").read_text(encoding="utf-8")
-    assert "no_adapter\tOTUB_2-COI-no_adapter_1" not in consolidated_keys
+    assert f"no_adapter\t{stable_key}" not in consolidated_keys
 
 
 def test_zero_emit_without_drop_keeps_previous_consolidated_ids(tmp_path: Path) -> None:
@@ -2851,6 +2909,12 @@ def test_drop_filter_corrects_status_when_ids_emptied(tmp_path: Path) -> None:
     env["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
     env["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
 
+    stable_key = prepare_proven_fixture(
+        tmp_path, env, "no_adapter", "OTUB_9-COI-no_adapter_1", "OTUB_9-COI",
+        FIXTURE_BIOLOGY["OTUB_9-COI"].representative, FIXTURE_BIOLOGY["OTUB_9-COI"].sequence, [lock_prev, lock_state], frozen_members=str(tmp_path / "otu_frozen_members.tsv"),
+    )
+    prior_lines = (out_dir / "consolidated_consensus_ids.txt").read_text().splitlines()
+    write_prior_owners(tmp_path, [("no_adapter", FIXTURE_BIOLOGY["OTUB_9-COI"], "OTUB_9-COI", [[prior_lines[1], prior_lines[0]]])])
     res = _run_consensus(tmp_path, env, min_reads="5", frozen_members=str(frozen))
     assert res.returncode == 0, res.stderr
     assert "locked but cache missing during carry-forward" in res.stderr
@@ -3110,9 +3174,13 @@ def test_locked_otu_revalidation_forces_recompute_when_due(tmp_path: Path) -> No
     env_keep["CONSENSUS_LOCK_REVALIDATE_EVERY_ROUNDS"] = "0"
     env_keep["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
     env_keep["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
+    stable_key = prepare_proven_fixture(
+        case_keep, env_keep, "no_adapter", "OTUB_1-COI-no_adapter_1", "OTUB_1-COI",
+        CEDAR.representative, CEDAR.sequence, [lock_prev_keep, case_keep / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.consensus.fasta", case_keep / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.meta"], frozen_members=str(case_keep / "otu_frozen_members.tsv"),
+    )
     res_keep = _run_consensus(case_keep, env_keep, min_reads="1", frozen_members=str(case_keep / "otu_frozen_members.tsv"))
     assert res_keep.returncode == 0, res_keep.stderr
-    assert (case_keep / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.consensus.fasta").exists()
+    assert (case_keep / "Consensus" / ".cache" / "no_adapter" / f"{CEDAR.stable}.consensus.fasta").exists()
 
     # Revalidation due every round -> locked OTU is recomputed (cache not blindly reused).
     case_reval = tmp_path / "reval"
@@ -3125,9 +3193,13 @@ def test_locked_otu_revalidation_forces_recompute_when_due(tmp_path: Path) -> No
     env_reval["CONSENSUS_ID_MISMATCH_POLICY"] = "fail"
     env_reval["CONSENSUS_ZERO_EMIT_POLICY"] = "warn"
     env_reval["CONSENSUS_DEBUG"] = "1"
+    stable_key = prepare_proven_fixture(
+        case_reval, env_reval, "no_adapter", "OTUB_1-COI-no_adapter_1", "OTUB_1-COI",
+        CEDAR.representative, CEDAR.sequence, [lock_prev_reval, case_reval / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.consensus.fasta", case_reval / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.meta"], frozen_members=str(case_reval / "otu_frozen_members.tsv"),
+    )
     res_reval = _run_consensus(case_reval, env_reval, min_reads="1", frozen_members=str(case_reval / "otu_frozen_members.tsv"))
     assert res_reval.returncode == 0, res_reval.stderr
-    assert not (case_reval / "Consensus" / ".cache" / "no_adapter" / "OTUB_1-COI-no_adapter_1.consensus.fasta").exists()
+    assert not (case_reval / "Consensus" / ".cache" / "no_adapter" / f"{CEDAR.stable}.consensus.fasta").exists()
     debug_log = (case_reval / "Consensus" / "consensus_debug.log").read_text(encoding="utf-8")
     assert "locked_cache_revalidation_triggered" in debug_log
 

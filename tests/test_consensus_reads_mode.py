@@ -1,6 +1,9 @@
 import os
 import shutil
 import subprocess
+from tests.test_consensus_stable_otu_identity_contract import (
+    CEDAR, add_current_fixture_evidence, prepare_proven_fixture,
+)
 from pathlib import Path
 
 
@@ -212,6 +215,11 @@ def test_cached_only_mode_emits_cached_consensus(tmp_path: Path) -> None:
 
     env = _consensus_env()
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
+    prepare_proven_fixture(
+        tmp_path, env, "no_adapter", "OTUB_1-COI-no_adapter_1", "OTUB_1-COI",
+        CEDAR.representative, CEDAR.sequence,
+        [cache_dir / "OTUB_1-COI-no_adapter_1.consensus.fasta"],
+    )
     result = subprocess.run(
         [
             "bash",
@@ -265,6 +273,7 @@ def test_cached_only_mode_lazy_hydrates_from_state_cache(tmp_path: Path) -> None
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["CONSENSUS_CACHE_STATE_ROOT"] = str(state_cache_root)
     env["CONSENSUS_CACHE_SYNC_SCRIPT"] = str(REPO_ROOT / "bin" / "sync_dir_atomic.sh")
+    add_current_fixture_evidence(tmp_path, env)
     result = subprocess.run(
         [
             "bash",
@@ -319,6 +328,11 @@ def test_consensus_phase_timings_summary_keeps_header_and_merge_rows(tmp_path: P
 
     env = _consensus_env()
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
+    prepare_proven_fixture(
+        tmp_path, env, "no_adapter", "OTUB_1-COI-no_adapter_1", "OTUB_1-COI",
+        CEDAR.representative, CEDAR.sequence,
+        [cache_dir / "OTUB_1-COI-no_adapter_1.consensus.fasta"],
+    )
     result = subprocess.run(
         [
             "bash",
@@ -389,6 +403,7 @@ def test_lazy_cache_hydration_only_restores_present_sample_dirs(tmp_path: Path) 
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["CONSENSUS_CACHE_STATE_ROOT"] = str(state_cache_root)
     env["CONSENSUS_CACHE_SYNC_SCRIPT"] = str(REPO_ROOT / "bin" / "sync_dir_atomic.sh")
+    add_current_fixture_evidence(tmp_path, env)
     result = subprocess.run(
         [
             "bash",
@@ -510,6 +525,7 @@ def test_state_only_cache_sample_is_not_hydrated_during_sample_work(tmp_path: Pa
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["CONSENSUS_CACHE_STATE_ROOT"] = str(state_cache_root)
     env["CONSENSUS_CACHE_SYNC_SCRIPT"] = str(REPO_ROOT / "bin" / "sync_dir_atomic.sh")
+    add_current_fixture_evidence(tmp_path, env)
     result = subprocess.run(
         [
             "bash",

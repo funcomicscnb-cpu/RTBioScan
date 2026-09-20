@@ -1,5 +1,6 @@
 import os
 import subprocess
+from tests.test_consensus_stable_otu_identity_contract import CEDAR, prepare_proven_fixture, write_prior_owners
 from pathlib import Path
 
 import pytest
@@ -671,6 +672,15 @@ def test_consensus_cached_only_filters_prior_consolidated_to_emitted_headers(tmp
 
     env = consensus_env()
     env["PATH"] = f"{tools}:{env['PATH']}"
+    prepare_proven_fixture(
+        tmp_path, env, "s1", "OTUB_1-COI", "OTUB_1-COI",
+        CEDAR.representative.replace("no_adapter_1", "s1"), CEDAR.sequence,
+        [cache_dir / "OTUB_1-COI.consensus.fasta"],
+    )
+    write_prior_owners(tmp_path, [("s1", CEDAR, "OTUB_1-COI", [
+        ["Consensus1_s1", ">s1|Consensus1|COI|reads-10"],
+        ["Consensus999_s1", ">s1|Consensus999|COI|reads-10"],
+    ])])
     subprocess.run(
         [
             "bash",
@@ -953,6 +963,11 @@ def test_consensus_zero_emission_with_inputs_fails_when_policy_fail(tmp_path: Pa
     env = consensus_env()
     env["PATH"] = f"{tools}:{env['PATH']}"
     env["CONSENSUS_ZERO_EMIT_POLICY"] = "fail"
+    prepare_proven_fixture(
+        tmp_path, env, "s1", "OTUB_1-COI", "OTUB_1-COI",
+        CEDAR.representative.replace("no_adapter_1", "s1"), CEDAR.sequence,
+        [cache_dir / "OTUB_1-COI.consensus.fasta"],
+    )
     with pytest.raises(subprocess.CalledProcessError):
         subprocess.run(
             [

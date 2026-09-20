@@ -2849,7 +2849,7 @@ def test_consensus_taxonomy_mode_default_validation_and_production_wiring() -> N
     assert "duplicate configured marker" in text
     assert "equalsIgnoreCase('null')" in text
     mode_wire = 'CONSENSUS_TAXONOMY_MODE="${consensusTaxonomyModeCanonical}" \\'
-    wrapper_call = "bash ${baseDir}/bin/Consensus_simple.sh"
+    wrapper_call = 'bash "${baseDir}/bin/Consensus_simple.sh"'
     assert consensus_block.count(mode_wire) == 1
     assert consensus_block.count(wrapper_call) == 1
     assert consensus_block.index(mode_wire) < consensus_block.index(wrapper_call)
