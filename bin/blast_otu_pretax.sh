@@ -78,91 +78,78 @@ run_target_worker() {
 	: > "$preblast_report"
 	: > "$blast_report"
 	: > "$blast_report_adj"
-
-	if [ -n "$memtax_src" ] && [ -f "${BASE_DIR}/${memtax_src}" ] && [ ! -f "$memtax_file" ]; then
-		cp "${BASE_DIR}/${memtax_src}" "$memtax_file"
-	fi
+	rm -f "${blast_report_adj}.state" "${blast_report_adj}.target" "${blast_report_adj}."*.pending
 
 	if ! seqkit grep -r -p "\\|${target}\\|" "$BLAST_INPUT_FASTA" > "$target_fasta"; then
 		echo "ERROR: failed to extract BLAST input reads for target $target" >&2
 		exit 1
 	fi
-
 	if [ ! -s "$target_fasta" ]; then
 		return 0
 	fi
 
-	cache_key="db=${db_path}|sig=$(db_sig "${db_path}")|taxdb=${TAXDB_DIR}|taxsig=$(dir_sig "${TAXDB_DIR}")|idfam=${id_fam}|evalue=${BLAST_EVALUE}|maxhsps=${BLAST_MAX_HSPS}|word=${WORD_SIZE}|qcov=${QCOV}|target=${target}"
-	if [ ! -f "$cache_meta_path" ] || [ "$(cat "$cache_meta_path" 2>/dev/null)" != "$cache_key" ]; then
-		: > "$cache_path"
-		printf '%s\n' "$cache_key" > "$cache_meta_path"
+	if [ -n "$memtax_src" ] && [ "$memtax_src" != "null" ]; then
+		case "$memtax_src" in /*) ;; *) memtax_src="${BASE_DIR}/${memtax_src}" ;; esac
 	fi
-	[ -f "$cache_path" ] || : > "$cache_path"
-
-	"${BASE_DIR}/bin/cache_blast_by_hash.pl" \
-		"$target_fasta" \
-		"$cache_path" \
-		"$preblast_cached" \
-		"$preblast_new_fasta" \
-		"$preblast_hash_new"
-
-	if [ -s "$preblast_new_fasta" ]; then
-		if blastn \
-			-query "$preblast_new_fasta" \
-			-db "$db_path" \
-			-num_threads "$worker_threads" \
-			-task megablast \
-			-dust no \
-			-outfmt "10 qseqid sseqid evalue length pident" \
-			-perc_identity "$id_fam" \
-			-evalue "$BLAST_EVALUE" \
-			-max_hsps "$BLAST_MAX_HSPS" \
-			-max_target_seqs 1 \
-			-word_size "$WORD_SIZE" \
-			-qcov_hsp_perc "$QCOV" \
-			-mt_mode 2 > "$preblast_new_txt"; then
-			:
-		else
-			echo "ERROR: blastn failed for target $target (exit $?)" >&2
-			exit 1
-		fi
+	# Content signatures bind both caches to the actual pinned taxonomy/reference.
+	# All persistent replacement is deferred until BLAST and taxonomy validate.
+	local cache_tool="${BASE_DIR}/bin/cache_blast_by_hash.pl"
+	local signatures
+	local ref_sig
+	local tax_sig
+	local subject_count
+	signatures="$("$cache_tool" --signature "$db_path" "${TAXONKIT_DB:-}" \
+		"idfam=$id_fam" "idgen=$id_gen" "idspec=$id_spec" "evalue=$BLAST_EVALUE" \
+		"maxhsps=$BLAST_MAX_HSPS" "word=$WORD_SIZE" "qcov=$QCOV" "target=$target" "seed=$memtax_src")"
+	IFS=$'\t' read -r cache_key ref_sig tax_sig <<< "$signatures"
+	# A limit smaller than the database can conceal genuine equal-best subjects.
+	subject_count="$(blastdbcmd -db "$db_path" -info | perl -ne \
+		'if (/([\d,]+) sequences;/) { $n=$1; $n=~s/,//g; print "$n\n"; $seen++ } END { die "Invalid BLAST database sequence count\n" unless $seen==1 && $n>0 && $n<=2147483647 }')"
+	target_tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/rtbioscan_blast_taxdepth_${idx}.XXXXXX")"
+	# The worker is already a subshell; this trap cannot affect another target.
+	trap 'rm -rf "$target_tmp_dir"' EXIT
+	local pending="${target_tmp_dir}/r4"
+	if (
+		cd "$target_tmp_dir"
+		"$cache_tool" --worker --depth-helper "${BASE_DIR}/bin/get_blast_taxdepth.pl" "$WORK_DIR/$target_fasta" "$cache_path" "$cache_key" "$pending" \
+			"$memtax_file" "$id_spec" "$id_gen" "$memtax_src" "$target" \
+			blastn -db "$db_path" -num_threads "$worker_threads" -task megablast -dust no \
+			-outfmt "6 qseqid sseqid staxids evalue length pident bitscore qstart qend sstart send qlen" \
+			-perc_identity "$id_fam" -evalue "$BLAST_EVALUE" -max_hsps "$BLAST_MAX_HSPS" \
+			-max_target_seqs "$subject_count" -word_size "$WORD_SIZE" -qcov_hsp_perc "$QCOV" -mt_mode 2
+	); then
+		:
+	else
+		taxdepth_status=$?
+		echo "ERROR: BLAST/taxonomy generation failed for target $target (exit $taxdepth_status)" >&2
+		exit 1
 	fi
-
-	if [ -s "$preblast_hash_new" ] && [ -s "$preblast_new_txt" ]; then
-		awk -F'\t' 'NR==FNR{h[$1]=$2; next} {split($0,a,","); if (a[1] in h) print h[a[1]] "\t" a[2] "\t" a[3] "\t" a[4] "\t" a[5];}' \
-			"$preblast_hash_new" \
-			"$preblast_new_txt" >> "$cache_path"
-		awk -F'\t' '{line[$1]=$0} END{for (k in line) print line[k]}' "$cache_path" \
-			| LC_ALL=C sort > "${cache_path}.tmp" \
-			&& mv "${cache_path}.tmp" "$cache_path"
-	fi
-
-	if [ -s "$preblast_cached" ] || [ -s "$preblast_new_txt" ]; then
-		cat "$preblast_cached" "$preblast_new_txt" > "$preblast_report"
-	fi
-
+	cp "${pending}.fasta" "$preblast_new_fasta"
+	cp "${pending}.raw" "$preblast_new_txt"
+	cp "${pending}.preblast" "$preblast_report"
+	cp "${pending}.report" "$blast_report_adj"
+	cp "${pending}.manifest" "${blast_report_adj}.manifest"
+	# Stage all targets first. A failure in any worker must publish no cache.
+	cp "${pending}.memtax" "${blast_report_adj}.memtax.pending"
+	cp "${pending}.cache" "${blast_report_adj}.cache.pending"
+	cp "${pending}.evidence" "${blast_report_adj}.evidence.pending"
+	cp "${pending}.all-evidence" "${blast_report_adj}.all-evidence.pending"
+	cp "${pending}.all-report" "${blast_report_adj}.state"
+	printf '%s\n' "$target" > "${blast_report_adj}.target"
+	rm -rf "$target_tmp_dir"
+	trap - EXIT
 	if [ -s "$preblast_report" ]; then
-		sed 's/,/;/g' "$preblast_report" | sed -E 's/\;\S+\|\S+\|/\;/' > "$blast_report"
-		target_tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/rtbioscan_blast_taxdepth_${idx}.XXXXXX")"
-		if (
-			cd "$target_tmp_dir"
-			"${BASE_DIR}/bin/get_blast_taxdepth.pl" "${WORK_DIR}/${blast_report}" "$id_spec" "$id_gen" "$memtax_file" > "${WORK_DIR}/${blast_report_adj}"
-		); then
-			:
-		else
-			taxdepth_status=$?
-			rm -rf "$target_tmp_dir"
-			echo "ERROR: get_blast_taxdepth.pl failed for target $target (exit $taxdepth_status)" >&2
-			exit 1
-		fi
-		rm -rf "$target_tmp_dir"
-		cp "$memtax_file" "${ROUND_BC_DIR}/${BARCODE}_memtax${idx}.txt" 2>/dev/null || true
 		echo "Blast analysis for ${target} is successful" 1>&2
 	fi
+
 }
 
 active_indices=()
 for idx0 in "${!TARGETS[@]}"; do
+	idx=$(( idx0 + 1 ))
+	: > "${BARCODE}_preblastreport${idx}.txt"
+	: > "${BARCODE}_blastreport${idx}_adj.txt"
+	rm -f "${BARCODE}_blastreport${idx}_adj.txt.state" "${BARCODE}_blastreport${idx}_adj.txt.target"
 	target="${TARGETS[$idx0]}"
 	if [ -n "$target" ] && [ "$target" != "null" ]; then
 		if grep -qF "|${target}|" "$BLAST_INPUT_FASTA" 2>/dev/null; then
@@ -217,12 +204,25 @@ fi
 
 : > "${BARCODE}_preblastreport_join.txt"
 : > "${BARCODE}_blastreport_join.txt"
+: > "${BARCODE}_blastreport_state_r4.txt"
+: > "${BARCODE}_blastreport_targets_r4.txt"
 for idx0 in "${!TARGETS[@]}"; do
 	idx=$(( idx0 + 1 ))
 	preblast_report="${BARCODE}_preblastreport${idx}.txt"
 	blast_report_adj="${BARCODE}_blastreport${idx}_adj.txt"
 	if [ -f "$preblast_report" ]; then
 		cat "$preblast_report" >> "${BARCODE}_preblastreport_join.txt"
+	fi
+	if [ -f "${blast_report_adj}.state" ]; then
+		target="${TARGETS[$idx0]}"
+		cache_tool="${BASE_DIR}/bin/cache_blast_by_hash.pl"
+		"$cache_tool" --publish-ready "${blast_report_adj}.memtax.pending" "${STATE_DIR}/memtax${idx}.txt" "${blast_report_adj}.manifest" memtax
+		"$cache_tool" --publish-ready "${blast_report_adj}.cache.pending" "${STATE_DIR}/otu_blast_cache_${target}.tsv" "${blast_report_adj}.manifest" cache
+		"$cache_tool" --publish-ready "${blast_report_adj}.evidence.pending" "${ROUND_BC_DIR}/${BARCODE}_blast_evidence_${target}.tsv" "${blast_report_adj}.manifest" evidence
+		"$cache_tool" --publish-ready "${blast_report_adj}.all-evidence.pending" "${STATE_DIR}/otu_blast_evidence_${target}.tsv" "${blast_report_adj}.manifest" all-evidence
+		cp "${STATE_DIR}/memtax${idx}.txt" "${ROUND_BC_DIR}/${BARCODE}_memtax${idx}.txt"
+		cat "${blast_report_adj}.state" >> "${BARCODE}_blastreport_state_r4.txt"
+		cat "${blast_report_adj}.target" >> "${BARCODE}_blastreport_targets_r4.txt"
 	fi
 	if [ -f "$blast_report_adj" ]; then
 		cat "$blast_report_adj" >> "${BARCODE}_blastreport_join.txt"

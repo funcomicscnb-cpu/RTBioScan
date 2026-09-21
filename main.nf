@@ -3559,30 +3559,14 @@ process blast_OTU_pretax {
 			exit 1
 		fi
 		if [ "\$STATE_BLASTREPORT_EXISTS" -eq 0 ]; then
-			cp ${barcode}_blastreport_join.txt ${barcode}_blastreport.txt
-		else
-			# Keep one line per qseqid; load new entries (small), stream existing (large).
-			awk 'NR==FNR {
-					line=\$0; if(line=="") next;
-					if(index(line,";")>0){ split(line,a,";"); } else { split(line,a,","); }
-					q=a[1]; if(q=="") next; len=a[4]+0; pid=a[5]+0;
-					if(!(q in best) || pid>bp[q] || (pid==bp[q] && len>bl[q])) {
-						best[q]=line; bp[q]=pid; bl[q]=len;
-					}
-					next
-				} {
-					line=\$0; if(line=="") next;
-					if(index(line,";")>0){ split(line,a,";"); } else { split(line,a,","); }
-					q=a[1]; if(q=="") next; len=a[4]+0; pid=a[5]+0;
-					if (q in best) {
-						if (bp[q]>pid || (bp[q]==pid && bl[q]>=len)) { print best[q]; } else { print line; }
-						delete best[q]; delete bp[q]; delete bl[q];
-					} else { print line; }
-				} END {
-					for(q in best) print best[q];
-				}' ${barcode}_blastreport_join.txt "\$STATE_BLASTREPORT_SNAPSHOT" \
-			| LC_ALL=C sort > ${barcode}_blastreport.txt
+			: > "\$STATE_BLASTREPORT_SNAPSHOT"
 		fi
+		# R4-A migration: rebuild active targets from signed cache evidence, never
+		# compare old percent-identity assignments against a corrected selector.
+		"\$BIN_DIR/cache_blast_by_hash.pl" --merge \
+			"\$STATE_BLASTREPORT_SNAPSHOT" \
+			"${barcode}_blastreport_state_r4.txt" \
+			"${barcode}_blastreport_targets_r4.txt" > ${barcode}_blastreport.txt
 		rm -f "\$STATE_BLASTREPORT_SNAPSHOT"
 		_t_blastreport_merge_end=\$(date +%s)
 		append_process_timing "blastreport_merge" "\$_t_blastreport_merge_start" "\$_t_blastreport_merge_end"

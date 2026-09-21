@@ -83,7 +83,12 @@ if blast_log:
 for line in query.read_text(encoding="utf-8").splitlines():
     if line.startswith(">"):
         qid = line[1:].split()[0]
-        print(f"{qid},123,1e-20,100,99.0")
+        values = dict(qseqid=qid, sseqid="123", staxids="123", evalue="1e-20",
+                      length="100", pident="99.0", bitscore="180", qstart="1",
+                      qend="4", sstart="1", send="4", qlen="4")
+        fields = args[args.index("-outfmt") + 1].split()
+        assert fields[0] == "6"
+        print("\\t".join(values[field] for field in fields[1:]))
 """,
     )
     _write_executable(
@@ -95,31 +100,40 @@ from pathlib import Path
 args = sys.argv[1:]
 if not args:
     raise SystemExit(2)
-path = None
-if "-t" in args:
-    path = Path(args[args.index("-t") + 1])
-elif args[-1] not in {"lineage", "reformat"}:
-    path = Path(args[-1])
-if path is not None and path.exists():
-    sys.stdout.write(path.read_text(encoding="utf-8"))
+path = Path(args[-1])
+if args[0] == "lineage":
+    for taxid in path.read_text().splitlines():
+        assert taxid == "123"
+        print("123\\tOrder;Family;Genus;Species\\t10;20;30;123\\tspecies")
+elif args[0] == "reformat":
+    for line in path.read_text().splitlines():
+        print(line + "\\tSpecies;Genus;Family;Order\\t123;30;20;10")
+else:
+    raise SystemExit(2)
 """,
     )
+
+    _write_executable(fake_bin / "blastdbcmd", "#!/bin/sh\necho '1 sequences; 4 total bases'\n")
 
     helper_base = tmp_path / "helper-base"
     helper_base.mkdir()
     os.symlink(REPO_ROOT / "bin", helper_base / "bin")
-    (helper_base / "memtax1.txt").write_text("123\tGenusA\tFamilyA\tOrderA\t123\tspecies\n", encoding="utf-8")
-    (helper_base / "memtax2.txt").write_text("123\tGenusB\tFamilyB\tOrderB\t123\tspecies\n", encoding="utf-8")
+    (helper_base / "memtax1.txt").write_text("123\t30\t20\t10\tspecies\n", encoding="utf-8")
+    (helper_base / "memtax2.txt").write_text("123\t30\t20\t10\tspecies\n", encoding="utf-8")
 
     db_root = tmp_path / "db-root"
     db_root.mkdir()
-    (db_root / "coi_db").write_text("coi\n", encoding="utf-8")
-    (db_root / "its_db").write_text("its\n", encoding="utf-8")
+    (db_root / "coi_db.nsq").write_text("coi\n", encoding="utf-8")
+    (db_root / "its_db.nsq").write_text("its\n", encoding="utf-8")
     taxdb_dir = tmp_path / "taxdb"
     taxdb_dir.mkdir()
     (taxdb_dir / "nodes.dmp").write_text("nodes\n", encoding="utf-8")
 
+    for name in ("names.dmp", "merged.dmp", "delnodes.dmp"):
+        (taxdb_dir / name).write_text(name + "\n", encoding="utf-8")
+
     env = os.environ.copy()
+    env["TAXONKIT_DB"] = str(taxdb_dir)
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     return env, helper_base, db_root, taxdb_dir
 
