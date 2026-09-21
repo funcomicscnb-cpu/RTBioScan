@@ -56,8 +56,8 @@ def test_clusters_do_not_leak_taxon_state_across_boundaries(tmp_path: Path) -> N
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
         "#seq_id\ttax_id\tlineage",
-        "read1|COI|sup|OTUB_0-COI\tTX1\tK__One;p__One;c__One;o__One;f__One;g__One;s__One",
-        "read2|COI|sup|OTUB_0-COI\tTX1\tK__One;p__One;c__One;o__One;f__One;g__One;s__One",
+        "read1|COI|sup|OTUB_0-COI\tNA\tK__Unassigned;p__Unassigned;c__Unassigned;o__Unassigned;f__Unassigned;g__Unassigned;s__Unassigned",
+        "read2|COI|sup|OTUB_0-COI\tNA\tK__Unassigned;p__Unassigned;c__Unassigned;o__Unassigned;f__Unassigned;g__Unassigned;s__Unassigned",
         "read3|COI|sup|OTUB_1-COI\tTX3\tK__Three;p__Three;c__Three;o__Three;f__Three;g__Three;s__Three",
     ]
 

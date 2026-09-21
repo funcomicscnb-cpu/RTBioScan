@@ -2406,8 +2406,8 @@ def test_main_nf_derives_no_adapter_policy_from_observed_annotations() -> None:
     assert 'if ! "\\$BIN_DIR/select_reads2sup.pl" blast_report_annotated_otu.txt 50 keep_no_adapter ${barcode}_read_pident.tsv "\\$BLOCKED_OTU" > tmp; then' in text
     assert 'ERROR: select_reads2sup.pl failed for ${barcode}/${round_barcode}' in text
     assert '"\\$BIN_DIR/select_reads2sup.pl" blast_report_annotated_otu.txt 50 keep_no_adapter ${barcode}_read_pident.tsv "\\$BLOCKED_OTU" > tmp || :' not in text
-    assert "sed -E 's/[Kpcofgs]__//g' tmp > blast_report_annotated_otu.txt || mv tmp blast_report_annotated_otu.txt" in text
-    assert "sed -E 's/[Kpcofgs]__//g' blast_report_annotated_otu.txt \\" in text
+    assert "sed -E 's/(^|[;\t])[KkPpCcOoFfGgSs]__/\\\\1/g' tmp > blast_report_annotated_otu.txt || mv tmp blast_report_annotated_otu.txt" in text
+    assert "sed -E 's/(^|[;\t])[KkPpCcOoFfGgSs]__/\\\\1/g' blast_report_annotated_otu.txt \\" in text
     assert '"\\$BIN_DIR/prefer_blast_rows_by_model.sh" \\' in text
     assert '--output blast_report_annotated_preferred.txt \\' in text
     assert '--policy sup_hac2sup_preferred; then' in text

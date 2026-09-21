@@ -123,6 +123,18 @@ annotated_bytes=0
 annotated_file_bytes=0
 _t_wrapper_total_start=$(now_ms)
 
+# Strict production authority is sealed R4-A evidence, never the legacy report.
+if [ "${RTB_R4B_ENABLE:-0}" = "1" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    export OTU_REFINE_WORKLOAD_STATS_FILE="$WORKLOAD_STATS_FILE"
+    export OTU_REFINE_PHASE_TIMINGS_MS_FILE="$PHASE_TIMINGS_MS_FILE"
+    export OTU_REFINE_PHASE_TIMINGS_FILE="$PHASE_TIMINGS_FILE"
+    export OTU_REFINE_ROUND_ID="$ROUND_ID"
+    export RTB_R4B_LEGACY_REPORT="$BLAST_REPORT"
+    exec perl "$SCRIPT_DIR/otu_refine_blastreport.pl" --r4b "$CLSTR_FILE" "$LINEAGE_FILE" "${RTB_R4B_CONTRACT:-}"
+fi
+
+
 if [ ! -e "$BLAST_REPORT" ] || [ ! -s "$CLSTR_FILE" ]; then
     write_workload_stats "$cluster_count" "$cluster_records" "$blastreport_rows" "$cluster_taxids_rows" "$worker_count" "$shard_count" "$shard_scheduler_mode" "$target_records_per_shard" "$smallest_shard_records" "$median_shard_records" "$largest_shard_records" "$largest_shard_fraction" "$max_single_cluster_records" "$max_single_cluster_fraction" "$merged_pairs_rows" "$merged_pairs_bytes" "$annotated_rows" "$annotated_bytes" "$annotated_file_bytes"
     exit 0

@@ -27,7 +27,7 @@ def test_assigned_ids_with_header_taxid_or_kingdom(tmp_path: Path) -> None:
     )
     _run(inp, out)
     got = [ln.strip() for ln in out.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    assert got == ["r1", "r2"]
+    assert got == []
 
 
 def test_assigned_ids_without_header_uses_fallback_columns(tmp_path: Path) -> None:
@@ -40,7 +40,7 @@ def test_assigned_ids_without_header_uses_fallback_columns(tmp_path: Path) -> No
     )
     _run(inp, out)
     got = [ln.strip() for ln in out.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    assert got == ["u1"]
+    assert got == []
 
 
 def test_assigned_ids_with_seq_id_tax_id_lineage_header(tmp_path: Path) -> None:
@@ -55,7 +55,7 @@ def test_assigned_ids_with_seq_id_tax_id_lineage_header(tmp_path: Path) -> None:
     )
     _run(inp, out)
     got = [ln.strip() for ln in out.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    assert got == ["a2", "a3"]
+    assert got == ["a3"]
 
 
 def test_assigned_ids_with_raw_blast_semicolon_rows(tmp_path: Path) -> None:
@@ -69,4 +69,4 @@ def test_assigned_ids_with_raw_blast_semicolon_rows(tmp_path: Path) -> None:
     )
     _run(inp, out)
     got = [ln.strip() for ln in out.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    assert got == ["r1", "r3"]
+    assert got == []

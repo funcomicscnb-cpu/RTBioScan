@@ -8,6 +8,17 @@ use lib "$FindBin::Bin/lib";
 
 use RTBioScan::OTURefineBlastreport qw(print_full_output);
 
+if (($ARGV[0] // '') eq '--r4b') {
+    shift @ARGV;
+    RTBioScan::OTURefineBlastreport::run_marker_contract($ARGV[0],$ARGV[1],$ARGV[2],\*STDOUT);
+    exit 0;
+}
+if (($ARGV[0] // '') eq '--publish-status') {
+    shift @ARGV;
+    RTBioScan::OTURefineBlastreport::publish_status_sidecar(@ARGV);
+    exit 0;
+}
+
 my ($input1, $input2, $non_ncbi_id2lineage) = @ARGV;
 
 if ( !defined $input1 || !-e $input1 || -z $input1

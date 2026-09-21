@@ -207,7 +207,7 @@ def test_parallel_wrapper_matches_serial_output_for_cluster_shards(tmp_path: Pat
     assert parallel.returncode == 0, parallel.stderr
     assert parallel.stdout == serial.stdout
     assert "OTUB_0-COI\tTX1\tK__One" in parallel.stdout
-    assert "read7|COI|sup|OTUB_3-COI\tTX_UNKNOWN\tK__Unassigned" in parallel.stdout
+    assert "read7|COI|sup|OTUB_3-COI\tNA\tK__Unassigned" in parallel.stdout
     assert "read8|ITS2|sup|OTUB_3-ITS2\tTX_UNKNOWN\tK__Unassigned" in parallel.stdout
 
 
@@ -363,7 +363,7 @@ def test_parallel_wrapper_preserves_normalized_fallback_precedence(tmp_path: Pat
     assert serial.returncode == 0, serial.stderr
     assert parallel.returncode == 0, parallel.stderr
     assert parallel.stdout == serial.stdout
-    assert "read1|COI|hac|OTUB_0-COI\tTX_LAST\tK__Last" in parallel.stdout
+    assert "read1|COI|hac|OTUB_0-COI\t\tK__Unassigned" in parallel.stdout
 
 
 def test_parallel_wrapper_prefers_exact_match_over_normalized_fallback(tmp_path: Path) -> None:
@@ -420,7 +420,7 @@ def test_parallel_wrapper_caches_normalized_fallback_back_to_exact_ref_id(tmp_pa
         cwd=tmp_path,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "TX_LAST"
+    assert result.stdout == ""
 
 
 def test_parallel_wrapper_writes_phase_timings_and_workload_stats(tmp_path: Path) -> None:

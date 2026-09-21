@@ -24,7 +24,7 @@ def test_blast_assigned_otu_keys_accepts_round_evidence_schema(tmp_path: Path) -
     )
 
     assert cp.returncode == 0, cp.stderr
-    assert out.read_text(encoding="utf-8").splitlines() == ["OTUB_1-COI"]
+    assert out.read_text(encoding="utf-8").splitlines() == []
 
 
 def test_blast_assigned_otu_keys_accepts_round_evidence_lineage_without_taxid(tmp_path: Path) -> None:

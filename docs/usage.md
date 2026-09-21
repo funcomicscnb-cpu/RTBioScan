@@ -2522,3 +2522,48 @@ BLAST-derived diagnostic exports are kept separate (non-canonical):
 - `${params.outdir}/ongoing/<round_barcode>/otu_members_blastdiag.tsv`
 - `${params.outdir}/ongoing/<round_barcode>/otu_sizes_blastdiag.tsv`
 - `${params.outdir}/ongoing/<round_barcode>/otu_members_blastdiag_stats.tsv`
+
+### Marker-scoped BLAST OTU taxonomy (R4-B)
+
+BLAST OTU assignment consumes the sealed R4-A evidence and marker-specific MEMTAX
+state. Each canonical member votes once within its marker projection. Equal-best
+read identities and equal OTU plurality winners resolve through their deepest
+validated common lineage; they remain explicitly ambiguous. Configured synthetic
+lineage authority is selected within the configured marker/target kingdom. Missing
+or conflicting authority yields `REFERENCE_UNRESOLVED`, and wrong-kingdom evidence
+yields `REFERENCE_INCONSISTENT`. Neither supplies an assigned vote. Deployed titles
+validate authority; they never fill missing configured ranks or replace it.
+
+`--assign_protection_level family|genus|species` uses actual validated lineage depth.
+A signed taxid is usable, but a taxid by itself does not meet a depth threshold.
+Production protection uses only `MARKER|representative_md5`. A projection without a
+representative key emits a warning and supplies no persistent OTU key. The standalone
+legacy key extractor can still print display identifiers with a diagnostic warning;
+its `--persistent` mode requires the validated R4-B sidecar and omits such identifiers.
+
+Old runs without sealed R4-A authority must regenerate that evidence through the
+existing workflow before R4-B can classify it. A missing or stale sealed file fails
+closed. The internal R4-B sidecar is recomputed, including after a lineage-source
+change; an old or partial sidecar is never used to reconstruct authority. Existing
+reference compatibility checks continue to govern reference changes on resume.
+
+Explicit offline reference operations accept a JSON contract with `lineage` and a
+`targets` array of objects containing `marker`, `kingdom`, `database`, and `seed`.
+For a bounded exported-metadata fixture, `metadata` can name a TSV of BLAST accession,
+native taxid and complete deployed title instead of reading the database. This is
+validation evidence, not an alternative synthetic lineage authority.
+
+```sh
+perl bin/install_taxonomy_release.pl --validate-marker-lineages contract.json
+perl bin/install_taxonomy_release.pl --write-marker-view contract.json NEW_VIEW.json
+perl bin/install_taxonomy_release.pl --validate-marker-view contract.json NEW_VIEW.json
+```
+
+Validation is read-only, requires no network and exits 2 when references disagree.
+The explicit new-view operation refuses unresolved/conflicting inputs and existing
+outputs. It publishes one JSON bundle atomically, containing sorted canonical TSV
+rows and a manifest of source hashes, markers, kingdoms, row counts, and the SHA-256
+of the TSV payload. It normalizes representation only; it cannot adjudicate conflicting
+biology, fill absent ranks, or repair/activate production references. Pipeline runs
+never invoke this operation. The existing taxonomy-release installation interface
+is unchanged.

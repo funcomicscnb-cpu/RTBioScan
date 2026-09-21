@@ -8,6 +8,14 @@ use File::Basename qw(dirname);
 use File::Path qw(make_path remove_tree);
 use File::Spec;
 use Getopt::Long qw(GetOptions);
+use FindBin;
+use lib "$FindBin::Bin/lib";
+
+# R4-B explicit offline reference operations; the release installer is unchanged.
+if (@ARGV && $ARGV[0] =~ /\A--(?:validate-marker-lineages|write-marker-view|validate-marker-view)\z/) {
+    require RTBioScan::OTURefineBlastreport;
+    exit RTBioScan::OTURefineBlastreport::marker_reference_cli(@ARGV);
+}
 
 my %opt;
 GetOptions(

@@ -241,3 +241,34 @@ The `--restart_mode` parameter provides additional recovery options:
 - `off` (default): normal run.
 - `restore`: restore rolling state from `results/temp/current` into `results/temp/ongoing` once.
 - `reset`: wipe `results/temp/current` and `results/temp/ongoing` once.
+
+### Internal BLAST marker-taxonomy sidecar
+
+`<barcode>_blast_otu_taxonomy_v1.tsv` is an internal round artifact. Its header is
+`#RTB-R4B-TAXONOMY`, version `1`, and a generation SHA-256 binding configuration and
+source evidence. A named-column line precedes the records; a count/body-SHA-256 footer
+and final newline seal the complete file. Publication validates the entire generation
+before atomically replacing the destination. It is derived evidence, not independently
+reusable taxonomy authority. A round with no cluster members retains existing empty
+placeholder behavior.
+
+Each row records the query/member, canonical OTU and marker, resolved taxid, explicit
+seven-rank lineage, assignment status, actual depth, direct/LCA origin, canonical-member
+and vote counts, winning support/tie count, stable representative key, and read-level
+status/lineage/origin/rejection reason with original signed IDs. Status counts retain
+minority and rejected evidence even when a valid direct plurality wins. Aliases cannot
+multiply a canonical member's vote. Missing ranks and absent stable keys are `NA`.
+
+The bounded statuses are `ASSIGNED`, `AMBIGUOUS_TIE`, `NO_HIT`,
+`FILTERED_INELIGIBLE`, `REFERENCE_UNRESOLVED`, `REFERENCE_INCONSISTENT`, and
+`COMPUTATION_FAILED`; unknown spellings are rejected. Numeric depth is -1 for unresolved
+lineage and 0–6 for kingdom through species. An LCA without a unique supported taxid
+retains its lineage with taxid `NA`. An ambiguous contribution to the winning identity
+retains its LCA origin; ambiguity in a different minority identity does not taint a
+direct winner. The existing public annotated-report columns and report denominators
+are unchanged. Consensus taxonomy and public reporting changes remain deferred.
+
+The existing OTU-refinement phase-timing and workload artifact names and columns
+remain available. Strict marker refinement reports `single_pass` scheduling and
+zero shard/merged-pair counters because it does not materialize those intermediates;
+cluster, member and annotated-output counts describe the work actually performed.

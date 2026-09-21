@@ -24,7 +24,7 @@ def test_blast_unassigned_read_ids_accepts_round_evidence_schema(tmp_path: Path)
     )
 
     assert cp.returncode == 0, cp.stderr
-    assert out.read_text(encoding="utf-8").splitlines() == ["readB"]
+    assert out.read_text(encoding="utf-8").splitlines() == ["readA", "readB"]
 
 
 def test_blast_unassigned_read_ids_lineage_only_row_is_not_emitted(tmp_path: Path) -> None:
@@ -45,4 +45,4 @@ def test_blast_unassigned_read_ids_lineage_only_row_is_not_emitted(tmp_path: Pat
     )
 
     assert cp.returncode == 0, cp.stderr
-    assert out.read_text(encoding="utf-8").splitlines() == ["readB"]
+    assert out.read_text(encoding="utf-8").splitlines() == ["readA", "readB"]

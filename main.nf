@@ -3658,6 +3658,24 @@ process blast_OTU_pretax {
 		    sup_summary_rows_merged=0
 		    sup_cache_restore_missing_fastq_ids=0
 		    sup_cache_restore_missing_summary_ids=0
+	    # R4-B bindings reuse the configured sources and R4-A state. The sidecar
+	    # is internal; no public output channel or failed-round cardinality changes.
+	    export RTB_R4B_ENABLE=1
+	    export RTB_R4B_TARGETS="\$_p_targets"
+	    export RTB_R4B_KINGDOMS="${params.target_taxa}"
+	    export RTB_R4B_DATABASES="\$_p_blast_db_specs"
+	    export RTB_R4B_SEEDS="\$_p_nonncbi_memtax"
+	    export RTB_R4B_FAMILY="\$_p_blast_id_family"
+	    export RTB_R4B_GENUS="\$_p_blast_id_genus"
+	    export RTB_R4B_SPECIES="\$_p_blast_id_spec"
+	    export RTB_R4B_EVALUE="${params.blast_evalue}"
+	    export RTB_R4B_MAX_HSPS="${params.blast_max_hsps}"
+	    export RTB_R4B_DB_ROOT="${db_dir}"
+	    export RTB_R4B_BASE="${baseDir}"
+	    export RTB_R4B_STATE="\$STATE_DIR"
+	    export RTB_R4B_HASH_MAP="\$OTU_HASH_MAP_STATE"
+	    export RTB_R4B_SIDECAR="blast_otu_taxonomy_v1.tsv"
+	    : > "\$RTB_R4B_SIDECAR"
 	    : > blast_report_annotated.txt
 	    : > blast_report_annotated_otu.txt
 	    : > blast_report_annotated_otu_evidence.txt
@@ -3713,6 +3731,10 @@ process blast_OTU_pretax {
 
 		_t_otu_refine_evidence_copy_start=\$(now_ms)
 		cp blast_report_annotated_otu.txt blast_report_annotated_otu_evidence.txt 2>/dev/null || true
+		if [ -s "\$RTB_R4B_SIDECAR" ]; then
+		    perl "\$BIN_DIR/otu_refine_blastreport.pl" --publish-status \
+		        "\$RTB_R4B_SIDECAR" "\$ROUND_DIR/${barcode}_blast_otu_taxonomy_v1.tsv" || exit 1
+		fi
 		_t_otu_refine_evidence_copy_end=\$(now_ms)
 		append_otu_refine_breakdown "evidence_copy" "\$_t_otu_refine_evidence_copy_start" "\$_t_otu_refine_evidence_copy_end"
 				OBSERVED_NO_ADAPTER=0
@@ -3758,10 +3780,10 @@ process blast_OTU_pretax {
 		append_process_timing "otu_refine" "\$_t_otu_refine_start" "\$_t_otu_refine_end"
 		_t_assignment_state_updates_start=\$(date +%s)
 	: > ${barcode}_assigned_read_ids.list
-	if [ -s "${barcode}_blastreport_round.txt" ]; then
+	if [ -s "\$RTB_R4B_SIDECAR" ]; then
 		if ! perl "\$BIN_DIR/blast_assigned_read_ids.pl" \
-			"${barcode}_blastreport_round.txt" \
-			${barcode}_assigned_read_ids.list; then
+			"\$RTB_R4B_SIDECAR" \
+			${barcode}_assigned_read_ids.list --min-level "${assignProtLevelCanonical}"; then
 			echo "ERROR: failed to compute assigned read IDs" 1>&2
 			exit 1
 		fi
@@ -3791,10 +3813,10 @@ process blast_OTU_pretax {
 			ASSIGNED_OTU_KEYS_PERSIST_STATS="\$ROUND_DIR/${barcode}_assigned_otu_keys_persist_stats.tsv"
 				ASSIGNED_OTU_PRESERVE_STATS="\$ROUND_DIR/${barcode}_assigned_otu_preserve_stats.tsv"
 				if ! perl "\$BIN_DIR/blast_assigned_otu_keys.pl" \
-					blast_report_annotated_otu_evidence.txt \
+					"\$RTB_R4B_SIDECAR" \
 					"\$BLAST_ASSIGNED_OTU_KEYS_ROUND" \
 					"\$OTU_HASH_MAP_STATE" \
-					--min-level "${assignProtLevelCanonical}"; then
+					--persistent --min-level "${assignProtLevelCanonical}"; then
 					echo "ERROR: failed to extract blast-assigned OTU keys" 1>&2
 					exit 1
 			fi
@@ -3905,8 +3927,8 @@ process blast_OTU_pretax {
 		    append_sup_path_timing "select_reads2sup" "\$_t_select_reads2sup_start" "\$_t_select_reads2sup_end"
 		    _t_taxonomy_cleanup_emit_start=\$(now_ms)
 		        if [ -s tmp ]; then
-	            sed -E 's/[Kpcofgs]__//g' tmp > blast_report_annotated_otu.txt || mv tmp blast_report_annotated_otu.txt
-	            sed -E 's/[Kpcofgs]__//g' blast_report_annotated_otu.txt \
+	            sed -E 's/(^|[;	])[KkPpCcOoFfGgSs]__/\\1/g' tmp > blast_report_annotated_otu.txt || mv tmp blast_report_annotated_otu.txt
+	            sed -E 's/(^|[;	])[KkPpCcOoFfGgSs]__/\\1/g' blast_report_annotated_otu.txt \
 	                | tr ';' '\t' \
 	                | perl -pe 's/\blineage\b/kingdom\tphylum\tclass\torder\tfamily\tgenus\tspecies/g' \
 	                > blast_report_annotated.txt
@@ -4345,7 +4367,7 @@ process blast_OTU_pretax {
 						: > "\$BLAST_UNASSIGNED_CURRENT_TMP"
 						if [ -s blast_report_annotated_otu_evidence.txt ]; then
 							if ! perl "\$BIN_DIR/blast_unassigned_read_ids.pl" \
-								blast_report_annotated_otu_evidence.txt \
+								"\$RTB_R4B_SIDECAR" \
 								"\$BLAST_UNASSIGNED_CURRENT_TMP" \
 								--min-level "${assignProtLevelCanonical}"; then
 								echo "WARN: blast_unassigned_read_ids.pl failed; clearing live blast-unassigned report state" 1>&2
@@ -4366,7 +4388,7 @@ process blast_OTU_pretax {
 						else
 							if [ -s blast_report_annotated_otu_evidence.txt ]; then
 								if ! perl "\$BIN_DIR/blast_unassigned_read_ids.pl" \
-									blast_report_annotated_otu_evidence.txt \
+									"\$RTB_R4B_SIDECAR" \
 									"\$BLAST_UNASSIGNED_IDS" \
 									--min-level "${assignProtLevelCanonical}"; then
 									echo "WARN: blast_unassigned_read_ids.pl failed; continuing without blast-unassigned prune" 1>&2

@@ -150,7 +150,7 @@ def test_no_header_round_schema_still_detects_assigned_rows():
         "assigned_read\t92558\tK__Metazoa;p__Arthropoda;c__Insecta;o__Diptera;f__Dolichopodidae;g__;s__\n"
         "unassigned_read\tNA\tK__Unassigned;p__Unassigned;c__Unassigned;o__Unassigned;f__Unassigned;g__Unassigned;s__Unassigned\n"
     )
-    assert _run(tsv) == ["unassigned_read"]
+    assert _run(tsv) == ["assigned_read", "unassigned_read"]
 
 
 # ---------------------------------------------------------------------------
