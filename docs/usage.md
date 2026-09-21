@@ -1415,7 +1415,22 @@ Enable the frozen-OTU subsystem that removes stable OTUs from active reclusterin
 
 Minimum evidence required before an OTU can be promoted into the frozen set.
 
-- Defaults: `3` rounds, `50` reads.
+- `--otu_frozen_min_rounds` (default `3`) is a separate temporal requirement: the number of recorded qualifying active-clustering observations for the representative-hash OTU.
+- `--otu_frozen_min_reads` (default `50`) retains its public compatibility name. It thresholds **`promotion_sequence_round_evidence`**: the sum of the per-round active-NR distinct-sequence counts recorded for that representative hash under the existing promotion-history and eligibility rules. The unit is **distinct-sequence-round observations**. It is neither current raw read depth nor current unique-sequence cardinality.
+- A sequence retained in several qualifying rounds contributes once in each recorded round. Raw observations of the same sequence do not multiply its per-round NR contribution. The growth window constrains recent count changes; it does not truncate the evidence sum to that window.
+- No-new/unchanged-pool rounds do not append history. A round that fails before the promotion update does not advance it; a successful retry with still-uncommitted new hashes can supply one qualifying observation. Existing history, growth checks, restart/resume, and accumulated-state rules remain in effect.
+
+For one OTU observed with `3` then `4` distinct active-NR sequences, assuming the other eligibility, growth, and abundance checks pass:
+
+| Recorded counts | Sequence-round evidence | Minimum rounds | `otu_frozen_min_reads` | Promotion |
+| --- | ---: | ---: | ---: | --- |
+| `3` | 3 | 2 | 5 | No: temporal and evidence requirements unmet |
+| `3, 4` | 7 | 2 | 5 | Yes |
+| `3, 4` | 7 | 2 | 7 | Yes: inclusive threshold |
+| `3, 4` | 7 | 2 | 8 | No: evidence below threshold |
+| `3, 4` | 7 | 3 | 5 | No: temporal requirement unmet |
+
+These populations are distinguished in the [membership and metric contract](output.md#membership-and-metric-contract).
 
 #### `--otu_frozen_growth_window` / `--otu_frozen_drop_ratio` / `--otu_frozen_min_frac`
 [back to Top](#rtbioscan-usage)
@@ -1590,7 +1605,7 @@ Minimum OTU member count gate for read-level OTU BLAST prefiltering.
 - Default: `3`.
 - Allowed values: integer `>= 0`.
 - `0` disables filtering (explicit opt-out).
-- Member counts are evaluated from the current round BLAST-input read set.
+- Member counts are **`blast_eligible_read_support`**, evaluated from the current round eligible BLAST-input raw-read set after the existing sequence-hash join. Multiple eligible raw reads sharing a uniquely assigned hash contribute support; ambiguous or unmapped hashes do not contribute to an OTU threshold. Under the enforced `drop` policy, those reads are excluded from the filtered query. This count is separate from canonical NR membership and frozen-promotion history.
 
 #### `--otu_blast_filter_mode`
 [back to Top](#rtbioscan-usage)
@@ -2487,6 +2502,8 @@ The canonical per-round OTU membership source is `${barcode}_otu_def_rpt.txt` ge
 - Read ID source: `read_id` column from the OTU-definition report.
 - OTU keys in this Phase-A export are round-local cluster labels (per barcode/round) and are not yet a cross-round stable streak key.
 - Singleton semantics from this export are therefore "single-sequence OTU member in the NR cluster report", not read-depth abundance.
+- Each pre-split NR cluster has exactly one starred representative. A marker-projected public OTU contains that representative only if its sequence belongs to that marker subgroup; its representative count may therefore be **zero or one**, never more than one. Projection must not elect or relabel a member to manufacture a representative. The shared round-local cluster label and original cluster/report roles preserve the pre-split relationship.
+- Exact raw duplicates of a frozen representative contribute no new NR membership. The original metadata-designated representative ID and flag are retained, including rounds containing only duplicate observations. Distinct NR sequences assigned to the frozen OTU remain separate members.
 
 Exports generated each round:
 

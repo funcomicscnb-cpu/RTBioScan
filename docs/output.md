@@ -202,7 +202,23 @@ Tab-separated. Each row is a read assigned to an OTU with BLAST taxonomy. Key co
 ### OTU membership (`otu_members.tsv`)
 [back to Top](#rtbioscan-output)
 
-Two-column TSV: `otu_key`, `read_id`. Canonical source for which reads belong to which OTU in each round. Derived from the OTU-definition report, independent of BLAST filtering.
+Two-column TSV: `otu_key`, `read_id`. Canonical source for the unique NR sequence relations belonging to each OTU in that round, derived from the OTU-definition report independently of BLAST filtering. Read IDs identify NR sequence members here; they are not a census of all raw observations. The schema and filenames are unchanged.
+
+#### Membership and metric contract
+
+The names below describe populations, not additional output columns. All are counts (no percentage denominator); their units, grouping, and time scope differ.
+
+| Population | Unit and grouping | Time scope and exclusions |
+| --- | --- | --- |
+| `canonical_membership` | Unique NR sequence-to-OTU relations, identified by the retained NR IDs | Current round's canonical relation assembled from retained active and accumulated frozen state. Exact duplicate raw observations and repeated identical NR relations add no members; distinct NR sequences do. |
+| `representative_count` | Starred original representative per pre-split NR cluster | Exactly one before marker splitting. A marker projection contains zero or one, according to whether that original representative belongs to the subgroup; never elect a replacement. |
+| `promotion_sequence_round_evidence` | Sum of recorded active-NR distinct-sequence counts per representative-hash OTU | Distinct-sequence-round observations under existing history/eligibility rules. A sequence can contribute in several qualifying rounds. The temporal minimum and growth-window checks are separate requirements. |
+| `blast_eligible_read_support` | Current eligible raw-read support per OTU after the existing hash join | Current BLAST-input round only. Multiple raw reads with a uniquely assigned hash contribute; ambiguous/unmapped hashes cannot contribute OTU support. The enforced drop policy excludes them from the filtered query. |
+| `consensus_reads_N` | Existing support represented by `reads-N` for the emitted consensus | Mode-dependent: selected representative OTU's read count in `representative` mode; sum of counts across merged consensus-cluster members in `cluster_total` mode. Cached consensus retains its existing provenance and mode semantics. It is not canonical NR cardinality. |
+
+For example, a pre-split cluster with a COI representative and an ITS2 member has two canonical members and one representative. Its COI and ITS2 projections each have one member, with representative counts `1` and `0`, respectively. Both trace to the same original pre-split cluster; no representative is invented. Separately, recorded promotion counts `3, 4` yield evidence `7`, so a threshold of `5` passes when the temporal and other checks also pass. See [promotion controls](usage.md#--otu_frozen_min_rounds----otu_frozen_min_reads).
+
+**Zero and missingness:** zero is valid only for a successfully computed population, such as the ITS2 projection's representative count above or an empty set of eligible matches. An absent output, an unexecuted/failed stage, and unavailable evidence do not establish zero. An empty frozen-by-hash append file means no additional relation was emitted; it does not mean accumulated frozen membership is zero. Absent/empty frozen metadata preserves the existing no-append behavior and supplies no representative authority. Malformed or conflicting metadata/hash-map input is an error, not a successful zero: the helper rejects it before replacing its output, and the success-only caller does not append it to persistent membership. Consumers must retain computation status and diagnostics when interpreting empty tables or missing values; no new sentinel or schema field is introduced here.
 
 ### Demultiplexing summary (`<barcode>_summary_demult_rpt.txt`)
 [back to Top](#rtbioscan-output)
