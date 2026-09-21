@@ -114,6 +114,8 @@ def _prepare(tmp_path, main, config, raw=None, prune="", delete=False, ready=Fal
         source += f'\nnew File("${{workflow.launchDir}}/artifacts/{process}.sh").text = """' + _stub_nonpaths(_shell(main, process)) + '"""\n'
     # Execute the actual prune lookup, including its existing empty/missing policy.
     prune_shell = main.split('C1_SAMPLES_FILE="${otuPruneSamplesFileValue}"', 1)[1].split('RTBIOSCAN_EFFECTIVE_IDENTITY_MODE=', 1)[0]
+    # R3-C3 places stable-identity projections after the lookup; they need state files, so probe only the lookup.
+    prune_shell = prune_shell.split('C1_STABLE_KEYS=', 1)[0]
     prune_shell = 'C1_SAMPLES_FILE="${otuPruneSamplesFileValue}"' + prune_shell
     prune_shell = prune_shell.replace('${sampleInfoDir}', '${workflow.launchDir}/sample-info').replace('${replicateModeCanonical}', 'collapse')
     backup = _shell(main, "backup_update_and_clean")
