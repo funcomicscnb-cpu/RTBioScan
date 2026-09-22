@@ -983,7 +983,14 @@ def test_optional_workload_write_failure_is_nonfatal(tmp_path):
 # to manufacture producer signatures, EVIDENCE, or MEMTAX.
 def production_fragment(start, end, bindings):
     text = (ROOT / 'main.nf').read_text()
-    text = text[text.index(start):text.index(end, text.index(start))]
+    begin = text.index(start)
+    # The end anchor is matched with its leading tabs optional (the shell body's tab prefix
+    # is not significant), bounded to this process block, and must be unique inside it.
+    assert end.startswith('\n'), end
+    block_end = text.index('\nprocess ', begin)
+    end_matches = list(re.finditer(r'\n\t*' + re.escape(end[1:].lstrip('\t')), text[begin:block_end]))
+    assert len(end_matches) == 1, (end, len(end_matches))
+    text = text[begin:begin + end_matches[0].start()]
     for key, value in bindings.items():
         text = text.replace('${' + key + '}', str(value))
     assert not re.search(r'(?<!\\)\$\{(?:params\.|baseDir|db_dir|taxdb_dir|barcode|qced_reads_nr|round_barcode)', text)

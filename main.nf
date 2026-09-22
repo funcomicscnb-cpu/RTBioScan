@@ -3248,6 +3248,62 @@ process blast_OTU_pretax {
       tuple val(barcode), val(round_barcode), file("blast_report_annotated.txt"), file("${barcode}_assigned_read_ids.list") into blast2consensus
       tuple val(barcode), val(round_barcode) into round_lock_done_blast_OTU_pretax_ch
 
+	// ---- Operational notes for the shell script of this process ----------------------
+	// Nextflow DSL1 captures the whole `script:` section below (Groovy prelude + shell
+	// string) as ONE Groovy String constant, and Groovy refuses constants longer than
+	// 65,535 UTF-16 code units (integrated-audit finding F03: the section had grown to
+	// 67,201 and the complete main.nf no longer compiled). The section is size-guarded by
+	// tests/test_main_nf_full_compile.py. Keep explanatory prose here, not inside the
+	// shell string, and keep the shell body's leading indentation minimal (it is not
+	// significant to bash: the body has no heredocs, and its multi-line quoted strings
+	// are awk programs). The notes below were relocated verbatim from the shell body and
+	// are listed in shell order under their section markers.
+	//
+	//   # append_otu_refine_breakdown writes:
+	//   # -- §2: OTU size pre-filter and protection re-injection --
+	//   # Rollout guard: compute filter stats in observe/enforce, but only switch query FASTA in enforce.
+	//   # Preserve sticky protected reads: re-inject their current members into BLAST input
+	//   # FASTA headers are UUID|TARGET|... but _PROTECTED_IDS has bare UUIDs;
+	//   # awk matches on UUID prefix (before first |) to extract protected reads.
+	//   # -- §3: Per-target BLAST --
+	//   # -- §4: BLAST state initialization flag and OTU refinement --
+	//   # merge, sort and republish every round with no reader). Current BLAST
+	//   # results come only from the sealed R4-A cache/evidence state. An existing
+	//   # legacy file is accepted purely as evidence that BLAST state had been
+	//   # initialized; a small versioned marker carries that flag for new runs.
+	//   # The legacy file is never parsed, rewritten or deleted.
+	//   # R4-B bindings reuse the configured sources and R4-A state. The sidecar
+	//   # is internal; no public output channel or failed-round cardinality changes.
+	//   # Attempt refinement whenever accumulated clusters are non-empty;
+	//   # an empty BLAST report is a valid all-unassigned result.
+	//   # Refinement is a core classification step, so unexpected failure is fatal.
+	//   # Persist assigned read IDs (round snapshot + ever-assigned history).
+	//   # -- §5: SUP/HAC selection and re-basecalling path --
+	//   # Prior report labels are display only. Resolve proven owners into this round's labels.
+	//   # All BLAST-hit reads (any model) for rolling pool retention
+	//   # Only rewrite the rolling FASTA when we have `|sup|` entries; otherwise keep existing contents.
+	//   # Always append HAC-derived sequences (hac_fixed + hac2sup) so consensus can extract them.
+	//   # Ensure all BLAST-hit reads are retained in the rolling pool
+	//   # Also include HAC-derived sequences on first creation.
+	//   # Preserve sticky protected reads in the rolling pool even when they are absent
+	//   # from the current round's BLAST-hit/HAC-focused append set.
+	//   # Rolling pool stats (pre-dedup)
+	//   # Deduplicate rolling FASTA by read_id, keeping best model (sup > hac > fast).
+	//   # O1: rebuild .fai index after dedup rewrite so consensus uses indexed random-access extraction.
+	//   # Delete first: a failed rebuild must leave no stale index (wrong byte offsets).
+	//   # Small-OTU pruning uses round-local OTU membership/size (independent of BLAST decision path).
+	//   # Protect ever-assigned reads plus current members of persisted protected OTU keys.
+	//   # Compute current blast-unassigned read IDs for live reporting, independent of prune-mode suppression.
+	//   # Compute blast-unassigned read IDs (reads whose OTU never received a BLAST assignment).
+	//   # Intentional sticky semantics: _last.list retains the most recent consensus
+	//   # unassigned determination across rounds. When consensus emits no new list,
+	//   # the previous one is re-used, keeping those reads excluded until overridden.
+	//   # -- §7: Report dedup and state finalization --
+	//   # Deduplicate canonical annotated reports by read_id keeping best model (sup > hac > fast).
+	//   # Diagnostic OTU membership export from evidence-tier BLAST OTU report.
+	//   # R4-D: advance the versioned BLAST-state initialization marker only after
+	//   # every state publication above succeeded (a failed attempt never reaches
+	//   # this point). The write is atomic and idempotent, so retries converge.
 	script:
 	if(!usingDockerProfile){
 	    db_dir = "$baseDir/"
@@ -3260,442 +3316,424 @@ process blast_OTU_pretax {
 		taxdb_dir = taxdb_dir + params.blast_taxdb
 	
 	"""
-	set -euo pipefail
-	shopt -s nullglob
-	export LC_ALL=C
-	export TAXONKIT_DB="${stateTaxonomyDataDirResolved}"
-	for _taxonomy_file in nodes.dmp names.dmp merged.dmp delnodes.dmp; do
-		if [ ! -r "\$TAXONKIT_DB/\$_taxonomy_file" ]; then
-			echo "ERROR: pinned TaxonKit taxonomy artifact is unavailable inside the execution environment: \$TAXONKIT_DB/\$_taxonomy_file" 1>&2
-			exit 1
+set -euo pipefail
+shopt -s nullglob
+export LC_ALL=C
+export TAXONKIT_DB="${stateTaxonomyDataDirResolved}"
+for _taxonomy_file in nodes.dmp names.dmp merged.dmp delnodes.dmp; do
+if [ ! -r "\$TAXONKIT_DB/\$_taxonomy_file" ]; then
+	echo "ERROR: pinned TaxonKit taxonomy artifact is unavailable inside the execution environment: \$TAXONKIT_DB/\$_taxonomy_file" 1>&2
+	exit 1
+fi
+done
+RESTART_TOKEN="${restartTokenForCache}"
+export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
+export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
+export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
+export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
+export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
+export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.blast_OTU_pretax.\$\$"
+source "${baseDir}/bin/round_lock_process_guard.sh"
+rtbioscan_round_lock_pin blast_OTU_pretax
+THREADS=${task.cpus}
+OTU_BLAST_MIN_MEMBERS="${otuBlastMinMembersStr}"
+OTU_BLAST_FILTER_MODE="${otuBlastFilterModeCanonical}"
+OTU_BLAST_FILTER_SKIP_ROUNDS="${otuBlastFilterSkipRoundsCanonical}"
+OTU_BLAST_ENFORCE_MISSING_MAX_FRAC="${otuBlastEnforceMissingMaxFracStr}"
+OTU_BLAST_ENFORCE_NO_CLUSTERS_POLICY="${otuBlastEnforceNoClustersPolicyCanonical}"
+OTU_SIZE_STREAK_MODE="${otuSizeStreakModeCanonical}"
+round_barcode="${round_barcode}"
+export BLASTDB=${taxdb_dir}
+STATE_DIR="${ongoingStateDir}/_state"
+OTU_HASH_MAP_STATE="${ongoingStateDir}/_state/${barcode}_otu_nr_hash_map.tsv"
+ASSIGNED_READ_IDS_EVER_STATE="\${STATE_DIR}/${barcode}_assigned_read_ids_ever.list"
+ASSIGNED_OTU_MEMBER_IDS_GRACE_STATE="\${STATE_DIR}/${barcode}_assigned_otu_member_ids_prev_round.list"
+CONSENSUS_ASSIGNED_MEMBER_IDS_GRACE_STATE="\${STATE_DIR}/${barcode}_consensus_assigned_member_ids_prev_round.list"
+PROTECTED_READ_IDS_EVER_STATE="\${STATE_DIR}/${barcode}_protected_read_ids_ever.list"
+DORADO_LOCK="\${STATE_DIR}/.dorado.lock"
+DORADO_LOCK_WAIT=${params.lock_wait_seconds}
+BLASTREPORT_LOCK="\${STATE_DIR}/.blastreport.lock"
+SUPFASTQ_LOCK="\${STATE_DIR}/.blastreport_sup.lock"
+QCED_LOCK="\${STATE_DIR}/.qced_reads.lock"
+mkdir -p "\${STATE_DIR}"
+LOCK_WAIT=${params.lock_wait_seconds}
+PIPELINE_BASEDIR="${baseDir}"
+BIN_DIR="${baseDir}/bin"
+LIB_DIR="\${BIN_DIR}/lib"
+ROUND_DIR="${ongoingStateDir}/${round_barcode}"
+CONSENSUS_DIR="${ongoingStateDir}/Consensus"
+copy_soft(){ cp "\$1" "\$2" 2>/dev/null||:; }
+source "\$LIB_DIR/lock_utils.sh"
+source "\$LIB_DIR/blast_process_common.sh"
+# } >> "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" 2>/dev/null || true
+# } >> "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" 2>/dev/null || true
+init_lock_helpers
+refresh_protected_read_ids_ever "\$PROTECTED_READ_IDS_EVER_STATE"
+	printf 'round_barcode\tphase\tseconds\n' > blast_process_timings.tsv
+	OTU_REFINE_PHASE_TIMINGS_FILE="${barcode}_otu_refine_phase_timings.tsv"
+	OTU_REFINE_PHASE_TIMINGS_MS_FILE="${barcode}_otu_refine_phase_timings_ms.tsv"
+	OTU_REFINE_WORKLOAD_STATS_FILE="${barcode}_otu_refine_workload_stats.tsv"
+	OTU_REFINE_PROCESS_BREAKDOWN_FILE="${barcode}_otu_refine_process_breakdown.tsv"
+	OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE="${barcode}_otu_refine_process_breakdown_ms.tsv"
+	printf 'round_barcode\tphase\tseconds\n'     > "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE"
+	printf 'round_barcode\tphase\tseconds\tms\n' > "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE"
+
+	source "\$LIB_DIR/db_sig_utils.sh"
+	_t_blast_prefilter_start=\$(date +%s)
+
+	ROUND_INDEX_FILE="\${STATE_DIR}/round_index.tsv"
+	ROUND_INDEX=\$(awk -F'\t' -v rb="\$round_barcode" '\$1==rb{print \$2; exit}' "\$ROUND_INDEX_FILE" 2>/dev/null || true)
+	if [ -z "\$ROUND_INDEX" ] || [[ "\$ROUND_INDEX" == *[!0-9]* ]] || [ "\$ROUND_INDEX" -lt 1 ]; then
+		echo "ERROR: missing/invalid round index for round_barcode=\$round_barcode (file: \$ROUND_INDEX_FILE)" 1>&2
+		exit 1
+	fi
+	OTU_BLAST_EFFECTIVE_MODE_TSV="${barcode}_blast_filter_effective_mode.tsv"
+	"\$BIN_DIR/otu_blast_effective_mode.sh" \
+		"\$OTU_BLAST_FILTER_MODE" \
+		"\$OTU_BLAST_FILTER_SKIP_ROUNDS" \
+		"\$ROUND_INDEX" \
+		> "\$OTU_BLAST_EFFECTIVE_MODE_TSV"
+	effective_mode_value() {
+		local key="\$1"
+		awk -F'\t' -v k="\$key" '\$1==k{print \$2; exit}' "\$OTU_BLAST_EFFECTIVE_MODE_TSV"
+	}
+	OTU_BLAST_EFFECTIVE_MODE=\$(effective_mode_value effective_mode)
+	OTU_BLAST_EFFECTIVE_REASON=\$(effective_mode_value reason)
+		OTU_BLAST_FORCE_USE_FILTERED="${otuBlastForceUseFiltered ? '1' : '0'}"
+		if [ "\$OTU_BLAST_FORCE_USE_FILTERED" = "1" ] && [ "\$OTU_BLAST_EFFECTIVE_MODE" != "off" ]; then
+			echo "INFO: otu_blast_filter force_use_filtered=1 bypassing threshold and no-cluster decision knobs" 1>&2
+			if [ "\$OTU_BLAST_EFFECTIVE_MODE" != "enforce" ]; then
+				echo "WARN: forcing otu blast filter to enforce (was effective_mode=\$OTU_BLAST_EFFECTIVE_MODE reason=\$OTU_BLAST_EFFECTIVE_REASON)" 1>&2
+			fi
+		OTU_BLAST_EFFECTIVE_MODE="enforce"
+		OTU_BLAST_EFFECTIVE_REASON="force_use_filtered"
+	fi
+	if [ "\$OTU_BLAST_EFFECTIVE_MODE" != "off" ] && [ "\$OTU_BLAST_EFFECTIVE_MODE" != "observe" ] && [ "\$OTU_BLAST_EFFECTIVE_MODE" != "enforce" ]; then
+		echo "ERROR: invalid otu blast effective mode '\$OTU_BLAST_EFFECTIVE_MODE'" 1>&2
+		exit 1
+	fi
+	echo "INFO: otu_blast_filter configured_mode=\$OTU_BLAST_FILTER_MODE effective_mode=\$OTU_BLAST_EFFECTIVE_MODE reason=\$OTU_BLAST_EFFECTIVE_REASON skip_rounds=\$OTU_BLAST_FILTER_SKIP_ROUNDS round_index=\$ROUND_INDEX" 1>&2
+
+		BLAST_INPUT_FASTA="${fasta_hq_qced}"
+		BLAST_FILTERED_FASTA="${barcode}_blast_filter_input.fasta"
+		BLAST_FILTER_STATS="${barcode}_blast_filter_stats.tsv"
+		BLAST_FILTER_KEPT_OTUS="${barcode}_blast_filter_kept_otus.tsv"
+		BLAST_FILTER_DROPPED_IDS="${barcode}_blast_filter_dropped_read_ids.list"
+		BLAST_FILTER_MISSING_POLICY="keep"
+		BLAST_FILTER_DECISION="${barcode}_blast_filter_decision.tsv"
+	ROUND_HASH_MAP="${barcode}_blast_round_hash_map.tsv"
+	ROUND_HASH_COUNTS="${barcode}_blast_round_hash_counts.tsv"
+	OTU_MEMBERS_BLASTDIAG="${barcode}_otu_members_blastdiag.tsv"
+	OTU_SIZES_BLASTDIAG="${barcode}_otu_sizes_blastdiag.tsv"
+	OTU_MEMBERS_BLASTDIAG_STATS="${barcode}_otu_members_blastdiag_stats.tsv"
+	{
+		printf 'effective_mode\t%s\n' "\$OTU_BLAST_EFFECTIVE_MODE"
+		printf 'configured_mode\t%s\n' "\$OTU_BLAST_FILTER_MODE"
+	} > "\$BLAST_FILTER_STATS"
+		: > "\$BLAST_FILTER_KEPT_OTUS"
+		: > "\$BLAST_FILTER_DROPPED_IDS"
+		: > "\$BLAST_FILTER_DECISION"
+	: > "\$ROUND_HASH_MAP"
+	: > "\$ROUND_HASH_COUNTS"
+	: > "\$OTU_MEMBERS_BLASTDIAG"
+	: > "\$OTU_SIZES_BLASTDIAG"
+	: > "\$OTU_MEMBERS_BLASTDIAG_STATS"
+	if [ "\$OTU_BLAST_EFFECTIVE_MODE" = "observe" ] || [ "\$OTU_BLAST_EFFECTIVE_MODE" = "enforce" ]; then
+		if [ "\$OTU_BLAST_EFFECTIVE_MODE" = "enforce" ]; then
+			BLAST_FILTER_MISSING_POLICY="drop"
 		fi
-	done
-		RESTART_TOKEN="${restartTokenForCache}"
-		export RTBIOSCAN_ROUND_LOCK_STATE_DIR="${ongoingStateDir}/_state"
-		export RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE="${round_barcode}"
-		export RTBIOSCAN_ROUND_LOCK_SCOPE="${round_lock_scope}"
-		export RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN="${round_generation_token}"
-		export RTBIOSCAN_ROUND_LOCK_HELPER="${baseDir}/bin/round_lock_generation.pl"
-		export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.blast_OTU_pretax.\$\$"
-		source "${baseDir}/bin/round_lock_process_guard.sh"
-		rtbioscan_round_lock_pin blast_OTU_pretax
-	THREADS=${task.cpus}
-	OTU_BLAST_MIN_MEMBERS="${otuBlastMinMembersStr}"
-	OTU_BLAST_FILTER_MODE="${otuBlastFilterModeCanonical}"
-	OTU_BLAST_FILTER_SKIP_ROUNDS="${otuBlastFilterSkipRoundsCanonical}"
-	OTU_BLAST_ENFORCE_MISSING_MAX_FRAC="${otuBlastEnforceMissingMaxFracStr}"
-	OTU_BLAST_ENFORCE_NO_CLUSTERS_POLICY="${otuBlastEnforceNoClustersPolicyCanonical}"
-	OTU_SIZE_STREAK_MODE="${otuSizeStreakModeCanonical}"
-	round_barcode="${round_barcode}"
-	export BLASTDB=${taxdb_dir}
-		STATE_DIR="${ongoingStateDir}/_state"
-		OTU_HASH_MAP_STATE="${ongoingStateDir}/_state/${barcode}_otu_nr_hash_map.tsv"
-		ASSIGNED_READ_IDS_EVER_STATE="\${STATE_DIR}/${barcode}_assigned_read_ids_ever.list"
-		ASSIGNED_OTU_MEMBER_IDS_GRACE_STATE="\${STATE_DIR}/${barcode}_assigned_otu_member_ids_prev_round.list"
-		CONSENSUS_ASSIGNED_MEMBER_IDS_GRACE_STATE="\${STATE_DIR}/${barcode}_consensus_assigned_member_ids_prev_round.list"
-		PROTECTED_READ_IDS_EVER_STATE="\${STATE_DIR}/${barcode}_protected_read_ids_ever.list"
-		DORADO_LOCK="\${STATE_DIR}/.dorado.lock"
-		DORADO_LOCK_WAIT=${params.lock_wait_seconds}
-		BLASTREPORT_LOCK="\${STATE_DIR}/.blastreport.lock"
-		SUPFASTQ_LOCK="\${STATE_DIR}/.blastreport_sup.lock"
-		QCED_LOCK="\${STATE_DIR}/.qced_reads.lock"
-		mkdir -p "\${STATE_DIR}"
-		LOCK_WAIT=${params.lock_wait_seconds}
-		PIPELINE_BASEDIR="${baseDir}"
-		BIN_DIR="${baseDir}/bin"
-		LIB_DIR="\${BIN_DIR}/lib"
-		ROUND_DIR="${ongoingStateDir}/${round_barcode}"
-		CONSENSUS_DIR="${ongoingStateDir}/Consensus"
-		copy_soft(){ cp "\$1" "\$2" 2>/dev/null||:; }
-		source "\$LIB_DIR/lock_utils.sh"
-		source "\$LIB_DIR/blast_process_common.sh"
-		# append_otu_refine_breakdown writes:
-		# } >> "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" 2>/dev/null || true
-		# } >> "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" 2>/dev/null || true
-		init_lock_helpers
-		refresh_protected_read_ids_ever "\$PROTECTED_READ_IDS_EVER_STATE"
-			printf 'round_barcode\tphase\tseconds\n' > blast_process_timings.tsv
-			OTU_REFINE_PHASE_TIMINGS_FILE="${barcode}_otu_refine_phase_timings.tsv"
-			OTU_REFINE_PHASE_TIMINGS_MS_FILE="${barcode}_otu_refine_phase_timings_ms.tsv"
-			OTU_REFINE_WORKLOAD_STATS_FILE="${barcode}_otu_refine_workload_stats.tsv"
-			OTU_REFINE_PROCESS_BREAKDOWN_FILE="${barcode}_otu_refine_process_breakdown.tsv"
-			OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE="${barcode}_otu_refine_process_breakdown_ms.tsv"
-			printf 'round_barcode\tphase\tseconds\n'     > "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE"
-			printf 'round_barcode\tphase\tseconds\tms\n' > "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE"
+		"\$BIN_DIR/otu_hash_map_from_fasta.pl" \
+			"${fasta_hq_qced}" \
+			"\$ROUND_HASH_MAP" \
+			"\$ROUND_HASH_COUNTS"
+		perl "\$BIN_DIR/otu_filter_reads_by_otu_size.pl" \
+			"${qced_reads_nr}" \
+			"\$ROUND_HASH_MAP" \
+			"${fasta_hq_qced}" \
+			"\$OTU_BLAST_MIN_MEMBERS" \
+			"\$BLAST_FILTERED_FASTA" \
+			"\$BLAST_FILTER_STATS" \
+			"\$BLAST_FILTER_KEPT_OTUS" \
+			"\$BLAST_FILTER_MISSING_POLICY"
+		"\$BIN_DIR/otu_blast_filter_decide.sh" \
+			"\$BLAST_FILTER_STATS" \
+			"\$OTU_BLAST_EFFECTIVE_MODE" \
+			"\$OTU_BLAST_ENFORCE_MISSING_MAX_FRAC" \
+			"\$OTU_BLAST_ENFORCE_NO_CLUSTERS_POLICY" \
+			"\$OTU_BLAST_FORCE_USE_FILTERED" \
+			> "\$BLAST_FILTER_DECISION"
 
-			source "\$LIB_DIR/db_sig_utils.sh"
-			# -- §2: OTU size pre-filter and protection re-injection --
-			_t_blast_prefilter_start=\$(date +%s)
-
-			ROUND_INDEX_FILE="\${STATE_DIR}/round_index.tsv"
-			ROUND_INDEX=\$(awk -F'\t' -v rb="\$round_barcode" '\$1==rb{print \$2; exit}' "\$ROUND_INDEX_FILE" 2>/dev/null || true)
-			if [ -z "\$ROUND_INDEX" ] || [[ "\$ROUND_INDEX" == *[!0-9]* ]] || [ "\$ROUND_INDEX" -lt 1 ]; then
-				echo "ERROR: missing/invalid round index for round_barcode=\$round_barcode (file: \$ROUND_INDEX_FILE)" 1>&2
-				exit 1
-			fi
-			OTU_BLAST_EFFECTIVE_MODE_TSV="${barcode}_blast_filter_effective_mode.tsv"
-			"\$BIN_DIR/otu_blast_effective_mode.sh" \
-				"\$OTU_BLAST_FILTER_MODE" \
-				"\$OTU_BLAST_FILTER_SKIP_ROUNDS" \
-				"\$ROUND_INDEX" \
-				> "\$OTU_BLAST_EFFECTIVE_MODE_TSV"
-			effective_mode_value() {
-				local key="\$1"
-				awk -F'\t' -v k="\$key" '\$1==k{print \$2; exit}' "\$OTU_BLAST_EFFECTIVE_MODE_TSV"
-			}
-			OTU_BLAST_EFFECTIVE_MODE=\$(effective_mode_value effective_mode)
-			OTU_BLAST_EFFECTIVE_REASON=\$(effective_mode_value reason)
-				OTU_BLAST_FORCE_USE_FILTERED="${otuBlastForceUseFiltered ? '1' : '0'}"
-				if [ "\$OTU_BLAST_FORCE_USE_FILTERED" = "1" ] && [ "\$OTU_BLAST_EFFECTIVE_MODE" != "off" ]; then
-					echo "INFO: otu_blast_filter force_use_filtered=1 bypassing threshold and no-cluster decision knobs" 1>&2
-					if [ "\$OTU_BLAST_EFFECTIVE_MODE" != "enforce" ]; then
-						echo "WARN: forcing otu blast filter to enforce (was effective_mode=\$OTU_BLAST_EFFECTIVE_MODE reason=\$OTU_BLAST_EFFECTIVE_REASON)" 1>&2
+		decision_value() {
+			local key="\$1"
+			awk -F'\t' -v k="\$key" '\$1==k{print \$2; exit}' "\$BLAST_FILTER_DECISION"
+		}
+		decision=\$(decision_value decision)
+		reason=\$(decision_value reason)
+		missing_frac=\$(decision_value missing_frac)
+		reads_total=\$(decision_value total_reads)
+		reads_missing=\$(decision_value reads_missing_from_clstr)
+		clstr_has_clusters=\$(decision_value clstr_has_clusters)
+		clstr_records=\$(decision_value clstr_records)
+		total_otus=\$(decision_value total_otus)
+		ambiguous_hash_cluster=\$(decision_value ambiguous_hash_cluster)
+			echo "INFO: otu_blast_filter mode=\$OTU_BLAST_FILTER_MODE effective_mode=\$OTU_BLAST_EFFECTIVE_MODE min_members=\$OTU_BLAST_MIN_MEMBERS decision=\$decision reason=\$reason missing_frac=\$missing_frac reads_total=\$reads_total reads_missing_from_clstr=\$reads_missing clstr_has_clusters=\$clstr_has_clusters clstr_records=\$clstr_records total_otus=\$total_otus ambiguous_hash_cluster=\$ambiguous_hash_cluster no_clusters_policy=\$OTU_BLAST_ENFORCE_NO_CLUSTERS_POLICY round_index=\$ROUND_INDEX skip_rounds=\$OTU_BLAST_FILTER_SKIP_ROUNDS" 1>&2
+			if [ "\$decision" = "use_filtered" ]; then
+				BLAST_INPUT_FASTA="\$BLAST_FILTERED_FASTA"
+				count_marker_reads() {
+					local fasta_path="\$1"
+					local marker_name="\$2"
+					if [ ! -s "\$fasta_path" ]; then
+						printf '0\n'
+						return
 					fi
-				OTU_BLAST_EFFECTIVE_MODE="enforce"
-				OTU_BLAST_EFFECTIVE_REASON="force_use_filtered"
-			fi
-			if [ "\$OTU_BLAST_EFFECTIVE_MODE" != "off" ] && [ "\$OTU_BLAST_EFFECTIVE_MODE" != "observe" ] && [ "\$OTU_BLAST_EFFECTIVE_MODE" != "enforce" ]; then
-				echo "ERROR: invalid otu blast effective mode '\$OTU_BLAST_EFFECTIVE_MODE'" 1>&2
-				exit 1
-			fi
-			echo "INFO: otu_blast_filter configured_mode=\$OTU_BLAST_FILTER_MODE effective_mode=\$OTU_BLAST_EFFECTIVE_MODE reason=\$OTU_BLAST_EFFECTIVE_REASON skip_rounds=\$OTU_BLAST_FILTER_SKIP_ROUNDS round_index=\$ROUND_INDEX" 1>&2
-
-				BLAST_INPUT_FASTA="${fasta_hq_qced}"
-				BLAST_FILTERED_FASTA="${barcode}_blast_filter_input.fasta"
-				BLAST_FILTER_STATS="${barcode}_blast_filter_stats.tsv"
-				BLAST_FILTER_KEPT_OTUS="${barcode}_blast_filter_kept_otus.tsv"
-				BLAST_FILTER_DROPPED_IDS="${barcode}_blast_filter_dropped_read_ids.list"
-				BLAST_FILTER_MISSING_POLICY="keep"
-				BLAST_FILTER_DECISION="${barcode}_blast_filter_decision.tsv"
-			ROUND_HASH_MAP="${barcode}_blast_round_hash_map.tsv"
-			ROUND_HASH_COUNTS="${barcode}_blast_round_hash_counts.tsv"
-			OTU_MEMBERS_BLASTDIAG="${barcode}_otu_members_blastdiag.tsv"
-			OTU_SIZES_BLASTDIAG="${barcode}_otu_sizes_blastdiag.tsv"
-			OTU_MEMBERS_BLASTDIAG_STATS="${barcode}_otu_members_blastdiag_stats.tsv"
-			{
-				printf 'effective_mode\t%s\n' "\$OTU_BLAST_EFFECTIVE_MODE"
-				printf 'configured_mode\t%s\n' "\$OTU_BLAST_FILTER_MODE"
-			} > "\$BLAST_FILTER_STATS"
-				: > "\$BLAST_FILTER_KEPT_OTUS"
-				: > "\$BLAST_FILTER_DROPPED_IDS"
-				: > "\$BLAST_FILTER_DECISION"
-			: > "\$ROUND_HASH_MAP"
-			: > "\$ROUND_HASH_COUNTS"
-			: > "\$OTU_MEMBERS_BLASTDIAG"
-			: > "\$OTU_SIZES_BLASTDIAG"
-			: > "\$OTU_MEMBERS_BLASTDIAG_STATS"
-			# Rollout guard: compute filter stats in observe/enforce, but only switch query FASTA in enforce.
-			if [ "\$OTU_BLAST_EFFECTIVE_MODE" = "observe" ] || [ "\$OTU_BLAST_EFFECTIVE_MODE" = "enforce" ]; then
-				if [ "\$OTU_BLAST_EFFECTIVE_MODE" = "enforce" ]; then
-					BLAST_FILTER_MISSING_POLICY="drop"
-				fi
-				"\$BIN_DIR/otu_hash_map_from_fasta.pl" \
-					"${fasta_hq_qced}" \
-					"\$ROUND_HASH_MAP" \
-					"\$ROUND_HASH_COUNTS"
-				perl "\$BIN_DIR/otu_filter_reads_by_otu_size.pl" \
-					"${qced_reads_nr}" \
-					"\$ROUND_HASH_MAP" \
-					"${fasta_hq_qced}" \
-					"\$OTU_BLAST_MIN_MEMBERS" \
-					"\$BLAST_FILTERED_FASTA" \
-					"\$BLAST_FILTER_STATS" \
-					"\$BLAST_FILTER_KEPT_OTUS" \
-					"\$BLAST_FILTER_MISSING_POLICY"
-				"\$BIN_DIR/otu_blast_filter_decide.sh" \
-					"\$BLAST_FILTER_STATS" \
-					"\$OTU_BLAST_EFFECTIVE_MODE" \
-					"\$OTU_BLAST_ENFORCE_MISSING_MAX_FRAC" \
-					"\$OTU_BLAST_ENFORCE_NO_CLUSTERS_POLICY" \
-					"\$OTU_BLAST_FORCE_USE_FILTERED" \
-					> "\$BLAST_FILTER_DECISION"
-
-				decision_value() {
-					local key="\$1"
-					awk -F'\t' -v k="\$key" '\$1==k{print \$2; exit}' "\$BLAST_FILTER_DECISION"
+					awk -F'|' -v marker="\$marker_name" '/^>/{hdr=substr(\$0,2); n=split(hdr,a,"|"); if(n>=2 && a[2]==marker) c++} END{print c+0}' "\$fasta_path"
 				}
-				decision=\$(decision_value decision)
-				reason=\$(decision_value reason)
-				missing_frac=\$(decision_value missing_frac)
-				reads_total=\$(decision_value total_reads)
-				reads_missing=\$(decision_value reads_missing_from_clstr)
-				clstr_has_clusters=\$(decision_value clstr_has_clusters)
-				clstr_records=\$(decision_value clstr_records)
-				total_otus=\$(decision_value total_otus)
-				ambiguous_hash_cluster=\$(decision_value ambiguous_hash_cluster)
-					echo "INFO: otu_blast_filter mode=\$OTU_BLAST_FILTER_MODE effective_mode=\$OTU_BLAST_EFFECTIVE_MODE min_members=\$OTU_BLAST_MIN_MEMBERS decision=\$decision reason=\$reason missing_frac=\$missing_frac reads_total=\$reads_total reads_missing_from_clstr=\$reads_missing clstr_has_clusters=\$clstr_has_clusters clstr_records=\$clstr_records total_otus=\$total_otus ambiguous_hash_cluster=\$ambiguous_hash_cluster no_clusters_policy=\$OTU_BLAST_ENFORCE_NO_CLUSTERS_POLICY round_index=\$ROUND_INDEX skip_rounds=\$OTU_BLAST_FILTER_SKIP_ROUNDS" 1>&2
-					if [ "\$decision" = "use_filtered" ]; then
-						BLAST_INPUT_FASTA="\$BLAST_FILTERED_FASTA"
-						count_marker_reads() {
-							local fasta_path="\$1"
-							local marker_name="\$2"
-							if [ ! -s "\$fasta_path" ]; then
-								printf '0\n'
-								return
-							fi
-							awk -F'|' -v marker="\$marker_name" '/^>/{hdr=substr(\$0,2); n=split(hdr,a,"|"); if(n>=2 && a[2]==marker) c++} END{print c+0}' "\$fasta_path"
-						}
-						extract_marker_reads() {
-							local fasta_path="\$1"
-							local marker_name="\$2"
-							awk -F'|' -v marker="\$marker_name" '/^>/{hdr=substr(\$0,2); n=split(hdr,a,"|"); keep=(n>=2 && a[2]==marker)} keep{print}' "\$fasta_path"
-						}
-						MARKER_RESCUE_STATS="\$ROUND_DIR/${barcode}_blast_marker_rescue.tsv"
-						: > "\$MARKER_RESCUE_STATS"
-						if [ "\$OTU_BLAST_MIN_MEMBERS" -gt 0 ]; then
-							_p_targets="${params.targets}"
-							IFS='|' read -ra _TARGETS <<< "\$_p_targets"
-						for target_marker in "\${_TARGETS[@]}"; do
-								if [ "\$target_marker" = "null" ] || [ -z "\$target_marker" ]; then
-									continue
-								fi
-								orig_marker_count=\$(count_marker_reads "${fasta_hq_qced}" "\$target_marker")
-								filtered_marker_count=\$(count_marker_reads "\$BLAST_INPUT_FASTA" "\$target_marker")
-								rescued_marker_count=0
-								if [ "\$orig_marker_count" -gt 0 ] && [ "\$filtered_marker_count" -lt "\$OTU_BLAST_MIN_MEMBERS" ]; then
-									MARKER_RESCUE_FASTA="\$ROUND_DIR/${barcode}_blast_marker_rescue_\${target_marker}.fasta"
-									extract_marker_reads "${fasta_hq_qced}" "\$target_marker" > "\$MARKER_RESCUE_FASTA" || : > "\$MARKER_RESCUE_FASTA"
-									if [ -s "\$MARKER_RESCUE_FASTA" ]; then
-										MARKER_RESCUE_MERGED="\$ROUND_DIR/${barcode}_blast_input_marker_rescue_\${target_marker}.fasta"
-										awk '/^>/{id=\$0; if(!(id in seen)){seen[id]=1; print; skip=0} else skip=1; next} !skip{print}' "\$BLAST_INPUT_FASTA" "\$MARKER_RESCUE_FASTA" > "\$MARKER_RESCUE_MERGED"
-										BLAST_INPUT_FASTA="\$MARKER_RESCUE_MERGED"
-										rescued_marker_count=\$(( orig_marker_count - filtered_marker_count ))
-										echo "INFO: rescuing sparse marker=\$target_marker into BLAST input because filtered_count=\$filtered_marker_count < min_members=\$OTU_BLAST_MIN_MEMBERS (original_count=\$orig_marker_count)" 1>&2
-									fi
-								fi
-								printf 'marker\t%s\noriginal_count\t%s\nfiltered_count\t%s\nrescued_count\t%s\n' "\$target_marker" "\$orig_marker_count" "\$filtered_marker_count" "\$rescued_marker_count" >> "\$MARKER_RESCUE_STATS"
-							done
+				extract_marker_reads() {
+					local fasta_path="\$1"
+					local marker_name="\$2"
+					awk -F'|' -v marker="\$marker_name" '/^>/{hdr=substr(\$0,2); n=split(hdr,a,"|"); keep=(n>=2 && a[2]==marker)} keep{print}' "\$fasta_path"
+				}
+				MARKER_RESCUE_STATS="\$ROUND_DIR/${barcode}_blast_marker_rescue.tsv"
+				: > "\$MARKER_RESCUE_STATS"
+				if [ "\$OTU_BLAST_MIN_MEMBERS" -gt 0 ]; then
+					_p_targets="${params.targets}"
+					IFS='|' read -ra _TARGETS <<< "\$_p_targets"
+				for target_marker in "\${_TARGETS[@]}"; do
+						if [ "\$target_marker" = "null" ] || [ -z "\$target_marker" ]; then
+							continue
 						fi
-						awk '/^>/{id=substr(\$0,2); sub(/ .*/, "", id); split(id,a,"|"); if (a[1]!="") print a[1]}' "${fasta_hq_qced}" | LC_ALL=C sort -u > "${barcode}_blast_filter_in_ids.list"
-						awk '/^>/{id=substr(\$0,2); sub(/ .*/, "", id); split(id,a,"|"); if (a[1]!="") print a[1]}' "\$BLAST_INPUT_FASTA" | LC_ALL=C sort -u > "${barcode}_blast_filter_kept_ids.list"
-						comm -23 "${barcode}_blast_filter_in_ids.list" "${barcode}_blast_filter_kept_ids.list" > "\$BLAST_FILTER_DROPPED_IDS" || : > "\$BLAST_FILTER_DROPPED_IDS"
-						rm -f "${barcode}_blast_filter_in_ids.list" "${barcode}_blast_filter_kept_ids.list"
-						# Preserve sticky protected reads: re-inject their current members into BLAST input
-						ASSIGNED_OTU_KEYS_EVER="\${STATE_DIR}/${barcode}_assigned_otu_keys_ever.list"
-						ASSIGNED_OTU_PRESERVE_PREBLAST="\$ROUND_DIR/${barcode}_assigned_otu_preserve_preblast.tsv"
-						_assigned_keys_count=0
-						[ -s "\$ASSIGNED_OTU_KEYS_EVER" ] && _assigned_keys_count=\$(wc -l < "\$ASSIGNED_OTU_KEYS_EVER" | tr -d ' ')
-						_protected_ever_count=0
-						[ -s "\$PROTECTED_READ_IDS_EVER_STATE" ] && _protected_ever_count=\$(wc -l < "\$PROTECTED_READ_IDS_EVER_STATE" | tr -d ' ')
-						_protected_added=0
-						if [ -s "\$PROTECTED_READ_IDS_EVER_STATE" ]; then
-							_PROTECTED_IDS="\$ROUND_DIR/${barcode}_blast_protected_ids.list"
-							cp "\$PROTECTED_READ_IDS_EVER_STATE" "\$_PROTECTED_IDS" 2>/dev/null || : > "\$_PROTECTED_IDS"
-							if [ -s "\$_PROTECTED_IDS" ]; then
-								_PROTECTED_FASTA="\$ROUND_DIR/${barcode}_blast_protected.fasta"
-								# FASTA headers are UUID|TARGET|... but _PROTECTED_IDS has bare UUIDs;
-								# awk matches on UUID prefix (before first |) to extract protected reads.
-								awk 'NR==FNR{ids[\$1]=1; next} /^>/{uuid=substr(\$0,2); sub(/[|].*/,"",uuid); p=(uuid in ids); if(p)print; next} p{print}' "\$_PROTECTED_IDS" "${fasta_hq_qced}" > "\$_PROTECTED_FASTA" || : > "\$_PROTECTED_FASTA"
-								if [ -s "\$_PROTECTED_FASTA" ]; then
-									_MERGED="\$ROUND_DIR/${barcode}_blast_input_merged.fasta"
-									awk '/^>/{id=\$0; if(!(id in seen)){seen[id]=1; print; skip=0} else skip=1; next} !skip{print}' "\$BLAST_INPUT_FASTA" "\$_PROTECTED_FASTA" > "\$_MERGED"
-									BLAST_INPUT_FASTA="\$_MERGED"
-									_protected_added=\$(wc -l < "\$_PROTECTED_IDS" | tr -d ' ')
-								fi
+						orig_marker_count=\$(count_marker_reads "${fasta_hq_qced}" "\$target_marker")
+						filtered_marker_count=\$(count_marker_reads "\$BLAST_INPUT_FASTA" "\$target_marker")
+						rescued_marker_count=0
+						if [ "\$orig_marker_count" -gt 0 ] && [ "\$filtered_marker_count" -lt "\$OTU_BLAST_MIN_MEMBERS" ]; then
+							MARKER_RESCUE_FASTA="\$ROUND_DIR/${barcode}_blast_marker_rescue_\${target_marker}.fasta"
+							extract_marker_reads "${fasta_hq_qced}" "\$target_marker" > "\$MARKER_RESCUE_FASTA" || : > "\$MARKER_RESCUE_FASTA"
+							if [ -s "\$MARKER_RESCUE_FASTA" ]; then
+								MARKER_RESCUE_MERGED="\$ROUND_DIR/${barcode}_blast_input_marker_rescue_\${target_marker}.fasta"
+								awk '/^>/{id=\$0; if(!(id in seen)){seen[id]=1; print; skip=0} else skip=1; next} !skip{print}' "\$BLAST_INPUT_FASTA" "\$MARKER_RESCUE_FASTA" > "\$MARKER_RESCUE_MERGED"
+								BLAST_INPUT_FASTA="\$MARKER_RESCUE_MERGED"
+								rescued_marker_count=\$(( orig_marker_count - filtered_marker_count ))
+								echo "INFO: rescuing sparse marker=\$target_marker into BLAST input because filtered_count=\$filtered_marker_count < min_members=\$OTU_BLAST_MIN_MEMBERS (original_count=\$orig_marker_count)" 1>&2
 							fi
 						fi
-						{
-							printf 'assigned_otu_keys_ever_count_preblast\t%s\n' "\$_assigned_keys_count"
-							printf 'protected_read_ids_ever_count_preblast\t%s\n' "\$_protected_ever_count"
-							printf 'protected_reads_added_to_blast_input\t%s\n' "\$_protected_added"
-						} > "\$ASSIGNED_OTU_PRESERVE_PREBLAST"
+						printf 'marker\t%s\noriginal_count\t%s\nfiltered_count\t%s\nrescued_count\t%s\n' "\$target_marker" "\$orig_marker_count" "\$filtered_marker_count" "\$rescued_marker_count" >> "\$MARKER_RESCUE_STATS"
+					done
+				fi
+				awk '/^>/{id=substr(\$0,2); sub(/ .*/, "", id); split(id,a,"|"); if (a[1]!="") print a[1]}' "${fasta_hq_qced}" | LC_ALL=C sort -u > "${barcode}_blast_filter_in_ids.list"
+				awk '/^>/{id=substr(\$0,2); sub(/ .*/, "", id); split(id,a,"|"); if (a[1]!="") print a[1]}' "\$BLAST_INPUT_FASTA" | LC_ALL=C sort -u > "${barcode}_blast_filter_kept_ids.list"
+				comm -23 "${barcode}_blast_filter_in_ids.list" "${barcode}_blast_filter_kept_ids.list" > "\$BLAST_FILTER_DROPPED_IDS" || : > "\$BLAST_FILTER_DROPPED_IDS"
+				rm -f "${barcode}_blast_filter_in_ids.list" "${barcode}_blast_filter_kept_ids.list"
+				ASSIGNED_OTU_KEYS_EVER="\${STATE_DIR}/${barcode}_assigned_otu_keys_ever.list"
+				ASSIGNED_OTU_PRESERVE_PREBLAST="\$ROUND_DIR/${barcode}_assigned_otu_preserve_preblast.tsv"
+				_assigned_keys_count=0
+				[ -s "\$ASSIGNED_OTU_KEYS_EVER" ] && _assigned_keys_count=\$(wc -l < "\$ASSIGNED_OTU_KEYS_EVER" | tr -d ' ')
+				_protected_ever_count=0
+				[ -s "\$PROTECTED_READ_IDS_EVER_STATE" ] && _protected_ever_count=\$(wc -l < "\$PROTECTED_READ_IDS_EVER_STATE" | tr -d ' ')
+				_protected_added=0
+				if [ -s "\$PROTECTED_READ_IDS_EVER_STATE" ]; then
+					_PROTECTED_IDS="\$ROUND_DIR/${barcode}_blast_protected_ids.list"
+					cp "\$PROTECTED_READ_IDS_EVER_STATE" "\$_PROTECTED_IDS" 2>/dev/null || : > "\$_PROTECTED_IDS"
+					if [ -s "\$_PROTECTED_IDS" ]; then
+						_PROTECTED_FASTA="\$ROUND_DIR/${barcode}_blast_protected.fasta"
+						awk 'NR==FNR{ids[\$1]=1; next} /^>/{uuid=substr(\$0,2); sub(/[|].*/,"",uuid); p=(uuid in ids); if(p)print; next} p{print}' "\$_PROTECTED_IDS" "${fasta_hq_qced}" > "\$_PROTECTED_FASTA" || : > "\$_PROTECTED_FASTA"
+						if [ -s "\$_PROTECTED_FASTA" ]; then
+							_MERGED="\$ROUND_DIR/${barcode}_blast_input_merged.fasta"
+							awk '/^>/{id=\$0; if(!(id in seen)){seen[id]=1; print; skip=0} else skip=1; next} !skip{print}' "\$BLAST_INPUT_FASTA" "\$_PROTECTED_FASTA" > "\$_MERGED"
+							BLAST_INPUT_FASTA="\$_MERGED"
+							_protected_added=\$(wc -l < "\$_PROTECTED_IDS" | tr -d ' ')
+						fi
 					fi
 				fi
-			_t_blast_prefilter_end=\$(date +%s)
-			append_process_timing "prefilter" "\$_t_blast_prefilter_start" "\$_t_blast_prefilter_end"
-			
-		_WORD_SIZE=50
-		_QCOV=50
-		_p_targets="${params.targets}"
-		IFS='|' read -ra _TARGETS   <<< "\$_p_targets"
-		_p_blast_db_specs="${params.blast_db_specs}"
-		IFS='|' read -ra _BLAST_DBS <<< "\$_p_blast_db_specs"
-		_p_blast_id_family="${params.blast_id_family}"
-		IFS='|' read -ra _ID_FAMILY <<< "\$_p_blast_id_family"
-		_p_blast_id_genus="${params.blast_id_genus}"
-		IFS='|' read -ra _ID_GENUS  <<< "\$_p_blast_id_genus"
-		_p_blast_id_spec="${params.blast_id_spec}"
-		IFS='|' read -ra _ID_SPEC   <<< "\$_p_blast_id_spec"
-		_p_nonncbi_memtax="${params.nonncbi_memtax}"
-		IFS='|' read -ra _MEMTAX    <<< "\$_p_nonncbi_memtax"
-		# -- §3: Per-target BLAST --
-		_t_per_target_blast_start=\$(date +%s)
-		"\$BIN_DIR/blast_otu_pretax.sh" \
-			"${barcode}" \
-			"\$BLAST_INPUT_FASTA" \
-			"\$STATE_DIR" \
-			"\$THREADS" \
-			"${baseDir}" \
-			"${db_dir}" \
-			"${taxdb_dir}" \
-			"\$ROUND_DIR" \
-			"\$_p_targets" \
-			"\$_p_blast_db_specs" \
-			"${params.blast_id_family}" \
-			"${params.blast_id_genus}" \
-			"${params.blast_id_spec}" \
-			"${params.nonncbi_memtax}" \
-			"${params.blast_evalue}" \
-			"${params.blast_max_hsps}"
-		_t_per_target_blast_end=\$(date +%s)
-		append_process_timing "per_target_blast" "\$_t_per_target_blast_start" "\$_t_per_target_blast_end"
-	
-		# -- §4: BLAST state initialization flag and OTU refinement --
-		# R4-D: the legacy _state/blastreport.txt content was write-only (snapshot,
-		# merge, sort and republish every round with no reader). Current BLAST
-		# results come only from the sealed R4-A cache/evidence state. An existing
-		# legacy file is accepted purely as evidence that BLAST state had been
-		# initialized; a small versioned marker carries that flag for new runs.
-		# The legacy file is never parsed, rewritten or deleted.
-		_t_blastreport_merge_start=\$(date +%s)
-		BLAST_STATE_INIT_MARKER="\${STATE_DIR}/blastreport_initialized_v1.txt"
-		STATE_BLASTREPORT_EXISTS=0
-		if acquire_lock "\${BLASTREPORT_LOCK}"; then
-			if [ -f "\$BLAST_STATE_INIT_MARKER" ] || [ -f "\${STATE_DIR}/blastreport.txt" ]; then
-				STATE_BLASTREPORT_EXISTS=1
+				{
+					printf 'assigned_otu_keys_ever_count_preblast\t%s\n' "\$_assigned_keys_count"
+					printf 'protected_read_ids_ever_count_preblast\t%s\n' "\$_protected_ever_count"
+					printf 'protected_reads_added_to_blast_input\t%s\n' "\$_protected_added"
+				} > "\$ASSIGNED_OTU_PRESERVE_PREBLAST"
 			fi
-			release_lock "\${BLASTREPORT_LOCK}"
-		else
-			exit 1
 		fi
-		_t_blastreport_merge_end=\$(date +%s)
-		append_process_timing "blastreport_merge" "\$_t_blastreport_merge_start" "\$_t_blastreport_merge_end"
-		_t_otu_refine_start=\$(date +%s)
-		    SUP_PATH_STATS_FILE="${barcode}_sup_path_stats.tsv"
-		    SUP_PATH_TIMINGS_MS_FILE="${barcode}_sup_path_timings_ms.tsv"
-		    DORADO_SUMMARY_HEADER='input_filename\tbatch_id\tparent_read_id\tread_id\trun_id\tchannel\tmux\tminknow_events\tstart_time\tduration\tpasses_filtering\ttemplate_start\tnum_events_template\ttemplate_duration\tsequence_length_template\tmean_qscore_template\tpore_type\texperiment_id\tsample_id\tend_reason\n'
-		    if ! printf 'round_barcode\tphase\tseconds\n' > "\$OTU_REFINE_PHASE_TIMINGS_FILE" 2>/dev/null; then
-		    	:
-		    fi
-		    if ! printf 'round_barcode\tphase\tseconds\tms\n' > "\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" 2>/dev/null; then
-		    	:
-		    fi
-		    if ! printf 'round_barcode\tphase\tseconds\n' > "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" 2>/dev/null; then
-		    	:
-		    fi
-		    if ! printf 'round_barcode\tphase\tseconds\tms\n' > "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" 2>/dev/null; then
-		    	:
-		    fi
-		    if ! printf 'round_barcode\tphase\tseconds\tms\n' > "\$SUP_PATH_TIMINGS_MS_FILE" 2>/dev/null; then
-		    	:
-		    fi
-		    if ! {
-		        printf 'key\tvalue\n'
-	        printf 'cluster_count\t0\n'
-	        printf 'cluster_records\t0\n'
-	        printf 'blastreport_rows\t0\n'
-	        printf 'cluster_taxids_rows\t0\n'
-	        printf 'worker_count\t0\n'
-	        printf 'shard_count\t0\n'
-	        printf 'shard_scheduler_mode\tequal_record_count\n'
-	        printf 'target_records_per_shard\t0\n'
-	        printf 'smallest_shard_records\t0\n'
-	        printf 'median_shard_records\t0\n'
-	        printf 'largest_shard_records\t0\n'
-		        printf 'largest_shard_fraction\t0\n'
-		        printf 'max_single_cluster_records\t0\n'
-		        printf 'max_single_cluster_fraction\t0\n'
-		        printf 'merged_pairs_rows\t0\n'
-		        printf 'merged_pairs_bytes\t0\n'
-		        printf 'annotated_rows\t0\n'
-		        printf 'annotated_bytes\t0\n'
-		        printf 'annotated_file_bytes\t0\n'
-		    } > "\$OTU_REFINE_WORKLOAD_STATS_FILE" 2>/dev/null; then
-		    	:
-		    fi
-		    if ! {
-		    	printf 'key\tvalue\n'
-		    	printf 'hac2sup_candidate_rows\t0\n'
-		    	printf 'hac2sup_candidate_unique_read_ids\t0\n'
-		    	printf 'sup_annotation_input_rows\t0\n'
-		    	printf 'dorado_sup_sam_records\t0\n'
-		    	printf 'dorado_sup_fastq_reads\t0\n'
-		    	printf 'hac2sup_sup_fasta_reads\t0\n'
-		    	printf 'sup_cache_hit_ids\t0\n'
-		    	printf 'sup_cache_miss_ids\t0\n'
-		    	printf 'sup_cache_restored_fastq_reads\t0\n'
-		    	printf 'sup_cache_restored_summary_rows\t0\n'
-		    	printf 'dorado_sup_reads_requested\t0\n'
-		    	printf 'dorado_sup_sam_records_new\t0\n'
-		    	printf 'dorado_sup_fastq_reads_new\t0\n'
-		        printf 'dorado_sup_summary_rows_new\t0\n'
-		        printf 'sup_pre_fastq_reads_merged\t0\n'
-		        printf 'sup_summary_rows_merged\t0\n'
-		        printf 'sup_cache_restore_missing_fastq_ids\t0\n'
-		        printf 'sup_cache_restore_missing_summary_ids\t0\n'
-		        printf 'shared_extract_union_ids\t0\n'
-		        printf 'shared_extract_hac2sup_ids\t0\n'
-		        printf 'shared_extract_hac_fixed_ids\t0\n'
-		        printf 'shared_extract_fasta_reads\t0\n'
-		    } > "\$SUP_PATH_STATS_FILE" 2>/dev/null; then
-		    	:
-		    fi
-		    hac2sup_candidate_rows=0
-		    hac2sup_candidate_unique_read_ids=0
-		    sup_annotation_input_rows=0
-		    dorado_sup_sam_records=0
-		    dorado_sup_fastq_reads=0
-		    hac2sup_sup_fasta_reads=0
-		    sup_cache_hit_ids=0
-		    sup_cache_miss_ids=0
-		    sup_cache_restored_fastq_reads=0
-		    sup_cache_restored_summary_rows=0
-		    dorado_sup_reads_requested=0
-		    dorado_sup_sam_records_new=0
-		    dorado_sup_fastq_reads_new=0
-		    dorado_sup_summary_rows_new=0
-		    sup_pre_fastq_reads_merged=0
-		    sup_summary_rows_merged=0
-		    sup_cache_restore_missing_fastq_ids=0
-		    sup_cache_restore_missing_summary_ids=0
-	    # R4-B bindings reuse the configured sources and R4-A state. The sidecar
-	    # is internal; no public output channel or failed-round cardinality changes.
-	    export RTB_R4B_ENABLE=1
-	    export RTB_R4B_TARGETS="\$_p_targets"
-	    export RTB_R4B_KINGDOMS="${params.target_taxa}"
-	    export RTB_R4B_DATABASES="\$_p_blast_db_specs"
-	    export RTB_R4B_SEEDS="\$_p_nonncbi_memtax"
-	    export RTB_R4B_FAMILY="\$_p_blast_id_family"
-	    export RTB_R4B_GENUS="\$_p_blast_id_genus"
-	    export RTB_R4B_SPECIES="\$_p_blast_id_spec"
-	    export RTB_R4B_EVALUE="${params.blast_evalue}"
-	    export RTB_R4B_MAX_HSPS="${params.blast_max_hsps}"
-	    export RTB_R4B_DB_ROOT="${db_dir}"
-	    export RTB_R4B_BASE="${baseDir}"
-	    export RTB_R4B_STATE="\$STATE_DIR"
-	    export RTB_R4B_HASH_MAP="\$OTU_HASH_MAP_STATE"
-	    export RTB_R4B_SIDECAR="blast_otu_taxonomy_v1.tsv"
-	    : > "\$RTB_R4B_SIDECAR"
-	    : > blast_report_annotated.txt
-	    : > blast_report_annotated_otu.txt
-	    : > blast_report_annotated_otu_evidence.txt
-	    : > blast_report_annotated_preferred.txt
+	_t_blast_prefilter_end=\$(date +%s)
+	append_process_timing "prefilter" "\$_t_blast_prefilter_start" "\$_t_blast_prefilter_end"
+			
+_WORD_SIZE=50
+_QCOV=50
+_p_targets="${params.targets}"
+IFS='|' read -ra _TARGETS   <<< "\$_p_targets"
+_p_blast_db_specs="${params.blast_db_specs}"
+IFS='|' read -ra _BLAST_DBS <<< "\$_p_blast_db_specs"
+_p_blast_id_family="${params.blast_id_family}"
+IFS='|' read -ra _ID_FAMILY <<< "\$_p_blast_id_family"
+_p_blast_id_genus="${params.blast_id_genus}"
+IFS='|' read -ra _ID_GENUS  <<< "\$_p_blast_id_genus"
+_p_blast_id_spec="${params.blast_id_spec}"
+IFS='|' read -ra _ID_SPEC   <<< "\$_p_blast_id_spec"
+_p_nonncbi_memtax="${params.nonncbi_memtax}"
+IFS='|' read -ra _MEMTAX    <<< "\$_p_nonncbi_memtax"
+_t_per_target_blast_start=\$(date +%s)
+"\$BIN_DIR/blast_otu_pretax.sh" \
+	"${barcode}" \
+	"\$BLAST_INPUT_FASTA" \
+	"\$STATE_DIR" \
+	"\$THREADS" \
+	"${baseDir}" \
+	"${db_dir}" \
+	"${taxdb_dir}" \
+	"\$ROUND_DIR" \
+	"\$_p_targets" \
+	"\$_p_blast_db_specs" \
+	"${params.blast_id_family}" \
+	"${params.blast_id_genus}" \
+	"${params.blast_id_spec}" \
+	"${params.nonncbi_memtax}" \
+	"${params.blast_evalue}" \
+	"${params.blast_max_hsps}"
+_t_per_target_blast_end=\$(date +%s)
+append_process_timing "per_target_blast" "\$_t_per_target_blast_start" "\$_t_per_target_blast_end"
+	
+# R4-D: the legacy _state/blastreport.txt content was write-only (snapshot,
+_t_blastreport_merge_start=\$(date +%s)
+BLAST_STATE_INIT_MARKER="\${STATE_DIR}/blastreport_initialized_v1.txt"
+STATE_BLASTREPORT_EXISTS=0
+if acquire_lock "\${BLASTREPORT_LOCK}"; then
+	if [ -f "\$BLAST_STATE_INIT_MARKER" ] || [ -f "\${STATE_DIR}/blastreport.txt" ]; then
+		STATE_BLASTREPORT_EXISTS=1
+	fi
+	release_lock "\${BLASTREPORT_LOCK}"
+else
+	exit 1
+fi
+_t_blastreport_merge_end=\$(date +%s)
+append_process_timing "blastreport_merge" "\$_t_blastreport_merge_start" "\$_t_blastreport_merge_end"
+_t_otu_refine_start=\$(date +%s)
+    SUP_PATH_STATS_FILE="${barcode}_sup_path_stats.tsv"
+    SUP_PATH_TIMINGS_MS_FILE="${barcode}_sup_path_timings_ms.tsv"
+    DORADO_SUMMARY_HEADER='input_filename\tbatch_id\tparent_read_id\tread_id\trun_id\tchannel\tmux\tminknow_events\tstart_time\tduration\tpasses_filtering\ttemplate_start\tnum_events_template\ttemplate_duration\tsequence_length_template\tmean_qscore_template\tpore_type\texperiment_id\tsample_id\tend_reason\n'
+    if ! printf 'round_barcode\tphase\tseconds\n' > "\$OTU_REFINE_PHASE_TIMINGS_FILE" 2>/dev/null; then
+    	:
+    fi
+    if ! printf 'round_barcode\tphase\tseconds\tms\n' > "\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" 2>/dev/null; then
+    	:
+    fi
+    if ! printf 'round_barcode\tphase\tseconds\n' > "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" 2>/dev/null; then
+    	:
+    fi
+    if ! printf 'round_barcode\tphase\tseconds\tms\n' > "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" 2>/dev/null; then
+    	:
+    fi
+    if ! printf 'round_barcode\tphase\tseconds\tms\n' > "\$SUP_PATH_TIMINGS_MS_FILE" 2>/dev/null; then
+    	:
+    fi
+    if ! {
+        printf 'key\tvalue\n'
+        printf 'cluster_count\t0\n'
+        printf 'cluster_records\t0\n'
+        printf 'blastreport_rows\t0\n'
+        printf 'cluster_taxids_rows\t0\n'
+        printf 'worker_count\t0\n'
+        printf 'shard_count\t0\n'
+        printf 'shard_scheduler_mode\tequal_record_count\n'
+        printf 'target_records_per_shard\t0\n'
+        printf 'smallest_shard_records\t0\n'
+        printf 'median_shard_records\t0\n'
+        printf 'largest_shard_records\t0\n'
+        printf 'largest_shard_fraction\t0\n'
+        printf 'max_single_cluster_records\t0\n'
+        printf 'max_single_cluster_fraction\t0\n'
+        printf 'merged_pairs_rows\t0\n'
+        printf 'merged_pairs_bytes\t0\n'
+        printf 'annotated_rows\t0\n'
+        printf 'annotated_bytes\t0\n'
+        printf 'annotated_file_bytes\t0\n'
+    } > "\$OTU_REFINE_WORKLOAD_STATS_FILE" 2>/dev/null; then
+    	:
+    fi
+    if ! {
+    	printf 'key\tvalue\n'
+    	printf 'hac2sup_candidate_rows\t0\n'
+    	printf 'hac2sup_candidate_unique_read_ids\t0\n'
+    	printf 'sup_annotation_input_rows\t0\n'
+    	printf 'dorado_sup_sam_records\t0\n'
+    	printf 'dorado_sup_fastq_reads\t0\n'
+    	printf 'hac2sup_sup_fasta_reads\t0\n'
+    	printf 'sup_cache_hit_ids\t0\n'
+    	printf 'sup_cache_miss_ids\t0\n'
+    	printf 'sup_cache_restored_fastq_reads\t0\n'
+    	printf 'sup_cache_restored_summary_rows\t0\n'
+    	printf 'dorado_sup_reads_requested\t0\n'
+    	printf 'dorado_sup_sam_records_new\t0\n'
+    	printf 'dorado_sup_fastq_reads_new\t0\n'
+        printf 'dorado_sup_summary_rows_new\t0\n'
+        printf 'sup_pre_fastq_reads_merged\t0\n'
+        printf 'sup_summary_rows_merged\t0\n'
+        printf 'sup_cache_restore_missing_fastq_ids\t0\n'
+        printf 'sup_cache_restore_missing_summary_ids\t0\n'
+        printf 'shared_extract_union_ids\t0\n'
+        printf 'shared_extract_hac2sup_ids\t0\n'
+        printf 'shared_extract_hac_fixed_ids\t0\n'
+        printf 'shared_extract_fasta_reads\t0\n'
+    } > "\$SUP_PATH_STATS_FILE" 2>/dev/null; then
+    	:
+    fi
+    hac2sup_candidate_rows=0
+    hac2sup_candidate_unique_read_ids=0
+    sup_annotation_input_rows=0
+    dorado_sup_sam_records=0
+    dorado_sup_fastq_reads=0
+    hac2sup_sup_fasta_reads=0
+    sup_cache_hit_ids=0
+    sup_cache_miss_ids=0
+    sup_cache_restored_fastq_reads=0
+    sup_cache_restored_summary_rows=0
+    dorado_sup_reads_requested=0
+    dorado_sup_sam_records_new=0
+    dorado_sup_fastq_reads_new=0
+    dorado_sup_summary_rows_new=0
+    sup_pre_fastq_reads_merged=0
+    sup_summary_rows_merged=0
+    sup_cache_restore_missing_fastq_ids=0
+    sup_cache_restore_missing_summary_ids=0
+    export RTB_R4B_ENABLE=1
+    export RTB_R4B_TARGETS="\$_p_targets"
+    export RTB_R4B_KINGDOMS="${params.target_taxa}"
+    export RTB_R4B_DATABASES="\$_p_blast_db_specs"
+    export RTB_R4B_SEEDS="\$_p_nonncbi_memtax"
+    export RTB_R4B_FAMILY="\$_p_blast_id_family"
+    export RTB_R4B_GENUS="\$_p_blast_id_genus"
+    export RTB_R4B_SPECIES="\$_p_blast_id_spec"
+    export RTB_R4B_EVALUE="${params.blast_evalue}"
+    export RTB_R4B_MAX_HSPS="${params.blast_max_hsps}"
+    export RTB_R4B_DB_ROOT="${db_dir}"
+    export RTB_R4B_BASE="${baseDir}"
+    export RTB_R4B_STATE="\$STATE_DIR"
+    export RTB_R4B_HASH_MAP="\$OTU_HASH_MAP_STATE"
+    export RTB_R4B_SIDECAR="blast_otu_taxonomy_v1.tsv"
+    : > "\$RTB_R4B_SIDECAR"
+    : > blast_report_annotated.txt
+    : > blast_report_annotated_otu.txt
+    : > blast_report_annotated_otu_evidence.txt
+    : > blast_report_annotated_preferred.txt
 
-			    # Attempt refinement whenever accumulated clusters are non-empty;
-			    # an empty BLAST report is a valid all-unassigned result.
-			    # Refinement is a core classification step, so unexpected failure is fatal.
-				    _t_otu_refine_wrapper_start=\$(now_ms)
-			    if [ -s "${qced_reads_nr}" ]; then
-			        if ! OTU_REFINE_ROUND_ID="${round_barcode}" \
-		             OTU_REFINE_PHASE_TIMINGS_FILE="\$OTU_REFINE_PHASE_TIMINGS_FILE" \
-		             OTU_REFINE_PHASE_TIMINGS_MS_FILE="\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" \
-		             OTU_REFINE_WORKLOAD_STATS_FILE="\$OTU_REFINE_WORKLOAD_STATS_FILE" \
-		             bash "\$BIN_DIR/otu_refine_blastreport_parallel.sh" \
-		             "${barcode}_blastreport_round.txt" \
-		             "${qced_reads_nr}" \
-		             "${baseDir}/${params.nonncbi_id2lineage_target}" \
-	             "\$THREADS" \
-	          > blast_report_annotated_otu.txt; then
-			            echo "ERROR: otu_refine_blastreport_parallel.sh failed for ${barcode}/${round_barcode}" 1>&2
-			            exit 1
-			        fi
-			    fi
-			    _t_otu_refine_wrapper_end=\$(now_ms)
-			    append_otu_refine_breakdown "wrapper_invoke_total" "\$_t_otu_refine_wrapper_start" "\$_t_otu_refine_wrapper_end"
-	    # Ensure OTU tokens always include marker when possible (OTUB_xxx-MARKER).
-	    _t_otu_refine_marker_start=\$(now_ms)
-	    if [ -s blast_report_annotated_otu.txt ]; then
-	        awk 'BEGIN{FS=OFS="\t"}
+		    _t_otu_refine_wrapper_start=\$(now_ms)
+	    if [ -s "${qced_reads_nr}" ]; then
+	        if ! OTU_REFINE_ROUND_ID="${round_barcode}" \
+             OTU_REFINE_PHASE_TIMINGS_FILE="\$OTU_REFINE_PHASE_TIMINGS_FILE" \
+             OTU_REFINE_PHASE_TIMINGS_MS_FILE="\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" \
+             OTU_REFINE_WORKLOAD_STATS_FILE="\$OTU_REFINE_WORKLOAD_STATS_FILE" \
+             bash "\$BIN_DIR/otu_refine_blastreport_parallel.sh" \
+             "${barcode}_blastreport_round.txt" \
+             "${qced_reads_nr}" \
+             "${baseDir}/${params.nonncbi_id2lineage_target}" \
+             "\$THREADS" \
+          > blast_report_annotated_otu.txt; then
+	            echo "ERROR: otu_refine_blastreport_parallel.sh failed for ${barcode}/${round_barcode}" 1>&2
+	            exit 1
+	        fi
+	    fi
+	    _t_otu_refine_wrapper_end=\$(now_ms)
+	    append_otu_refine_breakdown "wrapper_invoke_total" "\$_t_otu_refine_wrapper_start" "\$_t_otu_refine_wrapper_end"
+    # Ensure OTU tokens always include marker when possible (OTUB_xxx-MARKER).
+    _t_otu_refine_marker_start=\$(now_ms)
+    if [ -s blast_report_annotated_otu.txt ]; then
+        awk 'BEGIN{FS=OFS="\t"}
             /^#/ {print; next}
             {
                 hdr=\$1;
@@ -3714,159 +3752,157 @@ process blast_OTU_pretax {
                 }
                 print
             }' blast_report_annotated_otu.txt > blast_report_annotated_otu.norm || :
-	        mv blast_report_annotated_otu.norm blast_report_annotated_otu.txt
-	    fi
-	    _t_otu_refine_marker_end=\$(now_ms)
-	    append_otu_refine_breakdown "post_marker_normalize" "\$_t_otu_refine_marker_start" "\$_t_otu_refine_marker_end"
+        mv blast_report_annotated_otu.norm blast_report_annotated_otu.txt
+    fi
+    _t_otu_refine_marker_end=\$(now_ms)
+    append_otu_refine_breakdown "post_marker_normalize" "\$_t_otu_refine_marker_start" "\$_t_otu_refine_marker_end"
 
-		_t_otu_refine_evidence_copy_start=\$(now_ms)
-		cp blast_report_annotated_otu.txt blast_report_annotated_otu_evidence.txt 2>/dev/null || true
-		if [ -s "\$RTB_R4B_SIDECAR" ]; then
-		    perl "\$BIN_DIR/otu_refine_blastreport.pl" --publish-status \
-		        "\$RTB_R4B_SIDECAR" "\$ROUND_DIR/${barcode}_blast_otu_taxonomy_v1.tsv" || exit 1
-		fi
-		_t_otu_refine_evidence_copy_end=\$(now_ms)
-		append_otu_refine_breakdown "evidence_copy" "\$_t_otu_refine_evidence_copy_start" "\$_t_otu_refine_evidence_copy_end"
-				OBSERVED_NO_ADAPTER=0
-			OBSERVED_NON_NO_ADAPTER=0
-			SEPARATE_NO_ADAPTER=0
-			NO_ADAPTER_POLICY_TSV="${barcode}_no_adapter_policy.tsv"
-			: > "\$NO_ADAPTER_POLICY_TSV"
-					_t_otu_refine_no_adapter_start=\$(now_ms)
-					if [ -s blast_report_annotated_otu_evidence.txt ]; then
-						if ! bash "\$BIN_DIR/detect_no_adapter_policy.sh" blast_report_annotated_otu_evidence.txt > "\$NO_ADAPTER_POLICY_TSV"; then
-							echo "ERROR: detect_no_adapter_policy.sh failed for ${barcode}/${round_barcode}" 1>&2
-							exit 1
-						fi
-						no_adapter_policy_value() {
-							local key="\$1"
-							awk -F'\t' -v k="\$key" '\$1==k{print \$2; exit}' "\$NO_ADAPTER_POLICY_TSV"
-						}
-						validate_no_adapter_policy_value() {
-							local key="\$1"
-							local value="\$2"
-							case "\$value" in
-								0|1)
-									return 0
-									;;
-							esac
-							echo "ERROR: invalid no-adapter policy value for \${key}: '\${value}'" 1>&2
-							exit 1
-						}
-						OBSERVED_NO_ADAPTER=\$(no_adapter_policy_value observed_no_adapter)
-						OBSERVED_NON_NO_ADAPTER=\$(no_adapter_policy_value observed_non_no_adapter)
-						SEPARATE_NO_ADAPTER=\$(no_adapter_policy_value separate_no_adapter)
-						validate_no_adapter_policy_value observed_no_adapter "\$OBSERVED_NO_ADAPTER"
-						validate_no_adapter_policy_value observed_non_no_adapter "\$OBSERVED_NON_NO_ADAPTER"
-						validate_no_adapter_policy_value separate_no_adapter "\$SEPARATE_NO_ADAPTER"
-					fi
-					mkdir -p "\$ROUND_DIR" 2>/dev/null || true
-					copy_soft "\$NO_ADAPTER_POLICY_TSV" "\$ROUND_DIR/\$NO_ADAPTER_POLICY_TSV"
-			_t_otu_refine_no_adapter_end=\$(now_ms)
-			append_otu_refine_breakdown "no_adapter_policy" "\$_t_otu_refine_no_adapter_start" "\$_t_otu_refine_no_adapter_end"
-			echo "INFO: no_adapter_policy observed_no_adapter=\$OBSERVED_NO_ADAPTER observed_non_no_adapter=\$OBSERVED_NON_NO_ADAPTER separate_no_adapter=\$SEPARATE_NO_ADAPTER" 1>&2
-
-		_t_otu_refine_end=\$(date +%s)
-		append_process_timing "otu_refine" "\$_t_otu_refine_start" "\$_t_otu_refine_end"
-		_t_assignment_state_updates_start=\$(date +%s)
-	: > ${barcode}_assigned_read_ids.list
-	if [ -s "\$RTB_R4B_SIDECAR" ]; then
-		if ! perl "\$BIN_DIR/blast_assigned_read_ids.pl" \
-			"\$RTB_R4B_SIDECAR" \
-			${barcode}_assigned_read_ids.list --min-level "${assignProtLevelCanonical}"; then
-			echo "ERROR: failed to compute assigned read IDs" 1>&2
-			exit 1
-		fi
-	fi
-	# Persist assigned read IDs (round snapshot + ever-assigned history).
-	mkdir -p "\$ROUND_DIR" "\$STATE_DIR"
-	ASSIGNED_READ_IDS_RAW_ROUND="\$ROUND_DIR/${barcode}_assigned_read_ids_raw_current.list"
-	cp ${barcode}_assigned_read_ids.list "\$ASSIGNED_READ_IDS_RAW_ROUND" 2>/dev/null || true
-	if ! persist_read_ids_ever_state \
-		${barcode}_assigned_read_ids.list \
-		"\$ASSIGNED_READ_IDS_EVER_STATE"; then
-		echo "ERROR: failed to persist assigned read IDs" 1>&2
-		exit 1
-	fi
-	refresh_protected_read_ids_ever "\$PROTECTED_READ_IDS_EVER_STATE"
-	if ! filter_ids_present_in_fasta \
-		"\$ASSIGNED_READ_IDS_EVER_STATE" \
-		"${fasta_hq_qced}" \
-		"\$ROUND_DIR/${barcode}_assigned_read_ids.list"; then
-		echo "ERROR: failed to materialize effective assigned read IDs for current pool" 1>&2
-		exit 1
-	fi
-		ASSIGNED_OTU_KEYS_EVER="\${STATE_DIR}/${barcode}_assigned_otu_keys_ever.list"
-		BLAST_ASSIGNED_OTU_KEYS_ROUND="\$ROUND_DIR/${barcode}_blast_assigned_otu_keys_round.list"
-			ASSIGNED_OTU_MEMBERS_CURRENT_RAW="\$ROUND_DIR/${barcode}_assigned_otu_member_ids_raw_current.list"
-			ASSIGNED_OTU_MEMBERS_EVER="\$ROUND_DIR/${barcode}_assigned_otu_member_ids_ever.list"
-			ASSIGNED_OTU_KEYS_PERSIST_STATS="\$ROUND_DIR/${barcode}_assigned_otu_keys_persist_stats.tsv"
-				ASSIGNED_OTU_PRESERVE_STATS="\$ROUND_DIR/${barcode}_assigned_otu_preserve_stats.tsv"
-				if ! perl "\$BIN_DIR/blast_assigned_otu_keys.pl" \
-					"\$RTB_R4B_SIDECAR" \
-					"\$BLAST_ASSIGNED_OTU_KEYS_ROUND" \
-					"\$OTU_HASH_MAP_STATE" \
-					--persistent --min-level "${assignProtLevelCanonical}"; then
-					echo "ERROR: failed to extract blast-assigned OTU keys" 1>&2
+_t_otu_refine_evidence_copy_start=\$(now_ms)
+cp blast_report_annotated_otu.txt blast_report_annotated_otu_evidence.txt 2>/dev/null || true
+if [ -s "\$RTB_R4B_SIDECAR" ]; then
+    perl "\$BIN_DIR/otu_refine_blastreport.pl" --publish-status \
+        "\$RTB_R4B_SIDECAR" "\$ROUND_DIR/${barcode}_blast_otu_taxonomy_v1.tsv" || exit 1
+fi
+_t_otu_refine_evidence_copy_end=\$(now_ms)
+append_otu_refine_breakdown "evidence_copy" "\$_t_otu_refine_evidence_copy_start" "\$_t_otu_refine_evidence_copy_end"
+		OBSERVED_NO_ADAPTER=0
+	OBSERVED_NON_NO_ADAPTER=0
+	SEPARATE_NO_ADAPTER=0
+	NO_ADAPTER_POLICY_TSV="${barcode}_no_adapter_policy.tsv"
+	: > "\$NO_ADAPTER_POLICY_TSV"
+			_t_otu_refine_no_adapter_start=\$(now_ms)
+			if [ -s blast_report_annotated_otu_evidence.txt ]; then
+				if ! bash "\$BIN_DIR/detect_no_adapter_policy.sh" blast_report_annotated_otu_evidence.txt > "\$NO_ADAPTER_POLICY_TSV"; then
+					echo "ERROR: detect_no_adapter_policy.sh failed for ${barcode}/${round_barcode}" 1>&2
 					exit 1
+				fi
+				no_adapter_policy_value() {
+					local key="\$1"
+					awk -F'\t' -v k="\$key" '\$1==k{print \$2; exit}' "\$NO_ADAPTER_POLICY_TSV"
+				}
+				validate_no_adapter_policy_value() {
+					local key="\$1"
+					local value="\$2"
+					case "\$value" in
+						0|1)
+							return 0
+							;;
+					esac
+					echo "ERROR: invalid no-adapter policy value for \${key}: '\${value}'" 1>&2
+					exit 1
+				}
+				OBSERVED_NO_ADAPTER=\$(no_adapter_policy_value observed_no_adapter)
+				OBSERVED_NON_NO_ADAPTER=\$(no_adapter_policy_value observed_non_no_adapter)
+				SEPARATE_NO_ADAPTER=\$(no_adapter_policy_value separate_no_adapter)
+				validate_no_adapter_policy_value observed_no_adapter "\$OBSERVED_NO_ADAPTER"
+				validate_no_adapter_policy_value observed_non_no_adapter "\$OBSERVED_NON_NO_ADAPTER"
+				validate_no_adapter_policy_value separate_no_adapter "\$SEPARATE_NO_ADAPTER"
 			fi
-			if ! perl "\$BIN_DIR/persist_otu_keys_ever.pl" \
-				"\$BLAST_ASSIGNED_OTU_KEYS_ROUND" \
-				"\$ASSIGNED_OTU_KEYS_EVER" \
-				"\$ASSIGNED_OTU_KEYS_PERSIST_STATS"; then
-				echo "ERROR: failed to persist blast-assigned OTU keys" 1>&2
-				exit 1
-			fi
-			if ! perl "\$BIN_DIR/expand_otu_keys_to_member_ids.pl" \
-				"\$BLAST_ASSIGNED_OTU_KEYS_ROUND" \
-				"\$ROUND_DIR/otu_members_round.tsv" \
-				"\$ASSIGNED_OTU_MEMBERS_CURRENT_RAW" \
-				"" \
-				"\$OTU_HASH_MAP_STATE"; then
-				echo "ERROR: failed to expand current blast-assigned OTU keys into member reads" 1>&2
-				exit 1
-			fi
-			if ! materialize_round_grace_ids \
-				"\$ASSIGNED_OTU_MEMBER_IDS_GRACE_STATE" \
-				"\$ASSIGNED_OTU_MEMBERS_CURRENT_RAW" \
-				"\$ASSIGNED_OTU_MEMBERS_EVER"; then
-				echo "ERROR: failed to materialize next-round grace assigned-OTU member reads for current pool" 1>&2
-				exit 1
-			fi
-			_assigned_otu_keys_ever_count=0
-			_assigned_otu_member_ids_ever_count=0
-			[ -s "\$ASSIGNED_OTU_KEYS_EVER" ] && _assigned_otu_keys_ever_count=\$(wc -l < "\$ASSIGNED_OTU_KEYS_EVER" | tr -d ' ')
-			[ -s "\$ASSIGNED_OTU_MEMBERS_EVER" ] && _assigned_otu_member_ids_ever_count=\$(wc -l < "\$ASSIGNED_OTU_MEMBERS_EVER" | tr -d ' ')
-			{
-				printf 'protected_otu_keys_round_count\t%s\n' "\$_assigned_otu_keys_ever_count"
-				printf 'protected_otu_member_ids_round_count\t%s\n' "\$_assigned_otu_member_ids_ever_count"
-			} > "\$ASSIGNED_OTU_PRESERVE_STATS"
-		if [ -s "\$ASSIGNED_OTU_KEYS_PERSIST_STATS" ]; then
-			cat "\$ASSIGNED_OTU_KEYS_PERSIST_STATS" >> "\$ASSIGNED_OTU_PRESERVE_STATS"
-		fi
-		ASSIGNED_OTU_PRESERVE_PREBLAST="\$ROUND_DIR/${barcode}_assigned_otu_preserve_preblast.tsv"
-			if [ -s "\$ASSIGNED_OTU_PRESERVE_PREBLAST" ]; then
-				cat "\$ASSIGNED_OTU_PRESERVE_PREBLAST" >> "\$ASSIGNED_OTU_PRESERVE_STATS"
-			rm -f "\$ASSIGNED_OTU_PRESERVE_PREBLAST"
-		fi
-		_t_assignment_state_updates_end=\$(date +%s)
-		append_process_timing "assignment_state_updates" "\$_t_assignment_state_updates_start" "\$_t_assignment_state_updates_end"
-			if [ "\$SEPARATE_NO_ADAPTER" -eq 1 ]; then
-		    if [ -s blast_report_annotated_otu_evidence.txt ]; then
-		        if ! bash "\$BIN_DIR/filter_blast_rows_by_adapter_class.sh" blast_report_annotated_otu_evidence.txt no_adapter > blast_report_annotated_otu_noadapter.txt; then
-		        	echo "WARN: filter_blast_rows_by_adapter_class.sh failed for no_adapter split; continuing without split report" 1>&2
-		        	: > blast_report_annotated_otu_noadapter.txt
-		        fi
-		    else
-		        : > blast_report_annotated_otu_noadapter.txt
-		    fi
-	    else
-	        : > blast_report_annotated_otu_noadapter.txt
-	    fi
-			# -- §5: SUP/HAC selection and re-basecalling path --
-			_t_sup_selection_start=\$(date +%s)
-	    _t_read_pident_build_start=\$(now_ms)
-	    : > ${barcode}_read_pident.tsv
+			mkdir -p "\$ROUND_DIR" 2>/dev/null || true
+			copy_soft "\$NO_ADAPTER_POLICY_TSV" "\$ROUND_DIR/\$NO_ADAPTER_POLICY_TSV"
+	_t_otu_refine_no_adapter_end=\$(now_ms)
+	append_otu_refine_breakdown "no_adapter_policy" "\$_t_otu_refine_no_adapter_start" "\$_t_otu_refine_no_adapter_end"
+	echo "INFO: no_adapter_policy observed_no_adapter=\$OBSERVED_NO_ADAPTER observed_non_no_adapter=\$OBSERVED_NON_NO_ADAPTER separate_no_adapter=\$SEPARATE_NO_ADAPTER" 1>&2
+
+_t_otu_refine_end=\$(date +%s)
+append_process_timing "otu_refine" "\$_t_otu_refine_start" "\$_t_otu_refine_end"
+_t_assignment_state_updates_start=\$(date +%s)
+: > ${barcode}_assigned_read_ids.list
+if [ -s "\$RTB_R4B_SIDECAR" ]; then
+if ! perl "\$BIN_DIR/blast_assigned_read_ids.pl" \
+	"\$RTB_R4B_SIDECAR" \
+	${barcode}_assigned_read_ids.list --min-level "${assignProtLevelCanonical}"; then
+	echo "ERROR: failed to compute assigned read IDs" 1>&2
+	exit 1
+fi
+fi
+mkdir -p "\$ROUND_DIR" "\$STATE_DIR"
+ASSIGNED_READ_IDS_RAW_ROUND="\$ROUND_DIR/${barcode}_assigned_read_ids_raw_current.list"
+cp ${barcode}_assigned_read_ids.list "\$ASSIGNED_READ_IDS_RAW_ROUND" 2>/dev/null || true
+if ! persist_read_ids_ever_state \
+${barcode}_assigned_read_ids.list \
+"\$ASSIGNED_READ_IDS_EVER_STATE"; then
+echo "ERROR: failed to persist assigned read IDs" 1>&2
+exit 1
+fi
+refresh_protected_read_ids_ever "\$PROTECTED_READ_IDS_EVER_STATE"
+if ! filter_ids_present_in_fasta \
+"\$ASSIGNED_READ_IDS_EVER_STATE" \
+"${fasta_hq_qced}" \
+"\$ROUND_DIR/${barcode}_assigned_read_ids.list"; then
+echo "ERROR: failed to materialize effective assigned read IDs for current pool" 1>&2
+exit 1
+fi
+ASSIGNED_OTU_KEYS_EVER="\${STATE_DIR}/${barcode}_assigned_otu_keys_ever.list"
+BLAST_ASSIGNED_OTU_KEYS_ROUND="\$ROUND_DIR/${barcode}_blast_assigned_otu_keys_round.list"
+	ASSIGNED_OTU_MEMBERS_CURRENT_RAW="\$ROUND_DIR/${barcode}_assigned_otu_member_ids_raw_current.list"
+	ASSIGNED_OTU_MEMBERS_EVER="\$ROUND_DIR/${barcode}_assigned_otu_member_ids_ever.list"
+	ASSIGNED_OTU_KEYS_PERSIST_STATS="\$ROUND_DIR/${barcode}_assigned_otu_keys_persist_stats.tsv"
+		ASSIGNED_OTU_PRESERVE_STATS="\$ROUND_DIR/${barcode}_assigned_otu_preserve_stats.tsv"
+		if ! perl "\$BIN_DIR/blast_assigned_otu_keys.pl" \
+			"\$RTB_R4B_SIDECAR" \
+			"\$BLAST_ASSIGNED_OTU_KEYS_ROUND" \
+			"\$OTU_HASH_MAP_STATE" \
+			--persistent --min-level "${assignProtLevelCanonical}"; then
+			echo "ERROR: failed to extract blast-assigned OTU keys" 1>&2
+			exit 1
+	fi
+	if ! perl "\$BIN_DIR/persist_otu_keys_ever.pl" \
+		"\$BLAST_ASSIGNED_OTU_KEYS_ROUND" \
+		"\$ASSIGNED_OTU_KEYS_EVER" \
+		"\$ASSIGNED_OTU_KEYS_PERSIST_STATS"; then
+		echo "ERROR: failed to persist blast-assigned OTU keys" 1>&2
+		exit 1
+	fi
+	if ! perl "\$BIN_DIR/expand_otu_keys_to_member_ids.pl" \
+		"\$BLAST_ASSIGNED_OTU_KEYS_ROUND" \
+		"\$ROUND_DIR/otu_members_round.tsv" \
+		"\$ASSIGNED_OTU_MEMBERS_CURRENT_RAW" \
+		"" \
+		"\$OTU_HASH_MAP_STATE"; then
+		echo "ERROR: failed to expand current blast-assigned OTU keys into member reads" 1>&2
+		exit 1
+	fi
+	if ! materialize_round_grace_ids \
+		"\$ASSIGNED_OTU_MEMBER_IDS_GRACE_STATE" \
+		"\$ASSIGNED_OTU_MEMBERS_CURRENT_RAW" \
+		"\$ASSIGNED_OTU_MEMBERS_EVER"; then
+		echo "ERROR: failed to materialize next-round grace assigned-OTU member reads for current pool" 1>&2
+		exit 1
+	fi
+	_assigned_otu_keys_ever_count=0
+	_assigned_otu_member_ids_ever_count=0
+	[ -s "\$ASSIGNED_OTU_KEYS_EVER" ] && _assigned_otu_keys_ever_count=\$(wc -l < "\$ASSIGNED_OTU_KEYS_EVER" | tr -d ' ')
+	[ -s "\$ASSIGNED_OTU_MEMBERS_EVER" ] && _assigned_otu_member_ids_ever_count=\$(wc -l < "\$ASSIGNED_OTU_MEMBERS_EVER" | tr -d ' ')
+	{
+		printf 'protected_otu_keys_round_count\t%s\n' "\$_assigned_otu_keys_ever_count"
+		printf 'protected_otu_member_ids_round_count\t%s\n' "\$_assigned_otu_member_ids_ever_count"
+	} > "\$ASSIGNED_OTU_PRESERVE_STATS"
+if [ -s "\$ASSIGNED_OTU_KEYS_PERSIST_STATS" ]; then
+	cat "\$ASSIGNED_OTU_KEYS_PERSIST_STATS" >> "\$ASSIGNED_OTU_PRESERVE_STATS"
+fi
+ASSIGNED_OTU_PRESERVE_PREBLAST="\$ROUND_DIR/${barcode}_assigned_otu_preserve_preblast.tsv"
+	if [ -s "\$ASSIGNED_OTU_PRESERVE_PREBLAST" ]; then
+		cat "\$ASSIGNED_OTU_PRESERVE_PREBLAST" >> "\$ASSIGNED_OTU_PRESERVE_STATS"
+	rm -f "\$ASSIGNED_OTU_PRESERVE_PREBLAST"
+fi
+_t_assignment_state_updates_end=\$(date +%s)
+append_process_timing "assignment_state_updates" "\$_t_assignment_state_updates_start" "\$_t_assignment_state_updates_end"
+	if [ "\$SEPARATE_NO_ADAPTER" -eq 1 ]; then
+    if [ -s blast_report_annotated_otu_evidence.txt ]; then
+        if ! bash "\$BIN_DIR/filter_blast_rows_by_adapter_class.sh" blast_report_annotated_otu_evidence.txt no_adapter > blast_report_annotated_otu_noadapter.txt; then
+        	echo "WARN: filter_blast_rows_by_adapter_class.sh failed for no_adapter split; continuing without split report" 1>&2
+        	: > blast_report_annotated_otu_noadapter.txt
+        fi
+    else
+        : > blast_report_annotated_otu_noadapter.txt
+    fi
+    else
+        : > blast_report_annotated_otu_noadapter.txt
+    fi
+	_t_sup_selection_start=\$(date +%s)
+    _t_read_pident_build_start=\$(now_ms)
+    : > ${barcode}_read_pident.tsv
     if [ -s "${barcode}_blastreport_round.txt" ]; then
         awk -F'[;,]' 'NF>=5{
             q=\$1; pid=\$5+0;
@@ -3874,13 +3910,12 @@ process blast_OTU_pretax {
             if(id!="" && (!(id in best) || pid>best[id])) best[id]=pid;
         } END{ for(id in best) print id "\t" best[id]; }' ${barcode}_blastreport_round.txt > ${barcode}_read_pident.tsv
     fi
-	    _t_read_pident_build_end=\$(now_ms)
-	    append_sup_path_timing "read_pident_build" "\$_t_read_pident_build_start" "\$_t_read_pident_build_end"
+    _t_read_pident_build_end=\$(now_ms)
+    append_sup_path_timing "read_pident_build" "\$_t_read_pident_build_start" "\$_t_read_pident_build_end"
 
-	    _t_blocked_otu_build_start=\$(now_ms)
-	    CONSOLIDATED_OTU="${barcode}_consolidated_otu.tsv"
+    _t_blocked_otu_build_start=\$(now_ms)
+    CONSOLIDATED_OTU="${barcode}_consolidated_otu.tsv"
     : > "\$CONSOLIDATED_OTU"
-    # Prior report labels are display only. Resolve proven owners into this round's labels.
     if [ -s "\$CONSENSUS_DIR/consensus_ownership.tsv" ]; then
         CONSOLIDATED_CURRENT_IDENTITY="${barcode}_consolidated_current_identity.tsv"
         perl "\$BIN_DIR/consensus_otu_identity.pl" map --clstr "\$STATE_DIR/qced_reads_nr.fasta.clstr" \
@@ -3900,134 +3935,134 @@ process blast_OTU_pretax {
     : > "\$BLOCKED_OTU"
     if [ -s "\$FROZEN_READS" ] && [ -s "\$CONSOLIDATED_OTU" ] && [ -s blast_report_annotated_otu.txt ]; then
         perl "\$BIN_DIR/build_blocked_otu.pl" "\$CONSOLIDATED_OTU" "\$FROZEN_READS" blast_report_annotated_otu.txt > "\$BLOCKED_OTU"
-	    fi
-	    _t_blocked_otu_build_end=\$(now_ms)
-	    append_sup_path_timing "blocked_otu_build" "\$_t_blocked_otu_build_start" "\$_t_blocked_otu_build_end"
+    fi
+    _t_blocked_otu_build_end=\$(now_ms)
+    append_sup_path_timing "blocked_otu_build" "\$_t_blocked_otu_build_start" "\$_t_blocked_otu_build_end"
 
-		    _t_select_reads2sup_start=\$(now_ms)
-			    if [ -s "blast_report_annotated_otu.txt" ]; then
-			if ! "\$BIN_DIR/select_reads2sup.pl" blast_report_annotated_otu.txt 50 keep_no_adapter ${barcode}_read_pident.tsv "\$BLOCKED_OTU" > tmp; then
-				echo "ERROR: select_reads2sup.pl failed for ${barcode}/${round_barcode}" 1>&2
-				exit 1
-			fi
-		    else
-		        : > tmp
-		    fi
-		    _t_select_reads2sup_end=\$(now_ms)
-		    append_sup_path_timing "select_reads2sup" "\$_t_select_reads2sup_start" "\$_t_select_reads2sup_end"
-		    _t_taxonomy_cleanup_emit_start=\$(now_ms)
-		        if [ -s tmp ]; then
-	            sed -E 's/(^|[;	])[KkPpCcOoFfGgSs]__/\\1/g' tmp > blast_report_annotated_otu.txt || mv tmp blast_report_annotated_otu.txt
-	            sed -E 's/(^|[;	])[KkPpCcOoFfGgSs]__/\\1/g' blast_report_annotated_otu.txt \
-	                | tr ';' '\t' \
-	                | perl -pe 's/\blineage\b/kingdom\tphylum\tclass\torder\tfamily\tgenus\tspecies/g' \
-	                > blast_report_annotated.txt
-	        else
-	            : > blast_report_annotated_otu.txt
-	            : > blast_report_annotated.txt
-	        fi
+    _t_select_reads2sup_start=\$(now_ms)
+	    if [ -s "blast_report_annotated_otu.txt" ]; then
+	if ! "\$BIN_DIR/select_reads2sup.pl" blast_report_annotated_otu.txt 50 keep_no_adapter ${barcode}_read_pident.tsv "\$BLOCKED_OTU" > tmp; then
+		echo "ERROR: select_reads2sup.pl failed for ${barcode}/${round_barcode}" 1>&2
+		exit 1
+	fi
+    else
+        : > tmp
+    fi
+    _t_select_reads2sup_end=\$(now_ms)
+    append_sup_path_timing "select_reads2sup" "\$_t_select_reads2sup_start" "\$_t_select_reads2sup_end"
+    _t_taxonomy_cleanup_emit_start=\$(now_ms)
+        if [ -s tmp ]; then
+            sed -E 's/(^|[;	])[KkPpCcOoFfGgSs]__/\\1/g' tmp > blast_report_annotated_otu.txt || mv tmp blast_report_annotated_otu.txt
+            sed -E 's/(^|[;	])[KkPpCcOoFfGgSs]__/\\1/g' blast_report_annotated_otu.txt \
+                | tr ';' '\t' \
+                | perl -pe 's/\blineage\b/kingdom\tphylum\tclass\torder\tfamily\tgenus\tspecies/g' \
+                > blast_report_annotated.txt
+        else
+            : > blast_report_annotated_otu.txt
+            : > blast_report_annotated.txt
+        fi
 
-	if [ "\$SEPARATE_NO_ADAPTER" -eq 1 ]; then
-	    if [ -s blast_report_annotated_otu_noadapter.txt ]; then
-	        sed -E 's/[Kpcofgs]__//g' blast_report_annotated_otu_noadapter.txt > blast_report_annotated_otu_noadapter.tmp || mv blast_report_annotated_otu_noadapter.txt blast_report_annotated_otu_noadapter.tmp
-	        mv blast_report_annotated_otu_noadapter.tmp blast_report_annotated_otu_noadapter.txt
+if [ "\$SEPARATE_NO_ADAPTER" -eq 1 ]; then
+    if [ -s blast_report_annotated_otu_noadapter.txt ]; then
+        sed -E 's/[Kpcofgs]__//g' blast_report_annotated_otu_noadapter.txt > blast_report_annotated_otu_noadapter.tmp || mv blast_report_annotated_otu_noadapter.txt blast_report_annotated_otu_noadapter.tmp
+        mv blast_report_annotated_otu_noadapter.tmp blast_report_annotated_otu_noadapter.txt
             sed -E 's/[Kpcofgs]__//g' blast_report_annotated_otu_noadapter.txt \
                 | tr ';' '\t' \
                 | perl -pe 's/\blineage\b/kingdom\tphylum\tclass\torder\tfamily\tgenus\tspecies/g' \
                 > blast_report_annotated_noadapter.txt
-	    else
-	        : > blast_report_annotated_noadapter.txt
-	    fi
-	    _t_taxonomy_cleanup_emit_end=\$(now_ms)
-	    append_sup_path_timing "taxonomy_cleanup_emit" "\$_t_taxonomy_cleanup_emit_start" "\$_t_taxonomy_cleanup_emit_end"
+    else
+        : > blast_report_annotated_noadapter.txt
+    fi
+    _t_taxonomy_cleanup_emit_end=\$(now_ms)
+    append_sup_path_timing "taxonomy_cleanup_emit" "\$_t_taxonomy_cleanup_emit_start" "\$_t_taxonomy_cleanup_emit_end"
     else
         : > blast_report_annotated_noadapter.txt
         _t_taxonomy_cleanup_emit_end=\$(now_ms)
         append_sup_path_timing "taxonomy_cleanup_emit" "\$_t_taxonomy_cleanup_emit_start" "\$_t_taxonomy_cleanup_emit_end"
     fi
 
-	    rm -f blast_report_annotated_otu_noadapter.tmp
-	    hac2sup_candidate_rows=0
-		    hac2sup_candidate_unique_read_ids=0
-		    sup_annotation_input_rows=0
-		    dorado_sup_sam_records=0
-		    dorado_sup_fastq_reads=0
-		    hac2sup_sup_fasta_reads=0
-		    sup_cache_hit_ids=0
-		    sup_cache_miss_ids=0
-		    sup_cache_restored_fastq_reads=0
-		    sup_cache_restored_summary_rows=0
-		    dorado_sup_reads_requested=0
-		    dorado_sup_sam_records_new=0
-		    dorado_sup_fastq_reads_new=0
-		    dorado_sup_summary_rows_new=0
-		    sup_pre_fastq_reads_merged=0
-		    sup_summary_rows_merged=0
-		    sup_cache_restore_missing_fastq_ids=0
-		    sup_cache_restore_missing_summary_ids=0
-		    shared_extract_union_ids=0
-		    shared_extract_hac2sup_ids=0
-		    shared_extract_hac_fixed_ids=0
-		    shared_extract_fasta_reads=0
-		    barcode="${barcode}"
-		    SUP_TASK_CPUS="${task.cpus}"
-		    SUP_FASTA_HQ_QCED="${fasta_hq_qced}"
-		    SUP_BASEDIR="${baseDir}"
-		    SUP_DORADO_BIN="${doradoSummaryBin}"
-		    SUP_CACHE_LOCK="\${STATE_DIR}/.sup_basecall_cache.lock"
-		    SUP_CACHE_SCHEMA_VERSION="2"
-		    SUP_CACHE_RESTART_TOKEN="${restartTokenForCache ?: workflow.runName}"
-		    SUP_CACHE_DORADO_MODEL="${doradoSupModel}"
-		    SUP_CACHE_DORADO_ARGS="${doradoSupBasecallerArgs}"
-		    SUP_CACHE_MIN_QSCORE="${params.hq_quality_score}"
-		    SUP_CACHE_SKIP_PERSIST=0
-		    source "\$BIN_DIR/blast_sup_path.sh"
-		    sup_candidate_extract
-		    sup_cache_lookup
+    rm -f blast_report_annotated_otu_noadapter.tmp
+    hac2sup_candidate_rows=0
+    hac2sup_candidate_unique_read_ids=0
+    sup_annotation_input_rows=0
+    dorado_sup_sam_records=0
+    dorado_sup_fastq_reads=0
+    hac2sup_sup_fasta_reads=0
+    sup_cache_hit_ids=0
+    sup_cache_miss_ids=0
+    sup_cache_restored_fastq_reads=0
+    sup_cache_restored_summary_rows=0
+    dorado_sup_reads_requested=0
+    dorado_sup_sam_records_new=0
+    dorado_sup_fastq_reads_new=0
+    dorado_sup_summary_rows_new=0
+    sup_pre_fastq_reads_merged=0
+    sup_summary_rows_merged=0
+    sup_cache_restore_missing_fastq_ids=0
+    sup_cache_restore_missing_summary_ids=0
+    shared_extract_union_ids=0
+    shared_extract_hac2sup_ids=0
+    shared_extract_hac_fixed_ids=0
+    shared_extract_fasta_reads=0
+    barcode="${barcode}"
+    SUP_TASK_CPUS="${task.cpus}"
+    SUP_FASTA_HQ_QCED="${fasta_hq_qced}"
+    SUP_BASEDIR="${baseDir}"
+    SUP_DORADO_BIN="${doradoSummaryBin}"
+    SUP_CACHE_LOCK="\${STATE_DIR}/.sup_basecall_cache.lock"
+    SUP_CACHE_SCHEMA_VERSION="2"
+    SUP_CACHE_RESTART_TOKEN="${restartTokenForCache ?: workflow.runName}"
+    SUP_CACHE_DORADO_MODEL="${doradoSupModel}"
+    SUP_CACHE_DORADO_ARGS="${doradoSupBasecallerArgs}"
+    SUP_CACHE_MIN_QSCORE="${params.hq_quality_score}"
+    SUP_CACHE_SKIP_PERSIST=0
+    source "\$BIN_DIR/blast_sup_path.sh"
+    sup_candidate_extract
+    sup_cache_lookup
 
-				_t_hac_fixed_extract_start=\$(now_ms)
-					cut -f1 blast_report_annotated.txt | grep hac_fixed | cut -f1 -d"|" > hac_fixed_readids.list || true
-					if [ -s hac_fixed_readids.list ]; then
-						echo "INFO: hac_fixed reads detected" 1>&2
-					fi
+		_t_hac_fixed_extract_start=\$(now_ms)
+			cut -f1 blast_report_annotated.txt | grep hac_fixed | cut -f1 -d"|" > hac_fixed_readids.list || true
+			if [ -s hac_fixed_readids.list ]; then
+				echo "INFO: hac_fixed reads detected" 1>&2
+			fi
 
-			: > ${barcode}_qced_reads_hq_hac_fixed.fasta
-			_t_hac_fixed_extract_end=\$(now_ms)
-			append_sup_path_timing "hac_fixed_extract" "\$_t_hac_fixed_extract_start" "\$_t_hac_fixed_extract_end"
-			sup_shared_candidate_extract
-			_t_sup_selection_end=\$(date +%s)
-		append_process_timing "sup_selection" "\$_t_sup_selection_start" "\$_t_sup_selection_end"
+	: > ${barcode}_qced_reads_hq_hac_fixed.fasta
+	_t_hac_fixed_extract_end=\$(now_ms)
+	append_sup_path_timing "hac_fixed_extract" "\$_t_hac_fixed_extract_start" "\$_t_hac_fixed_extract_end"
+	sup_shared_candidate_extract
+	_t_sup_selection_end=\$(date +%s)
+append_process_timing "sup_selection" "\$_t_sup_selection_start" "\$_t_sup_selection_end"
 			
-			_t_dorado_sup_start=\$(date +%s)
-			: > ${barcode}_blastreport_sup.sam
-			: > ${barcode}_blastreport_sup_new.fastq
-			sup_summary_write_header ${barcode}_round_sup_new.tsv
-			sup_summary_write_header ${barcode}_round_sup.tsv
-				if [ -s ${barcode}_blastreport_hac.list ];
-				then
-				pod5_reads=""
-				if command -v pod5 >/dev/null 2>&1; then
-					pod5_reads=\$(pod5 inspect summary "${read_file}" 2>/dev/null | perl -ne 'if(/(\\d+)\\s+reads\\b/){print \$1; exit}' || true)
-				fi
-				if [ -n "\$pod5_reads" ] && [[ "\$pod5_reads" != *[!0-9]* ]] && [ "\$pod5_reads" -eq 0 ]; then
-					echo "ERROR: POD5 contains 0 reads; failing this run" 1>&2
-					exit 1
+	_t_dorado_sup_start=\$(date +%s)
+	: > ${barcode}_blastreport_sup.sam
+	: > ${barcode}_blastreport_sup_new.fastq
+	sup_summary_write_header ${barcode}_round_sup_new.tsv
+	sup_summary_write_header ${barcode}_round_sup.tsv
+		if [ -s ${barcode}_blastreport_hac.list ];
+		then
+		pod5_reads=""
+		if command -v pod5 >/dev/null 2>&1; then
+			pod5_reads=\$(pod5 inspect summary "${read_file}" 2>/dev/null | perl -ne 'if(/(\\d+)\\s+reads\\b/){print \$1; exit}' || true)
+		fi
+		if [ -n "\$pod5_reads" ] && [[ "\$pod5_reads" != *[!0-9]* ]] && [ "\$pod5_reads" -eq 0 ]; then
+			echo "ERROR: POD5 contains 0 reads; failing this run" 1>&2
+			exit 1
+			else
+				if [ -s ${barcode}_blastreport_hac_missing.list ]; then
+					_t_dorado_sup_basecaller_start=\$(now_ms)
+					if dorado_basecall_retry "SUP basecalling" "${barcode}_blastreport_sup.sam" \
+					"\$BIN_DIR/with_dorado_lock.sh" "\$DORADO_LOCK" "\$DORADO_LOCK_WAIT" "blast_OTU_pretax:\$round_barcode:sup" -- \
+					${doradoBasecallerLauncher} basecaller -x ${params.dorado_device} \
+					${doradoSupBasecallerArgs} \
+					--min-qscore ${params.hq_quality_score} -l ${barcode}_blastreport_hac_missing.list \
+					${doradoSupModel} ${read_file};
+					then
+						_t_dorado_sup_basecaller_end=\$(now_ms)
+						append_sup_path_timing "dorado_sup_basecaller" "\$_t_dorado_sup_basecaller_start" "\$_t_dorado_sup_basecaller_end"
+						echo "basecalling sup reads" 1>&2
 					else
-						if [ -s ${barcode}_blastreport_hac_missing.list ]; then
-							_t_dorado_sup_basecaller_start=\$(now_ms)
-							if dorado_basecall_retry "SUP basecalling" "${barcode}_blastreport_sup.sam" \
-							"\$BIN_DIR/with_dorado_lock.sh" "\$DORADO_LOCK" "\$DORADO_LOCK_WAIT" "blast_OTU_pretax:\$round_barcode:sup" -- \
-							${doradoBasecallerLauncher} basecaller -x ${params.dorado_device} \
-							${doradoSupBasecallerArgs} \
-							--min-qscore ${params.hq_quality_score} -l ${barcode}_blastreport_hac_missing.list \
-							${doradoSupModel} ${read_file};
-							then
-								_t_dorado_sup_basecaller_end=\$(now_ms)
-								append_sup_path_timing "dorado_sup_basecaller" "\$_t_dorado_sup_basecaller_start" "\$_t_dorado_sup_basecaller_end"
-								echo "basecalling sup reads" 1>&2
-							else
-								exit 1
-							fi
+						exit 1
+					fi
 						
     # SUP split-child diagnostic start
     _split_child_count=\$(awk -F '\\t' '
@@ -4038,486 +4073,462 @@ process blast_OTU_pretax {
         printf 'WARN: SUP emitted %s unique split-child QNAMEs; barcode=%s round=%s\\n' "\$_split_child_count" "${barcode}" "\$round_barcode" >&2
     fi
     # SUP split-child diagnostic end
-							_t_sup_fastq_recover_start=\$(now_ms)
-							samtools fastq -@ ${task.cpus} ${barcode}_blastreport_sup.sam > ${barcode}_blastreport_sup_new.fastq
-							_t_sup_fastq_recover_end=\$(now_ms)
-							append_sup_path_timing "sup_fastq_recover" "\$_t_sup_fastq_recover_start" "\$_t_sup_fastq_recover_end"
-							dorado_sup_sam_records_new=\$(awk 'BEGIN{c=0} !/^@/{c++} END{print c+0}' ${barcode}_blastreport_sup.sam 2>/dev/null || echo 0)
-							dorado_sup_fastq_reads_new=\$(awk 'END{print int(NR/4)}' ${barcode}_blastreport_sup_new.fastq 2>/dev/null || echo 0)
-							dorado_sup_sam_records="\$dorado_sup_sam_records_new"
-							sup_build_new_summary
-						else
-							echo "INFO: all HAC->SUP candidates satisfied from SUP cache; skipping Dorado" 1>&2
-							append_sup_path_timing "dorado_sup_basecaller" "\$(now_ms)" "\$(now_ms)"
-							append_sup_path_timing "sup_fastq_recover" "\$(now_ms)" "\$(now_ms)"
-						fi
-						sup_merge_outputs
-						sup_cache_persist
-						sup_post_dorado
+					_t_sup_fastq_recover_start=\$(now_ms)
+					samtools fastq -@ ${task.cpus} ${barcode}_blastreport_sup.sam > ${barcode}_blastreport_sup_new.fastq
+					_t_sup_fastq_recover_end=\$(now_ms)
+					append_sup_path_timing "sup_fastq_recover" "\$_t_sup_fastq_recover_start" "\$_t_sup_fastq_recover_end"
+					dorado_sup_sam_records_new=\$(awk 'BEGIN{c=0} !/^@/{c++} END{print c+0}' ${barcode}_blastreport_sup.sam 2>/dev/null || echo 0)
+					dorado_sup_fastq_reads_new=\$(awk 'END{print int(NR/4)}' ${barcode}_blastreport_sup_new.fastq 2>/dev/null || echo 0)
+					dorado_sup_sam_records="\$dorado_sup_sam_records_new"
+					sup_build_new_summary
+				else
+					echo "INFO: all HAC->SUP candidates satisfied from SUP cache; skipping Dorado" 1>&2
+					append_sup_path_timing "dorado_sup_basecaller" "\$(now_ms)" "\$(now_ms)"
+					append_sup_path_timing "sup_fastq_recover" "\$(now_ms)" "\$(now_ms)"
 				fi
+				sup_merge_outputs
+				sup_cache_persist
+				sup_post_dorado
+		fi
 			
-				mkdir -p "\$ROUND_DIR"
-				cp ${barcode}_blastreport_sup_annotated_pre.fastq "\$ROUND_DIR/blastreport_sup_annotated_pre.fastq"
-			if acquire_lock "\${SUPFASTQ_LOCK}"; then
-				SUP_DST="\${STATE_DIR}/blastreport_sup_annotated_pre.fastq"
-				rm -f "\$SUP_DST" "\${SUP_DST}.gz"
-				cp -f ${barcode}_blastreport_sup_annotated_pre.fastq.gz "\${SUP_DST}.gz" 2>/dev/null || true
-				release_lock "\${SUPFASTQ_LOCK}"
-			else
-				exit 1
-			fi
-			else
-				echo "No HAC->SUP reads detected; skipping SUP basecalling" 1>&2
-				: > ${barcode}_blastreport_sup.sam
-				: > ${barcode}_blastreport_sup_pre.fastq
-				sup_summary_write_header ${barcode}_round_sup.tsv
-				sup_emit_zero_timing "sup_fastq_merge"
-				sup_emit_zero_timing "sup_summary_merge"
-				sup_emit_zero_timing "sup_cache_persist"
-			fi
-		sup_write_stats
-		_t_dorado_sup_end=\$(date +%s)
-		append_process_timing "dorado_sup" "\$_t_dorado_sup_start" "\$_t_dorado_sup_end"
+		mkdir -p "\$ROUND_DIR"
+		cp ${barcode}_blastreport_sup_annotated_pre.fastq "\$ROUND_DIR/blastreport_sup_annotated_pre.fastq"
+	if acquire_lock "\${SUPFASTQ_LOCK}"; then
+		SUP_DST="\${STATE_DIR}/blastreport_sup_annotated_pre.fastq"
+		rm -f "\$SUP_DST" "\${SUP_DST}.gz"
+		cp -f ${barcode}_blastreport_sup_annotated_pre.fastq.gz "\${SUP_DST}.gz" 2>/dev/null || true
+		release_lock "\${SUPFASTQ_LOCK}"
+	else
+		exit 1
+	fi
+	else
+		echo "No HAC->SUP reads detected; skipping SUP basecalling" 1>&2
+		: > ${barcode}_blastreport_sup.sam
+		: > ${barcode}_blastreport_sup_pre.fastq
+		sup_summary_write_header ${barcode}_round_sup.tsv
+		sup_emit_zero_timing "sup_fastq_merge"
+		sup_emit_zero_timing "sup_summary_merge"
+		sup_emit_zero_timing "sup_cache_persist"
+	fi
+sup_write_stats
+_t_dorado_sup_end=\$(date +%s)
+append_process_timing "dorado_sup" "\$_t_dorado_sup_start" "\$_t_dorado_sup_end"
 	
-		grep -F "|sup|" ${barcode}_blastreport_join.txt > ${barcode}_preblastreport_sup.txt || :
-		# All BLAST-hit reads (any model) for rolling pool retention
-	BLAST_HIT_REPORT="${barcode}_blastreport_join.txt"
-	_t_rolling_pool_update_start=\$(date +%s)
-	: > ${barcode}_tmp_focus_sup.fasta
+grep -F "|sup|" ${barcode}_blastreport_join.txt > ${barcode}_preblastreport_sup.txt || :
+BLAST_HIT_REPORT="${barcode}_blastreport_join.txt"
+_t_rolling_pool_update_start=\$(date +%s)
+: > ${barcode}_tmp_focus_sup.fasta
+: > ${barcode}_tmp_focus_hit.fasta
+BLAST_HIT_EXTRACT_FAILED=0
+if [ -s ${barcode}_preblastreport_sup.txt ]; then
+perl "\$BIN_DIR/focus_hq_tax_fasta.pl" ${barcode}_preblastreport_sup.txt ${fasta_hq_qced} > ${barcode}_tmp_focus_sup.fasta || : > ${barcode}_tmp_focus_sup.fasta
+fi
+if [ -s "\$BLAST_HIT_REPORT" ]; then
+if ! perl "\$BIN_DIR/focus_hq_tax_fasta.pl" "\$BLAST_HIT_REPORT" ${fasta_hq_qced} > ${barcode}_tmp_focus_hit.fasta; then
+	BLAST_HIT_EXTRACT_FAILED=1
 	: > ${barcode}_tmp_focus_hit.fasta
-	BLAST_HIT_EXTRACT_FAILED=0
-	if [ -s ${barcode}_preblastreport_sup.txt ]; then
-		perl "\$BIN_DIR/focus_hq_tax_fasta.pl" ${barcode}_preblastreport_sup.txt ${fasta_hq_qced} > ${barcode}_tmp_focus_sup.fasta || : > ${barcode}_tmp_focus_sup.fasta
-	fi
-	if [ -s "\$BLAST_HIT_REPORT" ]; then
-		if ! perl "\$BIN_DIR/focus_hq_tax_fasta.pl" "\$BLAST_HIT_REPORT" ${fasta_hq_qced} > ${barcode}_tmp_focus_hit.fasta; then
-			BLAST_HIT_EXTRACT_FAILED=1
-			: > ${barcode}_tmp_focus_hit.fasta
-		fi
-	fi
+fi
+fi
 	
-			if acquire_lock "\${QCED_LOCK}"; then
-					if [ -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ];
-					then
-							if ! perl "\$BIN_DIR/filter_sup_non_no_adapter_fasta.pl" "\$PROTECTED_READ_IDS_EVER_STATE" "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" > tmp; then
-								echo "WARN: filter_sup_non_no_adapter_fasta.pl failed; retaining existing rolling pool prior to append" 1>&2
-								: > tmp
-							fi
-				# Only rewrite the rolling FASTA when we have `|sup|` entries; otherwise keep existing contents.
-				if [ -s tmp ]; then
-					cat tmp > "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-				fi
-
-				# Always append HAC-derived sequences (hac_fixed + hac2sup) so consensus can extract them.
-				: >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-				cat ${barcode}_qced_reads_hq_hac_fixed.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-				if [ -s ${barcode}_qced_reads_hq_hac2sup_sup.fasta ]; then
-					cat ${barcode}_qced_reads_hq_hac2sup_sup.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-				else
-					cat ${barcode}_qced_reads_hq_hac2sup.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-				fi
-
-				if [ -s ${barcode}_tmp_focus_sup.fasta ]; then
-					seqkit grep -r -p "\\|sup\\|" ${barcode}_tmp_focus_sup.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" || :
-				fi
-				# Ensure all BLAST-hit reads are retained in the rolling pool
-				if [ -s ${barcode}_tmp_focus_hit.fasta ]; then
-					cat ${barcode}_tmp_focus_hit.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-				fi
-			else
-				if [ "\$BLAST_HIT_EXTRACT_FAILED" -ne 0 ] && [ -s "\$BLAST_HIT_REPORT" ]; then
-					echo "ERROR: failed to initialize rolling pool from BLAST-hit FASTA extraction" 1>&2
-					exit 1
-				fi
-				cat ${barcode}_tmp_focus_hit.fasta > "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-				# Also include HAC-derived sequences on first creation.
-				cat ${barcode}_qced_reads_hq_hac_fixed.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-				if [ -s ${barcode}_qced_reads_hq_hac2sup_sup.fasta ]; then
-					cat ${barcode}_qced_reads_hq_hac2sup_sup.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-				else
-					cat ${barcode}_qced_reads_hq_hac2sup.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-				fi
-			fi
-			# Preserve sticky protected reads in the rolling pool even when they are absent
-			# from the current round's BLAST-hit/HAC-focused append set.
-			protected_pool_added=0
-			if [ -s "\$PROTECTED_READ_IDS_EVER_STATE" ] && [ -s ${barcode}_qced_reads_hq_accumulated.fasta ]; then
-				PROTECTED_POOL_FASTA="\${STATE_DIR}/${barcode}_rolling_pool_protected.fasta"
-				awk 'NR==FNR{ids[\$1]=1; next} /^>/{uuid=substr(\$0,2); sub(/[|].*/,"",uuid); keep=(uuid in ids); if(keep)print; next} keep{print}' \
-					"\$PROTECTED_READ_IDS_EVER_STATE" \
-					${barcode}_qced_reads_hq_accumulated.fasta > "\$PROTECTED_POOL_FASTA" || : > "\$PROTECTED_POOL_FASTA"
-				if [ -s "\$PROTECTED_POOL_FASTA" ]; then
-					cat "\$PROTECTED_POOL_FASTA" >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-					protected_pool_added=\$(grep -c '^>' "\$PROTECTED_POOL_FASTA" || echo 0)
-				fi
-				rm -f "\$PROTECTED_POOL_FASTA"
-			fi
-			# Rolling pool stats (pre-dedup)
-			ROLLING_POOL_STATS="\$ROUND_DIR/${barcode}_rolling_pool_stats.tsv"
-			: > "\$ROLLING_POOL_STATS"
-			if [ -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ]; then
-				pool_before=\$(grep -c '^>' "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" || echo 0)
-			else
-				pool_before=0
-			fi
-			hit_appended=0
-			if [ -s "\$BLAST_HIT_REPORT" ]; then
-				hit_appended=\$(awk -F'[;,]' 'NF>0 && \$1!=""{print \$1}' "\$BLAST_HIT_REPORT" | LC_ALL=C sort -u | wc -l | tr -d ' ')
-			fi
-			printf 'hit_ids_appended\t%s\nprotected_ids_reappended\t%s\npool_before_dedup\t%s\n' "\$hit_appended" "\$protected_pool_added" "\$pool_before" >> "\$ROLLING_POOL_STATS"
-			# Deduplicate rolling FASTA by read_id, keeping best model (sup > hac > fast).
-			DEDUP_TMP="\${STATE_DIR}/qced_reads_hq_accumulated.dedup.tmp"
-			awk 'BEGIN{FS="|"}
-				/^>/{
-					header=\$0;
-					id=substr(header,2);
-					model="";
-					if (index(id,"|")>0) { split(id,a,"|"); id=a[1]; model=a[3]; } else { model=""; }
-					if (model=="hac2sup" || model=="hac_fixed") model="hac";
-					rank=(model=="sup"?3:(model=="hac"?2:1));
-					if (!(id in best) || rank>best[id]) {
-						best[id]=rank; hdr[id]=header; seq[id]=""; keep=1;
-					} else {
-						keep=0;
-					}
-					cur=id;
-					next
-				}
-				{
-					if (keep) { seq[cur]=seq[cur] \$0 ORS; }
-				}
-				END{
-					for (id in hdr) {
-						print hdr[id];
-						printf "%s", seq[id];
-					}
-				}' "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" > "\$DEDUP_TMP" \
-					&& seqkit sort -n "\$DEDUP_TMP" > "\${DEDUP_TMP}.sorted" \
-					&& mv "\${DEDUP_TMP}.sorted" "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
-			# O1: rebuild .fai index after dedup rewrite so consensus uses indexed random-access extraction.
-			# Delete first: a failed rebuild must leave no stale index (wrong byte offsets).
-			rm -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta.fai"
-			command -v samtools >/dev/null 2>&1 && samtools faidx "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" 2>/dev/null || true
-			seqkit faidx "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" 2>/dev/null || true
-			pool_after=\$(grep -c '^>' "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" || echo 0)
-			printf 'pool_after_dedup\t%s\n' "\$pool_after" >> "\$ROLLING_POOL_STATS"
-			_t_rolling_pool_update_end=\$(date +%s)
-			append_process_timing "rolling_pool_update" "\$_t_rolling_pool_update_start" "\$_t_rolling_pool_update_end"
-			_t_prune_apply_start=\$(date +%s)
-					PRUNE_CUMULATIVE_POOL_ALL="${pruneCumulativePoolAll ? '1' : '0'}"
-					PRUNE_UNASSIGNED_DROP_READS="${(pruneUnassignedClusters && pruneUnassignedDropReads) ? 1 : 0}"
-					OTU_PRUNE_POLICY="${otuPruneFrozenPolicyCanonical}"
-					OTU_PRUNE_POLICY_EFFECTIVE="\$OTU_PRUNE_POLICY"
-					FORCE_PRUNE_MAX_MB="${otuLockForcePruneMaxFastaMbStr}"
-					FORCE_PRUNE_OVERRIDE="${otuForcePruneOverride ? '1' : '0'}"
-					ROUND_PRUNE_IDS="\$ROUND_DIR/${barcode}_round_prune_ids.list"
-					ROUND_PRUNE_STATS="\$ROUND_DIR/${barcode}_round_prune_stats.tsv"
-					ROUND_PRUNE_APPLY_STATS="\$ROUND_DIR/${barcode}_round_prune_apply.tsv"
-					C1_PRUNE_IDS="\$ROUND_DIR/${barcode}_c1_prune_ids.list"
-					SIZE_STREAK_PRUNE_IDS="\$ROUND_DIR/${barcode}_size_streak_prune_ids.list"
-					CONSENSUS_UNASSIGNED_PRUNE_IDS="\$ROUND_DIR/${barcode}_consensus_unassigned_prune_ids.list"
-					ROUND_PRUNE_TMP="\${STATE_DIR}/qced_reads_hq_accumulated.round_pruned.tmp"
-					mkdir -p "\$ROUND_DIR"
-					: > "\$C1_PRUNE_IDS"
-					: > "\$SIZE_STREAK_PRUNE_IDS"
-					: > "\$CONSENSUS_UNASSIGNED_PRUNE_IDS"
-					: > "\$ROUND_PRUNE_IDS"
-					: > "\$ROUND_PRUNE_STATS"
-					: > "\$ROUND_PRUNE_APPLY_STATS"
-					if [ "${replicateModeCanonical}" = "track" ] && [ -n "${otuPruneSamplesFileValue}" ]; then
-						echo "ERROR: --otu_prune_samples_file is not supported in track mode; prune must use track_active_units.txt" 1>&2
-						exit 1
+	if acquire_lock "\${QCED_LOCK}"; then
+			if [ -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ];
+			then
+					if ! perl "\$BIN_DIR/filter_sup_non_no_adapter_fasta.pl" "\$PROTECTED_READ_IDS_EVER_STATE" "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" > tmp; then
+						echo "WARN: filter_sup_non_no_adapter_fasta.pl failed; retaining existing rolling pool prior to append" 1>&2
+						: > tmp
 					fi
-
-					if awk -v t="\$FORCE_PRUNE_MAX_MB" 'BEGIN{exit !(t>0)}'; then
-						if [ -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ]; then
-								_fbytes=\$(wc -c < "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" | tr -d ' ')
-								_fmb=\$(awk -v b="\$_fbytes" 'BEGIN{printf "%.3f", b/1048576.0}')
-							if awk -v mb="\$_fmb" -v thr="\$FORCE_PRUNE_MAX_MB" 'BEGIN{exit !(mb>thr)}'; then
-								if [ "\$OTU_PRUNE_POLICY" = "never" ] && [ "\$FORCE_PRUNE_OVERRIDE" != "1" ]; then
-									echo "WARN: qced_reads_hq_accumulated.fasta size=\${_fmb}MB exceeds threshold=\${FORCE_PRUNE_MAX_MB}MB but archive policy is never and otu_force_prune_override=false; skipping forced archive (C1)" 1>&2
-								elif [ -s "\${STATE_DIR}/otu_consolidated_keys.tsv" ]; then
-									OTU_PRUNE_POLICY_EFFECTIVE="until_consolidated"
-									echo "WARN: qced_reads_hq_accumulated.fasta size=\${_fmb}MB exceeds threshold=\${FORCE_PRUNE_MAX_MB}MB; forcing consolidated-key archive (C1) for this round" 1>&2
-								else
-									echo "WARN: qced_reads_hq_accumulated.fasta size=\${_fmb}MB exceeds threshold=\${FORCE_PRUNE_MAX_MB}MB but no consolidated keys available; skipping forced archive (C1)" 1>&2
-								fi
-							fi
-						fi
-					fi
-
-					if [ "\$OTU_PRUNE_POLICY_EFFECTIVE" = "always" ]; then
-						if [ -s "\${STATE_DIR}/otu_frozen_members.tsv" ]; then
-							cut -f2 "\${STATE_DIR}/otu_frozen_members.tsv" \
-								| awk '{split(\$0,a,"|"); if (a[1]!="") print a[1]}' \
-								| LC_ALL=C sort -u > "\$C1_PRUNE_IDS"
-						fi
-					elif [ "\$OTU_PRUNE_POLICY_EFFECTIVE" = "until_consolidated" ]; then
-						if [ -s "\${STATE_DIR}/otu_consolidated_keys.tsv" ]; then
-							C1_SAMPLES_FILE="${otuPruneSamplesFileValue}"
-							if [ -z "\$C1_SAMPLES_FILE" ]; then
-								C1_SAMPLES_FILE="${sampleInfoDir}/samples.txt"
-								if [ "${replicateModeCanonical}" = "track" ]; then
-									C1_SAMPLES_FILE="${sampleInfoDir}/track_active_units.txt"
-								fi
-							fi
-							if [ ! -f "\$C1_SAMPLES_FILE" ]; then
-								C1_SAMPLES_FILE=""
-							fi
-							C1_STABLE_KEYS="\${DEDUP_TMP}.consolidated.stable.tsv"
-							C1_IDENTITY_MAP="\${DEDUP_TMP}.identity.tsv"
-							C1_DISPLAY_KEYS="\${DEDUP_TMP}.consolidated.display.tsv"
-							C1_DISPLAY_HEADERS="\${DEDUP_TMP}.current_headers.fasta"
-							perl "\$BIN_DIR/consensus_otu_identity.pl" keys --column 2 \
-								--input "\${STATE_DIR}/otu_consolidated_keys.tsv" --legacy "\${STATE_DIR}/consensus_legacy_ownership.tsv" --out "\$C1_STABLE_KEYS"
-							perl "\$BIN_DIR/consensus_otu_identity.pl" map --clstr "\${STATE_DIR}/qced_reads_nr.fasta.clstr" \
-								--hash-map "\$OTU_HASH_MAP_STATE" --targets "${params.targets}" --out "\$C1_IDENTITY_MAP"
-							perl "\$BIN_DIR/consensus_otu_identity.pl" display-keys --map "\$C1_IDENTITY_MAP" \
-								--input "\$C1_STABLE_KEYS" --out "\$C1_DISPLAY_KEYS"
-							perl "\$BIN_DIR/consensus_otu_identity.pl" prune-view --map "\$C1_IDENTITY_MAP" \
-								--clstr "\${STATE_DIR}/qced_reads_nr.fasta.clstr" --input "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" --out "\$C1_DISPLAY_HEADERS"
-							RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${replicateModeCanonical}" \
-							RTBIOSCAN_TRACK_ACTIVE_UNITS="${sampleInfoDir}/track_active_units.txt" \
-							RTBIOSCAN_TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv" \
-							"\$BIN_DIR/otu_c1_prune_ids.sh" \
-								"until_consolidated" \
-								"\$C1_DISPLAY_HEADERS" \
-								"\${DEDUP_TMP}.active_ids" \
-								"" \
-								"\$C1_DISPLAY_KEYS" \
-								"\$C1_SAMPLES_FILE" \
-								"${otuConsolidatedKeysMixedPolicyCanonical}" \
-								"\$OBSERVED_NO_ADAPTER"
-							awk '/^>/{id=substr(\$0,2); sub(/ .*/, "", id); split(id,a,"|"); if (a[1]!="") print a[1]}' "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" | LC_ALL=C sort -u > "\${DEDUP_TMP}.all_ids"
-							awk '{split(\$0,a,"|"); if (a[1]!="") print a[1]}' "\${DEDUP_TMP}.active_ids" | LC_ALL=C sort -u > "\${DEDUP_TMP}.active_base_ids"
-							comm -23 "\${DEDUP_TMP}.all_ids" "\${DEDUP_TMP}.active_base_ids" > "\$C1_PRUNE_IDS" || : > "\$C1_PRUNE_IDS"
-							rm -f "\${DEDUP_TMP}.active_ids" "\${DEDUP_TMP}.all_ids" "\${DEDUP_TMP}.active_base_ids"
-							rm -f "\$C1_STABLE_KEYS" "\$C1_IDENTITY_MAP" "\$C1_DISPLAY_KEYS" "\$C1_DISPLAY_HEADERS"
-						fi
-					fi
-
-					# Small-OTU pruning uses round-local OTU membership/size (independent of BLAST decision path).
-					SMALL_OTU_PRUNE_ENABLED=0
-					SMALL_OTU_PRUNE_REASON="unknown"
-					OTU_BLAST_FILTER_MODE="${otuBlastFilterModeCanonical}"
-					OTU_BLAST_FILTER_SKIP_ROUNDS="${otuBlastFilterSkipRoundsCanonical}"
-					OTU_BLAST_FORCE_USE_FILTERED="${otuBlastForceUseFiltered ? '1' : '0'}"
-					OTU_BLAST_MIN_MEMBERS="${otuBlastMinMembersStr}"
-					ROUND_INDEX_FILE="\${STATE_DIR}/round_index.tsv"
-					ROUND_INDEX=\$(awk -F'\t' -v rb="\$round_barcode" '\$1==rb{print \$2; exit}' "\$ROUND_INDEX_FILE" 2>/dev/null || true)
-					if [ -z "\$ROUND_INDEX" ] || [[ "\$ROUND_INDEX" == *[!0-9]* ]] || [ "\$ROUND_INDEX" -lt 1 ]; then
-						SMALL_OTU_PRUNE_REASON="missing_round_index"
-						echo "WARN: missing/invalid round index for small-OTU prune (round_barcode=\$round_barcode, file=\$ROUND_INDEX_FILE); skipping size-based pruning this round" 1>&2
-					elif [ -z "\$OTU_BLAST_MIN_MEMBERS" ] || [[ "\$OTU_BLAST_MIN_MEMBERS" == *[!0-9]* ]] || [ "\$OTU_BLAST_MIN_MEMBERS" -lt 2 ]; then
-						SMALL_OTU_PRUNE_REASON="min_members_lt2"
-					else
-						OTU_BLAST_EFFECTIVE_MODE_TSV="${barcode}_blast_filter_effective_mode_prune.tsv"
-						"\$BIN_DIR/otu_blast_effective_mode.sh" \
-							"\$OTU_BLAST_FILTER_MODE" \
-							"\$OTU_BLAST_FILTER_SKIP_ROUNDS" \
-							"\$ROUND_INDEX" \
-							> "\$OTU_BLAST_EFFECTIVE_MODE_TSV"
-						effective_mode_value() {
-							local key="\$1"
-							awk -F'\t' -v k="\$key" '\$1==k{print \$2; exit}' "\$OTU_BLAST_EFFECTIVE_MODE_TSV"
-						}
-							OTU_BLAST_EFFECTIVE_MODE=\$(effective_mode_value effective_mode)
-							OTU_BLAST_EFFECTIVE_REASON=\$(effective_mode_value reason)
-							if [ "\$OTU_BLAST_FORCE_USE_FILTERED" = "1" ] && [ "\$OTU_BLAST_EFFECTIVE_MODE" != "off" ]; then
-								echo "INFO: size_streak_prune force_use_filtered=1 bypassing threshold and no-cluster decision knobs" 1>&2
-								OTU_BLAST_EFFECTIVE_MODE="enforce"
-								OTU_BLAST_EFFECTIVE_REASON="force_use_filtered"
-							fi
-						if [ "\$OTU_BLAST_EFFECTIVE_MODE" = "enforce" ]; then
-							SMALL_OTU_PRUNE_ENABLED=1
-							SMALL_OTU_PRUNE_REASON="effective_mode_enforce"
-						else
-							SMALL_OTU_PRUNE_REASON="effective_mode_\${OTU_BLAST_EFFECTIVE_MODE}"
-						fi
-					fi
-					if [ "\$SMALL_OTU_PRUNE_ENABLED" = "1" ]; then
-						echo "INFO: size_streak_prune enabled=1 reason=\$SMALL_OTU_PRUNE_REASON round_index=\${ROUND_INDEX:-NA} min_members=\${OTU_BLAST_MIN_MEMBERS} skip_rounds=\${OTU_BLAST_FILTER_SKIP_ROUNDS} effective_mode=\${OTU_BLAST_EFFECTIVE_MODE:-NA}" 1>&2
-					else
-						echo "INFO: size_streak_prune enabled=0 reason=\$SMALL_OTU_PRUNE_REASON round_index=\${ROUND_INDEX:-NA} min_members=\${OTU_BLAST_MIN_MEMBERS} skip_rounds=\${OTU_BLAST_FILTER_SKIP_ROUNDS} effective_mode=\${OTU_BLAST_EFFECTIVE_MODE:-NA}" 1>&2
-					fi
-					APPLY_SIZE_STREAK=0
-					if [ "\$OTU_SIZE_STREAK_MODE" = "enforce" ] || [ "\$SMALL_OTU_PRUNE_ENABLED" = "1" ]; then
-						APPLY_SIZE_STREAK=1
-					fi
-						if [ "\$APPLY_SIZE_STREAK" = "1" ] && [ -s "\${STATE_DIR}/${barcode}_otu_size_streak_prune_ids_last.txt" ]; then
-							awk '{split(\$0,a,\"|\"); if (a[1] != \"\") print a[1]}' "\${STATE_DIR}/${barcode}_otu_size_streak_prune_ids_last.txt" | LC_ALL=C sort -u > "\$SIZE_STREAK_PRUNE_IDS"
-						fi
-						# Protect ever-assigned reads plus current members of persisted protected OTU keys.
-						PROTECTED_READ_IDS_EVER="\${STATE_DIR}/${barcode}_protected_read_ids_ever.list"
-						PROTECTED_READ_IDS_ROUND="\${ROUND_DIR}/${barcode}_assigned_otu_member_ids_ever.list"
-						PROTECTED_IDS="\${ROUND_DIR}/${barcode}_protected_prune_ids.list"
-						# Compute current blast-unassigned read IDs for live reporting, independent of prune-mode suppression.
-						BLAST_UNASSIGNED_CURRENT_STATE="\${STATE_DIR}/${barcode}_blast_unassigned_current.list"
-						BLAST_UNASSIGNED_CURRENT_TMP="\${BLAST_UNASSIGNED_CURRENT_STATE}.tmp"
-						: > "\$BLAST_UNASSIGNED_CURRENT_TMP"
-						if [ -s blast_report_annotated_otu_evidence.txt ]; then
-							if ! perl "\$BIN_DIR/blast_unassigned_read_ids.pl" \
-								"\$RTB_R4B_SIDECAR" \
-								"\$BLAST_UNASSIGNED_CURRENT_TMP" \
-								--min-level "${assignProtLevelCanonical}"; then
-								echo "WARN: blast_unassigned_read_ids.pl failed; clearing live blast-unassigned report state" 1>&2
-								: > "\$BLAST_UNASSIGNED_CURRENT_TMP"
-							fi
-						fi
-						mv -f "\$BLAST_UNASSIGNED_CURRENT_TMP" "\$BLAST_UNASSIGNED_CURRENT_STATE" 2>/dev/null \
-							|| cp -f "\$BLAST_UNASSIGNED_CURRENT_TMP" "\$BLAST_UNASSIGNED_CURRENT_STATE" 2>/dev/null \
-							|| true
-						rm -f "\$BLAST_UNASSIGNED_CURRENT_TMP" 2>/dev/null || true
-						# Compute blast-unassigned read IDs (reads whose OTU never received a BLAST assignment).
-					BLAST_UNASSIGNED_IDS="${barcode}_blast_unassigned_reads_round.list"
-					: > "\$BLAST_UNASSIGNED_IDS"
-					BLAST_UNASSIGNED_STATUS="mode_off"
-					if [ "${otuBlastUnassignedModeCanonical}" != "off" ]; then
-						if [ "\${ROUND_INDEX:-0}" -le "${params.otu_blast_unassigned_grace_rounds}" ] 2>/dev/null; then
-							BLAST_UNASSIGNED_STATUS="grace"
-						else
-							if [ -s blast_report_annotated_otu_evidence.txt ]; then
-								if ! perl "\$BIN_DIR/blast_unassigned_read_ids.pl" \
-									"\$RTB_R4B_SIDECAR" \
-									"\$BLAST_UNASSIGNED_IDS" \
-									--min-level "${assignProtLevelCanonical}"; then
-									echo "WARN: blast_unassigned_read_ids.pl failed; continuing without blast-unassigned prune" 1>&2
-									: > "\$BLAST_UNASSIGNED_IDS"
-								fi
-							fi
-							if [ "${otuBlastUnassignedModeCanonical}" = "observe" ]; then
-								BLAST_UNASSIGNED_STATUS="observe"
-								: > "\$BLAST_UNASSIGNED_IDS"
-							else
-								BLAST_UNASSIGNED_STATUS="applied"
-							fi
-						fi
-					fi
-					cp "\$BLAST_UNASSIGNED_IDS" "\$ROUND_DIR/${barcode}_blast_unassigned_reads_round.list" 2>/dev/null || true
-				cp blast_report_annotated_otu_evidence.txt "\$ROUND_DIR/${barcode}_blast_report_annotated_otu_evidence.txt" 2>/dev/null || true
-					# Intentional sticky semantics: _last.list retains the most recent consensus
-					# unassigned determination across rounds. When consensus emits no new list,
-					# the previous one is re-used, keeping those reads excluded until overridden.
-					if [ "\$PRUNE_UNASSIGNED_DROP_READS" = "1" ] && [ -s "\${STATE_DIR}/${barcode}_pruned_unassigned_reads_last.list" ]; then
-							awk '{split(\$0,a,"|"); if (a[1]!="") print a[1]}' "\${STATE_DIR}/${barcode}_pruned_unassigned_reads_last.list" | LC_ALL=C sort -u > "\$CONSENSUS_UNASSIGNED_PRUNE_IDS"
-					fi
-
-						if ! bash "\$BIN_DIR/prune_round_orchestrate.sh" \
-							--protected-read-ids-ever "\$PROTECTED_READ_IDS_EVER" \
-							--protected-read-ids-round "\$PROTECTED_READ_IDS_ROUND" \
-							--protected-ids "\$PROTECTED_IDS" \
-							--candidate size_streak "\$SIZE_STREAK_PRUNE_IDS" \
-							--candidate consensus_unassigned "\$CONSENSUS_UNASSIGNED_PRUNE_IDS" \
-							--candidate blast_unassigned "\$BLAST_UNASSIGNED_IDS" \
-						--c1-ids "\$C1_PRUNE_IDS" \
-						--round-prune-ids "\$ROUND_PRUNE_IDS" \
-						--round-prune-stats "\$ROUND_PRUNE_STATS" \
-						--prune-cumulative-pool-all "\$PRUNE_CUMULATIVE_POOL_ALL" \
-						--blast-unassigned-status "\$BLAST_UNASSIGNED_STATUS" \
-						--merge-error-context "failed to merge round prune ID lists"; then
-							exit 1
-					fi
-
-						cp "\$ROUND_PRUNE_IDS" "\${STATE_DIR}/${barcode}_round_prune_ids_last.list" 2>/dev/null || true
-						cp "\$ROUND_PRUNE_STATS" "\${STATE_DIR}/${barcode}_round_prune_stats_last.tsv" 2>/dev/null || true
-						_t_prune_apply_end=\$(date +%s)
-						append_process_timing "prune_apply" "\$_t_prune_apply_start" "\$_t_prune_apply_end"
-						release_lock "\${QCED_LOCK}"
-			else
-				exit 1
+		if [ -s tmp ]; then
+			cat tmp > "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
 		fi
-		rm -f ${barcode}_tmp_focus_sup.fasta ${barcode}_tmp_focus_hit.fasta
 
-		# -- §7: Report dedup and state finalization --
-		# Deduplicate canonical annotated reports by read_id keeping best model (sup > hac > fast).
-			for f in blast_report_annotated.txt blast_report_annotated_otu.txt blast_report_annotated_noadapter.txt; do
-				if [ -s "\$f" ]; then
-					awk 'BEGIN{FS=OFS="\t"}
-					{
-						split(\$1,a,"|"); id=a[1]; model=a[3];
-						if (model=="hac2sup" || model=="hac_fixed") model="hac";
-						r=(model=="sup"?3:(model=="hac"?2:1));
-						if (!(id in br) || r>br[id]) { br[id]=r; line[id]=\$0; }
-					}
-						END{ for(id in line) print line[id]; }' "\$f" \
-							| LC_ALL=C sort -k1,1 > "\${f}.tmp" && mv "\${f}.tmp" "\$f"
-					fi
-				done
+		: >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
+		cat ${barcode}_qced_reads_hq_hac_fixed.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
+		if [ -s ${barcode}_qced_reads_hq_hac2sup_sup.fasta ]; then
+			cat ${barcode}_qced_reads_hq_hac2sup_sup.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
+		else
+			cat ${barcode}_qced_reads_hq_hac2sup.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
+		fi
 
-			if [ "\$STATE_BLASTREPORT_EXISTS" -eq 1 ]; then
-				if ! "\$BIN_DIR/prefer_blast_rows_by_model.sh" \
-					--input blast_report_annotated.txt \
-					--output blast_report_annotated_preferred.txt \
-					--policy sup_hac2sup_preferred; then
-					echo "ERROR: failed to build preferred BLAST annotated report" 1>&2
-					exit 1
-				fi
-			else
-				cp blast_report_annotated.txt blast_report_annotated_preferred.txt 2>/dev/null || : > blast_report_annotated_preferred.txt
-			fi
-
-		# Diagnostic OTU membership export from evidence-tier BLAST OTU report.
-		if [ -s blast_report_annotated_otu_evidence.txt ]; then
-		if ! perl "\$BIN_DIR/otu_export_members_from_blastreport.pl" \
-			blast_report_annotated_otu_evidence.txt \
-			"\$OTU_MEMBERS_BLASTDIAG" \
-			"\$OTU_SIZES_BLASTDIAG" \
-			"\$OTU_MEMBERS_BLASTDIAG_STATS"; then
-			echo "WARN: failed to export BLAST-diagnostic OTU membership from blast_report_annotated_otu_evidence.txt" 1>&2
-			: > "\$OTU_MEMBERS_BLASTDIAG"
-			: > "\$OTU_SIZES_BLASTDIAG"
-			: > "\$OTU_MEMBERS_BLASTDIAG_STATS"
+		if [ -s ${barcode}_tmp_focus_sup.fasta ]; then
+			seqkit grep -r -p "\\|sup\\|" ${barcode}_tmp_focus_sup.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" || :
+		fi
+		if [ -s ${barcode}_tmp_focus_hit.fasta ]; then
+			cat ${barcode}_tmp_focus_hit.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
 		fi
 	else
-		: > "\$OTU_MEMBERS_BLASTDIAG"
-		: > "\$OTU_SIZES_BLASTDIAG"
-		: > "\$OTU_MEMBERS_BLASTDIAG_STATS"
-	fi
-	if [ -s "\$OTU_MEMBERS_BLASTDIAG_STATS" ]; then
-		sed 's/^/INFO: otu_members_blastdiag\t/' "\$OTU_MEMBERS_BLASTDIAG_STATS" 1>&2 || true
-	fi
-	
-		mkdir -p "\$ROUND_DIR"
-			copy_soft blast_process_timings.tsv "\$ROUND_DIR/${barcode}_blast_process_timings.tsv"
-			copy_soft blast_process_timings.tsv "\${STATE_DIR}/${barcode}_blast_process_timings_last.tsv"
-			copy_soft "\$OTU_REFINE_PHASE_TIMINGS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_phase_timings.tsv"
-			copy_soft "\$OTU_REFINE_PHASE_TIMINGS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_phase_timings_last.tsv"
-			copy_soft "\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_phase_timings_ms.tsv"
-			copy_soft "\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_phase_timings_ms_last.tsv"
-			copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" "\$ROUND_DIR/${barcode}_otu_refine_process_breakdown.tsv"
-			copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" "\${STATE_DIR}/${barcode}_otu_refine_process_breakdown_last.tsv"
-			copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_process_breakdown_ms.tsv"
-			copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_process_breakdown_ms_last.tsv"
-			copy_soft "\$OTU_REFINE_WORKLOAD_STATS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_workload_stats.tsv"
-			copy_soft "\$OTU_REFINE_WORKLOAD_STATS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_workload_stats_last.tsv"
-			copy_soft "\$SUP_PATH_STATS_FILE" "\$ROUND_DIR/${barcode}_sup_path_stats.tsv"
-			copy_soft "\$SUP_PATH_TIMINGS_MS_FILE" "\$ROUND_DIR/${barcode}_sup_path_timings_ms.tsv"
-			copy_soft "\$SUP_PATH_TIMINGS_MS_FILE" "\${STATE_DIR}/${barcode}_sup_path_timings_ms_last.tsv"
-			copy_soft ${barcode}_blastreport_hac.list "\$ROUND_DIR/${barcode}_blastreport_hac.list"
-			copy_soft ${barcode}_blastreport_sup.list "\$ROUND_DIR/${barcode}_blastreport_sup.list"
-			cp ${barcode}_blastreport_round.txt "\$ROUND_DIR/blastreport.txt"
-		# R4-D: advance the versioned BLAST-state initialization marker only after
-		# every state publication above succeeded (a failed attempt never reaches
-		# this point). The write is atomic and idempotent, so retries converge.
-		if acquire_lock "\${BLASTREPORT_LOCK}"; then
-			BLAST_STATE_INIT_TMP="\${BLAST_STATE_INIT_MARKER}.tmp.\$\$"
-			printf 'RTB-R4D-BLAST-STATE\t1\n' > "\$BLAST_STATE_INIT_TMP"
-			mv "\$BLAST_STATE_INIT_TMP" "\$BLAST_STATE_INIT_MARKER"
-			release_lock "\${BLASTREPORT_LOCK}"
-		else
+		if [ "\$BLAST_HIT_EXTRACT_FAILED" -ne 0 ] && [ -s "\$BLAST_HIT_REPORT" ]; then
+			echo "ERROR: failed to initialize rolling pool from BLAST-hit FASTA extraction" 1>&2
 			exit 1
 		fi
-		copy_soft "\$BLAST_FILTER_STATS" "\$ROUND_DIR/${barcode}_blast_filter_stats.tsv"
-		copy_soft "\$BLAST_FILTER_KEPT_OTUS" "\$ROUND_DIR/${barcode}_blast_filter_kept_otus.tsv"
-		copy_soft "\$BLAST_FILTER_DROPPED_IDS" "\$ROUND_DIR/${barcode}_blast_filter_dropped_read_ids.list"
-		copy_soft "\$BLAST_FILTER_DROPPED_IDS" "\${STATE_DIR}/${barcode}_blast_filter_dropped_read_ids_last.list"
-		copy_soft "\$OTU_MEMBERS_BLASTDIAG" "\$ROUND_DIR/otu_members_blastdiag.tsv"
-	copy_soft "\$OTU_SIZES_BLASTDIAG" "\$ROUND_DIR/otu_sizes_blastdiag.tsv"
-	copy_soft "\$OTU_MEMBERS_BLASTDIAG_STATS" "\$ROUND_DIR/otu_members_blastdiag_stats.tsv"
-		copy_soft "\$OTU_MEMBERS_BLASTDIAG" "\${STATE_DIR}/${barcode}_otu_members_blastdiag.tsv"
-		copy_soft "\$OTU_SIZES_BLASTDIAG" "\${STATE_DIR}/${barcode}_otu_sizes_blastdiag.tsv"
-		copy_soft "\$OTU_MEMBERS_BLASTDIAG_STATS" "\${STATE_DIR}/${barcode}_otu_members_blastdiag_stats_last.tsv"
-		rtbioscan_round_lock_unpin
+		cat ${barcode}_tmp_focus_hit.fasta > "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
+		cat ${barcode}_qced_reads_hq_hac_fixed.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
+		if [ -s ${barcode}_qced_reads_hq_hac2sup_sup.fasta ]; then
+			cat ${barcode}_qced_reads_hq_hac2sup_sup.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
+		else
+			cat ${barcode}_qced_reads_hq_hac2sup.fasta >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
+		fi
+	fi
+	protected_pool_added=0
+	if [ -s "\$PROTECTED_READ_IDS_EVER_STATE" ] && [ -s ${barcode}_qced_reads_hq_accumulated.fasta ]; then
+		PROTECTED_POOL_FASTA="\${STATE_DIR}/${barcode}_rolling_pool_protected.fasta"
+		awk 'NR==FNR{ids[\$1]=1; next} /^>/{uuid=substr(\$0,2); sub(/[|].*/,"",uuid); keep=(uuid in ids); if(keep)print; next} keep{print}' \
+			"\$PROTECTED_READ_IDS_EVER_STATE" \
+			${barcode}_qced_reads_hq_accumulated.fasta > "\$PROTECTED_POOL_FASTA" || : > "\$PROTECTED_POOL_FASTA"
+		if [ -s "\$PROTECTED_POOL_FASTA" ]; then
+			cat "\$PROTECTED_POOL_FASTA" >> "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
+			protected_pool_added=\$(grep -c '^>' "\$PROTECTED_POOL_FASTA" || echo 0)
+		fi
+		rm -f "\$PROTECTED_POOL_FASTA"
+	fi
+	ROLLING_POOL_STATS="\$ROUND_DIR/${barcode}_rolling_pool_stats.tsv"
+	: > "\$ROLLING_POOL_STATS"
+	if [ -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ]; then
+		pool_before=\$(grep -c '^>' "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" || echo 0)
+	else
+		pool_before=0
+	fi
+	hit_appended=0
+	if [ -s "\$BLAST_HIT_REPORT" ]; then
+		hit_appended=\$(awk -F'[;,]' 'NF>0 && \$1!=""{print \$1}' "\$BLAST_HIT_REPORT" | LC_ALL=C sort -u | wc -l | tr -d ' ')
+	fi
+	printf 'hit_ids_appended\t%s\nprotected_ids_reappended\t%s\npool_before_dedup\t%s\n' "\$hit_appended" "\$protected_pool_added" "\$pool_before" >> "\$ROLLING_POOL_STATS"
+	DEDUP_TMP="\${STATE_DIR}/qced_reads_hq_accumulated.dedup.tmp"
+	awk 'BEGIN{FS="|"}
+		/^>/{
+			header=\$0;
+			id=substr(header,2);
+			model="";
+			if (index(id,"|")>0) { split(id,a,"|"); id=a[1]; model=a[3]; } else { model=""; }
+			if (model=="hac2sup" || model=="hac_fixed") model="hac";
+			rank=(model=="sup"?3:(model=="hac"?2:1));
+			if (!(id in best) || rank>best[id]) {
+				best[id]=rank; hdr[id]=header; seq[id]=""; keep=1;
+			} else {
+				keep=0;
+			}
+			cur=id;
+			next
+		}
+		{
+			if (keep) { seq[cur]=seq[cur] \$0 ORS; }
+		}
+		END{
+			for (id in hdr) {
+				print hdr[id];
+				printf "%s", seq[id];
+			}
+		}' "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" > "\$DEDUP_TMP" \
+			&& seqkit sort -n "\$DEDUP_TMP" > "\${DEDUP_TMP}.sorted" \
+			&& mv "\${DEDUP_TMP}.sorted" "\${STATE_DIR}/qced_reads_hq_accumulated.fasta"
+	rm -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta.fai"
+	command -v samtools >/dev/null 2>&1 && samtools faidx "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" 2>/dev/null || true
+	seqkit faidx "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" 2>/dev/null || true
+	pool_after=\$(grep -c '^>' "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" || echo 0)
+	printf 'pool_after_dedup\t%s\n' "\$pool_after" >> "\$ROLLING_POOL_STATS"
+	_t_rolling_pool_update_end=\$(date +%s)
+	append_process_timing "rolling_pool_update" "\$_t_rolling_pool_update_start" "\$_t_rolling_pool_update_end"
+	_t_prune_apply_start=\$(date +%s)
+			PRUNE_CUMULATIVE_POOL_ALL="${pruneCumulativePoolAll ? '1' : '0'}"
+			PRUNE_UNASSIGNED_DROP_READS="${(pruneUnassignedClusters && pruneUnassignedDropReads) ? 1 : 0}"
+			OTU_PRUNE_POLICY="${otuPruneFrozenPolicyCanonical}"
+			OTU_PRUNE_POLICY_EFFECTIVE="\$OTU_PRUNE_POLICY"
+			FORCE_PRUNE_MAX_MB="${otuLockForcePruneMaxFastaMbStr}"
+			FORCE_PRUNE_OVERRIDE="${otuForcePruneOverride ? '1' : '0'}"
+			ROUND_PRUNE_IDS="\$ROUND_DIR/${barcode}_round_prune_ids.list"
+			ROUND_PRUNE_STATS="\$ROUND_DIR/${barcode}_round_prune_stats.tsv"
+			ROUND_PRUNE_APPLY_STATS="\$ROUND_DIR/${barcode}_round_prune_apply.tsv"
+			C1_PRUNE_IDS="\$ROUND_DIR/${barcode}_c1_prune_ids.list"
+			SIZE_STREAK_PRUNE_IDS="\$ROUND_DIR/${barcode}_size_streak_prune_ids.list"
+			CONSENSUS_UNASSIGNED_PRUNE_IDS="\$ROUND_DIR/${barcode}_consensus_unassigned_prune_ids.list"
+			ROUND_PRUNE_TMP="\${STATE_DIR}/qced_reads_hq_accumulated.round_pruned.tmp"
+			mkdir -p "\$ROUND_DIR"
+			: > "\$C1_PRUNE_IDS"
+			: > "\$SIZE_STREAK_PRUNE_IDS"
+			: > "\$CONSENSUS_UNASSIGNED_PRUNE_IDS"
+			: > "\$ROUND_PRUNE_IDS"
+			: > "\$ROUND_PRUNE_STATS"
+			: > "\$ROUND_PRUNE_APPLY_STATS"
+			if [ "${replicateModeCanonical}" = "track" ] && [ -n "${otuPruneSamplesFileValue}" ]; then
+				echo "ERROR: --otu_prune_samples_file is not supported in track mode; prune must use track_active_units.txt" 1>&2
+				exit 1
+			fi
+
+			if awk -v t="\$FORCE_PRUNE_MAX_MB" 'BEGIN{exit !(t>0)}'; then
+				if [ -f "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" ]; then
+						_fbytes=\$(wc -c < "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" | tr -d ' ')
+						_fmb=\$(awk -v b="\$_fbytes" 'BEGIN{printf "%.3f", b/1048576.0}')
+					if awk -v mb="\$_fmb" -v thr="\$FORCE_PRUNE_MAX_MB" 'BEGIN{exit !(mb>thr)}'; then
+						if [ "\$OTU_PRUNE_POLICY" = "never" ] && [ "\$FORCE_PRUNE_OVERRIDE" != "1" ]; then
+							echo "WARN: qced_reads_hq_accumulated.fasta size=\${_fmb}MB exceeds threshold=\${FORCE_PRUNE_MAX_MB}MB but archive policy is never and otu_force_prune_override=false; skipping forced archive (C1)" 1>&2
+						elif [ -s "\${STATE_DIR}/otu_consolidated_keys.tsv" ]; then
+							OTU_PRUNE_POLICY_EFFECTIVE="until_consolidated"
+							echo "WARN: qced_reads_hq_accumulated.fasta size=\${_fmb}MB exceeds threshold=\${FORCE_PRUNE_MAX_MB}MB; forcing consolidated-key archive (C1) for this round" 1>&2
+						else
+							echo "WARN: qced_reads_hq_accumulated.fasta size=\${_fmb}MB exceeds threshold=\${FORCE_PRUNE_MAX_MB}MB but no consolidated keys available; skipping forced archive (C1)" 1>&2
+						fi
+					fi
+				fi
+			fi
+
+			if [ "\$OTU_PRUNE_POLICY_EFFECTIVE" = "always" ]; then
+				if [ -s "\${STATE_DIR}/otu_frozen_members.tsv" ]; then
+					cut -f2 "\${STATE_DIR}/otu_frozen_members.tsv" \
+						| awk '{split(\$0,a,"|"); if (a[1]!="") print a[1]}' \
+						| LC_ALL=C sort -u > "\$C1_PRUNE_IDS"
+				fi
+			elif [ "\$OTU_PRUNE_POLICY_EFFECTIVE" = "until_consolidated" ]; then
+				if [ -s "\${STATE_DIR}/otu_consolidated_keys.tsv" ]; then
+					C1_SAMPLES_FILE="${otuPruneSamplesFileValue}"
+					if [ -z "\$C1_SAMPLES_FILE" ]; then
+						C1_SAMPLES_FILE="${sampleInfoDir}/samples.txt"
+						if [ "${replicateModeCanonical}" = "track" ]; then
+							C1_SAMPLES_FILE="${sampleInfoDir}/track_active_units.txt"
+						fi
+					fi
+					if [ ! -f "\$C1_SAMPLES_FILE" ]; then
+						C1_SAMPLES_FILE=""
+					fi
+					C1_STABLE_KEYS="\${DEDUP_TMP}.consolidated.stable.tsv"
+					C1_IDENTITY_MAP="\${DEDUP_TMP}.identity.tsv"
+					C1_DISPLAY_KEYS="\${DEDUP_TMP}.consolidated.display.tsv"
+					C1_DISPLAY_HEADERS="\${DEDUP_TMP}.current_headers.fasta"
+					perl "\$BIN_DIR/consensus_otu_identity.pl" keys --column 2 \
+						--input "\${STATE_DIR}/otu_consolidated_keys.tsv" --legacy "\${STATE_DIR}/consensus_legacy_ownership.tsv" --out "\$C1_STABLE_KEYS"
+					perl "\$BIN_DIR/consensus_otu_identity.pl" map --clstr "\${STATE_DIR}/qced_reads_nr.fasta.clstr" \
+						--hash-map "\$OTU_HASH_MAP_STATE" --targets "${params.targets}" --out "\$C1_IDENTITY_MAP"
+					perl "\$BIN_DIR/consensus_otu_identity.pl" display-keys --map "\$C1_IDENTITY_MAP" \
+						--input "\$C1_STABLE_KEYS" --out "\$C1_DISPLAY_KEYS"
+					perl "\$BIN_DIR/consensus_otu_identity.pl" prune-view --map "\$C1_IDENTITY_MAP" \
+						--clstr "\${STATE_DIR}/qced_reads_nr.fasta.clstr" --input "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" --out "\$C1_DISPLAY_HEADERS"
+					RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${replicateModeCanonical}" \
+					RTBIOSCAN_TRACK_ACTIVE_UNITS="${sampleInfoDir}/track_active_units.txt" \
+					RTBIOSCAN_TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv" \
+					"\$BIN_DIR/otu_c1_prune_ids.sh" \
+						"until_consolidated" \
+						"\$C1_DISPLAY_HEADERS" \
+						"\${DEDUP_TMP}.active_ids" \
+						"" \
+						"\$C1_DISPLAY_KEYS" \
+						"\$C1_SAMPLES_FILE" \
+						"${otuConsolidatedKeysMixedPolicyCanonical}" \
+						"\$OBSERVED_NO_ADAPTER"
+					awk '/^>/{id=substr(\$0,2); sub(/ .*/, "", id); split(id,a,"|"); if (a[1]!="") print a[1]}' "\${STATE_DIR}/qced_reads_hq_accumulated.fasta" | LC_ALL=C sort -u > "\${DEDUP_TMP}.all_ids"
+					awk '{split(\$0,a,"|"); if (a[1]!="") print a[1]}' "\${DEDUP_TMP}.active_ids" | LC_ALL=C sort -u > "\${DEDUP_TMP}.active_base_ids"
+					comm -23 "\${DEDUP_TMP}.all_ids" "\${DEDUP_TMP}.active_base_ids" > "\$C1_PRUNE_IDS" || : > "\$C1_PRUNE_IDS"
+					rm -f "\${DEDUP_TMP}.active_ids" "\${DEDUP_TMP}.all_ids" "\${DEDUP_TMP}.active_base_ids"
+					rm -f "\$C1_STABLE_KEYS" "\$C1_IDENTITY_MAP" "\$C1_DISPLAY_KEYS" "\$C1_DISPLAY_HEADERS"
+				fi
+			fi
+
+			SMALL_OTU_PRUNE_ENABLED=0
+			SMALL_OTU_PRUNE_REASON="unknown"
+			OTU_BLAST_FILTER_MODE="${otuBlastFilterModeCanonical}"
+			OTU_BLAST_FILTER_SKIP_ROUNDS="${otuBlastFilterSkipRoundsCanonical}"
+			OTU_BLAST_FORCE_USE_FILTERED="${otuBlastForceUseFiltered ? '1' : '0'}"
+			OTU_BLAST_MIN_MEMBERS="${otuBlastMinMembersStr}"
+			ROUND_INDEX_FILE="\${STATE_DIR}/round_index.tsv"
+			ROUND_INDEX=\$(awk -F'\t' -v rb="\$round_barcode" '\$1==rb{print \$2; exit}' "\$ROUND_INDEX_FILE" 2>/dev/null || true)
+			if [ -z "\$ROUND_INDEX" ] || [[ "\$ROUND_INDEX" == *[!0-9]* ]] || [ "\$ROUND_INDEX" -lt 1 ]; then
+				SMALL_OTU_PRUNE_REASON="missing_round_index"
+				echo "WARN: missing/invalid round index for small-OTU prune (round_barcode=\$round_barcode, file=\$ROUND_INDEX_FILE); skipping size-based pruning this round" 1>&2
+			elif [ -z "\$OTU_BLAST_MIN_MEMBERS" ] || [[ "\$OTU_BLAST_MIN_MEMBERS" == *[!0-9]* ]] || [ "\$OTU_BLAST_MIN_MEMBERS" -lt 2 ]; then
+				SMALL_OTU_PRUNE_REASON="min_members_lt2"
+			else
+				OTU_BLAST_EFFECTIVE_MODE_TSV="${barcode}_blast_filter_effective_mode_prune.tsv"
+				"\$BIN_DIR/otu_blast_effective_mode.sh" \
+					"\$OTU_BLAST_FILTER_MODE" \
+					"\$OTU_BLAST_FILTER_SKIP_ROUNDS" \
+					"\$ROUND_INDEX" \
+					> "\$OTU_BLAST_EFFECTIVE_MODE_TSV"
+				effective_mode_value() {
+					local key="\$1"
+					awk -F'\t' -v k="\$key" '\$1==k{print \$2; exit}' "\$OTU_BLAST_EFFECTIVE_MODE_TSV"
+				}
+					OTU_BLAST_EFFECTIVE_MODE=\$(effective_mode_value effective_mode)
+					OTU_BLAST_EFFECTIVE_REASON=\$(effective_mode_value reason)
+					if [ "\$OTU_BLAST_FORCE_USE_FILTERED" = "1" ] && [ "\$OTU_BLAST_EFFECTIVE_MODE" != "off" ]; then
+						echo "INFO: size_streak_prune force_use_filtered=1 bypassing threshold and no-cluster decision knobs" 1>&2
+						OTU_BLAST_EFFECTIVE_MODE="enforce"
+						OTU_BLAST_EFFECTIVE_REASON="force_use_filtered"
+					fi
+				if [ "\$OTU_BLAST_EFFECTIVE_MODE" = "enforce" ]; then
+					SMALL_OTU_PRUNE_ENABLED=1
+					SMALL_OTU_PRUNE_REASON="effective_mode_enforce"
+				else
+					SMALL_OTU_PRUNE_REASON="effective_mode_\${OTU_BLAST_EFFECTIVE_MODE}"
+				fi
+			fi
+			if [ "\$SMALL_OTU_PRUNE_ENABLED" = "1" ]; then
+				echo "INFO: size_streak_prune enabled=1 reason=\$SMALL_OTU_PRUNE_REASON round_index=\${ROUND_INDEX:-NA} min_members=\${OTU_BLAST_MIN_MEMBERS} skip_rounds=\${OTU_BLAST_FILTER_SKIP_ROUNDS} effective_mode=\${OTU_BLAST_EFFECTIVE_MODE:-NA}" 1>&2
+			else
+				echo "INFO: size_streak_prune enabled=0 reason=\$SMALL_OTU_PRUNE_REASON round_index=\${ROUND_INDEX:-NA} min_members=\${OTU_BLAST_MIN_MEMBERS} skip_rounds=\${OTU_BLAST_FILTER_SKIP_ROUNDS} effective_mode=\${OTU_BLAST_EFFECTIVE_MODE:-NA}" 1>&2
+			fi
+			APPLY_SIZE_STREAK=0
+			if [ "\$OTU_SIZE_STREAK_MODE" = "enforce" ] || [ "\$SMALL_OTU_PRUNE_ENABLED" = "1" ]; then
+				APPLY_SIZE_STREAK=1
+			fi
+				if [ "\$APPLY_SIZE_STREAK" = "1" ] && [ -s "\${STATE_DIR}/${barcode}_otu_size_streak_prune_ids_last.txt" ]; then
+					awk '{split(\$0,a,\"|\"); if (a[1] != \"\") print a[1]}' "\${STATE_DIR}/${barcode}_otu_size_streak_prune_ids_last.txt" | LC_ALL=C sort -u > "\$SIZE_STREAK_PRUNE_IDS"
+				fi
+				PROTECTED_READ_IDS_EVER="\${STATE_DIR}/${barcode}_protected_read_ids_ever.list"
+				PROTECTED_READ_IDS_ROUND="\${ROUND_DIR}/${barcode}_assigned_otu_member_ids_ever.list"
+				PROTECTED_IDS="\${ROUND_DIR}/${barcode}_protected_prune_ids.list"
+				BLAST_UNASSIGNED_CURRENT_STATE="\${STATE_DIR}/${barcode}_blast_unassigned_current.list"
+				BLAST_UNASSIGNED_CURRENT_TMP="\${BLAST_UNASSIGNED_CURRENT_STATE}.tmp"
+				: > "\$BLAST_UNASSIGNED_CURRENT_TMP"
+				if [ -s blast_report_annotated_otu_evidence.txt ]; then
+					if ! perl "\$BIN_DIR/blast_unassigned_read_ids.pl" \
+						"\$RTB_R4B_SIDECAR" \
+						"\$BLAST_UNASSIGNED_CURRENT_TMP" \
+						--min-level "${assignProtLevelCanonical}"; then
+						echo "WARN: blast_unassigned_read_ids.pl failed; clearing live blast-unassigned report state" 1>&2
+						: > "\$BLAST_UNASSIGNED_CURRENT_TMP"
+					fi
+				fi
+				mv -f "\$BLAST_UNASSIGNED_CURRENT_TMP" "\$BLAST_UNASSIGNED_CURRENT_STATE" 2>/dev/null \
+					|| cp -f "\$BLAST_UNASSIGNED_CURRENT_TMP" "\$BLAST_UNASSIGNED_CURRENT_STATE" 2>/dev/null \
+					|| true
+				rm -f "\$BLAST_UNASSIGNED_CURRENT_TMP" 2>/dev/null || true
+			BLAST_UNASSIGNED_IDS="${barcode}_blast_unassigned_reads_round.list"
+			: > "\$BLAST_UNASSIGNED_IDS"
+			BLAST_UNASSIGNED_STATUS="mode_off"
+			if [ "${otuBlastUnassignedModeCanonical}" != "off" ]; then
+				if [ "\${ROUND_INDEX:-0}" -le "${params.otu_blast_unassigned_grace_rounds}" ] 2>/dev/null; then
+					BLAST_UNASSIGNED_STATUS="grace"
+				else
+					if [ -s blast_report_annotated_otu_evidence.txt ]; then
+						if ! perl "\$BIN_DIR/blast_unassigned_read_ids.pl" \
+							"\$RTB_R4B_SIDECAR" \
+							"\$BLAST_UNASSIGNED_IDS" \
+							--min-level "${assignProtLevelCanonical}"; then
+							echo "WARN: blast_unassigned_read_ids.pl failed; continuing without blast-unassigned prune" 1>&2
+							: > "\$BLAST_UNASSIGNED_IDS"
+						fi
+					fi
+					if [ "${otuBlastUnassignedModeCanonical}" = "observe" ]; then
+						BLAST_UNASSIGNED_STATUS="observe"
+						: > "\$BLAST_UNASSIGNED_IDS"
+					else
+						BLAST_UNASSIGNED_STATUS="applied"
+					fi
+				fi
+			fi
+			cp "\$BLAST_UNASSIGNED_IDS" "\$ROUND_DIR/${barcode}_blast_unassigned_reads_round.list" 2>/dev/null || true
+		cp blast_report_annotated_otu_evidence.txt "\$ROUND_DIR/${barcode}_blast_report_annotated_otu_evidence.txt" 2>/dev/null || true
+			if [ "\$PRUNE_UNASSIGNED_DROP_READS" = "1" ] && [ -s "\${STATE_DIR}/${barcode}_pruned_unassigned_reads_last.list" ]; then
+					awk '{split(\$0,a,"|"); if (a[1]!="") print a[1]}' "\${STATE_DIR}/${barcode}_pruned_unassigned_reads_last.list" | LC_ALL=C sort -u > "\$CONSENSUS_UNASSIGNED_PRUNE_IDS"
+			fi
+
+				if ! bash "\$BIN_DIR/prune_round_orchestrate.sh" \
+					--protected-read-ids-ever "\$PROTECTED_READ_IDS_EVER" \
+					--protected-read-ids-round "\$PROTECTED_READ_IDS_ROUND" \
+					--protected-ids "\$PROTECTED_IDS" \
+					--candidate size_streak "\$SIZE_STREAK_PRUNE_IDS" \
+					--candidate consensus_unassigned "\$CONSENSUS_UNASSIGNED_PRUNE_IDS" \
+					--candidate blast_unassigned "\$BLAST_UNASSIGNED_IDS" \
+				--c1-ids "\$C1_PRUNE_IDS" \
+				--round-prune-ids "\$ROUND_PRUNE_IDS" \
+				--round-prune-stats "\$ROUND_PRUNE_STATS" \
+				--prune-cumulative-pool-all "\$PRUNE_CUMULATIVE_POOL_ALL" \
+				--blast-unassigned-status "\$BLAST_UNASSIGNED_STATUS" \
+				--merge-error-context "failed to merge round prune ID lists"; then
+					exit 1
+			fi
+
+				cp "\$ROUND_PRUNE_IDS" "\${STATE_DIR}/${barcode}_round_prune_ids_last.list" 2>/dev/null || true
+				cp "\$ROUND_PRUNE_STATS" "\${STATE_DIR}/${barcode}_round_prune_stats_last.tsv" 2>/dev/null || true
+				_t_prune_apply_end=\$(date +%s)
+				append_process_timing "prune_apply" "\$_t_prune_apply_start" "\$_t_prune_apply_end"
+				release_lock "\${QCED_LOCK}"
+	else
+		exit 1
+fi
+rm -f ${barcode}_tmp_focus_sup.fasta ${barcode}_tmp_focus_hit.fasta
+
+	for f in blast_report_annotated.txt blast_report_annotated_otu.txt blast_report_annotated_noadapter.txt; do
+		if [ -s "\$f" ]; then
+			awk 'BEGIN{FS=OFS="\t"}
+			{
+				split(\$1,a,"|"); id=a[1]; model=a[3];
+				if (model=="hac2sup" || model=="hac_fixed") model="hac";
+				r=(model=="sup"?3:(model=="hac"?2:1));
+				if (!(id in br) || r>br[id]) { br[id]=r; line[id]=\$0; }
+			}
+				END{ for(id in line) print line[id]; }' "\$f" \
+					| LC_ALL=C sort -k1,1 > "\${f}.tmp" && mv "\${f}.tmp" "\$f"
+			fi
+		done
+
+	if [ "\$STATE_BLASTREPORT_EXISTS" -eq 1 ]; then
+		if ! "\$BIN_DIR/prefer_blast_rows_by_model.sh" \
+			--input blast_report_annotated.txt \
+			--output blast_report_annotated_preferred.txt \
+			--policy sup_hac2sup_preferred; then
+			echo "ERROR: failed to build preferred BLAST annotated report" 1>&2
+			exit 1
+		fi
+	else
+		cp blast_report_annotated.txt blast_report_annotated_preferred.txt 2>/dev/null || : > blast_report_annotated_preferred.txt
+	fi
+
+if [ -s blast_report_annotated_otu_evidence.txt ]; then
+if ! perl "\$BIN_DIR/otu_export_members_from_blastreport.pl" \
+	blast_report_annotated_otu_evidence.txt \
+	"\$OTU_MEMBERS_BLASTDIAG" \
+	"\$OTU_SIZES_BLASTDIAG" \
+	"\$OTU_MEMBERS_BLASTDIAG_STATS"; then
+	echo "WARN: failed to export BLAST-diagnostic OTU membership from blast_report_annotated_otu_evidence.txt" 1>&2
+	: > "\$OTU_MEMBERS_BLASTDIAG"
+	: > "\$OTU_SIZES_BLASTDIAG"
+	: > "\$OTU_MEMBERS_BLASTDIAG_STATS"
+fi
+else
+: > "\$OTU_MEMBERS_BLASTDIAG"
+: > "\$OTU_SIZES_BLASTDIAG"
+: > "\$OTU_MEMBERS_BLASTDIAG_STATS"
+fi
+if [ -s "\$OTU_MEMBERS_BLASTDIAG_STATS" ]; then
+sed 's/^/INFO: otu_members_blastdiag\t/' "\$OTU_MEMBERS_BLASTDIAG_STATS" 1>&2 || true
+fi
+	
+mkdir -p "\$ROUND_DIR"
+	copy_soft blast_process_timings.tsv "\$ROUND_DIR/${barcode}_blast_process_timings.tsv"
+	copy_soft blast_process_timings.tsv "\${STATE_DIR}/${barcode}_blast_process_timings_last.tsv"
+	copy_soft "\$OTU_REFINE_PHASE_TIMINGS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_phase_timings.tsv"
+	copy_soft "\$OTU_REFINE_PHASE_TIMINGS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_phase_timings_last.tsv"
+	copy_soft "\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_phase_timings_ms.tsv"
+	copy_soft "\$OTU_REFINE_PHASE_TIMINGS_MS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_phase_timings_ms_last.tsv"
+	copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" "\$ROUND_DIR/${barcode}_otu_refine_process_breakdown.tsv"
+	copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_FILE" "\${STATE_DIR}/${barcode}_otu_refine_process_breakdown_last.tsv"
+	copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_process_breakdown_ms.tsv"
+	copy_soft "\$OTU_REFINE_PROCESS_BREAKDOWN_MS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_process_breakdown_ms_last.tsv"
+	copy_soft "\$OTU_REFINE_WORKLOAD_STATS_FILE" "\$ROUND_DIR/${barcode}_otu_refine_workload_stats.tsv"
+	copy_soft "\$OTU_REFINE_WORKLOAD_STATS_FILE" "\${STATE_DIR}/${barcode}_otu_refine_workload_stats_last.tsv"
+	copy_soft "\$SUP_PATH_STATS_FILE" "\$ROUND_DIR/${barcode}_sup_path_stats.tsv"
+	copy_soft "\$SUP_PATH_TIMINGS_MS_FILE" "\$ROUND_DIR/${barcode}_sup_path_timings_ms.tsv"
+	copy_soft "\$SUP_PATH_TIMINGS_MS_FILE" "\${STATE_DIR}/${barcode}_sup_path_timings_ms_last.tsv"
+	copy_soft ${barcode}_blastreport_hac.list "\$ROUND_DIR/${barcode}_blastreport_hac.list"
+	copy_soft ${barcode}_blastreport_sup.list "\$ROUND_DIR/${barcode}_blastreport_sup.list"
+	cp ${barcode}_blastreport_round.txt "\$ROUND_DIR/blastreport.txt"
+if acquire_lock "\${BLASTREPORT_LOCK}"; then
+	BLAST_STATE_INIT_TMP="\${BLAST_STATE_INIT_MARKER}.tmp.\$\$"
+	printf 'RTB-R4D-BLAST-STATE\t1\n' > "\$BLAST_STATE_INIT_TMP"
+	mv "\$BLAST_STATE_INIT_TMP" "\$BLAST_STATE_INIT_MARKER"
+	release_lock "\${BLASTREPORT_LOCK}"
+else
+	exit 1
+fi
+copy_soft "\$BLAST_FILTER_STATS" "\$ROUND_DIR/${barcode}_blast_filter_stats.tsv"
+copy_soft "\$BLAST_FILTER_KEPT_OTUS" "\$ROUND_DIR/${barcode}_blast_filter_kept_otus.tsv"
+copy_soft "\$BLAST_FILTER_DROPPED_IDS" "\$ROUND_DIR/${barcode}_blast_filter_dropped_read_ids.list"
+copy_soft "\$BLAST_FILTER_DROPPED_IDS" "\${STATE_DIR}/${barcode}_blast_filter_dropped_read_ids_last.list"
+copy_soft "\$OTU_MEMBERS_BLASTDIAG" "\$ROUND_DIR/otu_members_blastdiag.tsv"
+copy_soft "\$OTU_SIZES_BLASTDIAG" "\$ROUND_DIR/otu_sizes_blastdiag.tsv"
+copy_soft "\$OTU_MEMBERS_BLASTDIAG_STATS" "\$ROUND_DIR/otu_members_blastdiag_stats.tsv"
+copy_soft "\$OTU_MEMBERS_BLASTDIAG" "\${STATE_DIR}/${barcode}_otu_members_blastdiag.tsv"
+copy_soft "\$OTU_SIZES_BLASTDIAG" "\${STATE_DIR}/${barcode}_otu_sizes_blastdiag.tsv"
+copy_soft "\$OTU_MEMBERS_BLASTDIAG_STATS" "\${STATE_DIR}/${barcode}_otu_members_blastdiag_stats_last.tsv"
+rtbioscan_round_lock_unpin
 		"""
   }
 

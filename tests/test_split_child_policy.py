@@ -263,7 +263,11 @@ def diagnostic(work, stage, data, *, cache=False, awk=None):
     prelude = ""
     if stage == "SUP":
         start = text.index('if [ -s ${barcode}_blastreport_hac_missing.list ]; then')
-        end = text.index('\n\t\t\t\t\t\tsup_merge_outputs', start)
+        # End anchor with leading tabs optional (the shell body's tab prefix is not
+        # significant), bounded to this process block and unique inside it.
+        end_matches = list(re.finditer(r'\n\t*sup_merge_outputs', text[start:text.index('\nprocess ', start)]))
+        assert len(end_matches) == 1, len(end_matches)
+        end = start + end_matches[0].start()
         body = text[start:end]
         if not cache:
             (work / "bc01_blastreport_hac_missing.list").write_text("parent\n")
