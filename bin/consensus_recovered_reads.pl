@@ -18,8 +18,11 @@ require "$FindBin::Bin/lib/tabular_schema_util.pl";
 #     --consensus-dir <Consensus/> \
 #     --out <round_consensus_assigned_reads.list>
 
+require "$FindBin::Bin/consensus_taxonomy_by_hash.pl";
+
 my %opt;
 GetOptions(
+    'taxonomy-sidecar=s' => \$opt{taxonomy_sidecar},
     'blast-report=s'  => \$opt{blast_report},
     'consensus-dir=s' => \$opt{consensus_dir},
     'out=s'           => \$opt{out},
@@ -33,38 +36,9 @@ $opt{min_level} //= "genus";
 $opt{min_level} = lc($opt{min_level});
 $opt{min_level} = "genus" unless $opt{min_level} eq "family" || $opt{min_level} eq "species";
 
-# Level-appropriate column: genus non-empty => genus or better; family => family or better
-my $check_col = $opt{min_level} eq "species" ? "species"
-              : $opt{min_level} eq "genus"   ? "genus"
-              :                                "family";
-
-# --- Parse blast report: collect long_seq_ids meeting the level requirement ---
-my %assigned;   # consensus_id => 1
-if (-s $opt{blast_report}) {
-    open my $fh, '<', $opt{blast_report}
-        or die "open $opt{blast_report}: $!";
-    my ($cols_ref) = TabularSchemaUtil::read_required_header(
-        $fh,
-        $opt{blast_report},
-        'long_seq_id',
-    );
-    my @cols = @{$cols_ref};
-    while (my $line = <$fh>) {
-        chomp $line;
-        $line =~ s/\r$//;
-        my @f = split /\t/, $line, -1;
-        # Header: long_seq_id consensus_taxid kingdom phylum class order family genus species
-        my %row;
-        @row{@cols} = @f;
-        my $id      = ConsensusIdUtil::consensus_id_from_long_seq_id($row{long_seq_id});
-        my $col_val = $row{$check_col} // '';
-        $col_val =~ s/^\s+|\s+$//g;
-        next if !defined $id || $id eq '';
-        next if $col_val eq '' || lc($col_val) eq 'unassigned';
-        $assigned{$id} = 1;
-    }
-    close $fh;
-}
+# Use the same validated status/observed-depth predicate as assigned OTU keys.
+my %assigned=%{RTBioScan::ConsensusTaxonomy::assignments(
+    $opt{taxonomy_sidecar},$opt{blast_report},$opt{min_level})};
 
 # Early exit: no assigned consensus → empty output
 unless (%assigned) {

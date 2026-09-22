@@ -43,12 +43,11 @@ def test_blast_worker_first_failure_kills_remaining() -> None:
 def test_taxonkit_cache_metadata_invalidation_wired() -> None:
     """A6: taxdb signature sidecar and invalidation logic is present."""
     consensus_block = _consensus_block()
-    assert "TAXONKIT_CACHE_META=" in consensus_block
-    assert "_TAXDB_SIG=" in consensus_block
-    assert "_CACHED_TAXDB_SIG=" in consensus_block
-    assert "taxdb signature changed" in consensus_block
-    # meta persisted after cache update
-    assert "_TAXDB_SIG" in consensus_block.split("TAXONKIT_CACHE_META=")[1]
+    assert 'RTB_R4C_TAXONOMY="\\$TAXONKIT_DB"' in consensus_block
+    assert 'consensus_taxonomy_by_hash.pl" prepare \\' in consensus_block
+    assert '--state "\\${STATE_DIR}/consensus_taxonomy_\\${_t}_v1.tsv"' in consensus_block
+    assert 'consensus_taxonomy_by_hash.pl" publish \\' in consensus_block
+    assert 'r4b_signature($t,$t->{taxonomy})' in (REPO_ROOT / 'bin/consensus_taxonomy_by_hash.pl').read_text(encoding='utf-8')
 
 
 def test_blast_cache_key_uses_variables() -> None:
@@ -56,12 +55,11 @@ def test_blast_cache_key_uses_variables() -> None:
     consensus_block = _consensus_block()
     assert "_WORD_SIZE=50" in consensus_block
     assert "_QCOV=50" in consensus_block
-    # Nextflow escapes $ as \\$, so the cache key has \\${_WORD_SIZE}
-    assert 'word=\\${_WORD_SIZE}' in consensus_block
-    # No raw hardcoded value in the cache key line
-    cache_key_line = [l for l in consensus_block.splitlines() if "_KEY=" in l and "word=" in l]
-    assert cache_key_line, "cache key line not found"
-    assert "word=50|" not in cache_key_line[0]
+    # Nextflow escapes $ as \\$, so the BLAST call uses escaped shell variables.
+    assert '-word_size "\\$_WORD_SIZE" -qcov_hsp_perc "\\$_QCOV"' in consensus_block
+    cache_key_line = [l for l in (REPO_ROOT / 'bin/consensus_taxonomy_by_hash.pl').read_text(encoding='utf-8').splitlines() if 'return sha256_hex' in l]
+    assert cache_key_line, "scientific signature line not found"
+    assert "'word=50'" in cache_key_line[0] and "'qcov=50'" in cache_key_line[0]
 
 
 def test_consensus_cleanup_preserves_declared_join_output() -> None:
@@ -74,16 +72,15 @@ def test_consensus_cleanup_preserves_declared_join_output() -> None:
 
 def test_taxonomy_cache_joins_are_empty_safe() -> None:
     consensus_block = _consensus_block()
-    assert 'BEGIN{FS=OFS="\\t"; first=ARGV[1]}' in consensus_block
-    assert 'BEGIN{first=ARGV[1]}' in consensus_block
-    assert "FILENAME==first { c[\\$1]=1; next }" in consensus_block
-    assert "!(\\$1 in c) { print \\$1 }" in consensus_block
-    assert "FILENAME==first { lin[\\$1]=\\$2; next }" in consensus_block
-    third_join_block = consensus_block.split("fallback_lineage=", 1)[1].split("> tmp_tax_cols.tsv", 1)[0]
-    assert "awk -v fb=" in third_join_block
-    assert 'BEGIN{FS=OFS="\\t"; first=ARGV[1]}' in third_join_block
-    assert "FILENAME==first { lin[\\$1]=\\$2; next }" in third_join_block
-    assert "' tmp_tax.tsv tmp_idx.tsv \\" in third_join_block or "' tmp_tax.tsv tmp_idx.tsv" in third_join_block
+    assert 'consensus_taxonomy_by_hash.pl" prepare \\' in consensus_block
+    assert 'consensus_taxonomy_by_hash.pl" complete \\' in consensus_block
+    assert 'consensus_taxonomy_by_hash.pl" merge \\' in consensus_block
+    assert '--out consensus_taxonomy_v1.tsv --full consensus_blast_report_full.txt' in consensus_block
+    third_join_block = (REPO_ROOT / 'bin/consensus_taxonomy_by_hash.pl').read_text(encoding='utf-8').split('sub project {', 1)[1].split('sub assignments {', 1)[0]
+    assert 'my $table="long_seq_id\\tconsensus_taxid\\tkingdom' in third_join_block
+    assert "('Unassigned')x7" in third_join_block
+    assert 'atomic($full,$table);atomic($csv,$raw);' in third_join_block
+    assert 'read_sidecar($o->{out});project($validated,$o->{full},$o->{csv});' in third_join_block
     assert "FILENAME==cachedf" not in consensus_block
     assert "FILENAME==uniquef" not in consensus_block
     assert "FILENAME==mapf" not in consensus_block
@@ -99,6 +96,7 @@ def test_taxonomy_cache_joins_are_empty_safe() -> None:
 
 def test_consensus_taxid_filters_use_portable_numeric_match() -> None:
     consensus_block = _consensus_block()
-    assert '\\$2 != "" && \\$2 !~ /[^0-9]/ {print \\$0}' in consensus_block
-    assert '\\$1 != "" && \\$1 !~ /[^0-9]/ && \\$3 != "" { print \\$1, \\$3 }' in consensus_block
+    assert '\\$2 != "" && \\$2 !~ /[^0-9]/ {print \\$0}' not in consensus_block
+    assert '\\$1 != "" && \\$1 !~ /[^0-9]/ && \\$3 != "" { print \\$1, \\$3 }' not in consensus_block
+    assert r'$_[0] =~ /\A-?[1-9][0-9]*\z/' in (REPO_ROOT / 'bin/consensus_taxonomy_by_hash.pl').read_text(encoding='utf-8')
     assert '/^[0-9]+\\$/' not in consensus_block

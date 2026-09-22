@@ -266,9 +266,51 @@ lineage and 0–6 for kingdom through species. An LCA without a unique supported
 retains its lineage with taxid `NA`. An ambiguous contribution to the winning identity
 retains its LCA origin; ambiguity in a different minority identity does not taint a
 direct winner. The existing public annotated-report columns and report denominators
-are unchanged. Consensus taxonomy and public reporting changes remain deferred.
+are unchanged. Public denominator and report-policy changes remain deferred.
 
 The existing OTU-refinement phase-timing and workload artifact names and columns
 remain available. Strict marker refinement reports `single_pass` scheduling and
 zero shard/merged-pair counters because it does not materialize those intermediates;
 cluster, member and annotated-output counts describe the work actually performed.
+
+### Consensus taxonomy authority (R4-C)
+
+Consensus attribution uses an internal `consensus_taxonomy_<MARKER>_v1.tsv` in the
+existing consensus state directory. A merged `consensus_taxonomy_v1.tsv` is used
+inside the task; the reporting task reads the round copy
+`<barcode>_consensus_taxonomy_v1.tsv`. These artifacts do not add columns to the
+established 17-column public consensus report.
+
+The sealed TSV has exactly 23 fields, in this order:
+`long_seq_id`, `marker`, `sample`, `stable_otu_key`, `display_otu_key`,
+`consensus_id`, `sequence_hash`, `query_length`, `resolved_taxid`, `kingdom`,
+`phylum`, `class`, `order`, `family`, `genus`, `species`, `status`, `depth`,
+`origin`, `candidate_count`, `candidates_json`, `reason`, `signature`.
+Missing scalar values and ranks use `NA`; an empty candidate set is `[]`.
+Rows sort by full query identifier, with one attribution per query. Duplicate
+queries, ambiguous public identities and inconsistent sequence attributions are
+rejected. Stable ownership is the existing marker/representative-hash key, or
+`NA` when the marker projection has no representative ownership evidence.
+
+Statuses are `ASSIGNED`, `AMBIGUOUS_TIE`, `NO_HIT`, `REFERENCE_UNRESOLVED`,
+`REFERENCE_INCONSISTENT` and `COMPUTATION_FAILED`. Depth is -1 for no usable
+lineage, otherwise 0–6 for kingdom through species. Origin is independently
+recorded as `DIRECT`, `LCA` or `NONE`. Signed taxids are valid identities. Public
+unusable taxonomy retains the existing `Unassigned` placeholder.
+
+`candidates_json` retains every equal-best subject in subject order. Each tuple
+contains sequence hash, subject, subject taxid, e-value, alignment length,
+identity, bitscore, query start/end, subject start/end and query length. The
+selected metrics use R4-A canonical decimal encoding. A single direct subject
+can supply public `blast_hit`; multiple subjects use `NA`. The full-table
+`consensus_taxid` and public `taxid` contain the resolved signed identity or
+`NA`, including `NA` for a multi-taxid LCA.
+
+The first line is `#RTB-R4C-TAXONOMY`, version `1`, and a SHA-256 scientific
+signature, separated by tabs. The final `#END` line records the body-line count
+(including the field-name header) and SHA-256 of the exact newline-terminated
+body. Readers require the field count, ordering, coherent status/depth/origin,
+canonical evidence, footer, checksum and generation identity before publication.
+Each persistent file is published by a same-directory temporary file and rename.
+The marker files and round projection are separate atomic files; a retry
+validates and regenerates the complete current projection.

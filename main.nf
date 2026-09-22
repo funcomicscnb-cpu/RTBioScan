@@ -5056,258 +5056,111 @@ process consensus {
 		append_process_timing "prepare_and_consensus_simple" "\$_t_consensus_prepare_start" "\$_t_consensus_prepare_end"
 		# -- §4: Consensus BLAST annotation (per-target, parallel) --
 		_t_consensus_annotate_start=\$(timing_now_ms)
-
 		_p_targets="${params.targets}"
-		IFS='|' read -ra _TARGETS   <<< "\$_p_targets"
+		IFS='|' read -ra _TARGETS <<< "\$_p_targets"
 		_p_blast_db_specs="${params.blast_db_specs}"
 		IFS='|' read -ra _BLAST_DBS <<< "\$_p_blast_db_specs"
 		_p_blast_id_family="${params.blast_id_family}"
 		IFS='|' read -ra _ID_FAMILY <<< "\$_p_blast_id_family"
 		_p_blast_id_genus="${params.blast_id_genus}"
-		IFS='|' read -ra _ID_GENUS  <<< "\$_p_blast_id_genus"
+		IFS='|' read -ra _ID_GENUS <<< "\$_p_blast_id_genus"
 		_p_blast_id_spec="${params.blast_id_spec}"
-		IFS='|' read -ra _ID_SPEC   <<< "\$_p_blast_id_spec"
-		# O2: split thread budget across concurrent per-target BLASTs
+		IFS='|' read -ra _ID_SPEC <<< "\$_p_blast_id_spec"
+		IFS='|' read -ra _KINGDOMS <<< "${params.target_taxa}"
+		IFS='|' read -ra _SEEDS <<< "${params.nonncbi_memtax}"
+		_WORD_SIZE=50
+		_QCOV=50
 		_N_TARGETS="\${#_TARGETS[@]}"
 		THREADS_PER_BLAST="\$THREADS"
 		if [ "\$_N_TARGETS" -gt 1 ]; then
 			THREADS_PER_BLAST=\$(( THREADS / _N_TARGETS ))
 			[ "\$THREADS_PER_BLAST" -lt 1 ] && THREADS_PER_BLAST=1
 		fi
-			_blast_pids=()
-			_blast_targets=()
-			# C1: single source of truth for BLAST word_size/qcov
-			_WORD_SIZE=50
-			_QCOV=50
-
+		_blast_pids=()
+		_blast_targets=()
+		_taxonomy_ready=()
+		_taxonomy_plans=()
 		for _i in "\${!_TARGETS[@]}"; do
+			_idx=\$(( _i + 1 ))
+			_taxonomy_ready+=( "${barcode}_preblast_new\${_idx}.taxonomy" )
+			_taxonomy_plans+=( --plan "${barcode}_preblast_new\${_idx}.plan" )
 			(
 				_t="\${_TARGETS[\$_i]}"
 				_db="${db_dir}\${_BLAST_DBS[\$_i]}"
 				_id_fam="\${_ID_FAMILY[\$_i]}"
-				_idx=\$(( _i + 1 ))
 				_split_rc=0
+				: > ${barcode}_\${_t}.fasta
 				if (( \${#cons_files[@]} )); then
-					# Split merged consensus FASTAs by header token rather than seqkit grep mode.
-					# This preserves current header-driven target routing for IDs containing pipes.
 					awk -v target="|\${_t}|" '
 						BEGIN { RS=">"; ORS="" }
 						NR > 1 {
-							rec=\$0
-							header=\$1
+							rec=\$0; header=\$1
 							sub(/[[:space:]].*/, "", header)
-							if (index(header, target) > 0) {
-								print ">" rec
-							}
+							if (index(header, target) > 0) { print ">" rec }
 						}
 					' "\${cons_files[@]}" > ${barcode}_\${_t}.fasta || _split_rc=\$?
 				fi
 				if [ "\$_split_rc" -ne 0 ]; then
-					echo "ERROR: consensus target split failed target=\${_t} exit=\${_split_rc} sample=${barcode} round=${round_barcode}" 1>&2
-					: > ${barcode}_preblastreport\${_idx}.txt
-					exit 1
-				elif [ -s ${barcode}_\${_t}.fasta ]; then
-					_CACHE="\${STATE_DIR}/consensus_blast_cache_\${_t}.tsv"
-					_CACHE_META="\${STATE_DIR}/consensus_blast_cache_\${_t}.meta"
-					_KEY="db=\${_db}|sig=\$(db_sig \${_db})|taxdb=${taxdb_dir}|taxsig=\$(dir_sig ${taxdb_dir})|idfam=\${_id_fam}|evalue=${params.blast_evalue}|maxhsps=${params.blast_max_hsps}|word=\${_WORD_SIZE}|qcov=\${_QCOV}|target=\${_t}"
-					if [ ! -f "\$_CACHE_META" ] || [ "\$(cat "\$_CACHE_META" 2>/dev/null)" != "\$_KEY" ]; then
-						: > "\$_CACHE"
-						printf '%s\n' "\$_KEY" > "\$_CACHE_META"
-					fi
-					[ -f "\$_CACHE" ] || : > "\$_CACHE"
-					${baseDir}/bin/cache_blast_by_hash.pl ${barcode}_\${_t}.fasta "\$_CACHE" ${barcode}_preblast_cached\${_idx}.txt ${barcode}_preblast_new\${_idx}.fasta ${barcode}_preblast_hash_new\${_idx}.tsv
-	
-						if [ -s ${barcode}_preblast_new\${_idx}.fasta ]; then
-							if ! blastn -query ${barcode}_preblast_new\${_idx}.fasta -db "\$_db" -num_threads "\$THREADS_PER_BLAST" -task megablast -dust no -outfmt "10 qseqid sseqid evalue length pident" -perc_identity "\$_id_fam" -evalue ${params.blast_evalue} -max_hsps ${params.blast_max_hsps} -max_target_seqs 1 -word_size "\$_WORD_SIZE" -qcov_hsp_perc "\$_QCOV" -mt_mode 2 > ${barcode}_preblast_new\${_idx}.txt; then
-								echo "ERROR: consensus blastn failed target=\${_t} db=\${_db} sample=${barcode} round=${round_barcode}" 1>&2
-								exit 1
-							fi
-						else
-							: > ${barcode}_preblast_new\${_idx}.txt
-						fi
-	
-					if [ -s ${barcode}_preblast_hash_new\${_idx}.tsv ] && [ -s ${barcode}_preblast_new\${_idx}.txt ]; then
-						awk -F'\t' 'NR==FNR{h[\$1]=\$2; next} {split(\$0,a,","); if (a[1] in h) print h[a[1]] "\t" a[2] "\t" a[3] "\t" a[4] "\t" a[5];}' ${barcode}_preblast_hash_new\${_idx}.tsv ${barcode}_preblast_new\${_idx}.txt >> "\$_CACHE"
-						awk -F'\t' '{line[\$1]=\$0} END{for (k in line) print line[k]}' "\$_CACHE" | LC_ALL=C sort > "\${_CACHE}.tmp" && mv "\${_CACHE}.tmp" "\$_CACHE"
-					fi
-	
-					if [ -s ${barcode}_preblast_cached\${_idx}.txt ] || [ -s ${barcode}_preblast_new\${_idx}.txt ]; then
-						cat ${barcode}_preblast_cached\${_idx}.txt ${barcode}_preblast_new\${_idx}.txt > ${barcode}_preblastreport\${_idx}.txt
-					else
-						: > ${barcode}_preblastreport\${_idx}.txt
-					fi
-				else
-					# No consensus sequences matched this target — write empty report (non-fatal).
-					: > ${barcode}_preblastreport\${_idx}.txt
-				fi
-				) &
-				_blast_pids+=( "\$!" )
-				_blast_targets+=( "\${_TARGETS[\$_i]}" )
-			done
-			worker_failures_blast=0
-			for _j in "\${!_blast_pids[@]}"; do
-				_pid="\${_blast_pids[\$_j]}"
-				_t="\${_blast_targets[\$_j]:-unknown}"
-				if ! wait "\$_pid"; then
-					worker_failures_blast=\$((worker_failures_blast + 1))
-					echo "ERROR: consensus BLAST worker failed target=\${_t} sample=${barcode} round=${round_barcode}" 1>&2
-					# Kill remaining workers and abort immediately on first failure
-					for _k in "\${_blast_pids[@]}"; do
-						kill "\$_k" 2>/dev/null || true
-					done
-					echo "METRIC: worker_failures_blast=\${worker_failures_blast} sample=${barcode} round=${round_barcode}" 1>&2
+					echo "ERROR: consensus target split failed target=\${_t}" >&2
 					exit 1
 				fi
-			done
-			echo "METRIC: worker_failures_blast=0 sample=${barcode} round=${round_barcode}" 1>&2
-
-					# Robustly join preblast and blast reports; avoid `cat <glob> > out` hangs under `nullglob`.
-					# Always produce a header-only placeholder (never a sentinel string) so downstream parsers don't ingest junk.
-					if compgen -G "${barcode}_preblastreport[0-9]*.txt" > /dev/null; then
-					cat ${barcode}_preblastreport[0-9]*.txt > ${barcode}_preblastreport_join.txt
+				# No consensus sequences matched this target: publish a sealed empty projection.
+				export RTB_R4C_MARKER="\$_t" RTB_R4C_KINGDOM="\${_KINGDOMS[\$_i]}"
+				export RTB_R4C_DATABASE="\$_db" RTB_R4C_TAXONOMY="\$TAXONKIT_DB"
+				export RTB_R4C_FAMILY="\$_id_fam" RTB_R4C_GENUS="\${_ID_GENUS[\$_i]}" RTB_R4C_SPECIES="\${_ID_SPEC[\$_i]}"
+				export RTB_R4C_EVALUE="${params.blast_evalue}" RTB_R4C_MAX_HSPS="${params.blast_max_hsps}"
+				RTB_R4C_SEED="\${_SEEDS[\$_i]:-}"
+				case "\$RTB_R4C_SEED" in ''|null|/*) ;; *) RTB_R4C_SEED="${baseDir}/\$RTB_R4C_SEED" ;; esac
+				RTB_R4C_LINEAGE="${params.nonncbi_id2lineage_target}"
+				case "\$RTB_R4C_LINEAGE" in ''|null|/*) ;; *) RTB_R4C_LINEAGE="${baseDir}/\$RTB_R4C_LINEAGE" ;; esac
+				export RTB_R4C_SEED RTB_R4C_LINEAGE
+				# Legacy consensus_blast_cache rows lack complete HSP evidence and are never consumed.
+				perl "${baseDir}/bin/consensus_taxonomy_by_hash.pl" prepare \
+					--fasta ${barcode}_\${_t}.fasta --identity-map Consensus/otu_identity_current.tsv \
+					--state "\${STATE_DIR}/consensus_taxonomy_\${_t}_v1.tsv" --prefix ${barcode}_preblast_new\${_idx}
+				if [ -s ${barcode}_preblast_new\${_idx}.fasta ]; then
+					_max_targets=\$(perl "${baseDir}/bin/consensus_taxonomy_by_hash.pl" target-count --database "\$_db")
+					if ! blastn -query ${barcode}_preblast_new\${_idx}.fasta -db "\$_db" -num_threads "\$THREADS_PER_BLAST" -task megablast -dust no -outfmt "6 qseqid sseqid staxids evalue length pident bitscore qstart qend sstart send qlen" -perc_identity "\$_id_fam" -evalue ${params.blast_evalue} -max_hsps ${params.blast_max_hsps} -max_target_seqs "\$_max_targets" -word_size "\$_WORD_SIZE" -qcov_hsp_perc "\$_QCOV" -mt_mode 2 > ${barcode}_preblast_new\${_idx}.txt; then
+						echo "ERROR: consensus blastn failed target=\${_t} sample=${barcode} round=${round_barcode}" >&2
+						exit 1
+					fi
 				else
-					printf 'qseqid,sseqid,evalue,length,pident\n' > ${barcode}_preblastreport_join.txt
+					: > ${barcode}_preblast_new\${_idx}.txt
 				fi
-					# Build a tabular consensus blast report with taxonomy columns.
-					# Guard TaxonKit usage and skip non-numeric taxids (fallback to Unassigned).
-					printf 'long_seq_id\tconsensus_taxid\tkingdom\tphylum\tclass\torder\tfamily\tgenus\tspecies\n' > consensus_blast_report_full.txt
-						# -- §5: TaxonKit taxonomy depth assignment --
-		TAXONKIT_CACHE_STATE="\${STATE_DIR}/${barcode}_consensus_taxonkit_lineage_cache.tsv"
-						TAXONKIT_CACHE_META="\${STATE_DIR}/${barcode}_consensus_taxonkit_lineage_cache.meta"
-						TAXONKIT_CACHE_LOCAL="consensus_taxonkit_lineage_cache.tsv"
-						_TAXDB_SIG="\$(dir_sig ${taxdb_dir})"
-						_CACHED_TAXDB_SIG="\$(cat "\$TAXONKIT_CACHE_META" 2>/dev/null || true)"
-						if [ -s "\$TAXONKIT_CACHE_STATE" ] && [ "\$_CACHED_TAXDB_SIG" = "\$_TAXDB_SIG" ]; then
-							cp "\$TAXONKIT_CACHE_STATE" "\$TAXONKIT_CACHE_LOCAL" 2>/dev/null || : > "\$TAXONKIT_CACHE_LOCAL"
-						else
-							[ -n "\$_CACHED_TAXDB_SIG" ] && [ "\$_CACHED_TAXDB_SIG" != "\$_TAXDB_SIG" ] && \
-								echo "INFO: taxdb signature changed; invalidating taxonkit lineage cache sample=${barcode}" 1>&2 || true
-							: > "\$TAXONKIT_CACHE_LOCAL"
-						fi
-						if [ -s ${barcode}_preblastreport_join.txt ]; then
-						# tmp_idx columns: idx, qseqid, sseqid, taxid
-						# Use preblastreport_join.txt (raw BLAST CSV) to extract numeric taxids
-						# for TaxonKit lookup.
-						awk 'BEGIN{FS=","; OFS="\t"; i=0}
-							\$1 == "qseqid" { next }
-							\$2 != "" {
-								i++;
-								q=\$1; s=\$2; t="";
-								# s is the raw BLAST sseqid: either a bare numeric taxid
-								# or a hit id containing |kraken:taxid|NNN. Extract a numeric taxid portably.
-								# Avoid end-of-line anchors in regex here because dollar sign triggers Groovy interpolation
-								# in Nextflow script blocks. This is equivalent to "only digits" given s != "".
-								if (s !~ /[^0-9]/) {
-									t=s;
-								} else {
-										# BSD/macOS awk does not support match(s, r, a) with a capture array; use portable parsing.
-									tag="|kraken:taxid|";
-									pos=index(s, tag);
-									if (pos > 0) {
-										rest=substr(s, pos+length(tag));
-										if (match(rest, /^[0-9]+/)) {
-											t=substr(rest, RSTART, RLENGTH);
-										}
-									}
-								}
-								print i, q, s, t;
-							}' ${barcode}_preblastreport_join.txt > tmp_idx.tsv
-						# Nothing to annotate -> keep header-only output.
-						if [ ! -s tmp_idx.tsv ]; then
-							: > tmp_tax.tsv
-							: > tmp_tax_cols.tsv
-						else
-
-								# tmp_tax columns: idx, lineage (with rank prefixes); only for numeric taxids
-								: > tmp_tax.tsv
-								if command -v taxonkit >/dev/null 2>&1; then
-									cut -f1,4 tmp_idx.tsv | awk 'BEGIN{FS=OFS="\t"} \$2 != "" && \$2 !~ /[^0-9]/ {print \$0}' > tmp_taxids_numeric.tsv
-									if [ -s tmp_taxids_numeric.tsv ]; then
-										cut -f2 tmp_taxids_numeric.tsv | LC_ALL=C sort -u > tmp_taxids_unique.txt
-										: > tmp_tax_map.tsv
-										if [ -s "\$TAXONKIT_CACHE_LOCAL" ]; then
-											awk 'BEGIN{FS=OFS="\t"; first=ARGV[1]}
-												FILENAME==first { want[\$1]=1; next }
-												NF>=2 && (\$1 in want) && \$2 != "" { print \$1, \$2 }
-											' tmp_taxids_unique.txt "\$TAXONKIT_CACHE_LOCAL" | LC_ALL=C sort -u > tmp_tax_map.tsv
-										fi
-										if [ -s tmp_tax_map.tsv ]; then
-											cut -f1 tmp_tax_map.tsv | LC_ALL=C sort -u > tmp_taxids_cached.txt
-										else
-											: > tmp_taxids_cached.txt
-										fi
-										awk 'BEGIN{first=ARGV[1]}
-											FILENAME==first { c[\$1]=1; next }
-											!(\$1 in c) { print \$1 }
-										' tmp_taxids_cached.txt tmp_taxids_unique.txt > tmp_taxids_missing.txt
-										if [ -s tmp_taxids_missing.txt ]; then
-											taxonkit lineage tmp_taxids_missing.txt 2>/dev/null \
-												| taxonkit reformat -f "{K};{p};{c};{o};{f};{g};{s}" -P 2>/dev/null \
-												| awk -F'\t' 'BEGIN{OFS="\t"} NF>=3 && \$1 != "" && \$1 !~ /[^0-9]/ && \$3 != "" { print \$1, \$3 }' \
-												> tmp_tax_map_missing.tsv || : > tmp_tax_map_missing.tsv
-											if [ -s tmp_tax_map_missing.tsv ]; then
-												# B4: append-only + single compact instead of full cat+sort+mv rebuild
-												cat tmp_tax_map_missing.tsv >> tmp_tax_map.tsv
-												LC_ALL=C sort -u -o tmp_tax_map.tsv tmp_tax_map.tsv
-												cat tmp_tax_map_missing.tsv >> "\$TAXONKIT_CACHE_LOCAL"
-												LC_ALL=C sort -u -o "\$TAXONKIT_CACHE_LOCAL" "\$TAXONKIT_CACHE_LOCAL"
-											fi
-										fi
-										awk 'BEGIN{FS=OFS="\t"; first=ARGV[1]}
-											FILENAME==first { lin[\$1]=\$2; next }
-											{
-												idx=\$1;
-												taxid=\$2;
-												if (taxid in lin && lin[taxid] != "") {
-													print idx, lin[taxid];
-												}
-											}
-										' tmp_tax_map.tsv tmp_taxids_numeric.tsv > tmp_tax.tsv || : > tmp_tax.tsv
-									fi
-								fi
-
-							fallback_lineage='K__Unassigned;p__Unassigned;c__Unassigned;o__Unassigned;f__Unassigned;g__Unassigned;s__Unassigned'
-							awk -v fb="\$fallback_lineage" 'BEGIN{FS=OFS="\t"; first=ARGV[1]}
-								FILENAME==first { lin[\$1]=\$2; next }
-								{
-									idx=\$1; taxid=\$4;
-									if (taxid == "" || taxid == "NA") { print fb; next }
-									if (idx in lin && lin[idx] != "") { print lin[idx] } else { print fb }
-								}' tmp_tax.tsv tmp_idx.tsv \
-								| sed -E 's/[Kpcofgs]__//g' \
-								| tr ';' '\t' \
-								> tmp_tax_cols.tsv
-
-							# Resolve assignment depth: pident + thresholds => level (species/genus/family/unassigned).
-							# Per target, collect all hits then dedup by qseqid keeping deepest level.
-							: > tmp_assign_levels.tsv
-							for _i in "\${!_TARGETS[@]}"; do
-								_id_fam="\${_ID_FAMILY[\$_i]}"
-								_id_gen="\${_ID_GENUS[\$_i]}"
-								_id_spec="\${_ID_SPEC[\$_i]}"
-								_idx=\$(( _i + 1 ))
-								if [ -s ${barcode}_preblastreport\${_idx}.txt ]; then
-									bash ${baseDir}/bin/consensus_assign_depth.sh \
-										--report   ${barcode}_preblastreport\${_idx}.txt \
-										--family   "\$_id_fam" \
-										--genus    "\$_id_gen" \
-										--species  "\$_id_spec" \
-										>> tmp_assign_levels.tsv
-								fi
-							done
-							awk -F'\t' 'BEGIN{r["species"]=3;r["genus"]=2;r["family"]=1;r["unassigned"]=0}
-								{ if (!(\$1 in best) || r[\$2]>r[best[\$1]]) best[\$1]=\$2 }
-								END{ for (q in best) print q "\t" best[q] }
-							' tmp_assign_levels.tsv | LC_ALL=C sort > tmp_assign_levels_uniq.tsv
-
-							paste tmp_idx.tsv tmp_tax_cols.tsv > tmp_tax_join.tsv
-							bash ${baseDir}/bin/consensus_threshold_mask.sh tmp_assign_levels_uniq.tsv tmp_tax_join.tsv >> consensus_blast_report_full.txt
-						fi
-						if [ -f "\$TAXONKIT_CACHE_LOCAL" ]; then
-							cp "\$TAXONKIT_CACHE_LOCAL" "\$TAXONKIT_CACHE_STATE" 2>/dev/null || true
-							printf '%s\n' "\$_TAXDB_SIG" > "\$TAXONKIT_CACHE_META" 2>/dev/null || true
-						fi
-							fi
+				perl "${baseDir}/bin/consensus_taxonomy_by_hash.pl" complete \
+					--prefix ${barcode}_preblast_new\${_idx} --raw ${barcode}_preblast_new\${_idx}.txt
+			) &
+			_blast_pids+=( "\$!" )
+			_blast_targets+=( "\${_TARGETS[\$_i]}" )
+		done
+		worker_failures_blast=0
+		for _j in "\${!_blast_pids[@]}"; do
+			_pid="\${_blast_pids[\$_j]}"
+			_t="\${_blast_targets[\$_j]:-unknown}"
+			if ! wait "\$_pid"; then
+				worker_failures_blast=\$((worker_failures_blast + 1))
+				echo "ERROR: consensus BLAST worker failed target=\${_t} sample=${barcode} round=${round_barcode}" >&2
+				for _k in "\${_blast_pids[@]}"; do
+					kill "\$_k" 2>/dev/null || true
+				done
+				echo "METRIC: worker_failures_blast=\${worker_failures_blast}" >&2
+				exit 1
+			fi
+		done
+		echo "METRIC: worker_failures_blast=0" >&2
+		perl "${baseDir}/bin/consensus_taxonomy_by_hash.pl" merge \
+			--out consensus_taxonomy_v1.tsv --full consensus_blast_report_full.txt \
+			--csv ${barcode}_preblastreport_join.txt "\${_taxonomy_ready[@]}"
+		# All workers and projections validate before any authoritative state replacement.
+		for _i in "\${!_TARGETS[@]}"; do
+			perl "${baseDir}/bin/consensus_taxonomy_by_hash.pl" publish \
+				--plan "${barcode}_preblast_new\$(( _i + 1 )).plan" \
+				--input "\${_taxonomy_ready[\$_i]}" --out "\${STATE_DIR}/consensus_taxonomy_\${_TARGETS[\$_i]}_v1.tsv"
+		done
+		mkdir -p "${ongoingStateDir}/${round_barcode}"
+		perl "${baseDir}/bin/consensus_taxonomy_by_hash.pl" publish \
+			"\${_taxonomy_plans[@]}" \
+			--input consensus_taxonomy_v1.tsv --out "${ongoingStateDir}/${round_barcode}/${barcode}_consensus_taxonomy_v1.tsv"
 						# consensus provenance failfast start
 										if ! perl ${baseDir}/bin/emit_consensus_round_provenance.pl \
 							--consensus-dir Consensus \
@@ -5323,6 +5176,7 @@ process consensus {
 					: > "\$RECOVERY_IDS"
 					if ! perl ${baseDir}/bin/consensus_recovered_reads.pl \
 						--blast-report consensus_blast_report_full.txt \
+						--taxonomy-sidecar consensus_taxonomy_v1.tsv \
 						--consensus-dir Consensus \
 						--out "\$RECOVERY_IDS" \
 						--min-level "${assignProtLevelCanonical}"; then
@@ -5344,6 +5198,7 @@ process consensus {
 						mkdir -p "\$ROUND_DIR" "\$STATE_DIR"
 						if ! perl ${baseDir}/bin/consensus_assigned_otu_keys.pl \
 							--blast-report consensus_blast_report_full.txt \
+						--taxonomy-sidecar consensus_taxonomy_v1.tsv \
 							--provenance consensus_round_provenance.tsv \
 							--out "\$CONSENSUS_ASSIGNED_OTU_KEYS_ROUND" \
 							--min-level "${assignProtLevelCanonical}"; then
@@ -5915,6 +5770,13 @@ process _reporting_consensus_tax {
 			ROUND_FAILED=0
 			if [ -f "\$ROUND_FAILED_FILE" ]; then
 				ROUND_FAILED=1
+			fi
+
+			# R4-C strict attribution authority; failed-round placeholders remain header-only.
+			if [ "\$ROUND_FAILED" -eq 0 ]; then
+				export RTBIOSCAN_CONSENSUS_TAXONOMY="${ongoingStateDir}/${round_barcode}/${barcode}_consensus_taxonomy_v1.tsv"
+			else
+				unset RTBIOSCAN_CONSENSUS_TAXONOMY
 			fi
 
 				CONS_IDS_ROUND="${ongoingStateDir}/${round_barcode}/${barcode}_consensus_consolidated_ids.txt"

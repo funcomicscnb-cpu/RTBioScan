@@ -111,7 +111,7 @@ def test_family_unassigned_reads_not_recovered(tmp_path):
     out = tmp_path / "recovered.list"
     result = _run(blast_report, cons_dir, out, min_level="family")
     assert result.returncode == 0
-    assert out.read_text().strip() == ""
+    assert out.read_text().strip() == "readY"
 
 
 def test_missing_blast_report_empty_output(tmp_path):

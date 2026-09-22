@@ -2995,17 +2995,17 @@ def test_main_nf_wires_unassigned_cluster_prune_flow() -> None:
     assert 'if [ -f Consensus/pruned_unassigned_reads_round.list ]; then' in consensus_block
     assert 'consensus_pruned_unassigned_merge.sh \\' in consensus_block
     assert '--provenance consensus_round_provenance.tsv' in consensus_block
-    # Depth resolver wiring: all three thresholds per target, deepest-level dedup, then mask.
-    assert 'bash ${baseDir}/bin/consensus_assign_depth.sh \\' in consensus_block
-    assert '--family   "\\$_id_fam" \\' in consensus_block
-    assert '--genus    "\\$_id_gen" \\' in consensus_block
-    assert '--species  "\\$_id_spec" \\' in consensus_block
-    assert 'tmp_assign_levels_uniq.tsv' in consensus_block
-    assert 'consensus_threshold_mask.sh tmp_assign_levels_uniq.tsv' in consensus_block
+    # R4-C resolves selected evidence with all three marker thresholds.
+    assert 'consensus_taxonomy_by_hash.pl" prepare \\' in consensus_block
+    assert 'RTB_R4C_FAMILY="\\$_id_fam"' in consensus_block
+    assert 'RTB_R4C_GENUS="\\${_ID_GENUS[\\$_i]}"' in consensus_block
+    assert 'RTB_R4C_SPECIES="\\${_ID_SPEC[\\$_i]}"' in consensus_block
+    assert 'consensus_taxonomy_by_hash.pl" complete \\' in consensus_block
+    assert '--out consensus_taxonomy_v1.tsv --full consensus_blast_report_full.txt' in consensus_block
     # get_blast_taxdepth.pl must not appear in the consensus block (OTU-pretax path only).
     assert 'get_blast_taxdepth.pl' not in consensus_block
-    # Dedup awk must use escaped field refs (\$1, \$2) — Nextflow triple-double-quote context.
-    assert r'\$1 in best' in consensus_block
+    # Both assignment consumers must explicitly use the sealed attribution sidecar.
+    assert consensus_block.count('--taxonomy-sidecar consensus_taxonomy_v1.tsv') == 2
 
 
 def test_main_nf_wires_run_started_utc_file() -> None:

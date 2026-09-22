@@ -2567,3 +2567,30 @@ of the TSV payload. It normalizes representation only; it cannot adjudicate conf
 biology, fill absent ranks, or repair/activate production references. Pipeline runs
 never invoke this operation. The existing taxonomy-release installation interface
 is unchanged.
+
+### Consensus taxonomy cache migration (R4-C)
+
+Legacy `consensus_blast_cache_*` rows lack the complete HSP evidence needed for
+deterministic consensus attribution. They are ignored rather than promoted to
+authority. The first R4-C round rebuilds attribution from the current consensus
+FASTA against its marker database, including all equal-best subject candidates.
+The BLAST target limit is the database's sequence count; it is not used to choose
+a biological winner.
+
+The new internal consensus taxonomy sidecar is described in
+[Output](output.md#consensus-taxonomy-authority-r4-c). Its scientific signature
+binds marker database contents, pinned taxonomy contents, the configured synthetic
+seed or explicit disabled state, lineage authority, configured kingdom, all three
+identity thresholds, BLAST evidence parameters and schema version. Timestamps are
+not scientific inputs. A signature change causes a deterministic rebuild.
+Malformed, truncated or conflicting state fails closed instead of replacing prior
+authority. A prepared generation that becomes stale during evidence acquisition
+is refused; retry prepares against the current inputs.
+
+Cache-only rounds reuse validated attribution by sequence hash while reprojecting
+current consensus identities and stable OTU ownership. With unchanged inputs,
+authoritative and public bytes are reproducible. Publication validates the ready
+records against the sealed current query generation before atomically replacing
+each persistent file. Assigned keys and recovered reads use the same validated
+status and actual resolved minimum-depth predicate; taxid sign does not determine
+assignment. No public denominator or report-policy change is introduced here.

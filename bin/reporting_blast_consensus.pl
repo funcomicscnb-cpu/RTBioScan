@@ -14,6 +14,42 @@ if (!defined $blast_read || !defined $blastreport_consensus || !defined $barcode
 
 my $report_blast_consensus_file = $barcode_pipeline . "_blast_consensus_tax_rpt.txt";
 my $report_blast_consensus_consolidated_file = $barcode_pipeline . "_blast_consensus_tax_consolidated_rpt.txt";
+# The production caller supplies the validated R4-C authority. Legacy standalone
+# report callers keep their existing positional interface and public schema.
+if (defined($ENV{RTBIOSCAN_CONSENSUS_TAXONOMY}) && $ENV{RTBIOSCAN_CONSENSUS_TAXONOMY} ne '') {
+    require "$FindBin::Bin/consensus_taxonomy_by_hash.pl";
+    my (undef,$rows)=RTBioScan::ConsensusTaxonomy::read_sidecar($ENV{RTBIOSCAN_CONSENSUS_TAXONOMY});
+    my %ids;
+    if (defined($consolidated_ids_file) && -s $consolidated_ids_file) {
+        open my $f,'<',$consolidated_ids_file or die "read consolidated IDs: $!\n";
+        while (<$f>) { s/^>//;s/\s+$//;$ids{$_}=1 if length; }
+        close $f or die "close consolidated IDs: $!\n";
+    }
+    my $header=join("\t",qw(consensus_id otu_key barcode_by_homology basecalling_model
+        number_of_reads sample taxid blast_hit aln_length perc_id consensus_kingdom
+        consensus_phylum consensus_class consensus_order consensus_family consensus_genus consensus_species))."\n";
+    my ($text,$consolidated)=($header,$header);
+    for my $r (@$rows) {
+        my @counts=($r->{long_seq_id}=~/\|reads-(\d+)(?=\||$)/g);
+        die "ambiguous/missing consensus read count\n" unless @counts==1;
+        my $hit='NA';my $hs=$r->{candidates};
+        if ($r->{origin} eq 'DIRECT' && @$hs==1) {
+            $hit=$hs->[0][1];$hit =~ s/\|kraken:taxid\|-?[0-9]+\z//;
+        }
+        my @metrics=@$hs ? ($hs->[0][4],sprintf('%.3f', 0 + $hs->[0][5])) : ('NA','NA');
+        my @lineage=RTBioScan::ConsensusTaxonomy::usable($r->{status})
+            ? map {$_ eq 'NA' ? 'Unassigned' : $_} @$r{@RTBioScan::ConsensusTaxonomy::RANKS}
+            : ('Unassigned')x7;
+        my $line=join("\t",@$r{qw(consensus_id display_otu_key marker)},'consensus',
+            $counts[0],@$r{qw(sample resolved_taxid)},$hit,@metrics,@lineage)."\n";
+        $text.=$line;
+        $consolidated.=$line if $ids{$r->{consensus_id}} || $ids{$r->{long_seq_id}};
+    }
+    RTBioScan::ConsensusTaxonomy::atomic($report_blast_consensus_file,$text);
+    RTBioScan::ConsensusTaxonomy::atomic($report_blast_consensus_consolidated_file,$consolidated);
+    exit 0;
+}
+
 my $dropped_rows_invalid_sseqid_format = 0;
 
 sub parse_hit_taxid {
@@ -22,11 +58,11 @@ sub parse_hit_taxid {
     $raw =~ s/^\s+//;
     $raw =~ s/\s+$//;
     return ('', '', 'invalid') if $raw eq '';
-    if ($raw =~ /^(\d+)$/) {
+    if ($raw =~ /^(-?\d+)$/) {
         my $taxid = $1;
         return ($taxid, $taxid, 'numeric');
     }
-    if ($raw =~ /(\S+)\|kraken:taxid\|(\d+)/) {
+    if ($raw =~ /(\S+)\|kraken:taxid\|(-?\d+)/) {
         return ($1, $2, 'kraken');
     }
     return ('', '', 'invalid');
@@ -185,6 +221,8 @@ while (my $line = <$IN>) {
         $dropped_rows_invalid_sseqid_format++;
         next;
     }
+
+    $taxid = defined($tr[1]) && $tr[1] =~ /\A-?[1-9][0-9]*\z/ ? $tr[1] : 'NA';
 
     # consensus taxonomy TSV from the pipeline:
     #   long_seq_id, consensus_taxid, kingdom, phylum, class, order, family, genus, species

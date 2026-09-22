@@ -21,7 +21,8 @@ tax_join="$2"
 awk -F'\t' -v OFS='\t' -v _lf="$levels" '
 	FILENAME==_lf { lev[$1]=$2; next }
 	{
-		q=$2; s=$3;
+		q=$2; s=$4;
+		if (s !~ /^-?[0-9]+$/ || s == "0") s="NA";
 		k=$5; p=$6; c=$7; o=$8; f=$9; g=$10; sp=$11;
 		l=(q in lev) ? lev[q] : "";
 		if      (l == "genus")    { sp="Unassigned"; }
