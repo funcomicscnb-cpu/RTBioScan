@@ -2633,21 +2633,25 @@ def test_main_nf_blast_process_fixes_preserve_fail_fast_timing_and_locking() -> 
     assignment_end_pos = text.index('append_process_timing "assignment_state_updates" "\\$_t_assignment_state_updates_start" "\\$_t_assignment_state_updates_end"')
     assert otu_refine_pos < assignment_start_pos < assignment_end_pos
 
-    merge_start = text.index('STATE_BLASTREPORT_SNAPSHOT="${barcode}_blastreport_state_snapshot.txt"')
+    # R4-D: the write-only _state/blastreport.txt snapshot/merge/republish is
+    # retired; the same locked section now only derives the initialization
+    # flag (legacy file or versioned marker) and never touches the legacy file.
+    merge_start = text.index('BLAST_STATE_INIT_MARKER="\\${STATE_DIR}/blastreport_initialized_v1.txt"')
     merge_end = text.index('append_process_timing "blastreport_merge" "\\$_t_blastreport_merge_start" "\\$_t_blastreport_merge_end"')
     merge_block = text[merge_start:merge_end]
-    assert 'cp "\\${STATE_DIR}/blastreport.txt" "\\$STATE_BLASTREPORT_SNAPSHOT"' in merge_block
+    assert 'if acquire_lock "\\${BLASTREPORT_LOCK}"; then' in merge_block
+    assert 'if [ -f "\\$BLAST_STATE_INIT_MARKER" ] || [ -f "\\${STATE_DIR}/blastreport.txt" ]; then' in merge_block
     assert 'STATE_BLASTREPORT_EXISTS=1' in merge_block
-    assert '"\\$STATE_BLASTREPORT_SNAPSHOT"' in merge_block
-    assert 'rm -f "\\$STATE_BLASTREPORT_SNAPSHOT"' in merge_block
+    assert 'cp "\\${STATE_DIR}/blastreport.txt"' not in merge_block
+    assert 'cache_blast_by_hash.pl" --merge' not in merge_block
 
     publish_start = text.index('cp ${barcode}_blastreport_round.txt "\\$ROUND_DIR/blastreport.txt"')
     publish_end = text.index('copy_soft "\\$BLAST_FILTER_STATS" "\\$ROUND_DIR/${barcode}_blast_filter_stats.tsv"', publish_start)
     publish_block = text[publish_start:publish_end]
     assert 'if acquire_lock "\\${BLASTREPORT_LOCK}"; then' in publish_block
-    assert 'STATE_BLASTREPORT_TMP="\\${STATE_DIR}/blastreport.txt.tmp.\\$\\$"' in publish_block
-    assert 'cp ${barcode}_blastreport.txt "\\$STATE_BLASTREPORT_TMP"' in publish_block
-    assert 'mv "\\$STATE_BLASTREPORT_TMP" "\\${STATE_DIR}/blastreport.txt"' in publish_block
+    assert 'BLAST_STATE_INIT_TMP="\\${BLAST_STATE_INIT_MARKER}.tmp.\\$\\$"' in publish_block
+    assert 'mv "\\$BLAST_STATE_INIT_TMP" "\\$BLAST_STATE_INIT_MARKER"' in publish_block
+    assert 'mv "\\$STATE_BLASTREPORT_TMP" "\\${STATE_DIR}/blastreport.txt"' not in publish_block
     assert 'release_lock "\\${BLASTREPORT_LOCK}"' in publish_block
 
 
@@ -3321,7 +3325,9 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'cp "${barcode}_summary_demult_rpt.txt" "${ongoingStateDir}/_state/${barcode}_summary_demult_rpt.txt"' in summary_block
     assert '--demult "${demult_rpt}" \\' in summary_block
     assert '--read-fate-demult "${barcode}_read_fate_demult_first_seen.tsv" \\' in summary_block
-    assert '--schema-version "2.0" \\' in summary_block
+    assert '--schema-version "2.1" \\' in summary_block
+    assert '--blast-otu-reporting "\\$ROUND_DIR/${barcode}_blast_otu_reporting_v1.tsv" \\' in summary_block
+    assert '--summary "${summary}" \\' not in summary_block
     assert '--otu-sizes-round "${otu_sizes_round}" \\' in summary_block
     assert '--otu-size-streak "\\$ROUND_DIR/${barcode}_otu_size_streak.tsv" \\' in summary_block
     assert '--active-prune-counts "\\$ACTIVE_PRUNE_COUNTS_OUT" \\' in summary_block

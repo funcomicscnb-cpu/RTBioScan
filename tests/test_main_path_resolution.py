@@ -302,6 +302,20 @@ def test_head_candidate_generated_command_equivalence(tmp_path, default):
     head_config = subprocess.check_output(['git', 'show', f'{HEAD}:nextflow.config'], cwd=ROOT, text=True)
     # Isolate exactly the intentional promoter/dead-variable deletion in HEAD.
     head_main = _without_promoter(head_main)
+    # R4-D: isolate the intentional round-report invocation changes (schema
+    # 2.1, sealed reporting-sidecar inputs, retired --summary inputs).
+    r4d_replacements = [
+        ('\t\t\t--schema-version "2.0" \\\n\t\t\t--asset-snapshot-policy "latest_only" \\\n',
+         '\t\t\t--schema-version "2.1" \\\n\t\t\t--asset-snapshot-policy "latest_only" \\\n', 1),
+        ('\t\t\t--blast-otu "${blast_otu_pretax_rpt}" \\\n',
+         '\t\t\t--blast-otu "${blast_otu_pretax_rpt}" \\\n'
+         '\t\t\t--blast-otu-reporting "\\$ROUND_DIR/${barcode}_blast_otu_reporting_v1.tsv" \\\n'
+         '\t\t\t--blast-otu-reporting-cumulative "${ongoingStateDir}/_state/${barcode}_blast_otu_reporting_v1.tsv" \\\n', 1),
+        ('\t\t\t--summary "${summary}" \\\n\t\t\t--summary-otu "${summary_otu}" \\\n', '', 1),
+    ]
+    for old, new, count in r4d_replacements:
+        assert head_main.count(old) == count, old
+        head_main = head_main.replace(old, new)
     if not default:
         replacements = [
             ('${params.outdir}/sample_info/${run_name}/track_roster.tsv',

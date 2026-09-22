@@ -899,9 +899,9 @@ Pipe-separated minimum `pident` thresholds for species-level taxonomic assignmen
 ### `--nonncbi_memtax`
 [back to Top](#rtbioscan-usage)
 
-Pipe-separated paths to the per-marker memory-taxonomy tables used to adjust BLAST assignment depth, in the same order as `--targets`.
+Pipe-separated paths to the per-marker synthetic-taxon seed tables, in the same order as `--targets`. Each seed feeds the sealed per-marker R4-A `MEMTAX` state (`_state/memtax<i>.txt`), a validated memory of resolved rank identities bound to the reference and taxonomy signatures; it is not an independent taxonomy authority and does not by itself extend assignment coverage.
 
-- Default: `db/COInr_2024Jun_metazoa_memtax1.txt|db/ITS2nr_2024Jun_metazoa_memtax1.txt`.
+- Default: `db/COInr_2024Jun_metazoa_memtax1.txt|db/ITS2nr_2024Jun_viridiplantae_memtax2.txt`.
 - Provide one entry per marker; leave an entry empty to skip the table for that marker.
 - Empty entries still count toward the required 1:1 alignment with `--targets`.
 - Paths are resolved relative to the pipeline root.
@@ -2594,3 +2594,21 @@ records against the sealed current query generation before atomically replacing
 each persistent file. Assigned keys and recovered reads use the same validated
 status and actual resolved minimum-depth predicate; taxid sign does not determine
 assignment. No public denominator or report-policy change is introduced here.
+
+### Reporting denominators and cumulative state (R4-D)
+
+Public OTU tables and the `taxonomy_assignment` section of `round_report.json`
+count canonical NR membership relations: one row per member of the complete
+current membership, members inheriting their validated OTU assignment, raw
+duplicates and direct-hit non-members excluded, and explicit status counts
+instead of taxid-sign heuristics. Eligible raw-read support decides BLAST
+eligibility only. See [Output](output.md#public-otu-propagation-and-reporting-denominators-r4-d).
+
+`_state/<barcode>_blast_otu_pretax_rpt.txt` is now a current cumulative snapshot
+replaced atomically every round (never appended), so resumed or retried rounds
+cannot duplicate rows. The write-only `_state/blastreport.txt` merge and the
+`_state/<barcode>_sup.tsv` / `_state/<barcode>_hac.tsv` appends are retired;
+old files are tolerated and left untouched, and a small versioned marker
+records BLAST-state initialization for new runs. The standalone
+`bin/report_round_json.pl` options `--summary` and `--summary-otu` are
+deprecated: they are still accepted, print a warning and change nothing.

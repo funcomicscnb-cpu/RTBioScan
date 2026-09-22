@@ -4,7 +4,7 @@
 
 Each round writes one JSON object with `schema_version`.
 
-Current schema version: `2.0`.
+Current schema version: `2.1` (additive over `2.0`; see `taxonomy_assignment` and the R4-D notes below).
 
 This page is the machine-readable JSON contract. For biological and report terminology, see [Concepts](concepts.md). For user-facing report interpretation and output locations, see [Output](output.md).
 
@@ -182,7 +182,7 @@ Each row includes:
 - `frozen_otu_reads_total` (integer or null; frozen-OTU reads from this row's sample/group only; since schema `2.0`, frozen OTUs appear in a row only when frozen provenance provides positive reads for that sample/group)
 - `frozen_otu_reads_sample_total` (integer; same sample/group-scoped frozen-OTU read total as `frozen_otu_reads_total`, kept for compatibility; absent in schema versions older than `1.7`)
 - `otu_reads_sample_total` (integer; reads in OTUs contributing to this row that originate from this row's sample/group only; since schema `2.0`, this is the same sample/group-scoped quantity used by `reads_total` for OTU rows)
-- `reads_total` (integer or null; sample/group-scoped reads contributing to this OTU row; since schema `2.0`, no longer OTU-wide/global)
+- `reads_total` (integer or null; sample/group-scoped reads contributing to this OTU row; since schema `2.0`, no longer OTU-wide/global; since `2.1` the unit is the canonical NR membership relation, so hit-less members of an assigned OTU are included)
 - `otu_reads_global_total` (integer or null; diagnostic OTU-wide/global total for OTUs contributing to this row)
 - `frozen_otu_reads_global_total` (integer or null; diagnostic OTU-wide/global total for frozen OTUs contributing to this row)
 - `perc_id_min` / `perc_id_max` (number or null)
@@ -215,6 +215,42 @@ Each row includes:
 
 Additional field:
 - `species_interest_enabled` (boolean; true when a species-of-interest list is provided)
+
+### `taxonomy_assignment` (since schema `2.1`)
+[back to Top](#report-schema-round-reportjson)
+
+Additive namespace derived from the sealed R4-D reporting sidecar; `null` when
+no sidecar was available. Every count uses one unit: the canonical NR
+sequence-to-OTU membership relation.
+
+- `schema` (string; `r4d-v1`)
+- `unit` (string)
+- `round` (object; metrics for the current round sidecar)
+- `cumulative` (object or null; metrics for the current cumulative snapshot)
+- `cumulative_equals_round` (boolean or null)
+- `reconciliation.<level>` (`canonical_assigned_count`, `assignments_by_level_reads_total_sum`, `rank_gap_count`, `consistent`)
+
+Each metrics object contains `canonical_member_count`,
+`canonical_direct_hit_count`, `canonical_direct_attribution_count`,
+`canonical_assigned_count` / `canonical_unassigned_count` (objects keyed
+`family`, `genus`, `species`; they sum to `canonical_member_count`),
+`status_counts` and `read_status_counts` (the seven bounded statuses; each sums
+to `canonical_member_count`), `read_reason_counts`, `otu_count`,
+`stable_otu_count`, `otu_without_stable_key_count`, `assigned_otu_count` and
+`assigned_stable_otu_count` (per level), `blast_eligible_otu_count` (integer or
+null), `taxon_count`, `taxon_member_count_sum` (per level; equals the assigned
+count), `rank_gap_count` (per level), `assigned_fraction` (per level:
+`numerator`, `denominator`, `fraction` — `null` when the denominator is zero),
+`by_marker` (same fields per marker) and `by_sample_marker` (array of the same
+fields with `sample` and `marker`).
+
+R4-D also changes two predicates without renaming keys: OTU and consensus
+"assigned" decisions (`otu.active_by_marker_taxon`, `consensus.emitted_by_marker_taxon`,
+`sample_metrics.*.reads_blast_assigned`, `read_fate`) use validated status and
+lineage, so signed synthetic assignments count and taxid positivity is not a
+criterion; `otu.assignments_by_level` qualifies an OTU for a level by validated
+status and actual resolved depth when the sidecar is present (the percent-identity
+threshold check remains only as the compatibility path without a sidecar).
 
 ## Sample Metrics (`sample_metrics`)
 [back to Top](#report-schema-round-reportjson)

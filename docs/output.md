@@ -111,10 +111,11 @@ Each analysis round produces a directory under `results/temp/ongoing/state/<stat
 ```
 results/temp/ongoing/state/<state_id>/
   <round_barcode>/
-    round_report.json                             ← machine-readable round metrics (schema v2.0)
+    round_report.json                             ← machine-readable round metrics (schema v2.1)
     run_report.json                               ← run-level summary JSON derived from history after this round
     <barcode>_summary_demult_rpt.txt              ← demultiplexing read counts
-    <barcode>_blast_otu_pretax_rpt.txt            ← BLAST OTU assignments (round)
+    <barcode>_blast_otu_pretax_rpt.txt            ← BLAST OTU table: one row per canonical NR membership relation
+    <barcode>_blast_otu_reporting_v1.tsv          ← sealed R4-D reporting sidecar (internal status/depth/evidence)
     otu_members.tsv                               ← OTU membership (canonical, phase-A)
     otu_sizes.tsv                                 ← OTU sizes (canonical)
     Consensus/
@@ -138,7 +139,7 @@ HAC and newly generated SUP SAMs can independently contain split children. Their
 ### `round_report.json`
 [back to Top](#rtbioscan-output)
 
-Machine-readable metrics for each round, consumed by the HTML report renderer. Schema version: `2.0`. Key namespaces: `reads`, `otu`, `blast`, `consensus`, `read_fate`, `sample_metrics`, and `figures`. See `report_schema.md` for the full field reference.
+Machine-readable metrics for each round, consumed by the HTML report renderer. Schema version: `2.1` (additive over `2.0`: the `taxonomy_assignment` namespace carries explicit canonical-membership denominators, and OTU/consensus assignment predicates use validated status and lineage instead of taxid positivity, so signed synthetic assignments count). Key namespaces: `reads`, `otu`, `blast`, `consensus`, `read_fate`, `taxonomy_assignment`, `sample_metrics`, and `figures`. See `report_schema.md` for the full field reference.
 
 ### `run_report.json`
 [back to Top](#rtbioscan-output)
@@ -197,7 +198,36 @@ For downstream browsing and reuse, `results/ongoing/state/<state_id>/` and `resu
 ### BLAST OTU report (`<barcode>_blast_otu_pretax_rpt.txt`)
 [back to Top](#rtbioscan-output)
 
-Tab-separated. Each row is a read assigned to an OTU with BLAST taxonomy. Key columns: `read_id`, `otu_id`, `taxid`, `kingdom`, `lineage`, `pident`, `aln_len`. Per-round copies are useful for auditing and comparing round-to-round changes.
+Tab-separated, 17 columns (`read_id`, `barcode_by_homology`, `basecalling_model`,
+`sample`, `hit_id`, `taxid`, `aln_length`, `perc_id`, `otu_id`, `otu_taxid`,
+`otu_kingdom` … `otu_species`). Since R4-D the table holds **exactly one row per
+canonical NR sequence-to-OTU membership relation** of the complete current
+membership (accumulated frozen plus active relations, the same population as
+`otu_members_round.tsv`): every canonical member appears once, including members
+without any BLAST hit, and raw observations that are not canonical members (exact
+duplicates, direct-hit non-members) never appear. `read_id` is the member's
+full header plus its `OTUB_N-<marker>` display token (the best available model
+alias when a read was re-basecalled); `otu_id` stays the round-local display
+identity; `otu_taxid` and `otu_kingdom` … `otu_species` are the validated R4-B OTU
+assignment that every member inherits (`Unassigned` in all seven ranks when the
+OTU status is not `ASSIGNED`/`AMBIGUOUS_TIE`; `NA` marks a rank gap inside a
+usable partial lineage, e.g. a family-only assignment).
+
+`hit_id`, `taxid`, `aln_length` and `perc_id` describe **that member's own sealed
+direct evidence only** (R4-A all-evidence state): `hit_id` is the subject
+accession when exactly one equal-best subject exists (`NA` for a deferred tie or
+no hit), `taxid` is the member's validated direct read attribution (a signed
+synthetic identity is valid; `NA` when no usable direct attribution exists), and
+the alignment metrics come from the first equal-best candidate. A member without
+a direct hit carries `NA` in all four fields while still inheriting its OTU
+lineage; an inherited assignment never fabricates a read-level hit.
+
+The no-adapter table `<barcode>_blast_otu_noadapter_rpt.txt` is the same
+projection restricted to members whose sample is a no-adapter class, produced
+only when the round's no-adapter split is active; otherwise it is header-only.
+Per-round copies are useful for auditing and comparing round-to-round changes.
+The persistent `_state/<barcode>_blast_otu_pretax_rpt.txt` is the current
+cumulative snapshot described under [Cumulative BLAST OTU state](#cumulative-blast-otu-state-r4-d).
 
 ### OTU membership (`otu_members.tsv`)
 [back to Top](#rtbioscan-output)
@@ -314,3 +344,95 @@ canonical evidence, footer, checksum and generation identity before publication.
 Each persistent file is published by a same-directory temporary file and rename.
 The marker files and round projection are separate atomic files; a retry
 validates and regenerates the complete current projection.
+
+### Public OTU propagation and reporting denominators (R4-D)
+
+The experimental unit for OTU abundance and every public taxon count is one
+unique canonical NR sequence-to-OTU membership relation. It is not a raw
+observation, a BLAST HSP, a direct-hit row, an eligible-support observation, a
+consensus sequence or a round-local `OTUB` alias. The typed quantities are:
+
+| Quantity | Unit and rule |
+| --- | --- |
+| `canonical_member_count` | Unique `(marker, stable OTU, canonical member)` relations of the current membership joined to the validated R4-B sidecar. Exact duplicate raw observations add nothing; a hit-less member stays in the denominator; a directly hit non-member is excluded. |
+| `blast_eligible_read_support` | Raw-read support used only for BLAST eligibility (`otu_blast_min_members`). Never an abundance, a canonical size or a public denominator; the reporting sidecar records only the resulting per-OTU eligibility flag. |
+| `canonical_direct_hit_count` | Canonical members with sealed direct hit evidence (diagnostic; `canonical_direct_attribution_count` counts those whose read-level attribution is usable). |
+| `canonical_assigned_count[L]` | Members whose OTU status is `ASSIGNED` or `AMBIGUOUS_TIE` with actual resolved depth ≥ L (family = 4, genus = 5, species = 6). Members inherit the OTU assignment even without a direct hit; signed taxids qualify exactly like positive ones; a family-only assignment counts at family but not genus/species; an ambiguous tie counts only through its resolved depth. |
+| `canonical_unassigned_count[L]` | `canonical_member_count − canonical_assigned_count[L]`, never derived from taxid sign, missing hits, placeholder text or kingdom spelling. |
+| status counts | The bounded R4-B vocabulary (`ASSIGNED`, `AMBIGUOUS_TIE`, `NO_HIT`, `FILTERED_INELIGIBLE`, `REFERENCE_UNRESOLVED`, `REFERENCE_INCONSISTENT`, `COMPUTATION_FAILED`); they always sum to `canonical_member_count`, and read-level rejection reasons are counted separately. |
+| taxon counts | At each rank one assigned member contributes to exactly one taxon (a rank gap is counted under `NA`); the per-taxon sum equals `canonical_assigned_count[rank]`; OTU counts (`otu_count`, `stable_otu_count`, `assigned_otu_count`) are separate fields that count each OTU once. |
+| fractions | Stored with explicit numerator and denominator; `null` (never numeric zero) when the denominator is zero. |
+
+`REFERENCE_UNRESOLVED` and `REFERENCE_INCONSISTENT` members remain in the
+denominators, are excluded from every assigned numerator, appear in the status
+and reason diagnostics, and are never converted into no-hit or assigned. At this
+release R4-B reports members that never reached a sealed BLAST query (for
+example size-ineligible members) as `REFERENCE_UNRESOLVED` with reason
+`missing_sealed_query`; R4-D propagates that verbatim.
+
+The rolling tables written by `append_reports.pl` (species/genus/family time
+series, treemaps, marker/model breakdowns) count the same canonical-member rows;
+`NA` and `Unassigned` rank values never form a taxon, and `min_reads_sample`
+applies to canonical-member counts. Consensus `reads-N` counts keep their own
+documented mode semantics and are not canonical membership counts.
+
+### Internal BLAST OTU reporting sidecar (R4-D)
+
+`<barcode>_blast_otu_reporting_v1.tsv` (task local, round copy in the round
+directory, current snapshot in `_state/`) is the sealed artifact from which the
+public tables and the `taxonomy_assignment` metrics are projected. Its first
+line is `#RTB-R4D-REPORTING`, version `1` and a SHA-256 generation signature
+binding the R4-B sidecar signature, the canonical-membership bytes, the sealed
+per-marker evidence signatures, the eligibility list and the identity context
+(no timestamps); a `#columns` line, the rows, and a `#END` line with the row
+count and the SHA-256 of the exact body seal the file. Readers require the exact
+column set, one row per canonical member, canonical row order (marker, display
+OTU number, canonical member), coherent status/taxid/depth/origin for both the
+OTU and read level, consistent projection fields inside one OTU, per-OTU
+cardinality equal to `member_count`, and the footer before any use.
+
+The 36 fields are: `canonical_member`, `uuid`, `marker`, `read_id`,
+`barcode_by_homology`, `basecalling_model`, `sample`, `display_otu_key`,
+`stable_otu_key` (`MARKER|md5` or `NA`), `otu_status`, `otu_taxid`, `otu_depth`,
+`otu_origin`, the seven ranks, `member_count`, `blast_eligible` (`1`/`0`/`NA`),
+`direct_hit`, `read_status`, `read_taxid`, `read_depth`, `read_origin`,
+`read_reason`, `hit_id`, `hit_taxid`, `aln_length`, `perc_id`, `evalue`,
+`bitscore`, `candidate_count` and `source_taxids`. Missing values are `NA`.
+Duplicate canonical members are rejected; a conflicting relation (one member in
+two projections, or membership and sidecar disagreeing) fails the round instead
+of being resolved by row order. Publication is atomic (same-directory temporary
+file and rename after validation).
+
+### Cumulative BLAST OTU state (R4-D)
+
+`_state/<barcode>_blast_otu_reporting_v1.tsv`,
+`_state/<barcode>_blast_otu_pretax_rpt.txt` and
+`_state/<barcode>_blast_otu_noadapter_rpt.txt` form the current cumulative
+snapshot: the complete current canonical membership (accumulated frozen plus
+active relations) with its current classification, keyed by biological identity
+rather than `OTUB` number. Each round replaces all three files as one
+transaction from the validated round sidecar; they are never appended. Hence a
+retried or replayed round adds no duplicate, renumbering an `OTUB` creates no
+second row, stale classifications are replaced, a relation removed from the
+current membership disappears, a no-new or cache-only round republishes
+byte-identical files, and a failed publication leaves the previous snapshot in
+place. A legacy appended state file is tolerated as opaque input and replaced
+only after the complete new snapshot validated. Failed rounds keep their
+placeholder tables and leave the snapshot untouched. `report_round_json.pl`
+reads the snapshot through `--blast-otu-cumulative` and
+`--blast-otu-reporting-cumulative`; `--summary` and `--summary-otu` are
+deprecated and ignored (a deterministic warning is printed when they are given).
+
+### Retired write-only state (R4-D)
+
+- `_state/blastreport.txt` was snapshot-copied, merged, sorted and republished
+  every round although nothing read its content. Current BLAST results come only
+  from the sealed R4-A cache/evidence state. The round copy
+  `<round>/blastreport.txt` is kept. New runs write a small versioned marker
+  `_state/blastreport_initialized_v1.txt` after each successful BLAST state
+  publication; an existing legacy `_state/blastreport.txt` is accepted as
+  evidence of prior initialization and is never parsed, rewritten or deleted.
+- `_state/<barcode>_sup.tsv` and `_state/<barcode>_hac.tsv` had no consumer and
+  grew without bound. They are no longer created or appended; the round-local
+  `<round>/<barcode>_sup.tsv` and `<round>/<barcode>_hac.tsv` copies remain. Old
+  files are tolerated on resume and left untouched.

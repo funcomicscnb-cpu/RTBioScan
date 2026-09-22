@@ -2064,7 +2064,7 @@ def test_report_round_json_basic(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["run_id"] == "runA"
-    assert data["schema_version"] == "2.0"
+    assert data["schema_version"] == "2.1"  # R4-D additive schema bump
     assert data["barcode"] == "RTBioScan"
     assert data["round_barcode"] == "output_round_1"
     assert data["reads"]["total"] == 2
@@ -2098,9 +2098,11 @@ def test_report_round_json_basic(tmp_path: Path) -> None:
     assert data["consensus"]["consolidated"] == 2
     cons_break = data["consensus"]["emitted_by_marker_taxon"]
     assert cons_break["coi_assigned"] == 1
-    assert cons_break["its2_assigned"] == 0
+    # R4-D/R4-C parity: a consensus row carrying a validated lineage with taxid
+    # NA is a usable LCA assignment; taxid presence is not the criterion.
+    assert cons_break["its2_assigned"] == 1
     assert cons_break["coi_unassigned"] == 0
-    assert cons_break["its2_unassigned"] == 1
+    assert cons_break["its2_unassigned"] == 0
     read_fate = data["read_fate"]
     assert read_fate["marker_split_status"] == "invalid"
     assert "demux_stage_absent" in read_fate["data_reason_codes"]
@@ -2577,7 +2579,7 @@ def test_otu_reads_sample_total_per_sample(tmp_path: Path) -> None:
         otu_size=6,
     )
 
-    assert data["schema_version"] == "2.0"
+    assert data["schema_version"] == "2.1"  # R4-D additive schema bump
     sample_a_row = _otu_species_row_by_sample(data, "sample_A")
     sample_b_row = _otu_species_row_by_sample(data, "sample_B")
     assert sample_a_row["otu_reads_sample_total"] == 4

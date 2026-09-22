@@ -669,11 +669,15 @@ def test_parallel_wrapper_returns_empty_output_when_cluster_file_is_empty(tmp_pa
     clstr_file.write_text("", encoding="utf-8")
     lineage_file.write_text("TX1\tK__One\n", encoding="utf-8")
 
+    # Run inside tmp_path: the wrapper writes its otu_refine_* telemetry files
+    # relative to the working directory, and they must never land in the
+    # repository checkout (R4-D test-hygiene finding F-18).
     result = subprocess.run(
         ["bash", str(PARALLEL_SCRIPT), str(tax_file), str(clstr_file), str(lineage_file), "4"],
         capture_output=True,
         text=True,
         check=False,
+        cwd=tmp_path,
     )
 
     assert result.returncode == 0, result.stderr

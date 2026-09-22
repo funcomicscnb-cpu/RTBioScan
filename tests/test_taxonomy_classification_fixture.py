@@ -1,5 +1,6 @@
 import csv
 import importlib.util
+import os
 import subprocess
 from pathlib import Path
 
@@ -131,19 +132,40 @@ def test_chain_a_reference_candidates_capture_priority_adjudications():
     assert wolbachia_candidate["evidence_status"] == "confirmed"
     assert wolbachia_candidate["corrected_outcome"] == "bacterial_or_ambiguous"
 
-    lineage_map = REPO_ROOT / "db" / "DBnr_2024Jun_id2lineage.txt"
-    neg2704 = [
-        line.rstrip("\n").split("\t", 1)
-        for line in lineage_map.read_text(encoding="utf-8").splitlines()
-        if line.startswith("-2704\t")
-    ]
-    assert neg2704 == [
-        [
-            "-2704",
-            "k__Metazoa;p__Arthropoda;c__Insecta;o__Coleoptera;"
-            "f__Carabidae;g__Galerita;s__Galerita bicolor",
+    # The -2704 lineage assertion is self-contained: the committed downstream COI
+    # disposition fixture records the same synthetic identifier and lineage that
+    # the production id2lineage table carries (R4-D test-hygiene finding F-18:
+    # the previous version read the git-ignored production db/ file, so the
+    # test could only run on a checkout holding installed reference data).
+    # Species names differ only by the fixture's underscore spelling.
+    expected_lineage = (
+        "k__Metazoa;p__Arthropoda;c__Insecta;o__Coleoptera;"
+        "f__Carabidae;g__Galerita;s__Galerita bicolor"
+    )
+    disposition = {
+        row["reference_id"]: row
+        for row in read_tsv("chain_a_downstream_coi_disposition_v1.tsv")
+    }
+    isup_row = disposition["BOLD_COI-5P_ISUP118-14"]
+    assert isup_row["stored_taxid"] == "-2704"
+    assert isup_row["header_kingdom"] == "Metazoa"
+    assert isup_row["header_lineage"].replace("_", " ") == expected_lineage.replace("_", " ")
+
+    # When an installed reference table is present (production checkout or an
+    # explicitly named path), the exact production spelling is asserted too.
+    lineage_map = Path(
+        os.environ.get(
+            "RTBIOSCAN_ID2LINEAGE_PATH",
+            str(REPO_ROOT / "db" / "DBnr_2024Jun_id2lineage.txt"),
+        )
+    )
+    if lineage_map.is_file():
+        neg2704 = [
+            line.rstrip("\n").split("\t", 1)
+            for line in lineage_map.read_text(encoding="utf-8").splitlines()
+            if line.startswith("-2704\t")
         ]
-    ]
+        assert neg2704 == [["-2704", expected_lineage]]
 
 
 def test_b2_hypothesis_is_not_encoded_as_animal_truth():

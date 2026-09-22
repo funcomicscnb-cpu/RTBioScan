@@ -14,10 +14,9 @@ require "$FindBin::Bin/lib/taxon_util.pl";
 *canonical_marker_token = \&TaxonUtil::canonical_marker_token;
 *marker_filename_token = \&TaxonUtil::marker_filename_token;
 *marker_slug = \&TaxonUtil::marker_slug;
-*is_numeric_taxid    = \&TaxonUtil::is_numeric_taxid;
 
 my %opt = (
-  schema_version => '2.0',
+  schema_version => '2.1',
 );
 
 GetOptions(
@@ -46,6 +45,8 @@ GetOptions(
   'consensus-round-provenance=s' => \$opt{consensus_round_provenance},
   'summary=s'                    => \$opt{summary},
   'summary-otu=s'                => \$opt{summary_otu},
+  'blast-otu-reporting=s'        => \$opt{blast_otu_reporting},
+  'blast-otu-reporting-cumulative=s' => \$opt{blast_otu_reporting_cumulative},
   'round-failed-file=s'          => \$opt{round_failed_file},
   'otu-size-streak-stats=s'      => \$opt{otu_size_streak_stats},
   'otu-size-streak=s'            => \$opt{otu_size_streak},
@@ -84,6 +85,20 @@ GetOptions(
 for my $req (qw(run_id barcode round_barcode out)) {
   die "missing required --$req\n" unless defined $opt{$req} && $opt{$req} ne '';
 }
+
+# R4-D: --summary/--summary-otu were parsed but never read. They remain accepted
+# for external compatibility only, emit a deterministic warning and cannot
+# change any output.
+for my $deprecated (qw(summary summary_otu)) {
+  next unless defined $opt{$deprecated} && $opt{$deprecated} ne '';
+  (my $flag = $deprecated) =~ s/_/-/g;
+  print STDERR "WARN: --$flag is deprecated and ignored (R4-D); it has no effect on round_report.json\n";
+}
+
+# R4-D validated taxonomy rows (sealed reporting sidecars); populated after the
+# promotion alias map is available. Declared here so earlier subs can see them.
+our ($R4D_ROUND_ROWS, $R4D_CUMULATIVE_ROWS);
+our %R4D_OTU_VALIDATED;
 
 $opt{identity_mode} //= 'collapse';
 die "invalid --identity-mode '$opt{identity_mode}': must be 'collapse' or 'track'\n"
@@ -416,6 +431,20 @@ sub otu_row_qualifies_for_level {
   return 1 if !defined $threshold;
   return 0 if !defined $row->{perc_id};
   return $row->{perc_id} >= $threshold ? 1 : 0;
+}
+
+# R4-D: with a validated reporting sidecar, level qualification uses the explicit
+# OTU status and actual resolved depth (family=4, genus=5, species=6). The
+# percent-identity threshold check is the compatibility projection used only
+# when no sidecar is available; R4-A/R4-B already applied those thresholds.
+sub otu_row_qualifies_for_level_r4d {
+  my ($row, $level, $level_thresholds) = @_;
+  my $v = (defined $row->{otu_id} && $row->{otu_id} ne '') ? $R4D_OTU_VALIDATED{$row->{otu_id}} : undef;
+  if (defined $v) {
+    my %min = (family => 4, genus => 5, species => 6);
+    return ($v->{usable} && $v->{depth} >= $min{$level}) ? 1 : 0;
+  }
+  return otu_row_qualifies_for_level($row, $level, $level_thresholds);
 }
 
 sub is_kingdom_consistent {
@@ -1097,6 +1126,29 @@ sub merge_sample_class {
   return $old;
 }
 
+# R4-D public-projection predicates. Validated OTU status/depth from the sealed
+# reporting sidecar wins; otherwise a public row is assigned when any rank holds
+# a real taxon (unusable assignments project to `Unassigned`), or, for legacy
+# tables without lineage columns, when a signed taxid is present.
+sub public_taxonomy_row_assigned {
+  my ($taxid, $ranks) = @_;
+  for my $rank (@{ $ranks || [] }) {
+    my $t = normalize_taxon($rank);
+    return 1 if defined $t && $t ne '';
+  }
+  my $tax = trim_text($taxid // '');
+  return $tax =~ /^-?[1-9][0-9]*$/ ? 1 : 0;
+}
+
+sub public_otu_row_assigned {
+  my (%f) = @_;
+  if (defined $f{otu_id} && $f{otu_id} ne '' && exists $R4D_OTU_VALIDATED{$f{otu_id}}) {
+    return $R4D_OTU_VALIDATED{$f{otu_id}}{usable} ? 1 : 0;
+  }
+  return 1 if public_taxonomy_row_assigned(undef, $f{ranks});
+  return public_taxonomy_row_assigned(defined $f{otu_taxid} ? $f{otu_taxid} : $f{taxid}, []);
+}
+
 sub blast_row_is_assigned {
   my ($f_ref, $idx_ref) = @_;
   my @f = @{$f_ref};
@@ -1106,7 +1158,9 @@ sub blast_row_is_assigned {
   my $species_idx = $idx_ref->{species_idx};
   if (defined $tax_idx && $tax_idx <= $#f) {
     my $tax = trim_text($f[$tax_idx]);
-    return 1 if $tax ne '' && uc($tax) ne 'NA' && $tax =~ /^[0-9]+$/ && $tax > 0;
+    # R4-D: signed synthetic taxids are first-class identities; positivity is
+    # not an assignment criterion.
+    return 1 if $tax =~ /^-?[1-9][0-9]*$/;
   }
   for my $idx_field ($family_idx, $genus_idx, $species_idx) {
     next unless defined $idx_field && $idx_field <= $#f;
@@ -3280,7 +3334,7 @@ sub collect_otu_assignments_by_level {
     my $field = $levels{$level};
     my %groups;
     for my $row (@rows) {
-      next if !otu_row_qualifies_for_level($row, $level, $thresholds_by_level);
+      next if !otu_row_qualifies_for_level_r4d($row, $level, $thresholds_by_level);
       my $taxon = $row->{$field};
       next if !defined $taxon;
       my $sample = $row->{sample} // '';
@@ -3733,6 +3787,7 @@ sub consensus_assigned_by_marker_from_report {
   my $cons_idx = header_index_fallback(\%idx, 'consensus_id');
   my $marker_idx = header_index_fallback(\%idx, 'barcode_by_homology');
   my $tax_idx = header_index_fallback(\%idx, 'taxid');
+  my @cons_rank_idx = grep { defined $_ } map { header_index_fallback(\%idx, "consensus_$_", $_) } qw(family genus species kingdom);
   if (!defined $cons_idx || !defined $tax_idx) {
     close $FH;
     warn_once("missing_column:$path:consensus_id_or_taxid");
@@ -3749,7 +3804,7 @@ sub consensus_assigned_by_marker_from_report {
     my $cons_id = trim_text($f[$cons_idx]);
     next if $cons_id eq '';
     my $taxid = trim_text($f[$tax_idx]);
-    next if !is_numeric_taxid($taxid) || $taxid <= 0;
+    next unless public_taxonomy_row_assigned($taxid, [ map { $_ <= $#f ? $f[$_] : undef } @cons_rank_idx ]);
     next if $seen{$cons_id}++;
     my $marker = undef;
     if (defined $marker_idx && $marker_idx <= $#f) {
@@ -3832,8 +3887,12 @@ sub otu_assigned_by_marker_from_blast_otu {
         my $norm = normalize_otu_key($otu);
         next if $norm eq '' || !exists $filter_set->{$norm};
       }
-      my $taxid = trim_text($row->{taxid} // '');
-      next if !is_numeric_taxid($taxid) || $taxid <= 0;
+      next unless public_otu_row_assigned(
+        otu_id => trim_text($row->{otu_id} // $row->{OTU_id} // ''),
+        otu_taxid => $row->{otu_taxid},
+        taxid => $row->{taxid},
+        ranks => [ map { $row->{$_} } qw(otu_family otu_genus otu_species otu_kingdom) ],
+      );
       next if $seen{$otu}++;
       my $marker = marker_from_token($otu);
       if (!defined $marker) {
@@ -3868,6 +3927,8 @@ sub otu_assigned_by_marker_from_blast_otu {
   my $otu_idx = header_index_fallback(\%idx, 'otu_id', 'OTU_id');
   my $tax_idx = header_index_fallback(\%idx, 'taxid');
   my $marker_idx = header_index_fallback(\%idx, 'barcode_by_homology');
+  my $otu_tax_idx = header_index_fallback(\%idx, 'otu_taxid');
+  my @otu_rank_idx = map { header_index_fallback(\%idx, $_) } qw(otu_family otu_genus otu_species otu_kingdom);
   if (!defined $otu_idx || !defined $tax_idx) {
     close $FH;
     warn_once("missing_column:$path:otu_id_or_taxid");
@@ -3881,15 +3942,19 @@ sub otu_assigned_by_marker_from_blast_otu {
     next if is_repeated_header_line($line, $hdr);
     my @f = split /\t/, $line, -1;
     next if $otu_idx > $#f || $tax_idx > $#f;
-    my $otu = trim_text($f[$otu_idx]);
-    next if $otu eq '' || uc($otu) eq 'NA';
-    $otu = canonical_otu_alias($otu, $alias_ref);
+    my $otu_raw = trim_text($f[$otu_idx]);
+    next if $otu_raw eq '' || uc($otu_raw) eq 'NA';
+    my $otu = canonical_otu_alias($otu_raw, $alias_ref);
     if (defined $filter_set && ref($filter_set) eq 'HASH') {
       my $norm = normalize_otu_key($otu);
       next if $norm eq '' || !exists $filter_set->{$norm};
     }
-    my $taxid = trim_text($f[$tax_idx]);
-    next if !is_numeric_taxid($taxid) || $taxid <= 0;
+    next unless public_otu_row_assigned(
+      otu_id => $otu_raw,
+      otu_taxid => (defined $otu_tax_idx && $otu_tax_idx <= $#f ? $f[$otu_tax_idx] : undef),
+      taxid => ($tax_idx <= $#f ? $f[$tax_idx] : undef),
+      ranks => [ map { defined $_ && $_ <= $#f ? $f[$_] : undef } @otu_rank_idx ],
+    );
     next if $seen{$otu}++;
     my $marker = marker_from_token($otu);
     if (!defined $marker && defined $marker_idx && $marker_idx <= $#f) {
@@ -4027,8 +4092,8 @@ sub load_blast_otu_flags {
       my $marker = marker_from_token($marker_raw);
       $marker = marker_from_token($otu) if !defined $marker || $marker eq '';
       $marker = 'OTHER' if !defined $marker || $marker eq '';
-      my $taxid = trim_text($row->{taxid} // '');
-      my $taxid_ok = ($taxid ne '' && uc($taxid) ne 'NA') ? 1 : 0;
+      my $taxid = trim_text($row->{otu_taxid} // $row->{taxid} // '');
+      my $taxid_ok = $taxid =~ /^-?[1-9][0-9]*$/ ? 1 : 0;
       my $family = normalize_taxon($row->{otu_family} // '');
       my $genus  = normalize_taxon($row->{otu_genus}  // '');
       my $species = normalize_taxon($row->{otu_species} // '');
@@ -4072,7 +4137,7 @@ sub load_blast_otu_flags {
     $idx{lc($k)} = $i if $k ne '';
   }
   my $otu_idx = header_index_fallback(\%idx, 'otu_id', 'OTU_id');
-  my $taxid_idx = header_index_fallback(\%idx, 'taxid');
+  my $taxid_idx = header_index_fallback(\%idx, 'otu_taxid', 'taxid');
   my $marker_idx = header_index_fallback(\%idx, 'barcode_by_homology');
   my $family_idx = header_index_fallback(\%idx, 'otu_family');
   my $genus_idx = header_index_fallback(\%idx, 'otu_genus');
@@ -4096,7 +4161,7 @@ sub load_blast_otu_flags {
     $marker = marker_from_token($otu) if !defined $marker || $marker eq '';
     $marker = 'OTHER' if !defined $marker || $marker eq '';
     my $taxid = (defined $taxid_idx && $taxid_idx <= $#f) ? trim_text($f[$taxid_idx]) : '';
-    my $taxid_ok = ($taxid ne '' && uc($taxid) ne 'NA') ? 1 : 0;
+    my $taxid_ok = $taxid =~ /^-?[1-9][0-9]*$/ ? 1 : 0;
     my $family = (defined $family_idx && $family_idx <= $#f) ? normalize_taxon($f[$family_idx]) : undef;
     my $genus = (defined $genus_idx && $genus_idx <= $#f) ? normalize_taxon($f[$genus_idx]) : undef;
     my $species = (defined $species_idx && $species_idx <= $#f) ? normalize_taxon($f[$species_idx]) : undef;
@@ -4567,7 +4632,8 @@ sub load_blast_unassigned_otus {
       $seen{$otu} = 1;
       my $is_assigned = 0;
       my $tax = trim_text($row->{otu_taxid} // $row->{taxid} // '');
-      if ($tax ne '' && uc($tax) ne 'NA' && $tax =~ /^[0-9]+$/ && $tax > 0) {
+      # R4-D: a signed synthetic OTU taxid is a valid assignment identity.
+      if ($tax =~ /^-?[1-9][0-9]*$/) {
         $is_assigned = 1;
       }
       if (!$is_assigned) {
@@ -4636,7 +4702,7 @@ sub load_blast_unassigned_otus {
     my $is_assigned = 0;
     if (defined $tax_idx && $tax_idx <= $#f) {
       my $tax = trim_text($f[$tax_idx]);
-      if ($tax ne '' && uc($tax) ne 'NA' && $tax =~ /^[0-9]+$/ && $tax > 0) {
+      if ($tax =~ /^-?[1-9][0-9]*$/) {
         $is_assigned = 1;
       }
     }
@@ -4901,6 +4967,37 @@ my $reads_sup      = count_non_na_in_column($opt{read_info}, 'sup_length');
 
 my $round_index = load_round_index($opt{round_index_file});
 my $otu_alias_map = load_otu_promotion_alias_map();
+# R4-D validated taxonomy: the sealed reporting sidecars supply explicit status
+# and actual depth per canonical membership relation. A malformed sidecar fails
+# closed; an absent cumulative snapshot (first round) is simply unavailable.
+{
+  my %parsed_by_digest;
+  my $load = sub {
+    my ($path) = @_;
+    return undef unless defined $path && $path ne '' && -e $path;
+    require "$FindBin::Bin/r4_reporting_contract.pl" unless defined &RTBioScan::R4D::read_reporting;
+    # The cumulative snapshot normally is the round sidecar byte for byte;
+    # identical files are parsed once.
+    my $digest = RTBioScan::R4D::file_sha256($path);
+    return $parsed_by_digest{$digest} if exists $parsed_by_digest{$digest};
+    my (undef, $rows) = RTBioScan::R4D::read_reporting($path);
+    $parsed_by_digest{$digest} = $rows;
+    return $rows;
+  };
+  $R4D_ROUND_ROWS = $load->($opt{blast_otu_reporting});
+  $R4D_CUMULATIVE_ROWS = $load->($opt{blast_otu_reporting_cumulative});
+  if (defined $R4D_ROUND_ROWS) {
+    for my $r (@$R4D_ROUND_ROWS) {
+      my $entry = {
+        usable => RTBioScan::R4D::usable($r->{otu_status}),
+        depth => 0 + $r->{otu_depth},
+        status => $r->{otu_status},
+      };
+      $R4D_OTU_VALIDATED{ $r->{display_otu_key} } = $entry;
+      $R4D_OTU_VALIDATED{ canonical_otu_alias($r->{display_otu_key}, $otu_alias_map) } //= $entry;
+    }
+  }
+}
 my $otu_lock_sets   = otu_lock_sets($opt{otu_lock_summary});
 apply_otu_alias_map_to_lock_sets($otu_lock_sets, $otu_alias_map);
 my $otu_lock_break  = $otu_lock_sets->{counts};
@@ -5911,6 +6008,43 @@ for my $_otu_key (keys %$otu_rep_reads) {
   }
 }
 
+# R4-D additive taxonomy-assignment metrics (schema 2.1). Every count is derived
+# from the validated reporting sidecar rows; the denominator is the canonical
+# membership relation, never raw observations, HSPs or eligible support.
+my $taxonomy_assignment = undef;
+if (defined $R4D_ROUND_ROWS) {
+  my $round_metrics = RTBioScan::R4D::metrics($R4D_ROUND_ROWS);
+  my $cumulative_metrics = defined $R4D_CUMULATIVE_ROWS ? RTBioScan::R4D::metrics($R4D_CUMULATIVE_ROWS) : undef;
+  my %reconciliation;
+  for my $level (qw(family genus species)) {
+    my $sum = 0;
+    for my $r (@{ $otu_assignments_by_level->{$level} || [] }) {
+      $sum += $r->{reads_total} if defined $r->{reads_total};
+    }
+    my $assigned = $round_metrics->{canonical_assigned_count}{$level};
+    my $gap = $round_metrics->{rank_gap_count}{$level};
+    $reconciliation{$level} = {
+      canonical_assigned_count => $assigned,
+      assignments_by_level_reads_total_sum => $sum,
+      rank_gap_count => $gap,
+      consistent => ($sum + $gap == $assigned) ? JSON::PP::true() : JSON::PP::false(),
+    };
+  }
+  my $same = undef;
+  if (defined $cumulative_metrics) {
+    my $canon = JSON::PP->new->canonical;
+    $same = $canon->encode($round_metrics) eq $canon->encode($cumulative_metrics) ? JSON::PP::true() : JSON::PP::false();
+  }
+  $taxonomy_assignment = {
+    schema => 'r4d-v1',
+    unit => 'canonical NR sequence-to-OTU membership relation',
+    round => $round_metrics,
+    cumulative => $cumulative_metrics,
+    cumulative_equals_round => $same,
+    reconciliation => \%reconciliation,
+  };
+}
+
 my $obj = {
   schema_version => $opt{schema_version},
   run_id         => $opt{run_id},
@@ -5983,6 +6117,7 @@ my $obj = {
   assignment_thresholds => {
     otu => clone_threshold_tree($otu_assignment_thresholds),
   },
+  taxonomy_assignment => $taxonomy_assignment,
   identity_mode => $opt{identity_mode},
   sample_metrics => \%sample_metrics,
   (%TRACK_UNIT_METRICS ? (track_unit_metrics => \%TRACK_UNIT_METRICS) : ()),

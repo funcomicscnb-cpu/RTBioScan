@@ -1224,15 +1224,24 @@ if (!$skip_parser_state_publish) {
 #{
 #	sleep 2;
 #}
-run_cmd("cp $barcode_pipeline\\_blast_otu_pretax_rpt.txt $temp_dir/$barcode_pipeline\\_blast_otu_pretax_rpt.txt", fatal => 1);
-
+# R4-D: the persistent _state/<barcode>_blast_otu_pretax_rpt.txt is a current
+# cumulative snapshot published atomically by _reporting_blast_pretax from the
+# validated reporting sidecar. It is never overwritten or appended here. The
+# round table below already holds one row per canonical NR membership relation
+# of the complete current membership (accumulated frozen plus active), so the
+# rolling OTU taxon tables are computed from it directly.
 run_cmd("cp $barcode_pipeline\\_blast_consensus_tax_rpt.txt $temp_dir/$barcode_pipeline\\_blast_consensus_tax_rpt.txt", fatal => 1);
 
 
 #####	PLOTS BASED ON OTu TAXONOMICAL PREASSIGNMENTS
+# Unit: one row = one canonical NR sequence-to-OTU membership relation (R4-D).
+# Members inherit their OTU assignment; direct-hit non-members are absent.
+# `NA` and `Unassigned` rank values are missing taxonomy and never count as a
+# taxon (unresolved, inconsistent, filtered, no-hit and failed OTUs project to
+# `Unassigned`; rank gaps inside an assigned lineage project to `NA`).
 
 $header_flag=1;
-open FILE, "$temp_dir/$barcode_pipeline\_blast_otu_pretax_rpt.txt" or die "I couldn't open $temp_dir/$barcode_pipeline\_blast_otu_pretax_rpt.txt\n";
+open FILE, $round_blast_otu or die "I couldn't open $round_blast_otu\n";
 while(<FILE>)
 {
 	chomp;
@@ -1247,6 +1256,11 @@ while(<FILE>)
 		$header_flag=0;
 		}else
 		{
+			for my $rank_column (qw(otu_kingdom otu_phylum otu_class otu_order otu_family otu_genus otu_species)) {
+				next unless exists $header{$rank_column};
+				my $rank_index = $header{$rank_column};
+				$tr[$rank_index] = '' if is_unassigned_taxon($tr[$rank_index]);
+			}
 			$sample=$tr[$header{"sample"}];
 			my $is_no_adapter = ($sample =~ /^no_adapter/i) ? 1 : 0;
 			# Robust parsing: allow arbitrary sample names and avoid stale $1/$2 when regex doesn't match.
@@ -1476,7 +1490,9 @@ close FILE;
 @family_uniq=sort keys(%family);
 
 # Filter taxa for tables/plots:
-# - min_reads_sample controls which taxa are shown (based on total reads supporting the taxon).
+# - min_reads_sample controls which taxa are shown. For OTU tables the unit is
+#   the canonical NR membership relation counted above (R4-D), not raw reads,
+#   hits or eligible-support observations.
 # - when pre-classification files are provided, restrict taxa to those deemed "of interest".
 if($min_reads_sample && $min_reads_sample > 0)
 {

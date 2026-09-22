@@ -1813,15 +1813,10 @@ process _reporting_hac_basecalling {
 		printf "%b" "\$DORADO_SUMMARY_HEADER" > ${barcode}_round_hac.tsv
 	fi
 
-	# Append to rolling HAC summary without duplicating headers.
+	# R4-D: the persistent _state/<barcode>_hac.tsv append had no consumer and
+	# grew without bound; only the round-local copy is retained. Legacy state
+	# files are tolerated and left untouched.
 	mkdir -p ${ongoingStateDir}/_state
-	if [ ! -f ${ongoingStateDir}/_state/${barcode}_hac.tsv ]; then
-		cp ${barcode}_round_hac.tsv ${ongoingStateDir}/_state/${barcode}_hac.tsv
-	else
-		if [ -s ${barcode}_round_hac.tsv ]; then
-			tail -n +2 ${barcode}_round_hac.tsv >> ${ongoingStateDir}/_state/${barcode}_hac.tsv || true
-		fi
-	fi
 	cp -f ${barcode}_round_hac.tsv ${ongoingStateDir}/${round_barcode}/${barcode}_hac.tsv 2>/dev/null || true
 
 		perl ${baseDir}/bin/reporting_getting_hq.pl ${barcode}_round_hac.tsv ${round_hac_sam} ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt ${params.min_read_length} ${params.max_read_length} ${params.min_quality_score} ${barcode}
@@ -3545,29 +3540,24 @@ process blast_OTU_pretax {
 		_t_per_target_blast_end=\$(date +%s)
 		append_process_timing "per_target_blast" "\$_t_per_target_blast_start" "\$_t_per_target_blast_end"
 	
-		# -- §4: BLAST report merge and OTU refinement --
+		# -- §4: BLAST state initialization flag and OTU refinement --
+		# R4-D: the legacy _state/blastreport.txt content was write-only (snapshot,
+		# merge, sort and republish every round with no reader). Current BLAST
+		# results come only from the sealed R4-A cache/evidence state. An existing
+		# legacy file is accepted purely as evidence that BLAST state had been
+		# initialized; a small versioned marker carries that flag for new runs.
+		# The legacy file is never parsed, rewritten or deleted.
 		_t_blastreport_merge_start=\$(date +%s)
-		STATE_BLASTREPORT_SNAPSHOT="${barcode}_blastreport_state_snapshot.txt"
+		BLAST_STATE_INIT_MARKER="\${STATE_DIR}/blastreport_initialized_v1.txt"
 		STATE_BLASTREPORT_EXISTS=0
 		if acquire_lock "\${BLASTREPORT_LOCK}"; then
-			if [ -f "\${STATE_DIR}/blastreport.txt" ]; then
-				cp "\${STATE_DIR}/blastreport.txt" "\$STATE_BLASTREPORT_SNAPSHOT"
+			if [ -f "\$BLAST_STATE_INIT_MARKER" ] || [ -f "\${STATE_DIR}/blastreport.txt" ]; then
 				STATE_BLASTREPORT_EXISTS=1
 			fi
 			release_lock "\${BLASTREPORT_LOCK}"
 		else
 			exit 1
 		fi
-		if [ "\$STATE_BLASTREPORT_EXISTS" -eq 0 ]; then
-			: > "\$STATE_BLASTREPORT_SNAPSHOT"
-		fi
-		# R4-A migration: rebuild active targets from signed cache evidence, never
-		# compare old percent-identity assignments against a corrected selector.
-		"\$BIN_DIR/cache_blast_by_hash.pl" --merge \
-			"\$STATE_BLASTREPORT_SNAPSHOT" \
-			"${barcode}_blastreport_state_r4.txt" \
-			"${barcode}_blastreport_targets_r4.txt" > ${barcode}_blastreport.txt
-		rm -f "\$STATE_BLASTREPORT_SNAPSHOT"
 		_t_blastreport_merge_end=\$(date +%s)
 		append_process_timing "blastreport_merge" "\$_t_blastreport_merge_start" "\$_t_blastreport_merge_end"
 		_t_otu_refine_start=\$(date +%s)
@@ -4454,7 +4444,7 @@ process blast_OTU_pretax {
 					fi
 				done
 
-			if [ -f "\${STATE_DIR}/blastreport.txt" ]; then
+			if [ "\$STATE_BLASTREPORT_EXISTS" -eq 1 ]; then
 				if ! "\$BIN_DIR/prefer_blast_rows_by_model.sh" \
 					--input blast_report_annotated.txt \
 					--output blast_report_annotated_preferred.txt \
@@ -4506,15 +4496,19 @@ process blast_OTU_pretax {
 			copy_soft ${barcode}_blastreport_hac.list "\$ROUND_DIR/${barcode}_blastreport_hac.list"
 			copy_soft ${barcode}_blastreport_sup.list "\$ROUND_DIR/${barcode}_blastreport_sup.list"
 			cp ${barcode}_blastreport_round.txt "\$ROUND_DIR/blastreport.txt"
+		# R4-D: advance the versioned BLAST-state initialization marker only after
+		# every state publication above succeeded (a failed attempt never reaches
+		# this point). The write is atomic and idempotent, so retries converge.
 		if acquire_lock "\${BLASTREPORT_LOCK}"; then
-			STATE_BLASTREPORT_TMP="\${STATE_DIR}/blastreport.txt.tmp.\$\$"
-			cp ${barcode}_blastreport.txt "\$STATE_BLASTREPORT_TMP"
-			mv "\$STATE_BLASTREPORT_TMP" "\${STATE_DIR}/blastreport.txt"
+			BLAST_STATE_INIT_TMP="\${BLAST_STATE_INIT_MARKER}.tmp.\$\$"
+			printf 'RTB-R4D-BLAST-STATE\t1\n' > "\$BLAST_STATE_INIT_TMP"
+			mv "\$BLAST_STATE_INIT_TMP" "\$BLAST_STATE_INIT_MARKER"
 			release_lock "\${BLASTREPORT_LOCK}"
 		else
 			exit 1
 		fi
 		copy_soft "\$BLAST_FILTER_STATS" "\$ROUND_DIR/${barcode}_blast_filter_stats.tsv"
+		copy_soft "\$BLAST_FILTER_KEPT_OTUS" "\$ROUND_DIR/${barcode}_blast_filter_kept_otus.tsv"
 		copy_soft "\$BLAST_FILTER_DROPPED_IDS" "\$ROUND_DIR/${barcode}_blast_filter_dropped_read_ids.list"
 		copy_soft "\$BLAST_FILTER_DROPPED_IDS" "\${STATE_DIR}/${barcode}_blast_filter_dropped_read_ids_last.list"
 		copy_soft "\$OTU_MEMBERS_BLASTDIAG" "\$ROUND_DIR/otu_members_blastdiag.tsv"
@@ -4566,28 +4560,25 @@ process _reporting_blast_pretax {
 			BLAST_HEADER='read_id	barcode_by_homology	basecalling_model	sample	hit_id	taxid	aln_length	perc_id	otu_id	otu_taxid	otu_kingdom	otu_phylum	otu_class	otu_order	otu_family	otu_genus	otu_species'
 			DORADO_SUMMARY_HEADER='input_filename\tbatch_id\tparent_read_id\tread_id\trun_id\tchannel\tmux\tminknow_events\tstart_time\tduration\tpasses_filtering\ttemplate_start\tnum_events_template\ttemplate_duration\tsequence_length_template\tmean_qscore_template\tpore_type\texperiment_id\tsample_id\tend_reason\n'
 	
-		# Helper: persist per-round SUP summary to rolling state
+		# Helper: persist per-round SUP summary to the round directory.
+		# R4-D: the persistent _state/<barcode>_sup.tsv append had no consumer and
+		# grew without bound; it is no longer created or appended. Legacy files are
+		# tolerated and left untouched.
 		persist_sup_tsv() {
 			local tsv="\$1"
 			mkdir -p ${ongoingStateDir}/_state
-			if [ ! -f ${ongoingStateDir}/_state/${barcode}_sup.tsv ]; then
-				cp "\$tsv" ${ongoingStateDir}/_state/${barcode}_sup.tsv
-			else
-				tail -n +2 "\$tsv" >> ${ongoingStateDir}/_state/${barcode}_sup.tsv || true
-			fi
 			mkdir -p ${ongoingStateDir}/${round_barcode}
 			cp -f "\$tsv" ${ongoingStateDir}/${round_barcode}/${barcode}_sup.tsv 2>/dev/null || true
 		}
 
-		# Helper: run noadapter blast reporting when a noadapter report exists
+		# Helper: project the no-adapter public table from the validated R4-D
+		# reporting sidecar when this round's no-adapter split is active (the
+		# declared no-adapter evidence projection keeps its role as that gate).
+		NOADAPTER_SPLIT_ENABLED=0
 		run_noadapter_report() {
-			if [ -f ${blast_report_noadapter} ] && awk 'NF{found=1; exit} END{exit(found ? 0 : 1)}' ${blast_report_noadapter}; then
-				cp ${ongoingStateDir}/${round_barcode}/${barcode}_read_info_rpt.txt ${barcode}_noadapter_read_info_rpt.txt
-				export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
-				export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
-				perl ${baseDir}/bin/reporting_blast_otu.pl ${barcode}_round_sup.tsv ${blast_read} ${blast_report_noadapter} ${barcode}_noadapter_read_info_rpt.txt ${barcode}_noadapter
-				mv ${barcode}_noadapter_blast_otu_pretax_rpt.txt ${barcode}_blast_otu_noadapter_rpt.txt
-				rm -f ${barcode}_noadapter_read_info_rpt.txt
+			if [ -f ${blast_report_noadapter} ] && awk 'NF{found=1; exit} END{exit(found ? 0 : 1)}' ${blast_report_noadapter} && [ -s "\$R4D_REPORTING_ROUND" ]; then
+				NOADAPTER_SPLIT_ENABLED=1
+				perl ${baseDir}/bin/r4_reporting_contract.pl --project-noadapter "\$R4D_REPORTING_ROUND" ${barcode}_blast_otu_noadapter_rpt.txt
 			else
 				printf '%s\n' "\$BLAST_HEADER" > ${barcode}_blast_otu_noadapter_rpt.txt
 			fi
@@ -4603,6 +4594,19 @@ process _reporting_blast_pretax {
 				[ -f "\$_rpt_round" ] || cp "\$_rpt_state" "\$_rpt_round" 2>/dev/null || : > "\$_rpt_round"
 				export RTBIOSCAN_DEMUX_IDENTITY_CONTEXT="${demuxIdentityContext}"
 				export RTBIOSCAN_TARGET_TOKENS="${params.targets}"
+				# R4-D contract inputs: R3 canonical membership and the validated R4-B
+				# sidecar published by blast_OTU_pretax into this round's directory (the
+				# same round-directory contract already used for read_info above), plus
+				# the sealed R4-A all-evidence state. The declared preferred-model
+				# projection (blast_report_otu) is no longer a row source: it is a strict
+				# subset of canonical membership in rounds >= 2.
+				R4D_REPORTING_ROUND="${barcode}_blast_otu_reporting_v1.tsv"
+				export RTBIOSCAN_R4D_SIDECAR="${ongoingStateDir}/${round_barcode}/${barcode}_blast_otu_taxonomy_v1.tsv"
+				export RTBIOSCAN_R4D_MEMBERS="${ongoingStateDir}/${round_barcode}/otu_members_round.tsv"
+				export RTBIOSCAN_R4D_EVIDENCE_DIR="${ongoingStateDir}/_state"
+				export RTBIOSCAN_R4D_ELIGIBLE="${ongoingStateDir}/${round_barcode}/${barcode}_blast_filter_kept_otus.tsv"
+				export RTBIOSCAN_R4D_REPORTING_OUT="\$R4D_REPORTING_ROUND"
+				rm -f "\$R4D_REPORTING_ROUND"
 				if ! perl ${baseDir}/bin/reporting_blast_otu.pl ${barcode}_round_sup.tsv ${blast_read} ${blast_report_otu} "\$_rpt_round" ${barcode}; then
 					if [ "\$ROUND_FAILED" -eq 1 ]; then
 						cp "${failedRoundPlaceholderAssets.blastOtuPretaxRpt}" ${barcode}_blast_otu_pretax_rpt.txt
@@ -4683,33 +4687,28 @@ process _reporting_blast_pretax {
 			rm -f "\$TMP_BEST"
 		fi
 		
-		if cp ${barcode}_blast_otu_pretax_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_blast_otu_pretax_rpt.txt;
-		then
-			mkdir -p ${ongoingStateDir}/_state
-			if [ ! -f ${ongoingStateDir}/_state/${barcode}_blast_otu_pretax_rpt.txt ];
-			then
-				cp ${barcode}_blast_otu_pretax_rpt.txt ${ongoingStateDir}/_state/${barcode}_blast_otu_pretax_rpt.txt
-			else
-				if [ -s ${barcode}_blast_otu_pretax_rpt.txt ];
-				then
-					tail -n +2 ${barcode}_blast_otu_pretax_rpt.txt >> ${ongoingStateDir}/_state/${barcode}_blast_otu_pretax_rpt.txt
-				fi
+		mkdir -p ${ongoingStateDir}/_state
+		cp -f ${barcode}_blast_otu_pretax_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_blast_otu_pretax_rpt.txt 2>/dev/null || true
+		cp -f ${barcode}_blast_otu_noadapter_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_blast_otu_noadapter_rpt.txt 2>/dev/null || true
+		# R4-D cumulative-state contract: the persistent public tables are a current
+		# snapshot of the complete canonical membership (accumulated frozen plus
+		# active relations), keyed by biological identity and replaced atomically
+		# from the validated round reporting sidecar. They are never appended, so
+		# retry and replay add no duplicates; a failed publication keeps the previous
+		# snapshot; legacy appended files are replaced only after the complete new
+		# snapshot validated. Failed rounds keep their placeholders and leave the
+		# persistent snapshot untouched.
+		if [ "\$ROUND_FAILED" -eq 0 ] && [ -s "\$R4D_REPORTING_ROUND" ]; then
+			cp -f "\$R4D_REPORTING_ROUND" "${ongoingStateDir}/${round_barcode}/${barcode}_blast_otu_reporting_v1.tsv" 2>/dev/null || true
+			if ! perl ${baseDir}/bin/r4_reporting_contract.pl --publish-cumulative \
+				--reporting "\$R4D_REPORTING_ROUND" \
+				--state-dir "${ongoingStateDir}/_state" \
+				--barcode ${barcode} \
+				--noadapter-enabled "\$NOADAPTER_SPLIT_ENABLED"; then
+				echo "ERROR: failed to publish the cumulative BLAST OTU reporting snapshot for round ${round_barcode}" 1>&2
+				exit 1
 			fi
 		fi
-
-				if cp ${barcode}_blast_otu_noadapter_rpt.txt ${ongoingStateDir}/${round_barcode}/${barcode}_blast_otu_noadapter_rpt.txt;
-		then
-			mkdir -p ${ongoingStateDir}/_state
-			if [ ! -f ${ongoingStateDir}/_state/${barcode}_blast_otu_noadapter_rpt.txt ];
-			then
-				cp ${barcode}_blast_otu_noadapter_rpt.txt ${ongoingStateDir}/_state/${barcode}_blast_otu_noadapter_rpt.txt
-			else
-				if [ -s ${barcode}_blast_otu_noadapter_rpt.txt ];
-				then
-					tail -n +2 ${barcode}_blast_otu_noadapter_rpt.txt >> ${ongoingStateDir}/_state/${barcode}_blast_otu_noadapter_rpt.txt
-				fi
-			fi
-				fi
 				rtbioscan_round_lock_unpin
 
 		"""
@@ -6321,7 +6320,7 @@ process getting_run_summary {
 			--round-barcode "${round_barcode}" \
 			--targets "${params.targets}" \
 			--target-taxa "${params.target_taxa}" \
-			--schema-version "2.0" \
+			--schema-version "2.1" \
 			--asset-snapshot-policy "latest_only" \
 			--timestamp-utc "\$ROUND_TIMESTAMP_UTC" \
 			--out "\$out_path" \
@@ -6331,6 +6330,8 @@ process getting_run_summary {
 			--read-fate-demult "${barcode}_read_fate_demult_first_seen.tsv" \
 			--otu-def "${otu_def_rpt}" \
 			--blast-otu "${blast_otu_pretax_rpt}" \
+			--blast-otu-reporting "\$ROUND_DIR/${barcode}_blast_otu_reporting_v1.tsv" \
+			--blast-otu-reporting-cumulative "${ongoingStateDir}/_state/${barcode}_blast_otu_reporting_v1.tsv" \
 			--read-fate-blast "${barcode}_read_fate_blast_first_seen.tsv" \
 			--blast-unassigned-ids "\$ROUND_DIR/${barcode}_blast_unassigned_reads_round.list" \
 			--blast-otu-cumulative "${ongoingStateDir}/_state/${barcode}_blast_otu_pretax_rpt.txt" \
@@ -6340,8 +6341,6 @@ process getting_run_summary {
 			--consensus-round-provenance "${consensus_round_provenance}" \
 			--spec-basics-metazoa "${metazoaBasicsArg}" \
 			--spec-basics-viridiplantae "${viridiplantaeBasicsArg}" \
-			--summary "${summary}" \
-			--summary-otu "${summary_otu}" \
 		--otu-size-streak-stats "\$ROUND_DIR/${barcode}_otu_size_streak_stats.tsv" \
 			--otu-size-streak "\$ROUND_DIR/${barcode}_otu_size_streak.tsv" \
 		--otu-size-streak-mode "${otuSizeStreakModeCanonical}" \
