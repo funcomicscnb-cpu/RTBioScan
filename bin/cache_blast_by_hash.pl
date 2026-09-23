@@ -66,23 +66,24 @@ sub scan_sealed {
     fail("unsupported $kind schema") unless $line =~ /\A#RTB-R4-\Q$kind\E\t([12])\t([a-f0-9]{64})\r?\n\z/;
     my ($version,$sig)=($1,$2);
     fail('unsupported evidence schema') if $kind eq 'EVIDENCE' && $version!=1;
-    my $sha=Digest::SHA->new(256); my ($count,$end)=(0,0);
+    my $sha=Digest::SHA->new(256); my ($count,$end,$digest)=(0,0,undef);
     while (defined($line=<$f>)) {
         fail("truncated final row in $path") unless $line =~ s/\r?\n\z//;
         fail('embedded CR/NUL') if $line =~ /[\r\x00]/;
         if ($line =~ /^#END\t/) {
-            fail("incomplete $kind envelope") unless $line eq "#END\t$count\t".$sha->hexdigest;
+            $digest=$sha->hexdigest;
+            fail("incomplete $kind envelope") unless $line eq "#END\t$count\t$digest";
             fail('data after envelope') if defined(<$f>); $end=1; last;
         }
         $sha->add("$line\n"); $count++; $visit->($line,$version,$sig);
     }
     close $f or fail('close sealed input'); fail("incomplete $kind envelope") unless $end;
-    return ($sig,$version);
+    return ($sig,$version,$digest,$count);
 }
 sub unseal {
     my ($path,$kind)=@_; my @rows;
-    my ($sig,$version)=scan_sealed($path,$kind,sub { push @rows,$_[0] });
-    return ($sig,\@rows,$version);
+    my ($sig,$version,$digest,$count)=scan_sealed($path,$kind,sub { push @rows,$_[0] });
+    return ($sig,\@rows,$version,$digest,$count);
 }
 # Nonnegative decimal: coefficient with no leading/trailing zeros, and decimal
 # order = coefficient length + exponent. Zero has an empty coefficient. Integer
@@ -351,7 +352,7 @@ sub evidence_rows {
 }
 sub evidence_text { my ($c,$sig,$map)=@_; my @rows; evidence_rows($c,$map,sub { push @rows,$_[0] }); return sealed('EVIDENCE',$sig,\@rows); }
 sub evidence_read {
-    my ($path)=@_; my ($sig,$rows)=unseal($path,'EVIDENCE'); my (%seen,%map,%groups,%by_hash,%subject_tax);
+    my ($path)=@_; my ($sig,$rows,$version,$digest,$count)=unseal($path,'EVIDENCE'); my (%seen,%map,%groups,%by_hash,%subject_tax);
     for (@$rows) {
         my @v=split /\t/,$_,-1; fail('wrong evidence field count') unless @v==14;
         my $id=shift @v; my $status=pop @v; my $ranked; query_id($id); hash_id($v[0]);
@@ -369,7 +370,7 @@ sub evidence_read {
         fail('invalid tie cardinality') if ($status eq 'DEFERRED_TIE') != (@$rs>1);
         for (@$rs) { fail('unequal/inconsistent tie evidence') if $_->[1] ne $status || ($status eq 'DEFERRED_TIE' && better($_->[2],$rs->[0][2])!=0); }
     }
-    return ($sig,\%groups);
+    return ($sig,\%groups,{signature=>$sig,rows=>$count,body_sha256=>$digest});
 }
 sub memtax_read {
     my ($previous,$sig)=@_; return {} unless -e $previous;

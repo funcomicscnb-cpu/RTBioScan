@@ -275,12 +275,20 @@ The `--restart_mode` parameter provides additional recovery options:
 ### Internal BLAST marker-taxonomy sidecar
 
 `<barcode>_blast_otu_taxonomy_v1.tsv` is an internal round artifact. Its header is
-`#RTB-R4B-TAXONOMY`, version `1`, and a generation SHA-256 binding configuration and
-source evidence. A named-column line precedes the records; a count/body-SHA-256 footer
-and final newline seal the complete file. Publication validates the entire generation
+`#RTB-R4B-TAXONOMY`, version `2`, a generation SHA-256, and canonical JSON mapping each
+accepted marker to its sealed R4-A evidence `signature`, `rows`, and `body_sha256`.
+The JSON is `{}` when there are no markers. A named-column line precedes the records;
+a count/body-SHA-256 footer and final newline seal the complete file. Publication validates the entire generation
 before atomically replacing the destination. It is derived evidence, not independently
 reusable taxonomy authority. A round with no cluster members retains existing empty
 placeholder behavior.
+
+Reporting rejects a version 1 R4-B sidecar because it has no R4-A evidence provenance;
+it cannot infer a generation from current taxid sets. Nextflow does not generally hash
+arbitrary `bin/` content, so a cached version 1 B sidecar followed by a rerun of D
+fails closed. The full R4 chain is not yet integrated into local `main`; its eventual
+integration changes the relevant process bodies and does not migrate a production
+R4-B version 1 cache. No `main.nf` cache-token change is part of this correction.
 
 Each row records the query/member, canonical OTU and marker, resolved taxid, explicit
 seven-rank lineage, assignment status, actual depth, direct/LCA origin, canonical-member

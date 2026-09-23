@@ -148,9 +148,26 @@ def r4b_rows(model, reverse=False):
     return rows
 
 
-def r4b_text(rows, sig=SIG):
+def evidence_provenance(path: Path):
+    lines = path.read_bytes().replace(b"\r\n", b"\n").splitlines(keepends=True)
+    header = lines[0].decode("ascii").rstrip("\n").split("\t")
+    body = b"".join(lines[1:-1])
+    footer = lines[-1].decode("ascii").rstrip("\n").split("\t")
+    digest = hashlib.sha256(body).hexdigest()
+    assert footer == ["#END", str(len(lines) - 2), digest]
+    return {"signature": header[2], "rows": len(lines) - 2, "body_sha256": digest}
+
+
+def r4b_text(rows, provenance, sig=SIG):
     body = "".join("\t".join(str(row[c]) for c in R4B_COLUMNS) + "\n" for row in rows)
-    return f"#RTB-R4B-TAXONOMY\t1\t{sig}\n#columns\t" + "\t".join(R4B_COLUMNS) + f"\n{body}#END\t{len(rows)}\t{sha256(body)}\n"
+    prov = json.dumps(provenance, sort_keys=True, separators=(",", ":"))
+    return f"#RTB-R4B-TAXONOMY\t2\t{sig}\t{prov}\n#columns\t" + "\t".join(R4B_COLUMNS) + f"\n{body}#END\t{len(rows)}\t{sha256(body)}\n"
+
+
+def stamp_sidecar(root: Path, rows, sig=SIG):
+    provenance = {marker: evidence_provenance(root / "_state" / f"otu_blast_evidence_{marker}.tsv")
+                  for marker in sorted({row["marker"] for row in rows})}
+    (root / f"{BARCODE}_blast_otu_taxonomy_v1.tsv").write_text(r4b_text(rows, provenance, sig), encoding="utf-8")
 
 
 def evidence_rows(model, extra_observations=(), reverse=False):
@@ -191,10 +208,11 @@ def write_inputs(root: Path, model, extra_observations=(), reverse=False, sideca
     state = root / "_state"
     state.mkdir(exist_ok=True)
     (root / "otu_members_round.tsv").write_text(membership_text(model), encoding="utf-8")
+    evidence = evidence_rows(model, extra_observations, reverse=reverse)
+    for marker in {row["marker"] for row in r4b_rows(model)}:
+        (state / f"otu_blast_evidence_{marker}.tsv").write_text(sealed("EVIDENCE", SIG, evidence.get(marker, [])), encoding="utf-8")
     if sidecar:
-        (root / f"{BARCODE}_blast_otu_taxonomy_v1.tsv").write_text(r4b_text(r4b_rows(model, reverse=reverse)), encoding="utf-8")
-    for marker, lines in evidence_rows(model, extra_observations, reverse=reverse).items():
-        (state / f"otu_blast_evidence_{marker}.tsv").write_text(sealed("EVIDENCE", SIG, lines), encoding="utf-8")
+        stamp_sidecar(root, r4b_rows(model, reverse=reverse))
     if eligible:
         (root / "kept_otus.tsv").write_text("".join(f"CLUST_{o['n']}\n" for o in model if o["eligible"]), encoding="utf-8")
     return root
@@ -460,13 +478,14 @@ def test_model_aliases_and_cross_marker_shared_uuid(tmp_path):
     m0_row = next(r for r in rows if r["canonical_member"] == "m0|COI")
     alias = dict(m0_row, read_id=m0_row["read_id"].replace("|hac|", "|sup|"))
     rows.insert(0, alias)
-    (root / f"{BARCODE}_blast_otu_taxonomy_v1.tsv").write_text(r4b_text(rows), encoding="utf-8")
+    stamp_sidecar(root, rows)
     # The sup alias is a separate sealed query of the same sequence hash.
     ev = root / "_state" / "otu_blast_evidence_COI.tsv"
     lines = ev.read_text(encoding="utf-8").splitlines()[1:-1]
     m0_lines = [l for l in lines if l.startswith("m0|COI|hac|")]
     lines += [l.replace("m0|COI|hac|", "m0|COI|sup|", 1) for l in m0_lines]
     ev.write_text(sealed("EVIDENCE", SIG, lines), encoding="utf-8")
+    stamp_sidecar(root, rows)
     run_build(root)
     rows_out = public_rows(root)
     assert len(rows_out) == 3
@@ -535,7 +554,8 @@ def test_membership_identity_cases(tmp_path):
     assert reporting_rows(root7) == base_rows
 
 
-def test_evidence_generation_mismatch_fails_closed(tmp_path):
+@pytest.mark.parametrize("restamp", [False, True])
+def test_evidence_generation_mismatch_fails_closed(tmp_path, restamp):
     model, extra = core_model()
     root = write_inputs(tmp_path, model, extra)
     # R4-B recorded a hit for m0, but the sealed evidence says NO_HIT: stale generation.
@@ -544,8 +564,277 @@ def test_evidence_generation_mismatch_fails_closed(tmp_path):
     # NO_HIT together (the sealed file stays internally consistent).
     fixed = ["\t".join([l.split("\t")[0], l.split("\t")[1]] + ["NA"] * 11 + ["NO_HIT"]) if l.startswith(("m0|", "dup|")) else l for l in lines]
     (root / "_state" / "otu_blast_evidence_COI.tsv").write_text(sealed("EVIDENCE", SIG, fixed), encoding="utf-8")
+    if restamp:
+        stamp_sidecar(root, r4b_rows(model))
     result = run_build(root, check=False)
-    assert result.returncode != 0 and "disagree on direct evidence" in result.stderr
+    expected = "disagree on direct evidence" if restamp else "evidence provenance mismatch"
+    assert result.returncode != 0 and expected in result.stderr
+
+
+def assert_provenance_rejection(root, diagnostic):
+    state_before = {p.name: p.read_bytes() for p in (root / "_state").iterdir()}
+    result = run_build(root, check=False)
+    assert result.returncode != 0 and diagnostic in result.stderr
+    assert not (root / f"{BARCODE}_blast_otu_pretax_rpt.txt").exists()
+    assert not (root / f"{BARCODE}_blast_otu_reporting_v1.tsv").exists()
+    assert {p.name: p.read_bytes() for p in (root / "_state").iterdir()} == state_before
+    assert not list(root.glob(".r4d-publish-*"))
+
+
+def test_f02_old_and_new_generations_and_both_mismatch_directions(tmp_path):
+    model = [otu(0, members=[member("a")])]
+    old = write_inputs(tmp_path / "old", model)
+    evidence = old / "_state" / "otu_blast_evidence_COI.tsv"
+    old_bytes = evidence.read_bytes()
+    old_sidecar = (old / f"{BARCODE}_blast_otu_taxonomy_v1.tsv").read_bytes()
+    run_build(old)
+    old_public = public_rows(old)[0]
+    assert old_public["perc_id"] == "99.5"
+    fresh = write_inputs(tmp_path / "new", model)
+    new_evidence = fresh / "_state" / "otu_blast_evidence_COI.tsv"
+    new_evidence.write_bytes(old_bytes.replace(b"99.5", b"97.5"))
+    # Re-seal after changing the HSP while retaining the scientific signature.
+    changed = new_evidence.read_text().splitlines()[1:-1]
+    new_evidence.write_text(sealed("EVIDENCE", SIG, changed))
+    stamp_sidecar(fresh, r4b_rows(model))
+    new_sidecar = (fresh / f"{BARCODE}_blast_otu_taxonomy_v1.tsv").read_bytes()
+    run_build(fresh)
+    assert public_rows(fresh)[0]["perc_id"] == "97.5"
+    old_bad = write_inputs(tmp_path / "old-b-new-a", model)
+    (old_bad / "_state" / "otu_blast_evidence_COI.tsv").write_bytes(new_evidence.read_bytes())
+    assert_provenance_rejection(old_bad, "evidence provenance mismatch")
+    new_bad = write_inputs(tmp_path / "new-b-old-a", model)
+    (new_bad / f"{BARCODE}_blast_otu_taxonomy_v1.tsv").write_bytes(new_sidecar)
+    assert (new_bad / "_state" / "otu_blast_evidence_COI.tsv").read_bytes() == old_bytes
+    assert_provenance_rejection(new_bad, "evidence provenance mismatch")
+    assert old_sidecar != new_sidecar
+
+
+@pytest.mark.parametrize("change", ["remove_query", "hsp_identity", "header_signature", "empty", "missing", "tampered_footer"])
+def test_f02_evidence_mutations_fail_before_output(tmp_path, change):
+    model = [otu(0, members=[member("a"), member("b")])]
+    root = write_inputs(tmp_path, model)
+    path = root / "_state" / "otu_blast_evidence_COI.tsv"
+    rows = path.read_text().splitlines()[1:-1]
+    if change == "remove_query":
+        rows = rows[:1]
+    elif change == "hsp_identity":
+        rows[0] = rows[0].replace("99.5", "98.5")
+    elif change == "header_signature":
+        path.write_text(sealed("EVIDENCE", "b" * 64, rows))
+    elif change == "empty":
+        rows = []
+    elif change == "missing":
+        path.unlink()
+    elif change == "tampered_footer":
+        data = path.read_text()
+        path.write_text(data[:-2] + ("0" if data[-2] != "0" else "1") + "\n")
+    if change in {"remove_query", "hsp_identity", "empty"}:
+        path.write_text(sealed("EVIDENCE", SIG, rows))
+    diagnostic = ("missing R4-A evidence" if change == "missing" else
+                  "incomplete EVIDENCE envelope" if change == "tampered_footer" else
+                  "evidence provenance mismatch")
+    assert_provenance_rejection(root, diagnostic)
+
+
+def test_f02_empty_and_disabled_and_memberless_markers(tmp_path):
+    empty = [otu(0, status="REFERENCE_UNRESOLVED", members=[
+        member("a", read_status="REFERENCE_UNRESOLVED", evidence=None)])]
+    root = write_inputs(tmp_path / "empty", empty)
+    prov = evidence_provenance(root / "_state" / "otu_blast_evidence_COI.tsv")
+    assert prov == {"signature": SIG, "rows": 0, "body_sha256": hashlib.sha256(b"").hexdigest()}
+    run_build(root)
+    mismatch = write_inputs(tmp_path / "empty-mismatch", empty)
+    (mismatch / "_state" / "otu_blast_evidence_COI.tsv").write_text(
+        sealed("EVIDENCE", SIG, evidence_lines("a|COI|hac|barcode=|adapter=alpha", hash_of("COI", "a"), [])))
+    assert_provenance_rejection(mismatch, "evidence provenance mismatch")
+    active = write_inputs(tmp_path / "active", [otu(0, members=[member("a")]), otu(1, marker="ITS2", members=[])])
+    assert set(json.loads((active / f"{BARCODE}_blast_otu_taxonomy_v1.tsv").read_text().splitlines()[0].split("\t")[3])) == {"COI"}
+    (active / "_state" / "otu_blast_evidence_ITS2.tsv").write_text("unrelated disabled evidence\n")
+    run_build(active)
+    no_markers = write_inputs(tmp_path / "none", [])
+    assert no_markers.joinpath(f"{BARCODE}_blast_otu_taxonomy_v1.tsv").read_text().splitlines()[0].endswith("\t{}")
+    run_build(no_markers)
+
+
+def test_f02_marker_order_and_crlf_equivalence(tmp_path):
+    model = [otu(0, members=[member("a")]),
+             otu(1, marker="ITS2", taxid="-1156", ranks=PLANT,
+                 members=[member("b", taxid="-1156", ranks=PLANT)])]
+    forward = write_inputs(tmp_path / "forward", model)
+    reverse = write_inputs(tmp_path / "reverse", list(reversed(model)))
+    head = lambda root: (root / f"{BARCODE}_blast_otu_taxonomy_v1.tsv").read_bytes().splitlines()[0]
+    assert head(forward) == head(reverse)
+    run_build(forward)
+    for path in (reverse / "_state").glob("otu_blast_evidence_*.tsv"):
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+    run_build(reverse)
+    assert (forward / f"{BARCODE}_blast_otu_pretax_rpt.txt").read_bytes() == (reverse / f"{BARCODE}_blast_otu_pretax_rpt.txt").read_bytes()
+    assert reporting_rows(forward) == reporting_rows(reverse)
+    second = write_inputs(tmp_path / "second-only", model)
+    p = second / "_state" / "otu_blast_evidence_ITS2.tsv"
+    rows = p.read_text().splitlines()[1:-1]
+    rows[0] = rows[0].replace("99.5", "98.5")
+    p.write_text(sealed("EVIDENCE", SIG, rows))
+    assert_provenance_rejection(second, "evidence provenance mismatch for ITS2")
+
+
+@pytest.mark.parametrize("change", ["v1", "missing_object", "extra_marker", "missing_marker", "duplicate_marker",
+                                     "noncanonical", "altered_digest", "altered_rows", "uppercase_digest", "wrong_type", "missing_field", "extra_field"])
+def test_f02_bad_sidecar_provenance_fails_before_output(tmp_path, change):
+    model = [otu(0, members=[member("a")])]
+    root = write_inputs(tmp_path, model)
+    path = root / f"{BARCODE}_blast_otu_taxonomy_v1.tsv"
+    lines = path.read_text().splitlines(keepends=True)
+    header = lines[0].rstrip("\n").split("\t", 3)
+    provenance = json.loads(header[3])
+    if change == "v1":
+        lines[0] = f"{header[0]}\t1\t{header[2]}\n"
+    elif change == "missing_object":
+        lines[0] = "\t".join(header[:3]) + "\n"
+    else:
+        item = provenance["COI"]
+        if change == "extra_marker":
+            provenance["ITS2"] = dict(item)
+        elif change == "missing_marker":
+            provenance = {}
+        elif change == "duplicate_marker":
+            raw = json.dumps(item, sort_keys=True, separators=(",", ":"))
+            lines[0] = "\t".join(header[:3]) + f'\t{{"COI":{raw},"COI":{raw}}}\n'
+        elif change == "noncanonical":
+            lines[0] = "\t".join(header[:3]) + "\t" + json.dumps(provenance) + "\n"
+        elif change == "altered_digest":
+            item["body_sha256"] = "0" * 64
+        elif change == "altered_rows":
+            item["rows"] += 1
+        elif change == "uppercase_digest":
+            item["body_sha256"] = item["body_sha256"].upper()
+        elif change == "wrong_type":
+            item["rows"] = str(item["rows"])
+        elif change == "missing_field":
+            del item["rows"]
+        elif change == "extra_field":
+            item["path"] = "mutable.tsv"
+        if change not in {"duplicate_marker", "noncanonical"}:
+            lines[0] = "\t".join(header[:3]) + "\t" + json.dumps(provenance, sort_keys=True, separators=(",", ":")) + "\n"
+    path.write_text("".join(lines))
+    expected = "legacy R4-B sidecar" if change == "v1" else "provenance"
+    assert_provenance_rejection(root, expected)
+
+
+def test_f02_missing_empty_evidence_is_not_silently_skipped(tmp_path):
+    model = [otu(0, status="REFERENCE_UNRESOLVED", members=[
+        member("a", read_status="REFERENCE_UNRESOLVED", evidence=None)])]
+    root = write_inputs(tmp_path, model)
+    (root / "_state" / "otu_blast_evidence_COI.tsv").unlink()
+    assert_provenance_rejection(root, "missing R4-A evidence")
+
+
+def test_f02_b_provenance_is_from_parsed_scan(tmp_path):
+    from tests.test_blast_otu_marker_taxonomy_contract import fixture as b_fixture, seal as b_seal
+
+    cfg, env = b_fixture(tmp_path)
+    evidence = Path(cfg["targets"][0]["evidence"])
+    parsed_generation = evidence_provenance(evidence)
+    lines = evidence.read_text().splitlines()
+    replacement = tmp_path / "replacement.tsv"
+    replacement.write_text(b_seal("EVIDENCE", parsed_generation["signature"],
+                                  [row.replace("\t99\t", "\t98\t") for row in lines[1:-1]]))
+    assert evidence_provenance(replacement) != parsed_generation
+    injector = tmp_path / "inject.pl"
+    injector.write_text(r'''
+use strict; use warnings;
+use RTBioScan::OTURefineBlastreport;
+my $original = \&RTBioScan::R4A::evidence_read;
+{ no warnings 'redefine';
+  *RTBioScan::R4A::evidence_read = sub {
+    my @parsed = $original->(@_);
+    open my $src, '<', $ARGV[3] or die $!;
+    open my $dst, '>', $_[0] or die $!;
+    while (read $src, my $bytes, 65536) { print {$dst} $bytes or die $!; }
+    close $src or die $!; close $dst or die $!;
+    return @parsed;
+  };
+}
+RTBioScan::OTURefineBlastreport::run_marker_contract(@ARGV[0..2], \*STDOUT);
+''')
+    result = subprocess.run(["perl", "-I" + str(BIN / "lib"), str(injector), str(tmp_path / "reads.clstr"),
+                             str(tmp_path / "lineage.tsv"), str(tmp_path / "contract.json"), str(replacement)],
+                            cwd=tmp_path, env={**os.environ, **env}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    header = (tmp_path / "status.tsv").read_text().splitlines()[0].split("\t", 3)
+    assert header[1] == "2"
+    assert json.loads(header[3]) == {"COI": parsed_generation}
+    assert evidence_provenance(evidence) == evidence_provenance(replacement)
+
+
+@pytest.mark.parametrize("empty_its2", [False, True])
+def test_f02_json_pp_numeric_provenance_portability(tmp_path, empty_its2):
+    from tests.test_blast_otu_marker_taxonomy_contract import fixture as b_fixture
+
+    assignments = [(f"{name}|{marker}|sup|barcode=|adapter=alpha", marker, hits, 99)
+                   for name, marker, hits in (("a", "COI", ["-1"]),
+                                              ("b", "COI", ["-1"]),
+                                              ("c", "ITS2", None))]
+    outputs = {}
+    for mode in ("pp_b", "default"):
+        root = tmp_path / mode
+        root.mkdir()
+        cfg, env = b_fixture(root, assignments=assignments,
+                             definitions={"COI": {"-1": METAZOA}, "ITS2": {"-2": PLANT}})
+        if empty_its2:
+            evidence = Path(cfg["targets"][1]["evidence"])
+            evidence.write_text(sealed("EVIDENCE", evidence.read_text().splitlines()[0].split("\t")[2], []))
+        run_env = {**os.environ, **env}
+        run_env.pop("PERL_JSON_PP_USE_B", None)
+        if mode == "pp_b":
+            run_env["PERL_JSON_PP_USE_B"] = "1"
+        result = subprocess.run(["perl", str(BIN / "otu_refine_blastreport.pl"), "--r4b",
+                                 str(root / "reads.clstr"), str(root / "lineage.tsv"), str(root / "contract.json")],
+                                cwd=root, env=run_env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        sidecar = root / "status.tsv"
+        header = sidecar.read_text().splitlines()[0].split("\t", 3)
+        assert header[:2] == ["#RTB-R4B-TAXONOMY", "2"]
+        provenance = json.loads(header[3])
+        assert {marker: item["rows"] for marker, item in provenance.items()} == {
+            "COI": 2, "ITS2": 0 if empty_its2 else 1}
+        for item in provenance.values():
+            assert type(item["rows"]) is int and item["rows"] >= 0
+        assert json.dumps(provenance, sort_keys=True, separators=(",", ":")) == header[3]
+
+        # B validates its own generation before publishing; read it again through B's reader.
+        read = subprocess.run(["perl", "-I" + str(BIN / "lib"), "-MRTBioScan::OTURefineBlastreport",
+                               "-e", "RTBioScan::OTURefineBlastreport::read_status_sidecar($ARGV[0]);",
+                               str(sidecar)], cwd=root, env=run_env, capture_output=True, text=True)
+        assert read.returncode == 0, read.stderr
+
+        (root / f"{BARCODE}_blast_otu_taxonomy_v1.tsv").write_bytes(sidecar.read_bytes())
+        rows = [line.split("\t") for line in sidecar.read_text().splitlines()[2:-1]]
+        columns = sidecar.read_text().splitlines()[1].split("\t")[1:]
+        records = [dict(zip(columns, row)) for row in rows]
+        (root / "otu_members_round.tsv").write_text("otu_id\tread_id\n" + "".join(
+            f"{r['otu_id']}\t{r['canonical_member'].split('|')[0]}\n" for r in records))
+        (root / "kept_otus.tsv").write_text("CLUST_0\n")
+        state = root / "_state"
+        state.mkdir()
+        for target in cfg["targets"]:
+            (state / f"otu_blast_evidence_{target['marker']}.tsv").write_bytes(Path(target["evidence"]).read_bytes())
+        run_build(root)
+        outputs[mode] = (public_rows(root), reporting_rows(root))
+
+    assert outputs["pp_b"] == outputs["default"]
+
+    bad = tmp_path / "pp_b" / f"{BARCODE}_blast_otu_taxonomy_v1.tsv"
+    lines = bad.read_text().splitlines(keepends=True)
+    head = lines[0].split("\t", 3)
+    quoted = head[3].replace('"rows":2', '"rows":"2"')
+    assert quoted != head[3]
+    lines[0] = "\t".join(head[:3]) + "\t" + quoted
+    bad.write_text("".join(lines))
+    for name in (f"{BARCODE}_blast_otu_pretax_rpt.txt", f"{BARCODE}_blast_otu_reporting_v1.tsv"):
+        (bad.parent / name).unlink()
+    assert_provenance_rejection(bad.parent, "noncanonical R4-B evidence provenance")
 
 
 def test_corrupt_sidecar_fails_before_any_output(tmp_path):

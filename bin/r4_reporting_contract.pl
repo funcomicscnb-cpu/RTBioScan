@@ -127,8 +127,9 @@ sub r4b_signature_of {
     open my $f, '<', $path or fail("read R4-B sidecar $path: $!");
     my $head = <$f> // '';
     close $f;
-    fail('unsupported R4-B sidecar header') unless $head =~ /\A#RTB-R4B-TAXONOMY\t1\t([0-9a-f]{64})\n\z/;
-    return $1;
+    my ($sig,$provenance,$version)=RTBioScan::OTURefineBlastreport::r4b_header($head);
+    fail('legacy R4-B sidecar (v1) lacks R4-A evidence provenance') if $version==1;
+    return ($sig,$provenance);
 }
 
 # ---------------------------------------------------------------------------
@@ -136,13 +137,14 @@ sub r4b_signature_of {
 # and per-HSP validator, keeping only the canonical members' rows. Memory is
 # proportional to the current membership, never to the evidence history.
 sub load_evidence {
-    my ($dir, $markers, $wanted) = @_;
+    my ($dir, $markers, $wanted, $provenance) = @_;
+    fail('R4-B evidence provenance marker scope mismatch') unless join("\t",sort keys %$markers) eq join("\t",sort keys %$provenance);
     my (%by_key, %sigs);
     for my $marker (sort keys %$markers) {
         my $path = "$dir/otu_blast_evidence_$marker.tsv";
-        next unless -f $path;
+        fail("missing R4-A evidence for $marker: $path") unless -f $path;
         my (%group, %seen, %subject_tax);
-        my ($sig) = RTBioScan::R4A::scan_sealed($path, 'EVIDENCE', sub {
+        my ($sig,$version,$digest,$count) = RTBioScan::R4A::scan_sealed($path, 'EVIDENCE', sub {
             my ($line) = @_;
             my @v = split /\t/, $line, -1;
             fail('wrong evidence field count') unless @v == 14;
@@ -171,6 +173,8 @@ sub load_evidence {
             $subject_tax{ $v[1] } = $v[2];
             push @{ $g->{candidates} }, [ @v[1 .. 6] ];
         });
+        my $p=$provenance->{$marker};
+        fail("R4-A evidence provenance mismatch for $marker") unless $sig eq $p->{signature} && $count==$p->{rows} && $digest eq $p->{body_sha256};
         $sigs{$marker} = $sig;
         my %by_hash;
         for my $id (sort keys %group) {
@@ -208,7 +212,8 @@ sub build {
     if (!defined($o{sidecar}) || $o{sidecar} eq '' || !-e $o{sidecar}) {
         fail("R4-B sidecar missing for non-empty canonical membership ($member_total members)") if $member_total > 0;
     } else {
-        $r4b_sig = r4b_signature_of($o{sidecar});
+        my $provenance;
+        ($r4b_sig,$provenance) = r4b_signature_of($o{sidecar});
         my $r4b = RTBioScan::OTURefineBlastreport::read_status_sidecar($o{sidecar});
         my (%by_member, %seen_pair);
         for my $r (@$r4b) {
@@ -229,7 +234,7 @@ sub build {
             my $e = join(',', map { s/\t/:/r } @extra[0 .. ($#extra < 2 ? $#extra : 2)]);
             fail(sprintf('canonical membership and R4-B sidecar disagree (missing=%d [%s]; extra=%d [%s])', scalar(@missing), $m, scalar(@extra), $e));
         }
-        my ($evidence, $sigs) = load_evidence($o{evidence_dir}, \%markers, $membership->{by_member});
+        my ($evidence, $sigs) = load_evidence($o{evidence_dir}, \%markers, $membership->{by_member}, $provenance);
         $evidence_sigs = $sigs;
         my %lineage_cache;   # one OTU lineage text is shared by all its members
         for my $member (keys %by_member) {

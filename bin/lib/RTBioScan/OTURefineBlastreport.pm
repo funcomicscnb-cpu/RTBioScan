@@ -726,15 +726,37 @@ sub r4b_vote {
 }
 my @R4B_COLUMNS=qw(read_id otu_id marker taxid lineage status depth origin member_count votes support winner_count stable_key read_status read_taxid read_lineage read_depth read_origin read_reason source_taxids status_counts canonical_member);
 sub r4b_status_text {
-    my ($sig,$rows)=@_;
+    my ($sig,$rows,$provenance)=@_;
     my $body=join('',map { join("\t",map { defined($_) ? $_ : 'NA' } @$_{@R4B_COLUMNS})."\n" } @$rows);
-    return "#RTB-R4B-TAXONOMY\t1\t$sig\n#columns\t".join("\t",@R4B_COLUMNS)."\n".$body."#END\t".scalar(@$rows)."\t".sha256_hex($body)."\n";
+    return "#RTB-R4B-TAXONOMY\t2\t$sig\t".r4b_json()->encode($provenance)."\n#columns\t".join("\t",@R4B_COLUMNS)."\n".$body."#END\t".scalar(@$rows)."\t".sha256_hex($body)."\n";
+}
+sub r4b_header {
+    my ($head)=@_;
+    r4b_fail('unsupported status schema') unless $head =~ /\A#RTB-R4B-TAXONOMY\t([12])\t([0-9a-f]{64})(?:\t([^\r\n]*))?\n\z/;
+    my ($version,$sig,$json)=($1,$2,$3);
+    if ($version==1) { r4b_fail('invalid legacy status header') if defined $json; return ($sig,undef,1); }
+    r4b_fail('missing R4-B evidence provenance') unless defined $json;
+    my $provenance=eval { r4b_json()->decode($json) };
+    r4b_fail('invalid R4-B evidence provenance') unless ref($provenance) eq 'HASH';
+    my %canonical;
+    for my $marker (keys %$provenance) {
+        r4b_marker($marker);
+        my $p=$provenance->{$marker};
+        r4b_fail('invalid R4-B evidence provenance fields') unless ref($p) eq 'HASH'
+            && keys(%$p)==3 && exists($p->{signature}) && exists($p->{rows}) && exists($p->{body_sha256});
+        r4b_fail('invalid R4-B evidence provenance values') unless !ref($p->{signature}) && !ref($p->{body_sha256}) && !ref($p->{rows})
+            && $p->{signature}=~/\A[0-9a-f]{64}\z/ && $p->{body_sha256}=~/\A[0-9a-f]{64}\z/
+            && $p->{rows}=~/\A(?:0|[1-9][0-9]*)\z/;
+        $canonical{$marker}={signature=>$p->{signature},rows=>0+$p->{rows},body_sha256=>$p->{body_sha256}};
+    }
+    r4b_fail('noncanonical R4-B evidence provenance') unless r4b_json()->encode(\%canonical) eq $json;
+    return ($sig,\%canonical,2);
 }
 sub read_status_sidecar {
-    my ($path,$expected)=@_;my @rows;my (%seen,%projection,%members,%canonical,%observed_status);
+    my ($path,$expected)=@_;my @rows;my (%seen,%projection,%members,%canonical,%observed_status,%row_markers);
     open my $f,'<',$path or r4b_fail("read status $path");
-    my $head=<$f>//'';r4b_fail('unsupported status schema') unless $head =~ /\A#RTB-R4B-TAXONOMY\t1\t([0-9a-f]{64})\n\z/;
-    my $sig=$1;r4b_fail('stale status signature') if defined($expected) && $sig ne $expected;
+    my ($sig,$provenance)=r4b_header(<$f>//'');
+    r4b_fail('stale status signature') if defined($expected) && $sig ne $expected;
     r4b_fail('invalid status columns') unless (<$f>//'') eq "#columns\t".join("\t",@R4B_COLUMNS)."\n";
     my $sha=Digest::SHA->new(256);my ($count,$end)=(0,0);
     while (my $line=<$f>) {
@@ -748,6 +770,7 @@ sub read_status_sidecar {
         my %r;@r{@R4B_COLUMNS}=@v;
         r4b_fail('empty or control status field') if grep { $_ eq '' || /[\r\n\x00]/ } @v;
         r4b_marker($r{marker});
+        $row_markers{$r{marker}}=1;
         r4b_fail('invalid projection identity') unless $r{otu_id} =~ /\AOTUB_[0-9]+-\Q$r{marker}\E\z/;
         r4b_fail('invalid member relationship') unless $r{read_id} =~ /\A([^|\s]+)\|\Q$r{marker}\E\|.*\|\Q$r{otu_id}\E\z/ && $r{canonical_member} eq "$1|$r{marker}";
         r4b_fail('duplicate status member') if $seen{$r{read_id}}++;
@@ -782,6 +805,9 @@ sub read_status_sidecar {
         $r{_r4b_validated}=1;push @rows,\%r;
     }
     close $f or r4b_fail('close status');r4b_fail('missing status footer') unless $end;
+    if (defined $provenance) {
+        r4b_fail('R4-B evidence provenance marker scope mismatch') unless join("\t",sort keys %$provenance) eq join("\t",sort keys %row_markers);
+    }
     my %checked;
     for my $r (@rows) {
         next if $checked{$r->{otu_id}}++;
@@ -845,7 +871,7 @@ sub run_marker_contract {
         });
     }
     my ($authorities,$inventory)=r4b_lineage_authority($lineage,$cfg->{targets});
-    my (%read_results,%identities,%sources,%digests);
+    my (%read_results,%identities,%sources,%digests,%provenance);
     $digests{lineage}=RTBioScan::R4A::file_digest($lineage);$digests{clusters}=RTBioScan::R4A::file_digest($clstr);
     $digests{hash_map}=RTBioScan::R4A::file_digest($cfg->{hash_map}) if defined($cfg->{hash_map}) && -e $cfg->{hash_map};
     for my $t (@{$cfg->{targets}}) {
@@ -854,7 +880,9 @@ sub run_marker_contract {
         for (qw(family genus species evalue)) { RTBioScan::R4A::number($t->{$_},0,$_ eq 'evalue' ? undef : 100); }
         RTBioScan::R4A::uint($t->{max_hsps});
         my $sig=r4b_signature($t,$cfg->{taxonomy_dir});
-        my ($stored,$groups)=RTBioScan::R4A::evidence_read($t->{evidence});r4b_fail('stale R4-A evidence') unless $stored eq $sig;
+        my ($stored,$groups,$evidence_provenance)=RTBioScan::R4A::evidence_read($t->{evidence});r4b_fail('stale R4-A evidence') unless $stored eq $sig;
+        my $count=$evidence_provenance->{rows};
+        $provenance{$marker}={signature=>$evidence_provenance->{signature},rows=>0+$count,body_sha256=>$evidence_provenance->{body_sha256}};
         my ($msig,$version)=RTBioScan::R4A::scan_sealed($t->{memtax},'MEMTAX',sub {});
         r4b_fail('stale or unsupported R4-A MEMTAX') unless $msig eq $sig && $version==2;
         my $memory=RTBioScan::R4A::memtax_read($t->{memtax},$sig);
@@ -873,7 +901,7 @@ sub run_marker_contract {
         my $numeric=r4b_numeric_lineages(\%numeric,$cfg->{taxonomy_dir});
         my ($metadata,$issues,$meta_info)=r4b_metadata($t,\%needed);
         r4b_fail('conflicting reference accession identities') if keys %{$issues->{conflicting_accession}//{}};
-        $digests{"$marker:evidence"}=RTBioScan::R4A::file_digest($t->{evidence});$digests{"$marker:memtax"}=RTBioScan::R4A::file_digest($t->{memtax});
+        $digests{"$marker:evidence"}=$evidence_provenance;$digests{"$marker:memtax"}=RTBioScan::R4A::file_digest($t->{memtax});
         $digests{"$marker:signature"}=$sig;$digests{"$marker:metadata"}=$meta_info->{sha256};
         my (%aliases,%resolved_by_hash);
         for my $id (sort keys %$groups) {
@@ -916,7 +944,7 @@ sub run_marker_contract {
     }
     my $sig=sha256_hex(r4b_json()->encode({contract=>'R4-B-v1',configuration=>$cfg,sources=>\%digests}));
     my $sidecar=$cfg->{sidecar};r4b_fail('status sidecar path required') unless defined($sidecar) && $sidecar ne '';
-    my $text=r4b_status_text($sig,\@rows);
+    my $text=r4b_status_text($sig,\@rows,\%provenance);
     # Validate the whole generation before replacing its externally visible name.
     require File::Temp;my ($f,$tmp)=File::Temp::tempfile('.r4b-status-XXXXXX',DIR=>dirname($sidecar),UNLINK=>0);
     my $ok=eval {

@@ -159,7 +159,7 @@ def run_fixture(tmp_path, env=None):
 
 def sidecar(tmp_path):
     lines = (tmp_path / 'status.tsv').read_text().splitlines()
-    assert lines[0].startswith('#RTB-R4B-TAXONOMY\t1\t')
+    assert lines[0].startswith('#RTB-R4B-TAXONOMY\t2\t')
     names = lines[1].split('\t')[1:]
     rows = [dict(zip(names, row.split('\t'))) for row in lines[2:-1]]
     assert len(lines[-1].split('\t')) == 3
