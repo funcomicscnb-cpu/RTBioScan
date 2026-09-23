@@ -14,11 +14,22 @@ sync_changed_files() {
     mkdir -p "$dest_dir"
 
     local existing=()
+    local r4d_sources=()
     local src
     for src in "$@"; do
+        # A governed cumulative table is decided by its source's authority, never
+        # by its own presence: a publication may have just retracted the name.
+        if r4d_cumulative_governed "$src"; then
+            r4d_already_backed_up "$dest_dir" "$src" || r4d_sources+=( "$src" )
+            continue
+        fi
         [ -e "$src" ] || continue
         existing+=( "$src" )
     done
+
+    if [ "${#r4d_sources[@]}" -gt 0 ]; then
+        r4d_publish_backup "$dest_dir" "${r4d_sources[@]}" || return 1
+    fi
 
     if [ "${#existing[@]}" -eq 0 ]; then
         return 0
@@ -98,4 +109,96 @@ publish_gzip_atomic() {
     if [ "$uncompressed" != "$dest_gz" ]; then
         rm -f -- "$uncompressed"
     fi
+}
+
+# R4-I2: the cumulative BLAST OTU public tables (`<bc>_blast_otu_pretax_rpt.txt`,
+# `<bc>_blast_otu_noadapter_rpt.txt`) of a directory under generation authority
+# -- a pipeline `_state`, or a directory holding an R4-I2 record, member, lock
+# or temp, such as an earlier backup destination -- are never copied one by
+# one. The generation named by the source's sealed record (or its validated
+# legacy snapshot) is replicated into the destination as one generation, its
+# reporting sidecar included, with its own record
+# (RTBioScan::R4DCumulative::publish_backup): the tables change together, a
+# killed sync leaves the previous generation authoritative, and every later
+# copy of the destination repeats this. Damage or ambiguity fails the sync.
+# backup_update_and_clean names each source directory and barcode explicitly
+# (r4d_backup_generation), so no glob or existence test decides whether a
+# generation is backed up; a governed name handed to sync_changed_files is
+# resolved through its source's authority even when it is momentarily absent.
+# Other files, and these names in other directories, are synced exactly as
+# before.
+case "${BASH_SOURCE[0]}" in
+    /*) BACKUP_SYNC_LIB_DIR="${BASH_SOURCE[0]%/*}" ;;
+    */*) BACKUP_SYNC_LIB_DIR="$PWD/${BASH_SOURCE[0]%/*}" ;;
+    *) BACKUP_SYNC_LIB_DIR="$PWD" ;;
+esac
+
+r4d_cumulative_governed() {
+    local src="$1"
+    local name="${src##*/}"
+    local dir="${src%/*}"
+    local bc m
+
+    case "$name" in
+        *_blast_otu_pretax_rpt.txt) bc="${name%_blast_otu_pretax_rpt.txt}" ;;
+        *_blast_otu_noadapter_rpt.txt) bc="${name%_blast_otu_noadapter_rpt.txt}" ;;
+        *) return 1 ;;
+    esac
+    [ -n "$bc" ] || return 1
+    [ "$dir" != "$src" ] || dir="."
+    if [ "${dir##*/}" = "_state" ]; then
+        return 0
+    fi
+    for m in "$dir/${bc}_blast_otu_cumulative."* "$dir/.r4d-publish-${bc}-"* \
+        "$dir/${bc}_blast_otu_reporting_v1.tsv.gen-"* "$dir/${bc}_blast_otu_pretax_rpt.txt.gen-"* \
+        "$dir/${bc}_blast_otu_noadapter_rpt.txt.gen-"*; do
+        if [ -e "$m" ] || [ -L "$m" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+r4d_publish_backup() {
+    local dest_dir="$1"
+    shift
+    perl -e 'require $ARGV[0]; exit RTBioScan::R4DCumulative::backup_cli(@ARGV[1 .. $#ARGV]);' \
+        "$BACKUP_SYNC_LIB_DIR/RTBioScan/R4DCumulative.pm" "$dest_dir" "$@"
+}
+
+# Generations published by r4d_backup_generation in this shell, as
+# `|<dest>|<source dir>|<barcode>|`: the per-file sync of the same source into
+# the same destination does not repeat them.
+R4D_BACKED_UP="${R4D_BACKED_UP:-}"
+
+# r4d_backup_generation <dest dir> <source dir> <barcode>: back up the
+# source's cumulative generation of that barcode (resolved from its authority;
+# nothing when it has never been published; a failure when it is damaged or
+# not authentic).
+r4d_backup_generation() {
+    local dest_dir="$1"
+    local src_dir="$2"
+    local bc="$3"
+    mkdir -p "$dest_dir"
+    perl -e 'require $ARGV[0]; exit RTBioScan::R4DCumulative::backup_generation_cli(@ARGV[1 .. $#ARGV]);' \
+        "$BACKUP_SYNC_LIB_DIR/RTBioScan/R4DCumulative.pm" "$dest_dir" "$src_dir" "$bc" || return 1
+    R4D_BACKED_UP="${R4D_BACKED_UP}|${dest_dir}|${src_dir}|${bc}|"
+}
+
+r4d_already_backed_up() {
+    local dest_dir="$1"
+    local src="$2"
+    local name="${src##*/}"
+    local dir="${src%/*}"
+    local bc
+    case "$name" in
+        *_blast_otu_pretax_rpt.txt) bc="${name%_blast_otu_pretax_rpt.txt}" ;;
+        *_blast_otu_noadapter_rpt.txt) bc="${name%_blast_otu_noadapter_rpt.txt}" ;;
+        *) return 1 ;;
+    esac
+    [ "$dir" != "$src" ] || dir="."
+    case "$R4D_BACKED_UP" in
+        *"|${dest_dir}|${dir}|${bc}|"*) return 0 ;;
+    esac
+    return 1
 }

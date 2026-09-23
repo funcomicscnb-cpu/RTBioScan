@@ -7,6 +7,7 @@ use POSIX qw(strftime);
 use FindBin;
 require "$FindBin::Bin/lib/sample_label.pl";
 require "$FindBin::Bin/lib/taxon_util.pl";
+require "$FindBin::Bin/lib/RTBioScan/R4DCumulative.pm" unless defined &RTBioScan::R4DCumulative::resolve;
 *trim_text           = \&TaxonUtil::trim_text;
 *is_unassigned_taxon = \&TaxonUtil::is_unassigned_taxon;
 *normalize_taxon     = \&TaxonUtil::normalize_taxon;
@@ -4967,6 +4968,22 @@ my $reads_sup      = count_non_na_in_column($opt{read_info}, 'sup_length');
 
 my $round_index = load_round_index($opt{round_index_file});
 my $otu_alias_map = load_otu_promotion_alias_map();
+# R4-I2: the cumulative inputs name the public tables of a state snapshot.
+# They are read through the generation named by its sealed commit record (or
+# from a complete, validated pre-I2 snapshot); a pristine state is simply
+# absent, and an interrupted, partial, ambiguous or damaged one fails closed,
+# so it is never read as a mixture or as first-run absence. Tables outside a
+# state directory without any R4-I2 artifact are ordinary files. An authentic
+# pre-R4-D snapshot is sealed on first sight and read through its legacy
+# record: it has no reporting sidecar, so the cumulative R4-D metrics are
+# unavailable (null), never zero.
+my %r4d_cumulative_resolved;
+for my $key (qw(blast_otu_reporting_cumulative blast_otu_cumulative)) {
+  my ($dir, $bc, $product) = RTBioScan::R4DCumulative::split_live_path($opt{$key});
+  next unless defined $product;
+  my $res = $r4d_cumulative_resolved{"$dir\t$bc"} //= RTBioScan::R4DCumulative::resolve($dir, $bc);
+  $opt{$key} = $res->{paths}{$product} unless $res->{mode} eq 'ungoverned';
+}
 # R4-D validated taxonomy: the sealed reporting sidecars supply explicit status
 # and actual depth per canonical membership relation. A malformed sidecar fails
 # closed; an absent cumulative snapshot (first round) is simply unavailable.
@@ -6125,6 +6142,10 @@ my $obj = {
   warnings => \@warnings,
 };
 
+for my $key (sort keys %r4d_cumulative_resolved) {
+  die 'R4-D cumulative: the snapshot in ' . (split /\t/, $key)[0] . " was republished while it was being read; rerun\n"
+    unless RTBioScan::R4DCumulative::still_current($r4d_cumulative_resolved{$key});
+}
 open my $OUT, '>', $opt{out} or die "open $opt{out}: $!";
 print {$OUT} encode_json($obj), "\n";
 close $OUT;

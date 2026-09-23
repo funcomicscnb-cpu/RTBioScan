@@ -423,6 +423,171 @@ reads the snapshot through `--blast-otu-cumulative` and
 `--blast-otu-reporting-cumulative`; `--summary` and `--summary-otu` are
 deprecated and ignored (a deterministic warning is printed when they are given).
 
+Interruption safety (R4-I2). The three files form one generation, named by the
+sealed commit record `_state/<barcode>_blast_otu_cumulative.commit` (header
+`#RTB-R4D-CUMULATIVE`, version `1`, the generation id, its predecessor, the
+name/size/SHA-256 of each product and a SHA-256 seal); the record is the only
+authority. A publication writes immutable members `_state/<name>.gen-<generation>`
+and makes them durable, replaces the record with one rename (the commit), then
+retracts every public name that changes (renamed to `<name>.bak.<pid>`) before
+it links any of them to its committed member. A process killed or terminated
+before the commit leaves the previous generation authoritative, after it the
+new one. Every production reader (`report_round_json.pl`, `report_run_json.pl`,
+`report_render.py` and the backup table publication) resolves the record,
+checks each member's size and SHA-256, opens only those members, and before it
+writes output confirms they are still the same files; one predecessor
+generation is kept, so a reader overtaken by one further commit still
+completes, and one overtaken by two fails and is rerun. A synchronous failure
+restores the previous names, bytes and record exactly. The next publication
+(or the task retry) reconciles lagging public names and removes temporary
+files (`.r4d-publish-<barcode>-*`), rollback files (`<name>.bak.*`) and members
+of generations other than the committed one and its predecessor; one
+publication per barcode runs at a time (`<barcode>_blast_otu_cumulative.lock`).
+
+The public names are compatibility copies, never the authority: no portable
+filesystem operation switches three names at once (exFAT has no hard links, and
+symbolic links only where the operating system emulates them), so they change
+one by one. Because every changed name is
+retracted before any new one appears, the public names that exist at any
+instant hold one generation; after an interruption between the commit and the
+end of the projection some of them can be missing (a direct read fails) until
+the task retry, but they never mix generations. They are hard links of the
+committed members, with mode 0600. Byte copies replace hard links only when
+link(2) reports that the filesystem does not support them (ENOTSUP, EOPNOTSUPP
+or ENOSYS, or EPERM/EMLINK on a filesystem whose pathconf link limit is 1, such
+as exFAT or FAT); any other link error (EIO, ENOSPC, EACCES, EXDEV, EPERM on a
+filesystem with hard links) fails the publication with the previous generation
+intact. Where link(2) reports EPERM without a link limit of 1, publication
+fails closed. Symbolic links are never used.
+
+Without a record, only three `_state` contents are legitimate: a pristine first
+run (none of the three public names, no generation member, no record and no
+governed residue), a complete pre-I2 R4-D snapshot, which is served only after
+it is validated as one publication (a sealed reporting sidecar, the public
+table projected from it, and its no-adapter projection or the header-only
+table), and an authentic pre-R4-D snapshot, which is sealed on first sight
+(below). Governed residue is every transaction file of the barcode's names:
+generation members, `.r4d-publish-*` temporaries, the lock and other
+`<barcode>_blast_otu_cumulative.*` files, and a governed table name followed by
+a transaction suffix (`.tmp`, `.temp`, `.journal`, `.bak`, `.part`, `.partial`,
+`.new`, `.old`, `.orig`, optionally followed by `.`, `-`, `_` or `~` and more,
+or a trailing `~`) or a dot-prefixed partial copy of it (`.<name>.XXXXXX`);
+other files, such as `other.tmp` or `<barcode>_reads_time_rpt.txt.tmp`, never
+count. Every other record-less state fails closed, and each diagnostic says
+what the reporting task will do with it. The reporting task republishes a
+consistent snapshot and the residue its own interrupted first publication
+leaves (members, temporaries, the lock). It refuses to write over anything
+else before it writes anything (`publication refused`, a non-zero exit, every
+byte, inode, mode and time kept), so that no new generation erases the evidence
+of a state that is not authentic: a subset of the public names, inconsistent or
+malformed tables, rollback or journal files, another publisher's temporaries.
+Such a state needs explicit remediation (restore an authentic backup, or reset
+the state). Deleting the record never restores legacy mode. While a restart
+(`restart_mode=reset` or `restore`) of the state is being applied, or after it
+was interrupted, its `_state` fails closed for every reader and publisher:
+`bin/restart_handler.sh` records `status=applying` in
+`<outdir>/temp/.restart_applied.<state_id>` before it first changes the state
+and `status=applied` after its last change (rerunning an interrupted restart
+completes it); an unreadable or malformed record also fails closed. Other
+directories (a round directory, say) are subject to these rules only once they
+hold an R4-I2 file; until then their tables are ordinary files, and the
+publication rules above apply to the pipeline's `_state` only.
+
+Pre-R4-D outdirs (upgrade). The pre-R4-D pipeline (up to R4-C; `main` writes
+the same layout) creates `_state/<barcode>_blast_otu_pretax_rpt.txt` and
+`_state/<barcode>_blast_otu_noadapter_rpt.txt` from its first reported round's
+tables and appends every later round's rows, after copying each round's own
+tables into its round directory `temp/ongoing/state/<state_id>/<round_barcode>/`;
+`_state/round_index.tsv` orders the rounds and `_state/done_pod5.txt` lists the
+completed ones. Such a `_state` has no reporting sidecar and no record. Its
+tables are accepted only when they are exactly that: both tables present as
+regular files with the exact pre-R4-D header and complete 17-field rows, no
+other `<barcode>_blast_otu_*` entry and no other barcode's cumulative table,
+and each table equal to the header followed by the rows of the round tables of
+one leading run of the ledger's rounds (the same run for both tables, every
+completed round included, each completed round's tables present). The first
+reader or reporting task that meets it seals it once, under the publication
+lock: hard links `<name>.gen-<L>` of the two tables (their bytes, modes and
+times are never changed; verified byte copies without hard links) and a legacy
+record `<barcode>_blast_otu_cumulative.commit` with header
+`#RTB-PRE-R4D-LEGACY` version `1`, the generation id `L` (SHA-256 of the two
+product lines), predecessor `NA`, the name/size/SHA-256 of both tables, the
+number of rounds validated and the SHA-256 of their per-round digests, and a
+SHA-256 seal, committed by one rename. Sealing is idempotent, and a sealing
+killed part-way is completed by the next reader. From then on the snapshot is a
+committed generation without a reporting sidecar: `report_round_json.pl` reads
+the old public table for the historical values it always fed (per-sample OTU
+totals, the sunburst, the canonical OTU taxonomy) and reports the cumulative
+R4-D taxonomy-assignment metrics as unavailable (`null`, never zero; no sidecar
+is ever fabricated); `report_run_json.pl` and `report_render.py` read the old
+tables as before. Report-only rebuilds of such an outdir therefore work right
+after the upgrade. If the first upgraded round fails, the sealed legacy
+generation stays authoritative and `-resume` retries without any manual step;
+no partial new generation is ever visible. (If the snapshot cannot even be
+sealed, because of an I/O error, the reporting task fails and leaves it intact
+for its readers and for the retry.) The first complete publication
+replaces the legacy record by one rename (its record names the legacy
+generation as predecessor) and keeps the legacy members for one further commit;
+the next publication removes them. A `_state` that is not exactly this layout
+(a single table, a table appended, truncated, duplicated, reordered or taken
+from other rounds or other state, a wrong header, missing ledger or round
+tables, residue, a sidecar next to the tables) is never sealed: every reader
+fails closed with the reason and leaves every byte untouched, and the reporting
+task refuses to publish over it (see above). Results copies of the tables
+establish this authority only through a restore, which proves them against
+the live round ledger and round tables before it wipes those (below).
+
+Backup copies (R4-I2). `backup_update_and_clean` backs up the cumulative
+generation of its barcode by name, never through what a glob of the public
+names finds: section 2 from `_state` into `<outdir>/ongoing/state/<state_id>/`,
+section 7 from there into `<outdir>/current/state/<state_id>/tables/`
+(`r4d_backup_generation` in bin/lib/backup_sync.sh); a governed table handed to
+`sync_changed_files` is likewise resolved through its source's record even
+while its public name is retracted. The backup is a replica of the source's
+generation: its record (the same kind and generation id; a sealed pre-R4-D
+generation keeps its legacy record and provenance line), every member -- the
+reporting sidecar included -- written from bytes verified against the source
+record, the record replaced by one rename, then retraction and projection of
+the two public tables (a destination projects no sidecar name). A backup killed
+before its commit leaves the previous generation authoritative, after it the
+new one; every later copy of a destination, and `report_render.py`, resolve its
+record, so no reader combines the tables of two generations, and no backup is
+empty or mixed. Each destination keeps its current and previous generation.
+A source that has never been published is not backed up; a damaged or
+unauthenticated one fails the backup.
+
+`restart_mode=restore` restores the cumulative generation with its authority.
+Before it changes anything, `bin/restart_handler.sh` classifies the snapshot's
+generation of every barcode it holds (the structured
+`current/state/<state_id>/tables/`; the round copies in
+`temp/current/state/<state_id>/tables/` are never cumulative authority): a
+complete generation is accepted (its record's seal and every member's size and
+SHA-256 verified, as for the live record); an older backup is accepted only when retained
+evidence proves it -- an earlier candidate's backup record
+(`#RTB-R4D-CUMULATIVE-BACKUP`, two members) by the sidecar bytes its record
+binds (found by size and SHA-256 among the snapshot, the round copy in
+temp/current, the live `_state` and the live round directories), plain R4-D
+copies by a valid sealed sidecar whose projections they are exactly, and plain
+pre-R4-D copies by the live round ledger and round tables with the snapshot's
+completed-round ledger -- and anything else (a corrupt record, a missing or
+damaged member, a single table, members without a record, tables no evidence
+proves, compressed copies of the tables) refuses the restore with the reason,
+before any byte changes. After
+recording the restart as applying and before it wipes the live state, the
+handler completes a proven older backup in place into a full generation (so
+provenance is established while its evidence exists, and a repeated restore
+needs none); the snapshot copy then skips every governed name, and the
+generation is installed into `_state`: member copies verified against the
+record, the record committed by one rename, then its public names. The
+restored generation resolves at once, with its reporting sidecar for an R4-D
+generation: every report works before another round, failed rounds leave it
+authoritative, and the next complete publication supersedes it. A legacy
+backup record written by an earlier candidate (`#RTB-PRE-R4D-LEGACY-BACKUP`)
+is a complete legacy generation and is served and restored as such. Round-local
+copies of these tables (round directories and
+`temp/current/state/<state_id>/tables/`) are ordinary files and are copied
+exactly as before.
+
 ### Retired write-only state (R4-D)
 
 - `_state/blastreport.txt` was snapshot-copied, merged, sorted and republished

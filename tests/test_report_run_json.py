@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -5,6 +6,26 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "bin" / "report_run_json.pl"
+
+
+def _commit_cumulative_state(state_dir: Path, pretax: str) -> None:
+    """R4-I2: a `_state` cumulative BLAST OTU snapshot is read only as a
+    committed generation (sealed record + immutable members); a lone public
+    table is an incomplete snapshot and fails closed."""
+    names = {
+        "reporting": "RTBioScan_blast_otu_reporting_v1.tsv",
+        "public": "RTBioScan_blast_otu_pretax_rpt.txt",
+        "noadapter": "RTBioScan_blast_otu_noadapter_rpt.txt",
+    }
+    texts = {"reporting": b"", "public": pretax.encode("utf-8"), "noadapter": pretax.split("\n", 1)[0].encode("utf-8") + b"\n"}
+    lines = "".join(f"{p}\t{names[p]}\t{len(texts[p])}\t{hashlib.sha256(texts[p]).hexdigest()}\n" for p in names)
+    generation = hashlib.sha256(lines.encode("utf-8")).hexdigest()
+    head = f"#RTB-R4D-CUMULATIVE\t1\ngeneration\t{generation}\nprevious\tNA\n{lines}"
+    for p, text in texts.items():
+        (state_dir / f"{names[p]}.gen-{generation}").write_bytes(text)
+    (state_dir / names["public"]).write_bytes(texts["public"])
+    (state_dir / "RTBioScan_blast_otu_cumulative.commit").write_text(
+        head + f"#END\t{hashlib.sha256(head.encode('utf-8')).hexdigest()}\n", encoding="utf-8")
 
 
 def test_report_run_json_from_history(tmp_path: Path) -> None:
@@ -247,11 +268,11 @@ def test_report_run_json_emits_run_status_read_fate_from_cumulative_state(tmp_pa
         "r2\tCOI\thac\tsample_A_1\tnanopore\tgrab\tsub1\t1\tsample\tsample_A_1\n",
         encoding="utf-8",
     )
-    (state_dir / "RTBioScan_blast_otu_pretax_rpt.txt").write_text(
+    _commit_cumulative_state(
+        state_dir,
         "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_taxid\totu_kingdom\totu_phylum\totu_class\totu_order\totu_family\totu_genus\totu_species\n"
         "r1\tCOI\thac\tsample_A_1\thit1\t123\t100\t99\tOTUB_1-COI\t111\tMetazoa\tP\tC\tO\tF\tG\tS1\n"
         "r2\tCOI\thac\tsample_A_1\thit2\t456\t100\t98\tOTUB_2-COI\t222\tMetazoa\tP\tC\tO\tF\tG\tS2\n",
-        encoding="utf-8",
     )
     (state_dir / "RTBioScan_blast_unassigned_current.list").write_text("r2\n", encoding="utf-8")
 

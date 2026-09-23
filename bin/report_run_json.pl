@@ -269,10 +269,17 @@ sub build_run_status_read_fate {
     my $read_info = "$state_dir/${barcode_value}_read_info_rpt.txt";
     my $on_target = "$state_dir/${barcode_value}_on_target_rpt.txt";
     my $demux_cache = "$state_dir/${barcode_value}_demux_annotation_cache.tsv";
-    my $blast_otu_cumulative = "$state_dir/${barcode_value}_blast_otu_pretax_rpt.txt";
     my $blast_unassigned_current = "$state_dir/${barcode_value}_blast_unassigned_current.list";
 
-    return undef if !-s $read_info || !-s $on_target || !-s $demux_cache || !-s $blast_otu_cumulative;
+    return undef if !-s $read_info || !-s $on_target || !-s $demux_cache;
+    # R4-I2: the committed cumulative generation (or a complete, validated
+    # pre-I2 snapshot, or the sealed legacy generation of an authentic pre-R4-D
+    # snapshot), never a lagging, partial or interrupted public table; a
+    # damaged or ambiguous snapshot authority fails closed.
+    require "$FindBin::Bin/lib/RTBioScan/R4DCumulative.pm" unless defined &RTBioScan::R4DCumulative::resolve;
+    my $cumulative = RTBioScan::R4DCumulative::resolve($state_dir, $barcode_value);
+    my $blast_otu_cumulative = $cumulative->{paths}{public};
+    return undef if !defined($blast_otu_cumulative) || !-s $blast_otu_cumulative;
     return undef if !-e $blast_unassigned_current;
 
     my ($tmpfh, $tmpout) = tempfile('report_run_status_read_fate.XXXXXX', SUFFIX => '.json', UNLINK => 1);
@@ -297,6 +304,8 @@ sub build_run_status_read_fate {
     );
 
     my $ok = system(@cmd);
+    die "R4-D cumulative: the snapshot in $state_dir was republished while it was being read; rerun\n"
+        unless RTBioScan::R4DCumulative::still_current($cumulative);
     if ($ok != 0 || !-s $tmpout) {
         unlink $tmpout if -e $tmpout;
         return undef;

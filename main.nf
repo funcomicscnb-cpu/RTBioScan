@@ -6930,6 +6930,7 @@ process backup_update_and_clean {
 						esac
 					done
 					pngs_all=( "\$STATE_TMP"/*.png )
+					r4d_backup_generation "\$ONGOING_FINAL" "\$STATE_TMP" "${barcode}"
 					if (( \${#rpts_plain[@]} )); then sync_changed_files "\$ONGOING_FINAL" "\${rpts_plain[@]}"; fi
 					if (( \${#pngs_all[@]} )); then sync_changed_files "\$ONGOING_FINAL" "\${pngs_all[@]}"; fi
 					rpts_gzip_only=(
@@ -7137,6 +7138,7 @@ process backup_update_and_clean {
 			tables=( "\$ONGOING_FINAL"/*.txt "\$ONGOING_FINAL"/*.tsv "\$ONGOING_FINAL"/*.csv \
 				"\$ONGOING_FINAL"/*.txt.gz "\$ONGOING_FINAL"/*.tsv.gz "\$ONGOING_FINAL"/*.csv.gz \
 				"\$ONGOING_FINAL"/*_rpt.txt "\$ONGOING_FINAL"/*_rpt.txt.gz )
+			r4d_backup_generation "\$CURRENT_ROOT/tables" "\$ONGOING_FINAL" "${barcode}"
 			if (( \${#tables[@]} )); then
 				sync_changed_files "\$CURRENT_ROOT/tables" "\${tables[@]}"
 			fi

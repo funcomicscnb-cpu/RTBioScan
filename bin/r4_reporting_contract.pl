@@ -16,6 +16,7 @@ use lib "$FindBin::Bin/lib";
 use Digest::SHA qw(sha256_hex);
 use File::Basename qw(dirname basename);
 use File::Temp qw(tempfile);
+use IO::Handle ();
 use JSON::PP ();
 use Getopt::Long qw(GetOptionsFromArray);
 
@@ -24,6 +25,7 @@ use Getopt::Long qw(GetOptionsFromArray);
 require "$FindBin::Bin/lib/taxon_util.pl" unless defined &TaxonUtil::canonical_lineage;
 require RTBioScan::OTURefineBlastreport;
 require "$FindBin::Bin/reporting_identity_contract.pl";
+require "$FindBin::Bin/lib/RTBioScan/R4DCumulative.pm" unless defined &RTBioScan::R4DCumulative::resolve;
 # The R4-A helper declares no package; load it the way R4-B does so its subs
 # live in RTBioScan::R4A (sealed-evidence reader, canonical number display).
 {
@@ -421,40 +423,235 @@ sub atomic_text {
     die $err unless $ok;
 }
 
-# Replace several state files as one unit: every existing target is backed up,
-# every new file renamed in, and any failure restores the previous snapshot.
-# The existence of every target is recorded before the transaction touches the
-# filesystem, so a failure at any later step (temp creation, write, close,
-# backup rename, replacement) restores exactly the pre-transaction state:
-# previously existing targets are kept or restored, targets that did not exist
-# are removed if partially created, and no path is ever mistaken for "new".
-sub replace_files_atomically {
-    my (%files) = @_;
-    my (%tmp, %bak, %had);
-    $had{$_} = -e $_ ? 1 : 0 for keys %files;
+# ---------------------------------------------------------------------------
+# Cumulative snapshot publication (R4-I2; protocol in RTBioScan::R4DCumulative
+# and docs/output.md). The three state products form one generation named by
+# the sealed commit record:
+#   1. immutable members `<name>.gen-<generation>` are written and made durable;
+#   2. the record is replaced by one rename -- the commit point;
+#   3. every public name that changes is retracted (renamed to
+#      `<name>.bak.<pid>`) before any is projected onto its committed member,
+#      so the public names present at any instant hold one generation.
+# Process death before the commit leaves the previous generation
+# authoritative, after it the new one; readers resolving the record never see
+# a mixture. A synchronous failure restores the previous state exactly (names,
+# bytes, inodes and record). Old members are released only after the commit,
+# and the previous generation is kept for readers that resolved it just
+# before. One publisher per barcode holds the lock. A record-less authentic
+# pre-R4-D snapshot (an outdir written before the upgrade) is first sealed as a
+# legacy generation under that lock (RTBioScan::R4DCumulative::seal_pre_r4d),
+# so it stays authoritative until the new generation commits; a record-less
+# `_state` that is not authentic is never written
+# (RTBioScan::R4DCumulative::classify_publication).
+sub sync_directory { RTBioScan::R4DCumulative::sync_directory(@_) }
+sub acquire_publication_lock { RTBioScan::R4DCumulative::acquire_lock(@_) }
+sub release_publication_lock { RTBioScan::R4DCumulative::release_lock(@_) }
+
+sub write_durable {
+    my ($dir, $bc, $text) = @_;
+    my ($f, $t) = tempfile(".r4d-publish-$bc-XXXXXX", DIR => $dir, UNLINK => 0);
     my $ok = eval {
-        for my $path (sort keys %files) {
-            my ($f, $t) = tempfile('.r4d-publish-XXXXXX', DIR => dirname($path), UNLINK => 0);
-            $tmp{$path} = $t;
-            print {$f} $files{$path} or fail("write $t: $!");
-            close $f or fail("close $t: $!");
+        print {$f} $text or fail("write $t: $!");
+        $f->flush or fail("write $t: $!");
+        $f->sync or fail("sync $t: $!");
+        close $f or fail("close $t: $!");
+        1;
+    };
+    return $t if $ok;
+    my $err = $@;
+    unlink $t;
+    die $err;
+}
+
+# Hard links make a member and its public name one file. On a filesystem
+# without hard links (RTBioScan::R4DCumulative::hardlinks_unsupported) the name
+# is a durable byte copy instead; any other link failure is an error.
+sub link_or_copy {
+    my ($from, $to, $bc) = @_;
+    return 1 if link($from, $to);
+    my $errno = $! + 0;
+    if (!RTBioScan::R4DCumulative::hardlinks_unsupported(dirname($to), $errno)) { $! = $errno; return 0; }
+    my $text = do { open my $f, '<:raw', $from or return 0; local $/; my $t = <$f>; close $f; $t // '' };
+    my $t = write_durable(dirname($to), $bc, $text);
+    return 1 if rename $t, $to;
+    my $err = $!;
+    unlink $t;
+    $! = $err;
+    return 0;
+}
+
+# A public name already holds a committed member: the same file, or (without
+# hard links) the same bytes -- compared by size first, then SHA-256.
+sub same_content {
+    my ($copy, $name, $size, $sha) = @_;
+    return 1 if RTBioScan::R4DCumulative::same_file($copy, $name);
+    return RTBioScan::R4DCumulative::file_matches($name, $size, $sha);
+}
+
+# A same-inode rollback copy of the current record, `<record>.bak.<pid>`.
+# link(2) cannot replace a name, so one left under the same pid by a killed
+# publisher is replaced by rename(2).
+sub stage_backup {
+    my ($path, $bc, $scratch) = @_;
+    my $bak = "$path.bak.$$";
+    my $t = dirname($path) . "/.r4d-publish-$bc-bak-" . basename($path) . ".$$";
+    unlink $t if lstat $t;
+    push @$scratch, $t;
+    link_or_copy($path, $t, $bc) or fail("stage backup $bak: $!");
+    rename $t, $bak or fail("stage backup $bak: $!");
+    return $bak;
+}
+
+# Remove non-authoritative residue after a successful publication: temps and
+# rollback copies of this barcode, legacy R4-D temps and backups, and members
+# of every generation except the committed one and its predecessor -- only
+# while the record still names this commit (a restore may have replaced the
+# state meanwhile).
+sub cleanup_residue {
+    my ($dir, $bc, $keep) = @_;
+    return unless RTBioScan::R4DCumulative::record_names($dir, $bc, $keep);
+    my $names = RTBioScan::R4DCumulative::names($bc);
+    my $names_re = join('|', map { quotemeta } sort values %$names);
+    my $record = basename(RTBioScan::R4DCumulative::record_path($dir, $bc));
+    for my $e (sort(RTBioScan::R4DCumulative::dir_entries($dir))) {
+        my $stale = $e =~ /\A\.r4d-publish-(?:\Q$bc\E-|[A-Za-z0-9_]{6}\z)/
+            || $e =~ /\A(?:(?:$names_re)|\Q$record\E)\.bak\./
+            || ($e =~ /\A(?:$names_re)\.gen-(.*)\z/s && !$keep->{$1});
+        unlink "$dir/$e" if $stale;
+    }
+}
+
+sub publish_generation {
+    my ($dir, $bc, $live, $texts) = @_;
+    my @order = sort { $live->{$a} cmp $live->{$b} } keys %$live;
+    my %want = map { $_ => [ length($texts->{$_}), sha256_hex($texts->{$_}) ] } @order;
+    my $record = RTBioScan::R4DCumulative::record_path($dir, $bc);
+    my $lock_path = RTBioScan::R4DCumulative::lock_path($dir, $bc);
+    my $state_dir = RTBioScan::R4DCumulative::is_state_dir($dir);
+    if ($state_dir) {
+        # A state being reset or restored is never written; a record-less state
+        # is classified read-only before the lock is taken, so a refused one --
+        # legacy-like tables that are not authentic, residue no publication
+        # leaves -- is left exactly as it is.
+        RTBioScan::R4DCumulative::restart_fence($dir);
+        # (a record committed meanwhile by a concurrent sealing is handled under the lock)
+        eval { RTBioScan::R4DCumulative::classify_publication($dir, $bc); 1 } or do { my $e = $@; die $e unless lstat $record; }
+            unless lstat $record;
+    }
+    my $lock = acquire_publication_lock($lock_path);
+    my (%tmp, %created, %retracted, %projected, @scratch, $record_bak, $committed, $keep);
+    my $ok = eval {
+        my $current;
+        if (lstat $record) {
+            $current = eval { RTBioScan::R4DCumulative::parse_record($record, $bc) };
+            print STDERR "WARN: R4-D cumulative: replacing unreadable commit record: $@" unless $current;
+            # An earlier candidate's backup record restored from a results snapshot
+            # has no reporting member: it names no complete generation of this
+            # state. A legacy backup is the whole legacy generation.
+            $current = undef if $current && $current->{kind} eq 'backup';
+        } elsif ($state_dir) {
+            # Classified again under the lock. Upgrade: an authentic pre-R4-D
+            # snapshot is sealed first, so it stays authoritative until this
+            # generation commits; a complete R4-D snapshot, a pristine state and
+            # an interrupted first publication are superseded.
+            my ($class, $validated) = RTBioScan::R4DCumulative::classify_publication($dir, $bc);
+            $current = RTBioScan::R4DCumulative::seal_pre_r4d($dir, $bc, locked => 1, validated => $validated)
+                if $class eq 'pre-r4d';
         }
-        for my $path (sort keys %files) {
-            if ($had{$path}) { $bak{$path} = "$path.bak.$$"; rename $path, $bak{$path} or fail("stage backup $bak{$path}: $!"); }
+        my (undef, $generation) = RTBioScan::R4DCumulative::record_text($bc, \%want, undef);
+        my %gen = map { $_ => RTBioScan::R4DCumulative::generation_path($dir, basename($live->{$_}), $generation) } @order;
+        my %valid = map { $_ => RTBioScan::R4DCumulative::file_matches($gen{$_}, @{ $want{$_} }) } @order;
+        my $previous = $current ? ($current->{generation} ne $generation ? $current->{generation} : $current->{previous}) : undef;
+        # Retry, replay or unchanged round: the generation is already committed
+        # and only lagging public names are reconciled below.
+        if (!($current && $current->{generation} eq $generation && !grep { !$valid{$_} } @order)) {
+            # 1. Immutable members of the new generation. A product unchanged
+            #    since the committed generation is linked, not rewritten.
+            for my $p (@order) {
+                next if $valid{$p};
+                my $source;
+                if ($current && $current->{entries}{$p}) {
+                    my $e = $current->{entries}{$p};
+                    my $old = RTBioScan::R4DCumulative::generation_path($dir, $e->{name}, $current->{generation});
+                    $source = $old if $e->{sha} eq $want{$p}[1] && RTBioScan::R4DCumulative::file_matches($old, @{ $want{$p} });
+                }
+                if (!defined $source) {
+                    $tmp{$p} = write_durable($dir, $bc, $texts->{$p});
+                    $source = $tmp{$p};
+                }
+                my $fresh = !lstat $gen{$p};
+                unlink $gen{$p} or fail("replace damaged copy $gen{$p}: $!") unless $fresh;
+                link_or_copy($source, $gen{$p}, $bc) or fail("link $gen{$p}: $!");
+                $created{ $gen{$p} } = RTBioScan::R4DCumulative::identity($gen{$p}) if $fresh;
+            }
+            $record_bak = stage_backup($record, $bc, \@scratch) if lstat $record;
+            sync_directory($dir);
+            # 2. Commit.
+            my ($record_text) = RTBioScan::R4DCumulative::record_text($bc, \%want, $previous);
+            my $t = write_durable($dir, $bc, $record_text);
+            push @scratch, $t;
+            rename $t, $record or fail("commit $record: $!");
+            $committed = 1;
+            sync_directory($dir);
         }
-        for my $path (sort keys %files) { rename $tmp{$path}, $path or fail("replace $path: $!"); delete $tmp{$path}; }
+        # 3. Retract every public name that does not hold its committed member
+        #    before projecting any: the names present never mix generations.
+        my @lag = grep { !same_content($gen{$_}, $live->{$_}, @{ $want{$_} }) } @order;
+        for my $p (@lag) {
+            next unless lstat $live->{$p};
+            my $bak = "$live->{$p}.bak.$$";
+            unlink $bak if lstat $bak;
+            rename $live->{$p}, $bak or fail("stage backup $bak: $!");
+            $retracted{$p} = $bak;
+        }
+        for my $p (@lag) {
+            if (!defined $tmp{$p}) {
+                my $t = "$dir/.r4d-publish-$bc-link-$p.$$";
+                unlink $t if lstat $t;
+                push @scratch, $t;
+                link_or_copy($gen{$p}, $t, $bc) or fail("link $t: $!");
+                $tmp{$p} = $t;
+            }
+            rename $tmp{$p}, $live->{$p} or fail("replace $live->{$p}: $!");
+            delete $tmp{$p};
+            $projected{$p} = 1;
+        }
+        $keep = { $generation => 1, (defined($previous) ? ($previous => 1) : ()) };
         1;
     };
     my $err = $@;
     if (!$ok) {
-        for my $path (sort keys %files) {
-            unlink $path if -e $path && !$had{$path};
-            rename $bak{$path}, $path if $had{$path} && defined($bak{$path}) && -e $bak{$path};
+        # Undo the projection, then restore the retracted names, and only then
+        # the previous record: while the new record exists it names a complete
+        # generation, and the public names never mix generations. If a step
+        # fails the committed generation stays authoritative.
+        my $restored = 1;
+        for my $p (reverse @order) {
+            next unless $projected{$p};
+            unlink($live->{$p}) or $restored = 0;
         }
-        unlink $_ for grep { -e $_ } values %tmp;
+        if ($restored) {
+            for my $p (@order) {
+                next unless defined $retracted{$p};
+                rename($retracted{$p}, $live->{$p}) or $restored = 0;
+            }
+        }
+        if ($committed && $restored) {
+            if (defined $record_bak) { rename($record_bak, $record) or $restored = 0; }
+            else { unlink($record) or $restored = 0; }
+        }
+        if (!$restored) {
+            $err .= "R4-D: the committed cumulative generation stays authoritative (previous state not fully restorable)\n";
+        } else {
+            RTBioScan::R4DCumulative::unlink_own(\%created);
+            unlink $record_bak if defined($record_bak) && lstat $record_bak;
+        }
+        unlink $_ for grep { defined && lstat $_ } values(%tmp), @scratch;
+        release_publication_lock($lock, $lock_path);
         die $err;
     }
-    unlink $_ for grep { defined($_) && -e $_ } values %bak;
+    cleanup_residue($dir, $bc, $keep);
+    release_publication_lock($lock, $lock_path);
 }
 
 sub publish_cumulative {
@@ -463,12 +660,20 @@ sub publish_cumulative {
     my $text = reporting_text($sig, $rows);
     my $expected = do { local $/; open my $f, '<', $o{reporting} or fail("read $o{reporting}: $!"); my $t = <$f>; close $f; $t };
     fail('reporting sidecar bytes are not canonical') unless $text eq $expected;
-    my %files = (
-        $o{state_reporting} => $text,
-        $o{state_public} => public_text($rows),
-    );
-    $files{ $o{state_noadapter} } = $o{noadapter_enabled} ? noadapter_text($rows) : public_header() . "\n" if defined $o{state_noadapter};
-    replace_files_atomically(%files);
+    my %live = (reporting => $o{state_reporting}, public => $o{state_public}, noadapter => $o{state_noadapter});
+    my ($bc) = basename($o{state_reporting} // '') =~ /\A(.+)_blast_otu_reporting_v1\.tsv\z/;
+    fail('cumulative state reporting path must be <dir>/<barcode>_blast_otu_reporting_v1.tsv') unless defined $bc;
+    my $dir = dirname($o{state_reporting});
+    my $names = RTBioScan::R4DCumulative::names($bc);
+    for my $p (sort keys %$names) {
+        fail('cumulative state paths must be the three products of one barcode in one directory')
+            unless defined($live{$p}) && $live{$p} eq "$dir/$names->{$p}";
+    }
+    publish_generation($dir, $bc, \%live, {
+        reporting => $text,
+        public => public_text($rows),
+        noadapter => $o{noadapter_enabled} ? noadapter_text($rows) : public_header() . "\n",
+    });
     return scalar @$rows;
 }
 

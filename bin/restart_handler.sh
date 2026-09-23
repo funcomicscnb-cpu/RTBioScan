@@ -276,6 +276,35 @@ LEGACY_CURRENT="${OUTDIR}/temp/current/state/${STATE_ID}"
 CURRENT_ROOT="${OUTDIR}/current/state/${STATE_ID}"
 ONGOING_STATE="${ONGOING}/_state"
 
+case "${BASH_SOURCE[0]}" in
+    /*) RESTART_HANDLER_DIR="${BASH_SOURCE[0]%/*}" ;;
+    */*) RESTART_HANDLER_DIR="$PWD/${BASH_SOURCE[0]%/*}" ;;
+    *) RESTART_HANDLER_DIR="$PWD" ;;
+esac
+
+# The cumulative BLAST OTU generation is restored with its authority, never as
+# bare public tables (RTBioScan::R4DCumulative::restore_cli): `prepare`
+# authenticates the snapshot's generation read-only, `upgrade` completes a
+# proven older backup in place while the live state that proves it still
+# exists, `install` writes the generation, sidecar and record into `_state`.
+r4d_restore() {
+    perl -e 'require $ARGV[0]; exit RTBioScan::R4DCumulative::restore_cli(@ARGV[1 .. $#ARGV]);' \
+        "$RESTART_HANDLER_DIR/lib/RTBioScan/R4DCumulative.pm" "$1" "$ONGOING_STATE" "$CURRENT_ROOT" "$LEGACY_CURRENT"
+}
+
+# Governed cumulative names of any barcode (tables, sidecar, members, record and
+# residue): installed by `r4d_restore install`, never copied by the snapshot copy.
+restore_skips_governed_name() {
+    case "$1" in
+        *_blast_otu_pretax_rpt.txt|*_blast_otu_noadapter_rpt.txt|*_blast_otu_reporting_v1.tsv|\
+        *_blast_otu_pretax_rpt.txt.*|*_blast_otu_noadapter_rpt.txt.*|*_blast_otu_reporting_v1.tsv.*|\
+        *_blast_otu_cumulative.*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 wipe_dir_contents() {
     local dir="$1"
     [ -d "$dir" ] || return 0
@@ -401,6 +430,9 @@ else
         "$LEGACY_CURRENT/tables/to_figures"
     scan_restart_tree "$CURRENT_ROOT" "restore snapshot state" 1 \
         "$CURRENT_ROOT/tables/to_figures"
+    # A cumulative generation the snapshot holds but that cannot be authenticated
+    # refuses the restore here, before any state changes.
+    r4d_restore prepare
 fi
 
 # Publish the process-crash-visible operation epoch only after every read-only
@@ -415,6 +447,9 @@ if [ "$MODE" = "reset" ]; then
 fi
 
 # MODE=restore
+# Complete a proven older backup in place before the live state that proves it
+# is wiped.
+r4d_restore upgrade
 mkdir -p "$ONGOING"
 wipe_dir_contents "$ONGOING"
 mkdir -p "$ONGOING_STATE"
@@ -452,6 +487,9 @@ restore_from_root() {
                 if [ "$sub" = "tables" ] && [ "${item##*/}" = "to_figures" ]; then
                     continue
                 fi
+                if restore_skips_governed_name "${item##*/}"; then
+                    continue
+                fi
                 copy_items+=( "$item" )
             done
             if (( ${#copy_items[@]} )); then
@@ -465,8 +503,15 @@ restore_from_root() {
     # treat it as a flat snapshot and copy its top-level contents.
     if [ "$structured_layout_seen" -eq 0 ]; then
         items=( "$root"/* )
-        if (( ${#items[@]} )); then
-            cp -R "${items[@]}" "$ONGOING_STATE/"
+        copy_items=()
+        for item in ${items[@]+"${items[@]}"}; do
+            if restore_skips_governed_name "${item##*/}"; then
+                continue
+            fi
+            copy_items+=( "$item" )
+        done
+        if (( ${#copy_items[@]} )); then
+            cp -R "${copy_items[@]}" "$ONGOING_STATE/"
             restored=1
         fi
     fi
@@ -502,6 +547,12 @@ if [ -d "$CURRENT_ROOT/sequences/Consensus" ]; then
     cp -R "$CURRENT_ROOT/sequences/Consensus/." "$ONGOING_STATE/Consensus/"
     restored_any=1
 fi
+r4d_install_log="$(r4d_restore install)"
+printf '%s\n' "$r4d_install_log"
+case "$r4d_install_log" in
+    *"restore install: installed 0 generation(s)") ;;
+    *) restored_any=1 ;;
+esac
 if [ "$restored_any" -ne 1 ]; then
     write_restart_sentinel applied
     echo "WARN: restart_mode=restore requested but no snapshot found at $LEGACY_CURRENT or $CURRENT_ROOT; skipping restore" 1>&2
@@ -513,6 +564,9 @@ fi
 for gz in "$ONGOING_STATE"/*.txt.gz "$ONGOING_STATE"/*.tsv.gz "$ONGOING_STATE"/*.csv.gz "$ONGOING_STATE"/*_rpt.txt.gz; do
     [ -f "$gz" ] || continue
     out="${gz%.gz}"
+    if restore_skips_governed_name "${out##*/}"; then
+        continue
+    fi
     gunzip -c "$gz" > "$out"
 done
 

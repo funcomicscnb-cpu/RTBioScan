@@ -759,6 +759,94 @@ def format_taxonomy_assignment(parts):
     return "Unassigned"
 
 
+class R4DCumulativeStateError(RuntimeError):
+    """The cumulative BLAST OTU snapshot of a directory cannot be established."""
+
+
+R4D_RESOLVER = Path(__file__).resolve().parent / "lib" / "RTBioScan" / "R4DCumulative.pm"
+
+
+def resolve_r4d_cumulative(requests, barcode="RTBioScan"):
+    """R4-I2: resolve the cumulative BLAST OTU tables of each (directory,
+    expect) request through the shared resolver bin/lib/RTBioScan/R4DCumulative.pm
+    (one perl process for all requests; protocol in docs/output.md): the
+    generation named by the directory's sealed commit record (an authentic
+    pre-R4-D `_state` is sealed on first sight as a legacy generation), a
+    complete and validated pre-I2 snapshot, a pristine `_state` (absent) or,
+    outside `_state` and without any R4-I2 artifact, ordinary files
+    (ungoverned). An interrupted, partial, ambiguous or damaged snapshot raises
+    R4DCumulativeStateError."""
+    results = [None] * len(requests)
+    pending = []
+    for index, (directory, expect) in enumerate(requests):
+        directory = Path(directory)
+        try:
+            entries = os.listdir(directory)
+        except FileNotFoundError:
+            entries = []
+        except OSError as exc:
+            raise R4DCumulativeStateError(f"R4-D cumulative: cannot list {directory}: {exc}") from exc
+        if any(e.startswith(f"{barcode}_blast_otu_") or e.startswith(".r4d-publish-") for e in entries):
+            pending.append(index)
+            continue
+        # No public table and no artifact: nothing was published here.
+        results[index] = {"mode": "absent" if directory.name == "_state" else "ungoverned", "paths": {}, "ident": {},
+                          "record": str(directory / f"{barcode}_blast_otu_cumulative.commit"),
+                          "directory": str(directory), "barcode": barcode}
+    if pending:
+        args = []
+        for index in pending:
+            args += [str(requests[index][0]), requests[index][1]]
+        try:
+            proc = subprocess.run(
+                ["perl", "-e", "require $ARGV[0]; exit RTBioScan::R4DCumulative::resolve_cli(@ARGV[1 .. $#ARGV]);",
+                 str(R4D_RESOLVER), barcode, *args],
+                capture_output=True, text=True, check=False,
+            )
+            answers = json.loads(proc.stdout) if proc.returncode == 0 else None
+        except (OSError, ValueError) as exc:
+            raise R4DCumulativeStateError(f"R4-D cumulative: resolver failed: {exc}") from exc
+        if not isinstance(answers, list) or len(answers) != len(pending):
+            raise R4DCumulativeStateError(f"R4-D cumulative: resolver failed: {proc.stderr.strip()[-400:]}")
+        for index, answer in zip(pending, answers):
+            if not answer.get("ok"):
+                raise R4DCumulativeStateError(answer.get("error") or "R4-D cumulative: resolution failed")
+            answer["paths"] = {k: Path(v) for k, v in (answer.get("paths") or {}).items() if v}
+            answer["directory"] = str(requests[index][0])
+            answer["barcode"] = barcode
+            results[index] = answer
+    return results
+
+
+def r4d_cumulative_still_current(resolution):
+    """Committed members are immutable and kept for one further commit: they
+    need only still be the same files. A legacy or absent resolution is
+    invalidated by any commit and by any change of the public names."""
+    mode = resolution["mode"]
+    if mode == "ungoverned":
+        return True
+    directory = Path(resolution["directory"])
+    barcode = resolution["barcode"]
+    if mode != "committed":
+        if os.path.lexists(resolution["record"]):
+            return False
+        for suffix in ("_blast_otu_reporting_v1.tsv", "_blast_otu_pretax_rpt.txt", "_blast_otu_noadapter_rpt.txt"):
+            path = directory / f"{barcode}{suffix}"
+            if str(path) not in resolution["ident"] and os.path.lexists(path):
+                return False
+    for path, ident in resolution["ident"].items():
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False
+        if st.st_mode & 0o170000 != 0o100000:
+            return False
+        fields = [st.st_dev, st.st_ino, st.st_size] + ([] if mode == "committed" else [int(st.st_mtime)])
+        if ":".join(str(v) for v in fields) != ident:
+            return False
+    return True
+
+
 def collect_consensus_sequence_rows(run_id, out_path, state_id=None):
     if not run_id:
         return []
@@ -809,18 +897,31 @@ def collect_consensus_sequence_rows(run_id, out_path, state_id=None):
     def load_best_otu_assignments():
         by_otu = {}
         # Ongoing state stores tables under _state/; snapshots use tables/.
+        # R4-I2: the _state pair is read from its committed generation, and the
+        # results snapshot (current/state/<id>/tables) from its committed backup
+        # generation. temp/current tables hold round-local copies (never a
+        # cumulative backup) and are read as ordinary files.
+        cumulative, snapshot = resolve_r4d_cumulative(
+            [(ongoing_state_root / "_state", "state"), (state_roots[0] / "tables", "any")]
+        )
+
+        def snapshot_table(product, name):
+            if snapshot["mode"] == "ungoverned":
+                return state_roots[0] / "tables" / name
+            return snapshot["paths"].get(product)
+
         report_paths = [
             live_round_root / "tables" / "RTBioScan_blast_otu_pretax_rpt.txt",
             live_round_root / "tables" / "RTBioScan_blast_otu_noadapter_rpt.txt",
-            ongoing_state_root / "_state" / "RTBioScan_blast_otu_pretax_rpt.txt",
-            ongoing_state_root / "_state" / "RTBioScan_blast_otu_noadapter_rpt.txt",
-        ] + [
-            state_root / "tables" / "RTBioScan_blast_otu_pretax_rpt.txt" for state_root in state_roots
-        ] + [
-            state_root / "tables" / "RTBioScan_blast_otu_noadapter_rpt.txt" for state_root in state_roots
+            cumulative["paths"].get("public"),
+            cumulative["paths"].get("noadapter"),
+            snapshot_table("public", "RTBioScan_blast_otu_pretax_rpt.txt"),
+            state_roots[1] / "tables" / "RTBioScan_blast_otu_pretax_rpt.txt",
+            snapshot_table("noadapter", "RTBioScan_blast_otu_noadapter_rpt.txt"),
+            state_roots[1] / "tables" / "RTBioScan_blast_otu_noadapter_rpt.txt",
         ]
         for path in report_paths:
-            if not path.exists():
+            if path is None or not path.exists():
                 continue
             try:
                 lines = path.read_text(encoding="utf-8").splitlines()
@@ -873,6 +974,11 @@ def collect_consensus_sequence_rows(run_id, out_path, state_id=None):
                 prev = by_otu.get(otu_key)
                 if prev is None or score > prev["score"]:
                     by_otu[otu_key] = {"assignment": assignment, "score": score}
+        for resolution in (cumulative, snapshot):
+            if not r4d_cumulative_still_current(resolution):
+                raise R4DCumulativeStateError(
+                    f"R4-D cumulative: the snapshot in {resolution['directory']} was republished while it was being read; rerun"
+                )
         return {otu_key: info["assignment"] for otu_key, info in by_otu.items()}
 
     def load_consensus_assignments():

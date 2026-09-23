@@ -312,6 +312,14 @@ def test_head_candidate_generated_command_equivalence(tmp_path, default):
          '\t\t\t--blast-otu-reporting "\\$ROUND_DIR/${barcode}_blast_otu_reporting_v1.tsv" \\\n'
          '\t\t\t--blast-otu-reporting-cumulative "${ongoingStateDir}/_state/${barcode}_blast_otu_reporting_v1.tsv" \\\n', 1),
         ('\t\t\t--summary "${summary}" \\\n\t\t\t--summary-otu "${summary_otu}" \\\n', '', 1),
+        # R4-I2: backup_update_and_clean names the cumulative generation's source explicitly.
+        ('\t\t\t\t\tpngs_all=( "\\$STATE_TMP"/*.png )\n',
+         '\t\t\t\t\tpngs_all=( "\\$STATE_TMP"/*.png )\n'
+         '\t\t\t\t\tr4d_backup_generation "\\$ONGOING_FINAL" "\\$STATE_TMP" "${barcode}"\n', 1),
+        ('\t\t\t\t"\\$ONGOING_FINAL"/*_rpt.txt "\\$ONGOING_FINAL"/*_rpt.txt.gz )\n\t\t\tif (( \\${#tables[@]} )); then\n',
+         '\t\t\t\t"\\$ONGOING_FINAL"/*_rpt.txt "\\$ONGOING_FINAL"/*_rpt.txt.gz )\n'
+         '\t\t\tr4d_backup_generation "\\$CURRENT_ROOT/tables" "\\$ONGOING_FINAL" "${barcode}"\n'
+         '\t\t\tif (( \\${#tables[@]} )); then\n', 1),
     ]
     for old, new, count in r4d_replacements:
         assert head_main.count(old) == count, old
