@@ -1989,7 +1989,8 @@ while IFS= read -r sample; do
 					[ "$CONS_DEBUG" = "1" ] && cons_log "OTU=$otu_key skip_consensus n_cand<$min_reads (n_cand=$n_cand min_cand=${min_cand_use:-$min_cand})"
 					# Not enough pooled reads: keep cache by default to preserve recoverability.
 				if [ "$cache_below_min_policy" = "drop" ]; then
-					rm -f "$cache_meta" "$cache_cons"
+					rm -f "$sample_cache_dir/${stable_otu_key}.consensus.fasta" "$cache_cons"
+					perl "$identity_helper" meta --representative "$representative_id" --public-display "$public_display_key" --cache "$sample_cache_dir" --display "$otu_key" --key "$stable_otu_key"
 					cons_log "OTU=$otu_key cache_drop_below_min policy=drop"
 				else
 					if [ -s "$cache_cons" ] || [ -s "$cache_meta" ]; then
@@ -2571,7 +2572,8 @@ while IFS= read -r sample; do
 								fi
 							fi
 						else
-							rm -f "$sample_cache_dir/${stable_otu_key}.consensus.fasta" "$sample_cache_dir/${stable_otu_key}.meta"
+							rm -f "$sample_cache_dir/${stable_otu_key}.consensus.fasta" "$sample_cache_dir/${stable_otu_key}.consensus.fasta.revalidate" "$sample_cache_dir/${stable_otu_key}.consensus.fasta.unvalidated" "$sample_cache_dir/${stable_otu_key}.consensus.fasta.unvalidated.revalidate"
+							perl "$identity_helper" meta --representative "$representative_id" --public-display "$public_display_key" --cache "$sample_cache_dir" --display "$otu_key" --key "$stable_otu_key"
 							if [ "$old_reval_hash" != "NA" ]; then
 									cons_log "OTU=$otu_key lock_revalidation_result=missing_recompute_output old_hash=$old_reval_hash"
 								fi
