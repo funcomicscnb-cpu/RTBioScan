@@ -304,7 +304,7 @@ state_authority() {
 }
 
 state_authority_refuse() {
-    printf 'ERROR: restart_mode=restore refuses snapshot %s: %s. It records completed rounds but cannot prove that its accumulated reads, round map, ever-lists, prune and streak state are complete (a snapshot written before this check, or an interrupted backup). It cannot be restored safely: use restart_mode=reset and replay the input POD5 files, or restore from a snapshot a later completed backup has sealed.\n' \
+    printf 'ERROR: restart_mode=restore refuses snapshot %s: %s. It records completed rounds but cannot prove that its accumulated reads, round map, ever-lists, prune and streak state are complete (a snapshot written before this check, or an interrupted backup). It cannot be restored safely: use restart_mode=reset and replay the input POD5 files, or restore from a snapshot a later completed backup has sealed. Reset is eligible only without protected round-lock evidence in affected state or snapshot locations; restore still requires every safety check. Preserve the original state and replay inputs.\n' \
         "$1" "$2" 1>&2
     exit 1
 }
@@ -352,14 +352,15 @@ is_round_lock_namespace() {
 restart_refuse_path() {
     local path="$1"
     local reason="$2"
-    printf "ERROR: restart_mode=%s refuses to mutate round-lock state: %s: %s\n" \
+    printf "ERROR: restart_mode=%s refuses to mutate round-lock state: %s: %s. Stop related writers and preserve the original state; do not delete, edit, or fabricate round-lock records. For protected completed history, use a fresh namespace and reanalyse or a separately reviewed recovery procedure. restart_force does not bypass this check.\n" \
         "$MODE" "$reason" "$path" 1>&2
     return 1
 }
 
 # Reset and restore predate the fenced round-lock protocol.  They must never
-# erase, copy, or follow that protocol's live state or durable evidence.  Scan
-# with dotglob enabled only while collecting each directory's entries so that
+# erase, copy, or follow that protocol's live state or durable evidence.
+# Completed rounds retain protected history, so force cannot make them eligible.
+# Scan with dotglob enabled only while collecting each directory's entries so that
 # hidden protocol names are inspected without changing wipe/copy semantics.
 scan_restart_tree() {
     local root="$1"

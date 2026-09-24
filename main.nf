@@ -17,7 +17,7 @@ if (unsupportedContainerProfiles) {
     exit 1, """Unsupported RTBioScan execution profile: ${unsupportedContainerProfiles.join(', ')}.
 The inherited hecrp/nanortax container belonged to a different pipeline and has been removed.
 Use a provisioned host runtime for now. Do not resume state created with docker/singularity;
-start with a new --state_id (or reset the rolling state)."""
+start with a new --state_id; reset is available only at a boundary without protected round-lock evidence."""
 }
 if (usingCondaProfile) {
     exit 1, """The RTBioScan conda profile is not enabled yet.
@@ -624,6 +624,7 @@ if (!params.nonncbi_id2lineage_target?.toString()?.trim()) {
 // --- PREAMBLE §4: Startup operations (restart/restore handler) ---
 // Apply rolling-state restart semantics at script evaluation time (i.e. always runs, even with `-resume`).
 // This avoids `-resume` skipping restore/reset logic when processes are resumed from cache.
+// Reset/restore do not override protected round-lock evidence; restart_force only repeats an eligible operation.
 def effectiveRestartMode = params.restart_mode?.toString()?.trim()?.toLowerCase()
 if (!effectiveRestartMode || effectiveRestartMode == 'null') {
     effectiveRestartMode = 'off'

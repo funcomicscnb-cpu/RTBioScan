@@ -298,6 +298,9 @@ fail-closed policy is approved only with a stopped-world cutover gate:
    `.round_lock_release.*`, `.round_lock_finish.*`, `.round_lock_revocation.*`,
    `.round_inflight.*.tsv`, event, operator, and archive evidence. A reset or
    restore now refuses these namespaces; it does not glob-delete or copy them.
+   Normal completed rounds retain protected protocol history, so their in-place
+   state is ineligible for reset or restore. Neither this cutover nor the
+   quarantine operations prepare completed history for those actions.
 5. Resume only after the state is clear and every writer of round-owned state
    has been switched to the generation/pin protocol. The state fence itself is
    a short-lived helper-internal serialization mechanism, not a mutex held by
@@ -335,7 +338,17 @@ authenticate and continue it. If no explicit `--state_id` was supplied, the
 existing run-name default selects a different namespace on a newly named run;
 use an explicit state ID when continuity across invocations is required. Each
 actually applied reset or restore, including a forced same-mode operation,
-records a new random operation epoch. Exact `.` and `..` state identifiers are
+records a new random operation epoch. `restart_force=true` only repeats an
+otherwise eligible operation; it never bypasses protected round-lock checks.
+Reset requires an eligible boundary with no protected evidence in any location
+the handler would mutate. Restore is supported after genuine loss of the live
+ongoing tree only when retained snapshots pass the existing authentication and
+completeness checks and no protected evidence blocks it. Stop related writers,
+preserve the original state, and ensure replay inputs remain available. Never
+delete, edit, or fabricate round-lock records to make the scanner pass. There is
+no supported in-place preparation command for ordinary completed protected
+history; use a fresh namespace and reanalyse, or a separately reviewed recovery
+procedure. Exact `.` and `..` state identifiers are
 rejected before any restart path is constructed.
 The restart handler atomically records `status=applying` after read-only
 preflight and before its first destructive mutation, then records

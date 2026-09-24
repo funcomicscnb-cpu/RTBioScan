@@ -1298,7 +1298,7 @@ eval {
                 . "docker/singularity execution profile '$existing_profile'.\n"
                 . "The inherited hecrp/nanortax image belonged to a different pipeline, "
                 . "so this state cannot be resumed or migrated. Use a new --state_id or "
-                . "--restart_mode reset and reanalyse with a supported runtime.\n";
+                . "--restart_mode reset and reanalyse with a supported runtime. Reset is eligible only without protected round-lock evidence in affected state or snapshot locations; otherwise use a fresh namespace or a separately reviewed recovery procedure.\n";
         }
         my $existing_schema = $existing_ref->{schema_version} // '';
         die "ERROR: unsupported rolling-state contract schema '$existing_schema' at '$state_dir'\n"
@@ -1319,7 +1319,7 @@ eval {
                 die "ERROR: schema-v1 rolling state is incompatible with the legacy "
                     . "reference/taxonomy/classifier baseline at '$state_dir'.\n"
                     . join("\n", map { "  $_" } @legacy_changed)
-                    . "\nUse a new --state_id, --restart_mode reset, or the matching legacy inputs.\n";
+                    . "\nUse a new --state_id, --restart_mode reset, or the matching legacy inputs. Reset is eligible only without protected round-lock evidence in affected state or snapshot locations.\n";
             }
             if ($opt{contract_migration} ne 'attest_v1') {
                 die "ERROR: schema-v1 rolling state requires explicit toolchain migration at '$state_dir'.\n"
@@ -1327,7 +1327,7 @@ eval {
                     . "After verifying that this state was produced by the supported legacy host/locked "
                     . "runtime and not the inherited NanoRTax container, re-run once with "
                     . "--state_contract_migration attest_v1. Otherwise use a new --state_id or "
-                    . "--restart_mode reset.\n";
+                    . "--restart_mode reset, only if no protected round-lock evidence blocks it.\n";
             }
             my $old_taxonomy_dir = $existing_ref->{taxonomy_data_dir} // '';
             my $migrated_from = $existing_ref->{taxonomy_migrated_from_data_dir} // '';
@@ -1359,7 +1359,7 @@ eval {
             if (@changed) {
                 die "ERROR: incompatible rolling state at '$state_dir'.\n"
                     . join("\n", map { "  $_" } @changed)
-                    . "\nUse a new --state_id, --restart_mode reset, or the matching reference/taxonomy/classifier/toolchain versions.\n";
+                    . "\nUse a new --state_id, --restart_mode reset, or the matching reference/taxonomy/classifier/toolchain versions. Reset is eligible only without protected round-lock evidence in affected state or snapshot locations.\n";
             }
             my $old_taxonomy_dir = $existing_ref->{taxonomy_data_dir} // '';
             my $old_taxonomy_manifest_sha =
@@ -1396,7 +1396,7 @@ eval {
         my $has_material = state_has_material($state_dir);
         if ($has_material && $opt{policy} ne 'adopt_legacy') {
             die "ERROR: legacy rolling state exists without a compatibility manifest at '$state_dir'.\n"
-                . "Re-run once with --state_compatibility_policy adopt_legacy only after confirming that the state was produced by the current reference, taxonomy, classifier, and supported host runtime baseline. Never adopt state known or suspected to have been produced with the inherited docker/singularity NanoRTax image; use a new --state_id or --restart_mode reset instead.\n";
+                . "Re-run once with --state_compatibility_policy adopt_legacy only after confirming that the state was produced by the current reference, taxonomy, classifier, and supported host runtime baseline. Never adopt state known or suspected to have been produced with the inherited docker/singularity NanoRTax image; use a new --state_id or --restart_mode reset instead. Reset is eligible only without protected round-lock evidence in affected state or snapshot locations.\n";
         }
         print STDERR "WARNING: adopting legacy rolling state at '$state_dir' under the current compatibility contract\n"
             if $has_material;

@@ -1066,20 +1066,20 @@ Controls migration of schema-v1 compatibility state to schema v2.
 #### `--restart_mode`
 [back to Top](#rtbioscan-usage)
 
-One-shot rolling-state recovery action applied before the run starts.
+One-shot rolling-state recovery action applied before the run starts. Reset and restore refuse protected round-lock evidence in any live or snapshot location they would mutate. Normal completed rounds retain that evidence, so their in-place state is ineligible. Stop related writers, preserve the original state, and ensure replay inputs remain available before attempting an eligible recovery.
 
 - Default: `off`.
 - Allowed values:
   - `off`: normal behavior.
-  - `restore`: restore `results/temp/current/state/<state_id>` into `results/temp/ongoing/state/<state_id>`.
-  - `reset`: wipe both `results/temp/current/state/<state_id>` and `results/temp/ongoing/state/<state_id>` before starting.
+  - `restore`: restore retained snapshots into the live ongoing tree after genuine loss of that tree, only when snapshot authentication and completeness checks pass and no protected round-lock evidence blocks the operation. A completed in-place state is ineligible.
+  - `reset`: wipe the rolling state only at an eligible boundary with no protected round-lock evidence in any state or snapshot location the handler would mutate.
 
 During restore scanning, the presentation-only direct `live_round` and `.live_round_payloads` entries in `results/current/state/<state_id>` are ignored when that state has the structured `tables/` or `plots/` layout; they are never restored. Without that layout, normal symlink refusal remains in force.
 
 #### `--restart_force`
 [back to Top](#rtbioscan-usage)
 
-Force re-applying `--restart_mode` even if a sentinel file indicates it was already applied for this state.
+Repeat an otherwise eligible `--restart_mode` operation even if a sentinel file indicates it was already applied for this state. `restart_force=true` does not bypass safety checks or make protected completed history eligible. Never delete, edit, or fabricate round-lock records to make the scanner pass. For a protected completed namespace, use a fresh namespace and reanalyse, or follow a separately reviewed recovery procedure; there is no supported in-place preparation command.
 
 - Default: `false`.
 - Allowed values: boolean (`true/false`, `1/0`, `yes/no`, `on/off`).

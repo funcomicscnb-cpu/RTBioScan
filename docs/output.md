@@ -267,10 +267,12 @@ One FASTA file per OTU with a BLAST-assigned consensus sequence. These are the f
 
 Use `-resume` with Nextflow to continue an interrupted run. The pipeline restores its saved runtime state and resumes from the last completed round. The report history deduplicates by `run_id + barcode + round_barcode`, so resumed rounds do not create duplicate report entries.
 
-The `--restart_mode` parameter provides additional recovery options:
+The `--restart_mode` parameter provides bounded recovery options:
 - `off` (default): normal run.
-- `restore`: restore rolling state from `results/temp/current` into `results/temp/ongoing` once.
-- `reset`: wipe `results/temp/current` and `results/temp/ongoing` once.
+- `restore`: after genuine loss of the live ongoing tree, restore retained snapshots only if all existing authentication and completeness checks pass and no protected round-lock evidence blocks the operation.
+- `reset`: wipe rolling state only at an eligible boundary with no protected round-lock evidence in any state or snapshot location the handler would mutate.
+
+Normal completed rounds retain protected protocol history, so an in-place completed state is not eligible for reset or restore. `restart_force=true` may repeat an otherwise eligible operation but does not bypass safety checks. Stop related writers, preserve the original state, and ensure replay inputs remain available. Never delete, edit, or fabricate round-lock records to pass the scanner. Existing quarantine and cutover operations do not prepare completed history for reset or restore. There is no supported in-place preparation command for ordinary completed protected history; use a fresh namespace and reanalyse, or a separately reviewed recovery procedure.
 
 ### Internal BLAST marker-taxonomy sidecar
 
@@ -489,8 +491,7 @@ else before it writes anything (`publication refused`, a non-zero exit, every
 byte, inode, mode and time kept), so that no new generation erases the evidence
 of a state that is not authentic: a subset of the public names, inconsistent or
 malformed tables, rollback or journal files, another publisher's temporaries.
-Such a state needs explicit remediation (restore an authentic backup, or reset
-the state). Deleting the record never restores legacy mode. While a restart
+Such a state needs explicit remediation (restore an authentic backup after genuine live-tree loss, or reset only at an eligible boundary without protected round-lock evidence). Deleting the record never restores legacy mode. While a restart
 (`restart_mode=reset` or `restore`) of the state is being applied, or after it
 was interrupted, its `_state` fails closed for every reader and publisher:
 `bin/restart_handler.sh` records `status=applying` in
@@ -564,8 +565,7 @@ empty or mixed. Each destination keeps its current and previous generation.
 A source that has never been published is not backed up; a damaged or
 unauthenticated one fails the backup.
 
-`restart_mode=restore` restores the cumulative generation with its authority.
-Before it changes anything, `bin/restart_handler.sh` classifies the snapshot's
+`restart_mode=restore` restores the cumulative generation with its authority only after the protected round-lock namespace preflight permits restore. A normal completed in-place state retains protected history and is ineligible. Before it changes anything, `bin/restart_handler.sh` classifies the snapshot's
 generation of every barcode it holds (the structured
 `current/state/<state_id>/tables/`; the round copies in
 `temp/current/state/<state_id>/tables/` are never cumulative authority): a
