@@ -7045,6 +7045,10 @@ process backup_update_and_clean {
 				"\$STATE_TMP"/otu_seen_hashes.tsv "\$STATE_TMP"/*consensus_consolidated_ids.txt "\$STATE_TMP"/otu_consolidated_keys.tsv \
 				"\$STATE_TMP"/*_seen_read_ids.tsv "\$STATE_TMP"/*_on_target_state.tsv \
 				"\$STATE_TMP"/state_compatibility_manifest.tsv )
+			# R5-F01: seal a complete, integrity-bound copy of the authoritative state
+			# (and done_pod5.txt) in each root; restore refuses a root without one.
+			perl "${baseDir}/bin/state_snapshot_authority.pl" publish "\$STATE_TMP" "\$CURRENT_TEMP_ROOT" "\$CURRENT_ROOT" \
+				|| echo "WARN: state snapshot authority not published; restore refuses this snapshot until a later backup seals it" >&2
 			if (( \${#state_tables[@]} )); then
 				sync_changed_files "\$CURRENT_TEMP_ROOT/tables" "\${state_tables[@]}" 2>/dev/null || true
 				sync_changed_files "\$CURRENT_ROOT/tables" "\${state_tables[@]}" 2>/dev/null || true

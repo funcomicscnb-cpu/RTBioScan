@@ -320,6 +320,14 @@ def test_head_candidate_generated_command_equivalence(tmp_path, default):
          '\t\t\t\t"\\$ONGOING_FINAL"/*_rpt.txt "\\$ONGOING_FINAL"/*_rpt.txt.gz )\n'
          '\t\t\tr4d_backup_generation "\\$CURRENT_ROOT/tables" "\\$ONGOING_FINAL" "${barcode}"\n'
          '\t\t\tif (( \\${#tables[@]} )); then\n', 1),
+        # R5-F01: backup_update_and_clean seals the restore snapshot's completeness record.
+        ('\t\t\t\t"\\$STATE_TMP"/state_compatibility_manifest.tsv )\n\t\t\tif (( \\${#state_tables[@]} )); then\n',
+         '\t\t\t\t"\\$STATE_TMP"/state_compatibility_manifest.tsv )\n'
+         '\t\t\t# R5-F01: seal a complete, integrity-bound copy of the authoritative state\n'
+         '\t\t\t# (and done_pod5.txt) in each root; restore refuses a root without one.\n'
+         '\t\t\tperl "${baseDir}/bin/state_snapshot_authority.pl" publish "\\$STATE_TMP" "\\$CURRENT_TEMP_ROOT" "\\$CURRENT_ROOT" \\\n'
+         '\t\t\t\t|| echo "WARN: state snapshot authority not published; restore refuses this snapshot until a later backup seals it" >&2\n'
+         '\t\t\tif (( \\${#state_tables[@]} )); then\n', 1),
     ]
     for old, new, count in r4d_replacements:
         assert head_main.count(old) == count, old

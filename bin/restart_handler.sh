@@ -294,6 +294,21 @@ r4d_restore() {
 
 # Governed cumulative names of any barcode (tables, sidecar, members, record and
 # residue): installed by `r4d_restore install`, never copied by the snapshot copy.
+# The authoritative rolling state (accumulated reads, round map, ever-lists,
+# prune barrier/archive, streak state, the §6 tables) and its completed-round
+# ledger are restored only from a snapshot root's sealed completeness record
+# (bin/state_snapshot_authority.pl): verified read-only before the first
+# mutation, installed into `_state` after every compatibility copy.
+state_authority() {
+    perl "$RESTART_HANDLER_DIR/state_snapshot_authority.pl" "$@"
+}
+
+state_authority_refuse() {
+    printf 'ERROR: restart_mode=restore refuses snapshot %s: %s. It records completed rounds but cannot prove that its accumulated reads, round map, ever-lists, prune and streak state are complete (a snapshot written before this check, or an interrupted backup). It cannot be restored safely: use restart_mode=reset and replay the input POD5 files, or restore from a snapshot a later completed backup has sealed.\n' \
+        "$1" "$2" 1>&2
+    exit 1
+}
+
 restore_skips_governed_name() {
     case "$1" in
         *_blast_otu_pretax_rpt.txt|*_blast_otu_noadapter_rpt.txt|*_blast_otu_reporting_v1.tsv|\
@@ -433,6 +448,24 @@ else
     # A cumulative generation the snapshot holds but that cannot be authenticated
     # refuses the restore here, before any state changes.
     r4d_restore prepare
+    STATE_AUTHORITY_ROOT=""
+    for authority_root in "$LEGACY_CURRENT" "$CURRENT_ROOT"; do
+        authority_rc=0
+        state_authority verify "$authority_root" || authority_rc=$?
+        case "$authority_rc" in
+            0)
+                if [ -z "$STATE_AUTHORITY_ROOT" ]; then
+                    STATE_AUTHORITY_ROOT="$authority_root"
+                elif ! cmp -s "$STATE_AUTHORITY_ROOT/state_authority/AUTHORITY" \
+                    "$authority_root/state_authority/AUTHORITY"; then
+                    state_authority_refuse "$authority_root" \
+                        "its sealed state differs from $STATE_AUTHORITY_ROOT"
+                fi
+                ;;
+            3) ;;
+            *) state_authority_refuse "$authority_root" "no valid completeness record" ;;
+        esac
+    done
 fi
 
 # Publish the process-crash-visible operation epoch only after every read-only
@@ -508,6 +541,9 @@ restore_from_root() {
             if restore_skips_governed_name "${item##*/}"; then
                 continue
             fi
+            if [ "${item##*/}" = "state_authority" ]; then
+                continue
+            fi
             copy_items+=( "$item" )
         done
         if (( ${#copy_items[@]} )); then
@@ -553,6 +589,9 @@ case "$r4d_install_log" in
     *"restore install: installed 0 generation(s)") ;;
     *) restored_any=1 ;;
 esac
+if [ -n "$STATE_AUTHORITY_ROOT" ]; then
+    restored_any=1
+fi
 if [ "$restored_any" -ne 1 ]; then
     write_restart_sentinel applied
     echo "WARN: restart_mode=restore requested but no snapshot found at $LEGACY_CURRENT or $CURRENT_ROOT; skipping restore" 1>&2
@@ -580,5 +619,12 @@ if [ -d "$ONGOING_STATE/Consensus" ]; then
     cp -R "$ONGOING_STATE/Consensus/." "$ONGOING/Consensus/"
 fi
 rm -rf "$ONGOING_STATE/.parser_state_txn" "$ONGOING/.parser_state_txn"
+
+# Last, so no per-round or compatibility copy of a governed name
+# (sequences/qced_reads_hq_accumulated.fasta, tables/round_index.tsv,
+# done_pod5.txt) overrides the sealed state.
+if [ -n "$STATE_AUTHORITY_ROOT" ]; then
+    state_authority install "$STATE_AUTHORITY_ROOT" "$ONGOING_STATE"
+fi
 
 write_restart_sentinel applied

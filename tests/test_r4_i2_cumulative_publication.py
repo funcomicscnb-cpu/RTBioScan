@@ -2182,6 +2182,18 @@ def r4c_backup_round(r4c, L):
     shutil.copy2(L["state"] / "done_pod5.txt", temp_current / "done_pod5.txt")
 
 
+def f01_seal_snapshot(L):
+    """R5-F01: seal both snapshot roots with the production completeness record, by
+    the same command backup_update_and_clean runs in section 6, so the fixture is
+    a snapshot a post-F01 backup would have left."""
+    roots = [L["state"].parents[3] / "current" / "state" / "S1", L["current"]]
+    for root in roots:
+        root.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(["perl", str(BIN / "state_snapshot_authority.pl"), "publish", str(L["state"]),
+                             *map(str, roots)], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
 def outdir_view(root: Path):
     """The whole outdir except the handler's own lock-directory churn in temp/."""
     view = tree_snapshot(root)
@@ -2200,6 +2212,7 @@ def test_restore_proves_an_unsealed_pre_r4d_snapshot_before_the_wipe_and_install
     shutil.rmtree(L["state"].parent)
     clone_pre_r4d(pre_r4d, L["state"].parent)
     r4c_backup_round(r4c, L)
+    f01_seal_snapshot(L)
     tables = L["current"] / "tables"
     copies = {p: (tables / NAMES[p]).read_bytes() for p in PAIR}
     assert not (tables / RECORD).exists() and not (L["state"] / RECORD).exists()
@@ -2226,6 +2239,26 @@ def test_restore_proves_an_unsealed_pre_r4d_snapshot_before_the_wipe_and_install
         assert resolve(L["state"])["generation"] == generation
     publish(L["state"], gens["dirs"]["new"])
     assert committed_names(L["state"])[1] == generation and resolved_generation(L["state"], gens) == "new"
+
+
+def test_r5_f01_pre_r4d_legacy_snapshot_without_completeness_record_is_refused_before_any_change(pre_r4d, r4c,
+                                                                                                tmp_path):
+    """R5-F01: the pre-R4-D pipeline's own snapshot records completed rounds
+    (a nonempty done_pod5.txt) but no completeness record: the restore refuses it
+    before any change, with the reset/replay diagnostic."""
+    L = results_layout(tmp_path)
+    shutil.rmtree(L["state"].parent)
+    clone_pre_r4d(pre_r4d, L["state"].parent)
+    r4c_backup_round(r4c, L)
+    temp_current = tmp_path / "temp" / "current" / "state" / "S1"
+    assert (temp_current / "done_pod5.txt").stat().st_size > 0
+    assert not (temp_current / "state_authority").exists() and not (L["current"] / "state_authority").exists()
+    before = outdir_view(tmp_path)
+    result = restart_restore(tmp_path)
+    assert result.returncode != 0, result.stdout
+    assert "cannot be restored safely" in result.stderr and "restart_mode=reset" in result.stderr, result.stderr
+    assert outdir_view(tmp_path) == before
+    assert not (tmp_path / "temp" / ".restart_applied.S1").exists()
 
 
 RESTORE_REFUSALS = {
