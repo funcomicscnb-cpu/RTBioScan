@@ -668,10 +668,25 @@ if awk \
         if (line_no == 0) fail(identity_file ": empty identity file")
         if (identity_rows == 0) fail(identity_file ": identity file has no data rows")
     }
-    function taxonomy_suggestion(genus, species) {
-        if (genus == "" || genus == "Unassigned") return ""
-        if (species != "" && species != "Unassigned" && species != genus) return genus "_" species
-        return genus "_sp."
+    function taxonomy_suggestion(genus, species, suggestion) {
+        sub(/^[[:space:]]+/, "", genus)
+        sub(/[[:space:]]+$/, "", genus)
+        sub(/^[[:space:]]+/, "", species)
+        sub(/[[:space:]]+$/, "", species)
+        if (genus == "Unassigned") return ""
+        if (genus == "") {
+            if (species == "" || species == "Unassigned") return ""
+            gsub(/[[:space:]]+/, "_", species)
+            return species
+        }
+        if (species == "" || species == "Unassigned" || species == genus) return genus "_sp."
+        if (index(species, genus) == 1 && substr(species, length(genus) + 1, 1) ~ /[[:space:]]/) {
+            species = substr(species, length(genus) + 1)
+            sub(/^[[:space:]]+/, "", species)
+        }
+        suggestion = genus "_" species
+        gsub(/[[:space:]]+/, "_", suggestion)
+        return suggestion
     }
     function load_taxonomy(file,    line, line_no, count, fields, i, name, consensus_id, otu, marker, unit, sample, genus, species, key, signature, suggestion) {
         for (name in taxonomy_column) delete taxonomy_column[name]

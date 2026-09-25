@@ -116,6 +116,20 @@ def read_outputs(out):
     return fasta, summary
 
 
+def expected_taxon_suggestion(genus, species):
+    """Independent token-based oracle for the advisory header field."""
+    genus, species = genus.strip(), species.strip()
+    if genus == "Unassigned":
+        return ""
+    if not genus:
+        return "_".join(species.split()) if species != "Unassigned" else ""
+    if not species or species in ("Unassigned", genus):
+        return genus + "_sp."
+    if species.startswith(genus) and len(species) > len(genus) and species[len(genus)].isspace():
+        species = species[len(genus):].lstrip()
+    return "_".join((genus + "_" + species).split())
+
+
 def write_stale_outputs(out):
     out.mkdir(parents=True, exist_ok=True)
     (out / "voucher_sequences.fasta").write_text("stale fasta\n", encoding="utf-8")
@@ -203,6 +217,72 @@ def make_admission_fixture(tmp_path, candidates, taxonomy=()):
     write_taxonomy(tables, list(taxonomy))
     write_round_index(state_dir)
     return results, state_dir, consensus, tables, fasta_paths
+
+
+@pytest.mark.parametrize("reversed_rows", [False, True])
+@pytest.mark.parametrize("locale,hash_seed", [("C", "0"), ("en_US.UTF-8", "17")])
+def test_advisory_taxon_suggestions_preserve_voucher_records(tmp_path, reversed_rows, locale, hash_seed):
+    cases = [
+        ("Quercus", "Quercus robur", "Quercus_robur"),
+        ("Quercus", "robur", "Quercus_robur"),
+        ("Gorilla", "Gorilla gorilla", "Gorilla_gorilla"),
+        ("Quercus", "Quercus sp.", "Quercus_sp."),
+        ("Quercus", "Quercus cf. robur", "Quercus_cf._robur"),
+        ("Quercus", "Quercus aff. robur", "Quercus_aff._robur"),
+        ("Quercus", "", "Quercus_sp."),
+        ("", "Quercus robur", "Quercus_robur"),
+        ("", "", ""),
+        ("Unassigned", "Quercus robur", ""),
+        ("Quercus", "Unassigned", "Quercus_sp."),
+        ("Quercus", "Quercusilex", "Quercus_Quercusilex"),
+        ("  Quercus  ", "  Quercus   cf.   robur  ", "Quercus_cf._robur"),
+        ("  ", "  Quercus   robur  ", "Quercus_robur"),
+    ]
+    assert [expected_taxon_suggestion(g, s) for g, s, _ in cases] == [want for _, _, want in cases]
+    results, _, consensus, tables = make_state(tmp_path)
+    identity_rows, taxonomy_rows, expected = [], [], []
+    for index, (genus, species, suggestion) in enumerate(cases):
+        sample = f"sample-{index:02d}"
+        marker = "COI" if index % 2 else "ITS2"
+        unit = f"unit-{index:02d}_{marker}"
+        otu = f"OTUB_{index + 1}-{marker}"
+        sequence = ("ACGT" if marker == "ITS2" else "TGCA") + "ACGT"[index % 4] * (index + 1)
+        consensus_id = f"Consensus1_{unit}"
+        identity_rows.append((sample, marker, unit, unit))
+        write_fasta(consensus, unit, [(f"{unit}|Consensus1|{marker}|reads-{index + 5}|OTU={otu}", sequence)])
+        taxonomy_rows.append(tax_row(consensus_id, otu, marker, unit, genus, species))
+        header = f">{sample}|{marker}|reads-{index + 5}"
+        if suggestion:
+            header += f"|BLAST:{suggestion}"
+        expected.append((header + "\n" + sequence + "\n", f"{sample}\t{marker}\t{index + 5}\t{otu}\t{suggestion}\n"))
+    write_identity(results, "run-one", identity_rows)
+    write_taxonomy(tables, list(reversed(taxonomy_rows)) if reversed_rows else taxonomy_rows)
+    out = tmp_path / "export"
+    result = run_export(results, out, env={"LC_ALL": locale, "PYTHONHASHSEED": hash_seed})
+    assert result.returncode == 0, result.stderr
+    fasta, summary = read_outputs(out)
+    assert fasta == "".join(row[0] for row in expected)
+    assert summary == SUMMARY_HEADER + "".join(row[1] for row in expected)
+    assert fasta.count("\n>") + fasta.startswith(">") == len(cases)
+    assert len(summary.splitlines()) == len(cases) + 1
+
+
+def test_advisory_suggestion_normalizes_tabs_with_exact_genus_token():
+    source = SCRIPT.read_text(encoding="utf-8")
+    start = source.index("    function taxonomy_suggestion(")
+    end = source.index("    function load_taxonomy(", start)
+    awk_program = source[start:end] + 'BEGIN { print taxonomy_suggestion(genus, species) }'
+    for genus, species in [
+        (" \tQuercus  ", "\tQuercus\t  cf. \t robur \t"),
+        ("Quercus", "Quercusilex\tminor"),
+        ("", " \tQuercus\t robur\t"),
+    ]:
+        result = subprocess.run(
+            ["awk", "-v", f"genus={genus}", "-v", f"species={species}", awk_program],
+            text=True, capture_output=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == expected_taxon_suggestion(genus, species) + "\n"
 
 
 def test_positional_markers_filter_taxonomy_and_explicit_marker_compatibility(tmp_path):
