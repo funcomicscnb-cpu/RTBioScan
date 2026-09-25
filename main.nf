@@ -6906,6 +6906,8 @@ process backup_update_and_clean {
 			FEEDER_METADATA_DIR="${podBaseDir}/metadata"
 			FEEDER_SLICE_SIDECAR="\$FEEDER_METADATA_DIR/${round_barcode}_slice.tsv"
 			FEEDER_GLOBAL_LEDGER_DIR="${feederGlobalLedgerDir}"
+            JOINT_CANDIDATE="\$PWD/.rtb-joint-candidate.\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN"
+            JOINT_FINISHED="\$PWD/.rtb-joint-finished.\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN"
 
 					if [ "\${RTBIOSCAN_ROUND_LOCK_ALREADY_COMPLETED:-0}" -ne 1 ]; then
 					# -- §2: Rolling state publish (copy _rpt.txt + PNGs to ongoing results) --
@@ -6967,7 +6969,8 @@ process backup_update_and_clean {
 				fi
 				READ_BASE="\$(basename -- "\$READ_PATH" 2>/dev/null || echo "\$READ_PATH")"
 				ENTRY="\$READ_KEY\t\${READ_SIZE:-}\t\${READ_MTIME:-}\t\${READ_INODE:-0}\t\$READ_BASE"
-				if [ -f \$STATE_TMP/done_pod5.txt ];
+
+			if [ -f \$STATE_TMP/done_pod5.txt ];
 				then
 						printf '%s\n' "\$ENTRY" >> \$STATE_TMP/done_pod5.txt
 						echo "Appending to done_pod5.txt"  1>&2
@@ -7024,6 +7027,79 @@ process backup_update_and_clean {
 		# blocked consensus assignments. Use `nextflow clean` after the full run
 		# if workspace cleanup is required.
 
+            JOINT_READY=0
+            if [ "\$RTBIOSCAN_ROUND_LOCK_SCOPE" = full_round ]; then
+                JOINT_CONTROL="\$PWD/.rtb-joint-worker.\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN.\$\$"
+                joint_preflight() {
+                    perl "${baseDir}/bin/state_snapshot_authority.pl" emit-worker "\$JOINT_CONTROL" "${params.lock_wait_seconds}" "\$(( ${staleLockTtlMinutesStr} * 60 ))" || return 1
+                    local mode pending worker_pid worker_rc worker_token
+                    mode="\$(python3 "${baseDir}/bin/report_read_fate_repair.py" --check-live-order --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --round-index-file "\$STATE_TMP/round_index.tsv" --targets "${params.targets}" --target-taxa "${params.target_taxa}")" || return 1
+                    case "\$mode" in append|normalize) ;; *) return 1 ;; esac
+                    pending="\$(python3 "\$JOINT_CONTROL/driver.py" inspect "${ongoingStateDir}" "${stateId}")" || return 1
+                    if [ "\$mode" = normalize ] || [ "\$pending" = pending ]; then
+                        env -i PATH="\$PATH" LC_ALL=C LANG=C LC_CTYPE=C TMPDIR="\${TMPDIR:-/private/tmp}" \
+                            /bin/bash "\$JOINT_CONTROL/worker.sh" 2 "${ongoingStateDir}" "${stateId}" \
+                            "\$(perl -e 'print unpack("H*",\$ARGV[0])' "${barcode}")" \
+                            "\$(perl -e 'print unpack("H*",\$ARGV[0])' "${round_barcode}")" \
+                            "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" "\$\$" "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN" \
+                            "\$JOINT_CONTROL/worker.pin" "${baseDir}/bin/round_lock_process_guard.sh" \
+                            "\$RTBIOSCAN_ROUND_LOCK_HELPER" "${baseDir}/bin/state_snapshot_authority.pl" \
+                            "${baseDir}/bin/report_read_fate_repair.py" "\$JOINT_CONTROL/driver.py" \
+                            "${params.targets}" "${params.target_taxa}" "${assignProtLevelCanonical}" \
+                            "${outdirResolved}" "\$JOINT_CONTROL" </dev/null >"\$JOINT_CONTROL/worker.log" 2>"\$JOINT_CONTROL/worker.err" &
+                        worker_pid=\$!
+                        local ack_rc=0
+                        python3 "\$JOINT_CONTROL/driver.py" ack "\$JOINT_CONTROL" "\$worker_pid" "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN" "${params.lock_wait_seconds}" || ack_rc=\$?
+                        worker_rc=0
+                        wait "\$worker_pid" || worker_rc=\$?
+                        while kill -0 "\$worker_pid" 2>/dev/null; do
+                            wait "\$worker_pid" || worker_rc=\$?
+                        done
+                        [ "\$ack_rc" -eq 0 ] && [ "\$worker_rc" -eq 0 ] || return 1
+                        worker_token="\$(python3 "\$JOINT_CONTROL/driver.py" success "\$JOINT_CONTROL" "\$worker_pid" "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN")" || return 1
+                        perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" unpin --state-dir "\$STATE_TMP" --round-barcode "${round_barcode}" --scope full_round --token "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" --pin-token "\$worker_token" --best-effort || return 1
+                    fi
+                    perl "${baseDir}/bin/state_snapshot_authority.pl" prepare "${ongoingStateDir}" "${stateId}" "${barcode}" "${round_barcode}" "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN" "${demuxIdentityContext}" "${params.targets}" "\$JOINT_CANDIDATE" "\$CURRENT_TEMP_ROOT" "\$CURRENT_ROOT"
+                }
+                if joint_preflight; then
+                    JOINT_READY=1
+                else
+                    echo "WARN: JOINT_RF_PIN_PUBLICATION_SKIPPED: prior snapshot retained; fresh full-round replay required" >&2
+                fi
+            else
+                echo "INFO: JOINT_DORADO_FREEZE: retained joint snapshot unchanged" >&2
+            fi
+        fi
+
+        joint_finish_round() {
+			if [ "\$RTBIOSCAN_ROUND_LOCK_SCOPE" = "full_round" ]; then
+				if [ "\${RTBIOSCAN_ROUND_LOCK_ALREADY_COMPLETED:-0}" -eq 1 ]; then
+					perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" finish \
+						--state-dir "\$RTBIOSCAN_ROUND_LOCK_STATE_DIR" \
+						--round-barcode "\$RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE" \
+						--scope "\$RTBIOSCAN_ROUND_LOCK_SCOPE" \
+						--token "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN"
+				else
+					perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" finish \
+						--state-dir "\$RTBIOSCAN_ROUND_LOCK_STATE_DIR" \
+						--round-barcode "\$RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE" \
+						--scope "\$RTBIOSCAN_ROUND_LOCK_SCOPE" \
+						--token "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" \
+						--pin-token "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN"
+				fi
+			else
+				perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" finish \
+					--state-dir "\$RTBIOSCAN_ROUND_LOCK_STATE_DIR" \
+					--round-barcode "\$RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE" \
+					--scope "\$RTBIOSCAN_ROUND_LOCK_SCOPE" \
+					--token "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN"
+			fi
+
+        }
+        joint_snapshot_region() {
+            set -euo pipefail
+            shopt -s nullglob
+            source "${baseDir}/bin/lib/backup_sync.sh"
 			if [ -f \$STATE_TMP/done_pod5.txt ];
 			then
 				cp \$STATE_TMP/done_pod5.txt done_pod5.txt
@@ -7048,47 +7124,37 @@ process backup_update_and_clean {
 				"\$STATE_TMP"/state_compatibility_manifest.tsv )
 			# R5-F01: seal a complete, integrity-bound copy of the authoritative state
 			# (and done_pod5.txt) in each root; restore refuses a root without one.
-			perl "${baseDir}/bin/state_snapshot_authority.pl" publish "\$STATE_TMP" "\$CURRENT_TEMP_ROOT" "\$CURRENT_ROOT" \
-				|| echo "WARN: state snapshot authority not published; restore refuses this snapshot until a later backup seals it" >&2
+			perl "${baseDir}/bin/state_snapshot_authority.pl" capture "\$JOINT_CANDIDATE" "${ongoingStateDir}" "\$CURRENT_TEMP_ROOT" "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN"
 			if (( \${#state_tables[@]} )); then
 				sync_changed_files "\$CURRENT_TEMP_ROOT/tables" "\${state_tables[@]}" 2>/dev/null || true
 				sync_changed_files "\$CURRENT_ROOT/tables" "\${state_tables[@]}" 2>/dev/null || true
 			fi
-					fi
 
 
-		# ---- Release round lock (before heavy I/O) ----
-		# POD5 staging complete; release now so round N+1 can start
-		# while this process copies Consensus/plots/tables (outside lock).
-			if [ "\$RTBIOSCAN_ROUND_LOCK_SCOPE" = "full_round" ]; then
-				if [ "\${RTBIOSCAN_ROUND_LOCK_ALREADY_COMPLETED:-0}" -eq 1 ]; then
-					perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" finish \
-						--state-dir "\$RTBIOSCAN_ROUND_LOCK_STATE_DIR" \
-						--round-barcode "\$RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE" \
-						--scope "\$RTBIOSCAN_ROUND_LOCK_SCOPE" \
-						--token "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN"
-				else
-					perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" finish \
-						--state-dir "\$RTBIOSCAN_ROUND_LOCK_STATE_DIR" \
-						--round-barcode "\$RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE" \
-						--scope "\$RTBIOSCAN_ROUND_LOCK_SCOPE" \
-						--token "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" \
-						--pin-token "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN"
-				fi
-			else
-				perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" finish \
-					--state-dir "\$RTBIOSCAN_ROUND_LOCK_STATE_DIR" \
-					--round-barcode "\$RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE" \
-					--scope "\$RTBIOSCAN_ROUND_LOCK_SCOPE" \
-					--token "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN"
-			fi
-			if [ ! -f done_pod5.txt ]; then
-				if [ ! -f "\$STATE_TMP/done_pod5.txt" ]; then
-					echo "ERROR: authenticated completed round lacks done_pod5.txt state" >&2
-					exit 1
-				fi
-				cp "\$STATE_TMP/done_pod5.txt" done_pod5.txt
-			fi
+
+
+            joint_finish_round
+            : > "\$JOINT_FINISHED"
+            perl "${baseDir}/bin/state_snapshot_authority.pl" seal "\$JOINT_CANDIDATE" "\$CURRENT_TEMP_ROOT" "\$CURRENT_ROOT"
+        }
+
+        export STATE_TMP CURRENT_TEMP_ROOT CURRENT_ROOT JOINT_CANDIDATE JOINT_FINISHED
+        if [ "\${JOINT_READY:-0}" -eq 1 ]; then
+            JOINT_REGION="\$PWD/.rtb-joint-region.\$\$"
+            { declare -f joint_finish_round; declare -f joint_snapshot_region; printf '%s\n' joint_snapshot_region; } > "\$JOINT_REGION"
+            if ! perl "${baseDir}/bin/state_snapshot_authority.pl" transaction "\$JOINT_CANDIDATE" "\$CURRENT_TEMP_ROOT" "\$CURRENT_ROOT" "${ongoingStateDir}" "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN" /bin/bash "\$JOINT_REGION"; then
+                echo "WARN: joint publication incomplete; transaction evidence retained" >&2
+            fi
+        elif [ "\${RTBIOSCAN_ROUND_LOCK_ALREADY_COMPLETED:-0}" -eq 1 ] && [ "\$RTBIOSCAN_ROUND_LOCK_SCOPE" = full_round ] && [ -f "\$JOINT_CANDIDATE" ]; then
+            perl "${baseDir}/bin/state_snapshot_authority.pl" resume "\$JOINT_CANDIDATE" "\$CURRENT_TEMP_ROOT" "\$CURRENT_ROOT" || echo "WARN: retained joint publication retry deferred" >&2
+        fi
+        if [ ! -f "\$JOINT_FINISHED" ]; then
+            if [ ! -f done_pod5.txt ] && [ -f "\$STATE_TMP/done_pod5.txt" ]; then
+                cp "\$STATE_TMP/done_pod5.txt" done_pod5.txt
+            fi
+            joint_finish_round
+        fi
+            [ -f done_pod5.txt ] || { echo "ERROR: retained task completion ledger missing" >&2; exit 1; }
 
 
 		# -- §7: Post-lock heavy copies + disk-pressure cleanup --
@@ -7119,8 +7185,8 @@ process backup_update_and_clean {
 			if [ -d ${ongoingStateDir}/Consensus ]; then
 				mkdir -p "\$CURRENT_TEMP_ROOT/sequences/Consensus"
 				mkdir -p "\$CURRENT_ROOT/sequences/Consensus"
-				sync_changed_tree "${ongoingStateDir}/Consensus" "\$CURRENT_TEMP_ROOT/sequences/Consensus" 2>/dev/null || true
-				sync_changed_tree "${ongoingStateDir}/Consensus" "\$CURRENT_ROOT/sequences/Consensus" 2>/dev/null || true
+				sync_joint_consensus_compat "${ongoingStateDir}/Consensus" "\$CURRENT_TEMP_ROOT/sequences/Consensus"
+				sync_joint_consensus_compat "${ongoingStateDir}/Consensus" "\$CURRENT_ROOT/sequences/Consensus"
 			fi
 
 				if [ -d \$ONGOING_FINAL/single_exp ];
@@ -7203,41 +7269,12 @@ process backup_update_and_clean {
 			return 0
 		}
 		publish_report_history() {
-			local publish_mode="append"
-			if ! publish_mode="\$(python3 ${baseDir}/bin/report_read_fate_repair.py \
-				--check-live-order \
-				--state-dir "${ongoingStateDir}" \
-				--current-round-barcode "${round_barcode}" \
-				--targets "${params.targets}" \
-				--target-taxa "${params.target_taxa}" 2>/dev/null)"; then
-				echo "WARN: report order check failed; forcing normalization for ${round_barcode}" 1>&2
-				publish_mode="normalize"
-			fi
-			if ! acquire_report_history_lock; then
-				return \$?
-			fi
-			trap 'release_report_history_lock' EXIT HUP INT TERM
-			local publish_rc=0
-			if [ "\$publish_mode" = "normalize" ]; then
-				echo "INFO: normalizing report history order for ${round_barcode}" 1>&2
-				python3 ${baseDir}/bin/report_read_fate_repair.py \
-					--live \
-					--skip-render \
-					--state-dir "${ongoingStateDir}" \
-					--current-round-barcode "${round_barcode}" \
-					--targets "${params.targets}" \
-					--target-taxa "${params.target_taxa}" \
-					--blast-unassigned-min-level "${assignProtLevelCanonical}" \
-					--outdir "${outdirResolved}"
-				publish_rc=\$?
-			else
-				LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_history_append.sh --no-lock "\$ROUND_REPORT_JSON" "\$REPORT_HISTORY_JSONL" "\$REPORT_HISTORY_LOCK"
-				publish_rc=\$?
-			fi
-			release_report_history_lock
-			trap - EXIT HUP INT TERM
-			return "\$publish_rc"
-			}
+            acquire_report_history_lock || return 2
+            local publish_rc=0
+            LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_history_append.sh --no-lock "\$ROUND_REPORT_JSON" "\$REPORT_HISTORY_JSONL" "\$REPORT_HISTORY_LOCK" || publish_rc=\$?
+            release_report_history_lock
+            return "\$publish_rc"
+        }
 			report_live_publish_rc=0
 			if [ ! -s "\$ROUND_REPORT_JSON" ] || [ ! -d "\$ROUND_LIVE_STAGE" ]; then
 				echo "ERROR: invariant violated - required live-round publication inputs missing" 1>&2

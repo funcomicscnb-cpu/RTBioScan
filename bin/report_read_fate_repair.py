@@ -389,6 +389,114 @@ def rebuild_blast_unassigned_current(
             tmp_path.unlink()
 
 
+def authoritative_regular_path(path: Path, *, directory: bool = False) -> None:
+    """Reject aliases before the opt-in authority path can read or mutate."""
+    import stat
+    path = path.absolute()
+    if ".." in path.parts:
+        raise SystemExit(f"ERROR: authoritative round order: unsafe path: {path}")
+    try:
+        for parent in reversed(path.parents):
+            if not stat.S_ISDIR(parent.lstat().st_mode):
+                raise ValueError("unsafe ancestor")
+        mode = path.lstat().st_mode
+        if not (stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)):
+            raise ValueError("unsafe type")
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"ERROR: authoritative round order: unsafe/missing path {path}: {error}")
+
+
+def authoritative_round_context(state_dir: Path, index_file: Path, current: str):
+    """Admit an exact global prefix without changing the read-fate fold."""
+    def refuse(message):
+        raise SystemExit("ERROR: authoritative round order: " + message)
+    authoritative_regular_path(index_file)
+    raw = index_file.read_bytes()
+    if not raw or not raw.endswith(b"\n"):
+        refuse("empty or truncated mapping")
+    mapping = {}
+    used = set()
+    for row in raw[:-1].split(b"\n"):
+        match = re.fullmatch(rb"([^\t/]+)\t([1-9][0-9]{0,8})", row)
+        if not match:
+            refuse("malformed headerless mapping row")
+        try:
+            rb = match[1].decode("utf-8", "strict")
+        except UnicodeError:
+            refuse("unrepresentable round identity")
+        if rb in {".", ".."} or any(c in rb for c in ("\x00", "\r")):
+            refuse("unsafe round identity")
+        idx = int(match[2])
+        if rb in mapping or idx in used:
+            refuse("duplicate round barcode or index")
+        mapping[rb] = idx; used.add(idx)
+    if current not in mapping:
+        refuse(f"boundary absent: {current}")
+    entries = {}
+    for child in state_dir.iterdir():
+        if child.name == "_state" or not child.is_dir():
+            continue
+        path = child / "round_report.json"
+        if not path.exists():
+            continue
+        authoritative_regular_path(child, directory=True)
+        authoritative_regular_path(path)
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            refuse(f"malformed report: {path}")
+        rb = obj.get("round_barcode") if isinstance(obj, dict) else None
+        if not isinstance(rb, str) or rb != child.name or rb in entries or rb not in mapping:
+            refuse(f"missing or inconsistent mapping: {path}")
+        if not isinstance(obj, dict) or obj.get("state_id") != state_dir.name or not isinstance(obj.get("barcode"), str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", obj["barcode"]) or not isinstance(obj.get("run_id"), str) or not obj["run_id"]:
+            refuse(f"inconsistent identity: {path}")
+        local = child / "round_index.tsv"
+        if local.exists() or local.is_symlink():
+            authoritative_regular_path(local)
+            expected = f"round_barcode\tround_index\n{rb}\t{mapping[rb]}\n".encode()
+            if local.read_bytes() != expected:
+                refuse(f"inconsistent round-local mapping: {local}")
+        entries[rb] = (child, obj)
+    prefix = sorted((rb for rb in mapping if mapping[rb] <= mapping[current]), key=mapping.__getitem__)
+    for rb in prefix:
+        if rb not in entries:
+            refuse(f"missing retained report: {state_dir / rb / 'round_report.json'}")
+        directory, obj = entries[rb]
+        for suffix in ("demult_rpt.txt", "blast_otu_pretax_rpt.txt"):
+            authoritative_regular_path(directory / f"{obj['barcode']}_{suffix}")
+        for suffix in ("read_info_rpt.txt", "on_target_rpt.txt", "blast_unassigned_reads_round.list", "blast_report_annotated_otu_evidence.txt"):
+            producer = directory / f"{obj['barcode']}_{suffix}"
+            if producer.exists() or producer.is_symlink():
+                authoritative_regular_path(producer)
+    if not prefix or prefix[-1] != current:
+        refuse("boundary is not terminal")
+    return mapping, [entries[rb] for rb in prefix]
+
+
+def authoritative_history_publish_mode(history_path: Path, current: str, mapping: dict, entries: list):
+    expected = [obj["round_barcode"] for _, obj in entries if obj["round_barcode"] != current]
+    if not history_path.exists() and not history_path.is_symlink():
+        return "append" if not expected else "normalize"
+    authoritative_regular_path(history_path)
+    if history_path.stat().st_size == 0:
+        return "append" if not expected else "normalize"
+    seen = []
+    malformed = False
+    for line in history_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            malformed = True
+            continue
+        rb = obj.get("round_barcode") if isinstance(obj, dict) else None
+        if not rb or rb not in mapping:
+            raise SystemExit("ERROR: authoritative round order: unmapped history identity")
+        seen.append(rb)
+    return "append" if not malformed and seen == expected else "normalize"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -414,6 +522,7 @@ def main() -> int:
             "matching *_slice.tsv are excluded and their round_report.json renamed to .orphan."
         ),
     )
+    parser.add_argument("--round-index-file", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.blast_unassigned_min_level not in {"family", "genus", "species"}:
         raise SystemExit(f"ERROR: invalid --blast-unassigned-min-level: {args.blast_unassigned_min_level}")
@@ -427,36 +536,51 @@ def main() -> int:
     state_state_dir = state_dir / "_state"
     history_path = state_state_dir / "report_history.jsonl"
 
+    authoritative = None
+    if args.round_index_file is not None:
+        if not args.round_index_file:
+            raise SystemExit("ERROR: --round-index-file requires a nonempty path")
+        if not (args.live or args.check_live_order) or not args.current_round_barcode:
+            raise SystemExit("ERROR: --round-index-file requires live/check mode and current round")
+        if args.valid_rounds_from_feeder_metadata:
+            raise SystemExit("ERROR: authoritative ordering and feeder metadata filtering cannot be combined")
+        authoritative_regular_path(Path(args.state_dir), directory=True)
+        authoritative = authoritative_round_context(state_dir, Path(args.round_index_file), args.current_round_barcode)
+        authoritative_mode = authoritative_history_publish_mode(history_path, args.current_round_barcode, *authoritative)
+
     if args.check_live_order:
         if not args.current_round_barcode:
             raise SystemExit("ERROR: --current-round-barcode is required with --check-live-order")
-        print(history_publish_mode(state_dir, history_path, args.current_round_barcode))
+        print(authoritative_mode if authoritative is not None else history_publish_mode(state_dir, history_path, args.current_round_barcode))
         return 0
 
-    round_entries: list[tuple[Path, dict]] = []
-    for child in state_dir.iterdir():
-        if not child.is_dir() or child.name == "_state":
-            continue
-        round_json = child / "round_report.json"
-        if not round_json.exists():
-            continue
-        round_obj = json.loads(round_json.read_text(encoding="utf-8"))
-        round_entries.append((child, round_obj))
+    if authoritative is not None:
+        round_entries = authoritative[1]
+    else:
+        round_entries: list[tuple[Path, dict]] = []
+        for child in state_dir.iterdir():
+            if not child.is_dir() or child.name == "_state":
+                continue
+            round_json = child / "round_report.json"
+            if not round_json.exists():
+                continue
+            round_obj = json.loads(round_json.read_text(encoding="utf-8"))
+            round_entries.append((child, round_obj))
 
-    if not round_entries:
-        raise SystemExit(f"ERROR: no round_report.json files found under {state_dir}")
-
-    round_entries.sort(key=lambda item: round_sort_key(item[1], item[0]))
-    if args.live and args.current_round_barcode:
-        round_entries = [
-            (round_dir, round_obj)
-            for round_dir, round_obj in round_entries
-            if not round_is_future(str(round_obj.get("round_barcode") or round_dir.name), args.current_round_barcode)
-        ]
         if not round_entries:
-            raise SystemExit(
-                f"ERROR: no round_report.json files remain after bounding live repair to {args.current_round_barcode}"
-            )
+            raise SystemExit(f"ERROR: no round_report.json files found under {state_dir}")
+
+        round_entries.sort(key=lambda item: round_sort_key(item[1], item[0]))
+        if args.live and args.current_round_barcode:
+            round_entries = [
+                (round_dir, round_obj)
+                for round_dir, round_obj in round_entries
+                if not round_is_future(str(round_obj.get("round_barcode") or round_dir.name), args.current_round_barcode)
+            ]
+            if not round_entries:
+                raise SystemExit(
+                    f"ERROR: no round_report.json files remain after bounding live repair to {args.current_round_barcode}"
+                )
 
     if args.valid_rounds_from_feeder_metadata:
         feeder_meta = Path(args.valid_rounds_from_feeder_metadata)

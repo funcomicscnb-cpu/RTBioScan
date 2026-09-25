@@ -120,6 +120,15 @@ def _prepare(tmp_path, main, config, raw=None, prune="", delete=False, ready=Fal
     prune_shell = prune_shell.replace('${sampleInfoDir}', '${workflow.launchDir}/sample-info').replace('${replicateModeCanonical}', 'collapse')
     backup = _shell(main, "backup_update_and_clean")
     disposal = backup[backup.index('# -- §3: done_pod5 append'):backup.index('# -- §6: State-tables snapshot')]
+    if '            JOINT_READY=0' in disposal:
+        # The disposal code ends before RF-PIN/candidate work. Exercise its
+        # unchanged bytes, then the exact task-output copy from the fenced
+        # region; this harness does not publish scientific snapshot roots.
+        disposal = disposal.split('            JOINT_READY=0', 1)[0]
+        region = backup.split('joint_snapshot_region() {', 1)[1]
+        copy_line = next(line for line in region.splitlines() if line.strip() == r'cp \$STATE_TMP/done_pod5.txt done_pod5.txt')
+        root_copy = next(line for line in region.splitlines() if line.strip() == r'cp \$STATE_TMP/done_pod5.txt "\$CURRENT_TEMP_ROOT"/')
+        disposal += copy_line + '\n' + root_copy + '\n'
     disposal = disposal.replace('${params.delete_input_pod5}', 'true' if delete else 'false')
     disposal = disposal.replace('${baseDir}', '${workflow.launchDir}/stub-base').replace('${runMode}', 'realtime').replace('${params.watch}', 'true').replace('${params.delete_from_ori_dir}', 'false')
     output_decl = main.split('process backup_update_and_clean {', 1)[1].split('output:', 1)[1].splitlines()[1].strip()
@@ -344,6 +353,16 @@ def test_head_candidate_generated_command_equivalence(tmp_path, default):
         for old, new, count in replacements:
             assert head_main.count(old) == count, old
             head_main = head_main.replace(old, new)
+    # PROTECTED_TEST_MAP: exact approved joint-v2 backup command delta.
+    # Its semantics are exercised by the worker/publication tests. Freeze the
+    # literal bytes here so this allowance cannot absorb unrelated changes.
+    candidate_main = (ROOT / 'main.nf').read_text()
+    candidate_backup = _shell(candidate_main, 'backup_update_and_clean')
+    import hashlib
+    assert hashlib.sha256(candidate_backup.encode()).hexdigest() == '3d7f6afb30761bd16ce8b6155045e90adde5547bcaadd3ac33cbe08542080d3b'
+    predecessor_backup = _shell(head_main, 'backup_update_and_clean')
+    assert head_main.count(predecessor_backup) == 1
+    head_main = head_main.replace(predecessor_backup, candidate_backup.replace('${outdirResolved}', '${params.outdir}'), 1)
     raw = None if default else str(tmp_path / 'absolute-link') + '/./results/'
     (tmp_path / 'target').mkdir()
     (tmp_path / 'absolute-link').symlink_to(tmp_path / 'target', target_is_directory=True)

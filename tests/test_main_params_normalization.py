@@ -3363,13 +3363,15 @@ def test_main_nf_wires_round_report_json_history_and_html_render() -> None:
     assert 'release_report_history_lock() {' in backup_block
     assert 'acquire_report_history_lock() {' in backup_block
     assert 'publish_report_history() {' in backup_block
-    assert '--check-live-order \\' in backup_block
-    assert '--current-round-barcode "${round_barcode}" \\' in backup_block
-    assert 'INFO: normalizing report history order for ${round_barcode}' in backup_block
-    assert '--live \\' in backup_block
-    assert '--skip-render \\' in backup_block
-    assert "trap 'release_report_history_lock' EXIT HUP INT TERM" in backup_block
-    assert 'trap - EXIT HUP INT TERM' in backup_block
+    # RF-PIN: the fresh worker owns normalization before candidate construction.
+    preflight = backup_block.split('joint_preflight() {', 1)[1].split('if joint_preflight; then', 1)[0]
+    history = backup_block.split('publish_report_history() {', 1)[1].split('report_live_publish_rc=0', 1)[0]
+    assert '--check-live-order --state-dir "${ongoingStateDir}"' in preflight
+    assert '--current-round-barcode "${round_barcode}" --round-index-file "\\$STATE_TMP/round_index.tsv"' in preflight
+    assert '/bin/bash "\\$JOINT_CONTROL/worker.sh" 2 ' in preflight
+    assert preflight.index('wait "\\$worker_pid"') < preflight.index('state_snapshot_authority.pl" prepare ')
+    assert 'report_read_fate_repair.py' not in history
+    assert 'acquire_report_history_lock || return 2' in history
     assert 'bash ${baseDir}/bin/report_live_publish.sh \\' in backup_block
     assert '--lock-path "\\$REPORT_LIVE_PUBLISH_LOCK"' in backup_block
     assert 'bash ${baseDir}/bin/report_history_append.sh --no-lock "\\$ROUND_REPORT_JSON" "\\$REPORT_HISTORY_JSONL" "\\$REPORT_HISTORY_LOCK"' in backup_block
@@ -3616,8 +3618,11 @@ def test_main_nf_backup_update_and_clean_uses_incremental_backup_sync_helpers() 
     assert 'cp -R ${ongoingStateDir}/Consensus/. "\\$CURRENT_ROOT/sequences/Consensus/" 2>/dev/null || true' not in backup_block
     assert 'sync_changed_files "\\$ONGOING_FINAL" "\\${rpts_plain[@]}"' in backup_block
     assert 'publish_gzip_atomic "\\$rpt" "\\$ONGOING_FINAL/\\$(basename -- "\\$rpt").gz"' in backup_block
-    assert 'sync_changed_tree "${ongoingStateDir}/Consensus" "\\$CURRENT_TEMP_ROOT/sequences/Consensus" 2>/dev/null || true' in backup_block
-    assert 'sync_changed_tree "${ongoingStateDir}/Consensus" "\\$CURRENT_ROOT/sequences/Consensus" 2>/dev/null || true' in backup_block
+    assert 'sync_joint_consensus_compat "${ongoingStateDir}/Consensus" "\\$CURRENT_TEMP_ROOT/sequences/Consensus"' in backup_block
+    assert 'sync_joint_consensus_compat "${ongoingStateDir}/Consensus" "\\$CURRENT_ROOT/sequences/Consensus"' in backup_block
+    assert 'sync_changed_tree "${ongoingStateDir}/Consensus" "\\$CURRENT_ROOT/sequences/single_exp/Consensus"' in backup_block
+    assert 'state_snapshot_authority.pl" capture ' in backup_block
+    assert 'state_snapshot_authority.pl" seal ' in backup_block
     assert '"\\$STATE_TMP"/read_qscore_rolling.tsv' in text
     assert '"\\$STATE_TMP"/*_seen_read_ids.tsv' in text
     assert '"\\$STATE_TMP"/*_on_target_state.tsv' in text

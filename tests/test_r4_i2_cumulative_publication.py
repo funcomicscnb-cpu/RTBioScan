@@ -2183,15 +2183,33 @@ def r4c_backup_round(r4c, L):
 
 
 def f01_seal_snapshot(L):
-    """R5-F01: seal both snapshot roots with the production completeness record, by
-    the same command backup_update_and_clean runs in section 6, so the fixture is
-    a snapshot a post-F01 backup would have left."""
-    roots = [L["state"].parents[3] / "current" / "state" / "S1", L["current"]]
-    for root in roots:
-        root.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(["perl", str(BIN / "state_snapshot_authority.pl"), "publish", str(L["state"]),
-                             *map(str, roots)], capture_output=True, text=True, check=False)
-    assert result.returncode == 0, result.stderr
+    """Wrap completed F01 fixtures in authenticated joint-v2, preserving R4 bytes."""
+    import runpy
+    import tempfile
+    api=runpy.run_path(str(REPO_ROOT/'tests/test_r5_final_design_regressions.py'))
+    roots=[L['state'].parents[3]/'current/state/S1',L['current']]
+    with tempfile.TemporaryDirectory(prefix='r4-joint-fixture-',dir=L['state'].parents[5]) as scratch:
+        work=Path(scratch);live=work/'S1';shutil.copytree(L['state'].parent,live)
+        seed=api['joint_fixture'](work/'seed')/'state_authority'
+        for suffix in api['PARSER_NAMES']+api['FATE_NAMES']:
+            dest=live/'_state'/f'{BARCODE}_{suffix}'
+            assert not dest.exists(),dest
+            shutil.copy2(seed/f'b_{suffix}',dest)
+        rb=(live/'_state/round_index.tsv').read_text().splitlines()[-1].split('\t')[0]
+        token='a'*64;pin='b'*64;acq='c'*64;h=BIN/'round_lock_generation.pl';authority=BIN/'state_snapshot_authority.pl'
+        common=['--state-dir',str(live/'_state'),'--round-barcode',rb,'--scope','full_round','--token',token]
+        def command(*args,env=None):
+            r=subprocess.run(list(map(str,args)),capture_output=True,text=True,env=env)
+            assert r.returncode==0,r.stderr
+        command('perl',h,'acquire',*common,'--pin-token',acq,'--owner-pid',os.getpid(),'--wait-seconds','1','--stale-seconds','30')
+        command('perl',h,'handoff',*common,'--pin-token',acq)
+        command('perl',h,'pin',*common,'--pin-token',pin,'--owner-pid',os.getpid(),'--role','backup_update_and_clean')
+        env={**os.environ,'RTBIOSCAN_ROUND_LOCK_STATE_DIR':str(live/'_state'),'RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE':rb,'RTBIOSCAN_ROUND_LOCK_SCOPE':'full_round','RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN':token,'RTBIOSCAN_ROUND_LOCK_ALREADY_COMPLETED':'0'}
+        candidate=work/'candidate'
+        command('perl',authority,'prepare',live,'S1',BARCODE,rb,token,pin,'sample','COI',candidate,*roots,env=env)
+        region=work/'region.py'
+        region.write_text("import subprocess,sys\na,c,l,t1,t2,h,pin,rb,token=sys.argv[1:]\nrun=lambda *a:subprocess.run(a,check=True)\nrun('perl',a,'capture',c,l,t1,pin)\nrun('perl',h,'finish','--state-dir',l+'/_state','--round-barcode',rb,'--scope','full_round','--token',token,'--pin-token',pin)\nrun('perl',a,'seal',c,t1,t2)\n")
+        command('perl',authority,'transaction',candidate,*roots,live,pin,sys.executable,region,authority,candidate,live,*roots,h,pin,rb,token,env=env)
 
 
 def outdir_view(root: Path):
@@ -2291,6 +2309,7 @@ def test_restore_refuses_a_snapshot_it_cannot_authenticate_before_any_change(pre
     shutil.rmtree(L["state"].parent)
     clone_pre_r4d(pre_r4d, L["state"].parent)
     r4c_backup_round(r4c, L)
+    f01_seal_snapshot(L)
     RESTORE_REFUSALS[case](L)
     before = outdir_view(tmp_path)
     result = restart_restore(tmp_path)

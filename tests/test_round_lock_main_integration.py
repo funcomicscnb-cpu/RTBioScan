@@ -358,13 +358,11 @@ def test_backup_completion_skip_and_finish_are_generation_authenticated() -> Non
     finish = r'perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" finish'
     assert backup.count(skip) == 1
     assert backup.index(skip) < backup.index(section_2) < backup.index(section_6)
-    assert backup.index(section_6) < backup.index(finish)
-    skip_tail = backup[
-        backup.index('if (( \\${#state_tables[@]} )); then') : backup.index(
-            "# ---- Release round lock"
-        )
-    ]
-    assert _compact(skip_tail).endswith("fi fi")
+    # Finish is now defined once and invoked inside the supervised region.
+    region = backup.split('joint_snapshot_region() {', 1)[1].split('export STATE_TMP', 1)[0]
+    assert region.index('state_snapshot_authority.pl" capture ') < region.index('joint_finish_round')
+    assert region.index('joint_finish_round') < region.index('state_snapshot_authority.pl" seal ')
+    assert 'state_snapshot_authority.pl" transaction ' in backup
 
     # Active full-round completion is authorized by the final writer pin.
     finish_positions = [match.start() for match in re.finditer(re.escape(finish), backup)]
@@ -390,7 +388,7 @@ def test_backup_completion_skip_and_finish_are_generation_authenticated() -> Non
     assert (
         r'if [ "\${RTBIOSCAN_ROUND_LOCK_ALREADY_COMPLETED:-0}" -eq 1 ]; then'
     ) in backup
-    assert "authenticated completed round lacks done_pod5.txt state" in backup
+    assert '[ -f done_pod5.txt ] || { echo "ERROR: retained task completion ledger missing"' in backup
 
 
 def test_generation_token_changes_cache_keys_without_replacing_restart_token() -> None:

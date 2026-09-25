@@ -61,6 +61,7 @@ esac
 
 mkdir -p "${OUTDIR}/temp"
 
+if [ "${RTB_JOINT_RESTART_OWNER:-}" != "$$" ]; then
 waited=0
 while ! mkdir "$LOCKDIR" 2>/dev/null; do
     sleep 1
@@ -70,6 +71,8 @@ while ! mkdir "$LOCKDIR" 2>/dev/null; do
         exit 1
     fi
 done
+
+fi
 
 cleanup_restart_handler() {
     local status="$1"
@@ -317,7 +320,7 @@ restore_skips_governed_name() {
             return 0
             ;;
     esac
-    return 1
+    state_authority governed "$1"
 }
 
 wipe_dir_contents() {
@@ -407,6 +410,10 @@ scan_restart_tree() {
         fi
         if [ -L "$entry" ]; then
             if [ "$reject_symlinks" -eq 1 ]; then
+                if [ "$MODE" = restore ] && [ "$purpose" = "restore snapshot state" ] &&
+                    state_authority presentation-leaf "$CURRENT_ROOT" "$entry"; then
+                    continue
+                fi
                 if [ -n "$ignored_presentation_tree" ]; then
                     case "$entry" in
                         "$ignored_presentation_tree"/*)
@@ -429,6 +436,19 @@ scan_restart_tree() {
     done
 }
 
+# Keep the existing restart lock while the child retains the two existing
+# snapshot flock descriptors through admission and installation. The child
+# rechecks all paths and the sentinel; it does not create snapshot roots.
+if [ "$MODE" = restore ] && [ "${RTB_JOINT_RESTART_OWNER:-}" != "$$" ]; then
+    if state_authority restore-supervise "$STATE_ID" "$ONGOING" "$LEGACY_CURRENT" "$CURRENT_ROOT" \
+        /bin/bash "$RESTART_HANDLER_DIR/restart_handler.sh"; then
+        RESTART_HANDLER_SUCCESS=1
+        exit 0
+    else
+        exit "$?"
+    fi
+fi
+
 # Complete every destructive preflight before the first wipe.  The live state
 # tree may contain ordinary symlinks (rm removes the link itself), but restore
 # snapshots may not: their copy paths could otherwise traverse or reproduce an
@@ -442,31 +462,16 @@ fi
 if [ "$MODE" = "reset" ]; then
     scan_restart_tree "$LEGACY_CURRENT" "reset snapshot state" 0
 else
-    scan_restart_tree "$LEGACY_CURRENT" "restore snapshot state" 1 \
-        "$LEGACY_CURRENT/tables/to_figures"
-    scan_restart_tree "$CURRENT_ROOT" "restore snapshot state" 1 \
-        "$CURRENT_ROOT/tables/to_figures"
-    # A cumulative generation the snapshot holds but that cannot be authenticated
-    # refuses the restore here, before any state changes.
+    scan_restart_tree "$LEGACY_CURRENT" "restore snapshot state" 1
+    scan_restart_tree "$CURRENT_ROOT" "restore snapshot state" 1 "$CURRENT_ROOT/tables/to_figures"
+    authority_choice="$(state_authority select "$STATE_ID" "$ONGOING" "$LEGACY_CURRENT" "$CURRENT_ROOT")"
+    case "$authority_choice" in
+        0) STATE_AUTHORITY_ROOT="" ;;
+        1) STATE_AUTHORITY_ROOT="$LEGACY_CURRENT" ;;
+        2) STATE_AUTHORITY_ROOT="$CURRENT_ROOT" ;;
+        *) state_authority_refuse "$CURRENT_ROOT" "invalid joint source selection" ;;
+    esac
     r4d_restore prepare
-    STATE_AUTHORITY_ROOT=""
-    for authority_root in "$LEGACY_CURRENT" "$CURRENT_ROOT"; do
-        authority_rc=0
-        state_authority verify "$authority_root" || authority_rc=$?
-        case "$authority_rc" in
-            0)
-                if [ -z "$STATE_AUTHORITY_ROOT" ]; then
-                    STATE_AUTHORITY_ROOT="$authority_root"
-                elif ! cmp -s "$STATE_AUTHORITY_ROOT/state_authority/AUTHORITY" \
-                    "$authority_root/state_authority/AUTHORITY"; then
-                    state_authority_refuse "$authority_root" \
-                        "its sealed state differs from $STATE_AUTHORITY_ROOT"
-                fi
-                ;;
-            3) ;;
-            *) state_authority_refuse "$authority_root" "no valid completeness record" ;;
-        esac
-    done
 fi
 
 # Publish the process-crash-visible operation epoch only after every read-only
@@ -527,7 +532,9 @@ restore_from_root() {
                 copy_items+=( "$item" )
             done
             if (( ${#copy_items[@]} )); then
-                cp -R "${copy_items[@]}" "$ONGOING_STATE/"
+                for item in "${copy_items[@]}"; do
+                    state_authority overlay-copy "$root" "$item" "$ONGOING_STATE/${item##*/}"
+                done
                 restored=1
             fi
         fi
@@ -548,13 +555,15 @@ restore_from_root() {
             copy_items+=( "$item" )
         done
         if (( ${#copy_items[@]} )); then
-            cp -R "${copy_items[@]}" "$ONGOING_STATE/"
+            for item in "${copy_items[@]}"; do
+                state_authority overlay-copy "$root" "$item" "$ONGOING_STATE/${item##*/}"
+            done
             restored=1
         fi
     fi
 
     # Always try to restore done_pod5 tracking if present.
-    if [ -f "${root}/done_pod5.txt" ]; then
+    if [ -z "$STATE_AUTHORITY_ROOT" ] && [ -f "${root}/done_pod5.txt" ]; then
         mkdir -p "${ONGOING_STATE}"
         cp -f "${root}/done_pod5.txt" "${ONGOING_STATE}/done_pod5.txt"
     fi
@@ -581,7 +590,7 @@ fi
 # If only current/state is available, also restore consensus sequences if present.
 if [ -d "$CURRENT_ROOT/sequences/Consensus" ]; then
     mkdir -p "$ONGOING_STATE/Consensus"
-    cp -R "$CURRENT_ROOT/sequences/Consensus/." "$ONGOING_STATE/Consensus/"
+    state_authority compat-copy "$CURRENT_ROOT/sequences/Consensus" "$ONGOING_STATE/Consensus" 0 0
     restored_any=1
 fi
 r4d_install_log="$(r4d_restore install)"
@@ -613,11 +622,11 @@ done
 # Restore consensus artifacts if present in sequence snapshots.
 if [ -d "$ONGOING_STATE/single_exp/Consensus" ]; then
     mkdir -p "$ONGOING/Consensus"
-    cp -R "$ONGOING_STATE/single_exp/Consensus/." "$ONGOING/Consensus/"
+    state_authority compat-copy "$ONGOING_STATE/single_exp/Consensus" "$ONGOING/Consensus" 0 0
 fi
 if [ -d "$ONGOING_STATE/Consensus" ]; then
     mkdir -p "$ONGOING/Consensus"
-    cp -R "$ONGOING_STATE/Consensus/." "$ONGOING/Consensus/"
+    state_authority compat-copy "$ONGOING_STATE/Consensus" "$ONGOING/Consensus" 0 0
 fi
 rm -rf "$ONGOING_STATE/.parser_state_txn" "$ONGOING/.parser_state_txn"
 

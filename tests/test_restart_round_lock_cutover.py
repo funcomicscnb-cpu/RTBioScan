@@ -448,11 +448,14 @@ def test_restore_copy_failure_stays_applying_and_returns_nonzero(
     snapshot.parent.mkdir(parents=True)
     snapshot.write_text("snapshot\n", encoding="utf-8")
     fake_bin = tmp_path / "fake-bin"
-    fake_cp = fake_bin / "cp"
+    fake_cp = fake_bin / "perl"
+    real_perl = shutil.which("perl")
+    assert real_perl is not None
     cp_log = tmp_path / "cp-exit-73-invocation.txt"
     fake_bin.mkdir()
     fake_cp.write_text(
         f"""#!/bin/bash
+case "$2" in overlay-copy|compat-copy) ;; *) exec "{real_perl}" "$@" ;; esac
 printf 'FAKE_CP_EXIT_73\\n%s\\n' "$*" > "{cp_log}"
 exit 73
 """,
@@ -502,11 +505,14 @@ def test_restore_consensus_copy_failure_stays_applying_and_retry_recovers(
     snapshot.write_text(">otu\nACGT\n", encoding="utf-8")
     (paths["current"] / "tables").mkdir()
     fake_bin = tmp_path / "fake-bin"
-    fake_cp = fake_bin / "cp"
+    fake_cp = fake_bin / "perl"
+    real_perl = shutil.which("perl")
+    assert real_perl is not None
     cp_log = tmp_path / "consensus-cp-exit-73-invocation.txt"
     fake_bin.mkdir()
     fake_cp.write_text(
         f"""#!/bin/bash
+case "$2" in overlay-copy|compat-copy) ;; *) exec "{real_perl}" "$@" ;; esac
 printf 'FAKE_CONSENSUS_CP_EXIT_73\\n%s\\n' "$*" > "{cp_log}"
 exit 73
 """,
@@ -517,7 +523,7 @@ exit 73
     result = _run("restore", outdir, operation_id=OPERATION_A, path_prefix=fake_bin)
 
     assert cp_log.is_file(), "positive control: handler did not reach consensus cp"
-    assert "sequences/Consensus/." in cp_log.read_text(encoding="utf-8")
+    assert "sequences/Consensus" in cp_log.read_text(encoding="utf-8")
     assert result.returncode == 73, (result.stdout, result.stderr)
     assert not destination.exists()
     assert paths["sentinel"].read_text(encoding="utf-8") == _applying_record(
@@ -842,11 +848,14 @@ def test_restore_never_flat_copies_a_presentation_only_structured_snapshot(
 
     result = _run("restore", outdir)
 
-    assert result.returncode == 0, result.stderr
-    assert (paths["state"] / legacy_table.name).read_text(encoding="utf-8") == "round\n"
-    assert not (paths["state"] / "tables").exists()
-    assert not (paths["state"] / "to_figures").exists()
+    assert result.returncode != 0
+    assert "unsafe presentation alias" in result.stderr.lower(), result.stderr
+    assert legacy_table.read_text(encoding="utf-8") == "round\n"
     assert outside.read_text(encoding="utf-8") == "outside\n"
+    assert presentation_link.is_symlink()
+    assert presentation_link.readlink() == outside
+    assert not paths["sentinel"].exists()
+    assert not paths["ongoing"].exists()
 
 
 def test_restore_accepts_published_live_round_without_copying_presentation_artifacts(

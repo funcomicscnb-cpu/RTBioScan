@@ -202,3 +202,25 @@ r4d_already_backed_up() {
     esac
     return 1
 }
+
+
+# Joint-v2 canonical Consensus state is transported only by the authority
+# transaction. Other Consensus products keep their existing backup behavior.
+sync_joint_consensus_compat() {
+    local src_dir="$1" dest_dir="$2" child name
+    [ -d "$src_dir" ] || return 0
+    mkdir -p "$dest_dir"
+    local dotglob_was_set=0
+    shopt -q dotglob && dotglob_was_set=1
+    shopt -s dotglob
+    for child in "$src_dir"/*; do
+        [ -e "$child" ] || [ -L "$child" ] || continue
+        name="${child##*/}"
+        case "$name" in
+            .cache|consensus_ownership.tsv|consolidated_consensus_ids.txt) continue ;;
+        esac
+        perl "$BACKUP_SYNC_LIB_DIR/../state_snapshot_authority.pl" compat-copy \
+            "$child" "$dest_dir/$name" 0 0 || return 1
+    done
+    [ "$dotglob_was_set" -eq 1 ] || shopt -u dotglob
+}

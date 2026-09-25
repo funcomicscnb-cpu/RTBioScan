@@ -108,7 +108,8 @@ def run_round(L, n: int, profile: str, prune: bool = False, min_rounds: int = 4)
         append(st / f"{bc}_seen_read_ids.tsv", "".join(f"{r}\n" for r in reads))
         # an OTU that stays unassigned every round: its streak reaches the threshold at round min_rounds
         streak(L, bc, marker, n, rdir, min_rounds)
-    append(st / "otu_frozen_members.tsv", f"OTUB_{n}\t{n}\n")
+    marker0 = next(iter(PROFILES[profile].values()))[0]
+    append(st / "otu_frozen_members.tsv", f"OTUB_{n}\tfrozenOTUB_{n}|{marker0}\t1\n")
     append(st / "read_qscore_rolling.tsv", f"r{n}\tsup\t20\n")
     # derived scratch rebuilt every round (not authoritative)
     (st / "qced_reads_nr.fasta.clstr").write_text(f">Cluster {n}\n")
@@ -149,24 +150,95 @@ def streak(L, bc, marker, n, rdir, min_rounds):
     shutil.copyfile(nxt, state)
 
 
-def backup(L, check=True):
-    """§5 done_pod5 copy + §6 (verbatim) + the §7 per-round copies that collide."""
-    script = (f"set -euo pipefail\nshopt -s nullglob\nsource '{SYNC}'\nSTATE_TMP='{L['state']}'\n"
-              f"CURRENT_TEMP_ROOT='{L['tcur']}'\nCURRENT_ROOT='{L['cur']}'\n"
-              f"mkdir -p \"$CURRENT_TEMP_ROOT\"\ncp \"$STATE_TMP/done_pod5.txt\" \"$CURRENT_TEMP_ROOT\"/\n"
-              + section6())
-    r = run(["/bin/bash", "-c", script], check=False)
-    if check:
-        assert r.returncode == 0 and "WARN: state snapshot authority" not in r.stderr, r.stderr
-    rounds = sorted(p for p in L["ongoing"].iterdir() if p.name.startswith("FAX"))
-    last = rounds[-1]
-    seq = L["tcur"] / "sequences"
-    (L["tcur"] / "tables").mkdir(parents=True, exist_ok=True)
-    seq.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(last / "round_index.tsv", L["tcur"] / "tables" / "round_index.tsv")
-    for rd in rounds:  # a round-prune copy stays in sequences/ until a later prune replaces it
-        if (rd / POOL).exists():
-            shutil.copyfile(rd / POOL, seq / POOL)
+def joint_context(L):
+    """Map the old F01 producer fixture onto the approved completed-v2 wire.
+    The existing rolling-pool/prune/streak writers and their assertions stay
+    unchanged; parser and BLAST dependencies use valid, explicit units."""
+    st=L['state']
+    rows=(st/'round_index.tsv').read_text().splitlines()
+    rb=rows[-1].split('\t')[0]
+    barcodes=sorted(p.name.removesuffix('_seen_read_ids.tsv') for p in st.glob('*_seen_read_ids.tsv'))
+    marker='ITS2' if 'barcode01' in barcodes else 'COI'
+    from tests.test_r5_final_design_regressions import DEMULT, PARSER_NAMES
+    for bc in barcodes:
+        for kind,header in [('demult_rpt',DEMULT),('otu_def_rpt',DEMULT.rstrip('\n')+'\tOTU_id\tOTU_role\n')]:
+            (st/f'{bc}_{kind}.txt').write_text(header)
+            h=hashlib.sha1(header.rstrip('\n').encode()).hexdigest()
+            (st/f'{bc}_{kind}.contract.tsv').write_text(f'contract_version\t1\nreport_kind\t{kind}\ncontext\tsample\nrow_count\t0\nempty_contract\tgenuinely_empty\nheader_sha1\t{h}\n')
+        (st/f'{bc}_demult_bootstrap.seeded').touch()
+        for suffix in ('read_fate_demux_seen.tsv','read_fate_blast_seen.tsv'):(st/f'{bc}_{suffix}').touch()
+        (st/f'{bc}_demux_annotation_cache.tsv').write_text(DEMULT)
+    # Preserve each existing frozen cluster identity while supplying the
+    # producer's three-column membership schema and a canonical marker ID.
+    memberships=[]
+    for line in (st/'otu_frozen_members.tsv').read_text().splitlines():
+        fields=line.split('\t');key=fields[0]
+        memberships.append(f'{key}\tfrozen{key}|{marker}\t1\n')
+    (st/'otu_frozen_members.tsv').write_text(''.join(memberships))
+    qids=sorted({line.split('\t')[1] for line in memberships})
+    maps={qid:hashlib.md5(qid.encode()).hexdigest() for qid in qids}
+    cache=[f'Q\t{h}\n' for h in sorted(set(maps.values()))]+[f'M\t{q}\t{h}\n' for q,h in sorted(maps.items())]
+    evidence=['\t'.join([q,h]+['NA']*11+['NO_HIT'])+'\n' for q,h in sorted(maps.items())]
+    for kind,version,name,body_rows in [('CACHE',2,f'otu_blast_cache_{marker}.tsv',cache),('EVIDENCE',1,f'otu_blast_evidence_{marker}.tsv',evidence),('MEMTAX',2,'memtax1.txt',[])]:
+        header=f'#RTB-R4-{kind}\t{version}\t'+('d'*64)+'\n';body=header+''.join(body_rows)
+        (st/name).write_text(body+f'#END\t{len(body_rows)}\t{sha(body[len(header):].encode())}\n')
+    return rb,barcodes[0],marker
+
+
+def backup(L, check=True, rename_cut=None, fault_member=None):
+    """Drive the real joint coordinator around the verbatim §5/§6 region."""
+    rb,bc,marker=joint_context(L)
+    # Keep this F01 scientific-state fixture free of round-lock history, as
+    # before. Authenticate an exact retained copy for its v2 snapshot producer;
+    # round-lock refusal itself remains covered by the protected restart suite.
+    original=L
+    live_copy=L['work']/('publication-'+rb)/SID
+    if live_copy.exists():shutil.rmtree(live_copy)
+    shutil.copytree(L['ongoing'],live_copy)
+    L={**L,'ongoing':live_copy,'state':live_copy/'_state'}
+    token=sha(rb.encode());pin=sha((rb+'backup').encode());acq=sha((rb+'acquire').encode())
+    helper=BIN/'round_lock_generation.pl'
+    common=['--state-dir',str(L['state']),'--round-barcode',rb,'--scope','full_round','--token',token]
+    if not (L['state']/'.round_inflight.lockdir').exists():
+        run(['perl',str(helper),'acquire',*common,'--pin-token',acq,'--owner-pid',str(os.getpid()),'--wait-seconds','1','--stale-seconds','30'])
+        run(['perl',str(helper),'handoff',*common,'--pin-token',acq])
+    run(['perl',str(helper),'pin',*common,'--pin-token',pin,'--owner-pid',str(os.getpid()),'--role','backup_update_and_clean'])
+    env={'RTBIOSCAN_ROUND_LOCK_STATE_DIR':str(L['state']),'RTBIOSCAN_ROUND_LOCK_ROUND_BARCODE':rb,'RTBIOSCAN_ROUND_LOCK_SCOPE':'full_round','RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN':token,'RTBIOSCAN_ROUND_LOCK_ALREADY_COMPLETED':'0'}
+    candidate=L['work']/f'{rb}.candidate'
+    if candidate.exists():candidate.unlink()
+    run(['perl',str(HELPER),'prepare',str(L['ongoing']),SID,bc,rb,token,pin,'sample',marker,str(candidate),str(L['tcur']),str(L['cur'])],env=env)
+    region=L['work']/f'{rb}.region.sh'
+    # The region is extracted from the current source; no live post-release
+    # fallback or test implementation of publication is substituted for it.
+    text=MAIN.read_text();body=text.split('        joint_snapshot_region() {',1)[1].split('\n        }\n',1)[0]
+    body=body.replace('\\$','$').replace('${baseDir}',str(REPO)).replace('${ongoingStateDir}',str(L['ongoing']))
+    region.write_text('set -euo pipefail\n'+f"cd '{L['work']}'\nSTATE_TMP='{L['state']}'\nCURRENT_TEMP_ROOT='{L['tcur']}'\nCURRENT_ROOT='{L['cur']}'\nJOINT_CANDIDATE='{candidate}'\nJOINT_FINISHED='{L['work']/('finished-'+rb)}'\nRTBIOSCAN_ROUND_LOCK_PIN_TOKEN='{pin}'\njoint_finish_round() {{ perl '{helper}' finish --state-dir '{L['state']}' --round-barcode '{rb}' --scope full_round --token '{token}' --pin-token '{pin}'; }}\n"+body)
+    if rename_cut is not None or fault_member is not None:
+        # Fault only the coordinator's root renames, after the atomic rename.
+        # Each actual helper subprocess shares the counter; scientific fixtures
+        # and pin/finish records are not injection targets.
+        fault_dir=L['work']/('fault-'+rb);fault_dir.mkdir(exist_ok=True)
+        counter=fault_dir/'counter';counter.write_text('0')
+        module=fault_dir/'JointFault.pm'
+        module.write_text(r"""package JointFault;
+BEGIN { *CORE::GLOBAL::rename = sub ($$) {
+ my($from,$to)=@_;my$ok=CORE::rename($from,$to);return $ok unless $ok;
+ if(index($to,$ENV{JOINT_FAULT_T1}.'/')==0||index($to,$ENV{JOINT_FAULT_T2}.'/')==0){
+  open(my$f,'+<',$ENV{JOINT_FAULT_COUNTER}) or die $!;my$n=<$f>;seek($f,0,0);truncate($f,0);$n++;print $f $n;close($f);
+  my$member=$ENV{JOINT_FAULT_MEMBER}//'';
+  if(($member ne ''&&$to=~m{/\Q$member\E\z})||($ENV{JOINT_FAULT_CUT}&&$n==$ENV{JOINT_FAULT_CUT})){print STDERR "injected publication boundary $n\n"; kill 9,$$; die "SIGKILL failed"}
+ } return $ok;
+}; } 1;
+""")
+        env.update({'PERL5OPT':f'-I{fault_dir} -MJointFault','JOINT_FAULT_T1':str(L['tcur']),'JOINT_FAULT_T2':str(L['cur']),'JOINT_FAULT_COUNTER':str(counter),'JOINT_FAULT_MEMBER':fault_member or '', 'JOINT_FAULT_CUT':str(rename_cut or 0)})
+    r=run(['perl',str(HELPER),'transaction',str(candidate),str(L['tcur']),str(L['cur']),str(L['ongoing']),pin,'/bin/bash',str(region)],env=env,check=False)
+    if check:assert r.returncode==0,r.stderr
+    last=original['ongoing']/rb
+    seq=L['tcur']/'sequences';seq.mkdir(parents=True,exist_ok=True)
+    (L['tcur']/'tables').mkdir(parents=True,exist_ok=True)
+    shutil.copyfile(last/'round_index.tsv',L['tcur']/'tables/round_index.tsv')
+    for rd in sorted(original['ongoing'].glob('FAX*')):
+        if (rd/POOL).exists():shutil.copyfile(rd/POOL,seq/POOL)
     return r
 
 
@@ -351,14 +423,9 @@ def test_interrupted_backup_is_never_accepted_and_retry_converges(tmp_path, vict
         run_round(L, n, "default")
         backup(L)
     run_round(L, 3, "default")
-    # the backup fails at the first member it copies (the ever-list sorts first) or after
-    # several members were already rewritten (round_index.tsv sorts last)
-    (L["state"] / victim).chmod(0)
-    try:
-        r = backup(L, check=False)
-    finally:
-        (L["state"] / victim).chmod(0o644)
-    assert "WARN: state snapshot authority not published" in r.stderr
+    # Inject at the authorized v2 capture boundary, after both invalidations.
+    r = backup(L, check=False, fault_member=victim)
+    assert r.returncode != 0 and "injected publication boundary" in r.stderr
     for root in (L["tcur"], L["cur"]):  # the round-2 authority was invalidated, nothing new accepted
         assert not _record(root).exists()
     before = outdir_view(L)
@@ -511,18 +578,25 @@ def independent_record_check(root: Path):
         return None
     raw = rec.read_bytes()
     lines = raw.split(b"\n")
-    assert lines[-1] == b"" and lines[0] == b"#RTB-STATE-AUTHORITY\t1"
+    assert lines[-1] == b"" and lines[0] == b"#RTB-JOINT-AUTHORITY\t2"
     end = lines[-2].split(b"\t")
     body = b"".join(line + b"\n" for line in lines[:-2])
-    assert end[0] == b"#END" and int(end[1]) == len(lines) - 3 and end[2].decode() == sha(body)
-    members = {}
-    for line in lines[1:-2]:
-        tag, name, size, digest = line.decode().split("\t")
-        assert tag == "member" and "/" not in name
-        data = (d / name).read_bytes()
-        assert len(data) == int(size) and sha(data) == digest, name
-        members[name] = data
-    assert {p.name for p in d.iterdir()} - {"AUTHORITY", ".lock"} == set(members)
+    groups=[line for line in lines if line.startswith(b'group\t')]
+    entries=[line for line in lines if line.startswith(b'entry\t')]
+    assert end[0]==b'#END' and int(end[1])==len(groups) and int(end[2])==len(entries) and end[3].decode()==sha(body)
+    members={}
+    for line in entries:
+        tag,group,encoded,kind,size,digest=line.decode().split('\t')
+        name=bytes.fromhex(encoded).decode()
+        assert not name.startswith('/') and '..' not in name.split('/')
+        p=root/name
+        if kind=='A': assert not os.path.lexists(p)
+        elif kind=='D': assert p.is_dir() and not p.is_symlink()
+        else:
+            assert kind=='F' and not p.is_symlink()
+            data=p.read_bytes();assert len(data)==int(size) and sha(data)==digest,name
+            if name.startswith('state_authority/'):members[p.name]=data
+    assert {p.name for p in d.iterdir()} - {'AUTHORITY','.lock'} == set(members)
     return members
 
 
@@ -538,24 +612,28 @@ def test_process_death_at_every_publication_boundary_never_publishes_an_incomple
     saved = tmp_path / "saved"
     for key in ("tcur", "cur"):
         shutil.copytree(L[key], saved / key, symlinks=True)
+    prior = independent_record_check(L['tcur'])
     k = 0
     while True:
         k += 1
         for key in ("tcur", "cur"):
             shutil.rmtree(L[key])
             shutil.copytree(saved / key, L[key], symlinks=True)
-        r = run(["perl", "-e", CRASH_WRAPPER, str(HELPER), "publish", str(L["state"]), str(L["tcur"]), str(L["cur"])],
-                env={"F01_KILL_AT_RENAME": str(k)}, check=False)
-        crashed = r.returncode == -9
+        r = backup(L, check=False, rename_cut=k)
+        crashed = r.returncode != 0
+        if crashed: assert "injected publication boundary" in r.stderr, r.stderr
         got = [independent_record_check(L[key]) for key in ("tcur", "cur")]
-        for g in got:  # a record exists only for the complete round-3 snapshot
-            assert g is None or g == want, k
-        if any(g is None for g in got):
+        for g in got:  # pre-invalidation cuts may retain the prior complete seal
+            assert g is None or g in (want, prior), k
+        if crashed:
             before = outdir_view(L)
             assert_refused(L, restore(L), before)
         # the next backup converges on the uninterrupted snapshot
-        assert run(["perl", str(HELPER), "publish", str(L["state"]), str(L["tcur"]), str(L["cur"])]).returncode == 0
+        assert backup(L).returncode == 0
         assert [independent_record_check(L[key]) for key in ("tcur", "cur")] == [want, want]
         if not crashed:
             break
-    assert k > 2 * len(want)  # every member rename and both record renames were crash points
+    # V2 retains content-identical members. Count every actual changed-member
+    # rename on both roots, two marker renames and two seal renames; the final
+    # iteration is the first cut beyond the publication's mutation trace.
+    assert k == 2 * sum(prior.get(name) != data for name,data in want.items()) + 5
