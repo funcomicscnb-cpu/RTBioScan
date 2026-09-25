@@ -2312,9 +2312,9 @@ Enable or disable incremental HTML report rendering (`${params.outdir}/report_ht
 - Report figures are copied into `${params.outdir}/report_html/runs/<run_id>/report_assets` from `${params.outdir}/ongoing/_state` using `assets/report/figures.tsv`.
 - Sample figure definitions are read from `assets/report/figures_sample.tsv` and attached under each sample panel.
 - Index report (`${params.outdir}/report_html/report.html`) is cross-run and does not render a figure gallery.
-- Index charts are run-level summaries derived from the latest round (`run_summary` in `run_report.json`).
+- Index charts are run-level summaries derived from the latest non-failed round (`run_summary` in `run_report.json`). When every recorded round failed, `run_summary` and `run_summary_source_round` are absent and charts use their established N/A behavior.
 - Runs are displayed in pages of 10 (latest updated first).
-- `run_summary_source_round` records the round_barcode used to compute each run summary.
+- `run_summary_source_round` records the latest non-failed round_barcode used to compute each run summary. A successful empty round is eligible; a history row without `round_status` is treated as ok. Latest-attempt `last_round_*` fields still describe the latest attempted round.
 - Figures are rendered in per-run reports under `${params.outdir}/report_html/runs/<run_id>/`, including `report.html` and, in track mode, `report_replicates.html` and `report_replicates_primers.html`.
 - Missing figures in per-run reports are shown as placeholders (not interactive).
 - Per-run report navigation exposes `Run Info` (`report.html`) and, in track mode, `Primer Comparison` (`report_replicates.html`) plus `Replicate Comparison` (`report_replicates_primers.html`).

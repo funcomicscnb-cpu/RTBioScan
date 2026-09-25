@@ -1,12 +1,15 @@
 import csv
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = REPO_ROOT / "bin" / "report_run_json.pl"
+SCRIPT = Path(os.environ.get("RTB_REPORT_RUN_JSON_SCRIPT", REPO_ROOT / "bin" / "report_run_json.pl"))
 
 
 def _oracle_normalized_id(raw: str) -> str:
@@ -589,3 +592,71 @@ def test_report_run_json_track_mode_emits_stage_three_report_views(tmp_path: Pat
             "is_primary": False,
         },
     ]
+
+
+@pytest.mark.parametrize(
+    ("case", "statuses", "expected_source", "expected_attempt"),
+    [
+        ("ok_ok", ["ok", "ok"], "round_002", "round_002"),
+        ("ok_failed", ["ok", "failed"], "round_001", "round_002"),
+        ("failed_failed", ["failed", "failed"], None, "round_002"),
+        ("ok_failed_ok", ["ok", "failed", "ok"], "round_003", "round_003"),
+        ("ok_empty_ok", ["ok", "empty_ok"], "round_002", "round_002"),
+        ("failed_legacy", ["failed", None], "round_002", "round_002"),
+    ],
+)
+def test_r6_f03_summary_uses_latest_nonfailed_and_metadata_uses_latest_attempt(
+    tmp_path: Path, case: str, statuses: list[str | None], expected_source: str | None, expected_attempt: str
+) -> None:
+    rows = []
+    for index, status in enumerate(statuses, 1):
+        empty = status in ("failed", "empty_ok")
+        count = 0 if empty else 100 + index
+        row = {
+            "run_id": "runA",
+            "barcode": "B1",
+            "round_barcode": f"round_{index:03d}",
+            "timestamp_utc": f"2026-03-06T00:{index:02d}:00Z",
+            "reads": {"total": count, "on_target": count},
+            "read_fate": {"blast_assigned_reads": count},
+            "otu": {"active_by_marker_taxon": {"coi_assigned": count}},
+            "consensus": {"emitted_by_marker_taxon": {"coi_assigned": count}},
+        }
+        if status is not None:
+            row["round_status"] = "ok" if status == "empty_ok" else status
+        if status == "failed":
+            row["failure_reason"] = f"failed at round_{index:03d}"
+        rows.append(row)
+
+    # Independent selection: attempted and eligible rows are chosen separately.
+    order = lambda row: int(row["round_barcode"].rsplit("_", 1)[1])
+    latest_attempt = max(rows, key=order)
+    eligible = [row for row in rows if row.get("round_status", "ok") != "failed"]
+    latest_nonfailed = max(eligible, key=order) if eligible else None
+    assert latest_attempt["round_barcode"] == expected_attempt, case
+    assert (latest_nonfailed["round_barcode"] if latest_nonfailed else None) == expected_source, case
+
+    history = tmp_path / "history.jsonl"
+    history.write_text("\n".join(json.dumps(row) for row in reversed(rows)) + "\n", encoding="utf-8")
+    out = tmp_path / "run_report.json"
+    cmd = ["perl", str(SCRIPT), "--history", str(history), "--out", str(out),
+           "--run-id", "runA", "--barcode", "B1", "--outdir", "results",
+           "--report-rel-path", "runs/runA/report.html"]
+    rc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    assert rc.returncode == 0, rc.stderr
+    data = json.loads(out.read_text(encoding="utf-8"))
+
+    assert data["last_round_barcode"] == latest_attempt["round_barcode"]
+    assert data["last_round_timestamp_utc"] == latest_attempt["timestamp_utc"]
+    assert data["last_round_status"] == latest_attempt.get("round_status", "ok")
+    if latest_attempt.get("round_status") == "failed":
+        assert data["last_round_failure_reason"] == latest_attempt["failure_reason"]
+    else:
+        assert "last_round_failure_reason" not in data
+    if latest_nonfailed is None:
+        assert "run_summary" not in data
+        assert "run_summary_source_round" not in data
+    else:
+        assert data["run_summary_source_round"] == latest_nonfailed["round_barcode"]
+        for field in ("reads", "read_fate", "otu", "consensus"):
+            assert data["run_summary"][field] == latest_nonfailed[field]

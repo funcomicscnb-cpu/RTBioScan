@@ -528,7 +528,13 @@ sub aggregate_run_summary {
 }
 
 if (defined $last_round_obj) {
-    my $summary = extract_run_summary($last_round_obj);
+    my @summary_candidates = grep {
+        ($_->{obj}->{round_status} // 'ok') ne 'failed'
+    } @round_candidates;
+    my $summary_round = @summary_candidates
+        ? (sort { compare_round_candidates($a, $b) } @summary_candidates)[-1]
+        : undef;
+    my $summary = defined $summary_round ? extract_run_summary($summary_round->{obj}) : undef;
     my $totals = aggregate_run_summary(\@round_candidates);
     my $run_status_read_fate = build_run_status_read_fate(
         $history,
@@ -541,7 +547,8 @@ if (defined $last_round_obj) {
     $record->{run_summary} = $summary if defined $summary;
     $record->{run_totals} = $totals if defined $totals;
     $record->{run_status_read_fate} = $run_status_read_fate if defined $run_status_read_fate;
-    $record->{run_summary_source_round} = $last_round_barcode if $last_round_barcode ne '';
+    $record->{run_summary_source_round} = $summary_round->{round_barcode}
+        if defined $summary && $summary_round->{round_barcode} ne '';
 }
 
 my $now_epoch = parse_ts($now_utc);

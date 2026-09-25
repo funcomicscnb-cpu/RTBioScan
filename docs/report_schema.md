@@ -325,8 +325,8 @@ Common optional keys:
 - `status_color` (string; renderer hint)
 - `status_cadence_seconds` (number or null)
 - `status_age_seconds` (number or null)
-- `run_summary_source_round` (string; round used for the current summary cards)
-- `run_summary` (object with latest-round `reads`, `otu`, `consensus`, `read_fate` snapshots)
+- `run_summary_source_round` (string; latest non-failed round used for the current summary cards; absent when all rounds failed)
+- `run_summary` (object with latest non-failed round `reads`, `otu`, `consensus`, `read_fate` snapshots; absent when all rounds failed)
 
 When `report_views` is present, each entry includes:
 - `view_id` (string; `sample|replicate|track_detail`)
@@ -379,8 +379,8 @@ Optional keys:
 - `status_color` (string; `green|orange|red`)
 - `status_age_seconds` (integer or null; seconds since last update)
 - `status_cadence_seconds` (integer or null; expected cadence between updates)
-- `run_summary_source_round` (string; round_barcode used to compute `run_summary`)
-- `run_summary` (object; latest round snapshot for index charts)
+- `run_summary_source_round` (string; latest non-failed round_barcode used to compute `run_summary`; absent when all rounds failed)
+- `run_summary` (object; latest non-failed round snapshot for index charts; absent when all rounds failed)
   - `reads`
     - `total` (integer or null)
     - `on_target` (integer or null)
