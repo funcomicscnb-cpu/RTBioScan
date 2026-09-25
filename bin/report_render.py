@@ -1517,11 +1517,10 @@ def find_sample_round_entry(round_obj, sample_id, sample_label):
         return {}
     if sample_id and sample_id in sample_metrics and isinstance(sample_metrics[sample_id], dict):
         return sample_metrics[sample_id]
-    sample_base = normalize_sample_base(sample_label)
     for raw in sample_metrics.values():
         if not isinstance(raw, dict):
             continue
-        if normalize_sample_base(raw.get("label") or raw.get("sample_id")) == sample_base:
+        if raw.get("label") == sample_label:
             return raw
     return {}
 

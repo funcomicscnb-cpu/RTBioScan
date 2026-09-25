@@ -252,6 +252,142 @@ def test_append_generated_sample_figures_uses_signatures_and_regenerates_on_chan
     assert calls["history_reads"] == 3
 
 
+def _sample_identity_rounds(marker, reverse=False):
+    """Round values are specified by producer label, independently of renderer matching."""
+    values = [
+        [("north", "Lake_North", 3), ("south", "Lake_South", 7), ("east", "Lake_East", 11), ("pine", "Pine_West", 2)],
+        [("south", "Lake_South", 13), ("pine", "Pine_West", 4)],
+        [("south", "Lake_South", 17), ("east", "Lake_East", 19)],
+        [("old_north", "Lake_North", 23), ("pine", "Pine_West", 6)],
+        [("north", "Lake_North", 29), ("old_south", "Lake_South", 31), ("east", "Lake_East", 37), ("pine", "Pine_West", 8)],
+    ]
+    rounds = []
+    for index, entries in enumerate(values, 1):
+        if reverse:
+            entries = list(reversed(entries))
+        rounds.append({
+            "run_id": "runX",
+            "round_barcode": f"round_{index:03d}",
+            "timestamp_utc": f"2026-03-06T00:{index:02d}:00Z",
+            "sample_metrics": {
+                key: {"sample_id": key, "label": label, "reads_demux": reads,
+                      "reads_demux_by_marker": {name: reads for name in marker}, "figures": []}
+                for key, label, reads in entries
+            },
+            "otu": {"assignments_by_level": {}},
+            "consensus": {"assignments_by_level": {}},
+        })
+    return rounds
+
+
+def test_history_sample_identity_direct_exact_missing_and_track(tmp_path: Path) -> None:
+    mod = _load_report_render_module()
+    direct = {"sample_metrics": {
+        "north": {"label": "Lake_North", "reads_demux": 5},
+        "old_north": {"label": "Lake_North", "reads_demux": 99},
+    }}
+    assert mod.find_sample_round_entry(direct, "north", "Lake_North")["reads_demux"] == 5
+    assert mod.find_sample_round_entry(direct, "absent", "Lake_North")["reads_demux"] == 5
+    assert mod.find_sample_round_entry(direct, "absent", "Lake_South") == {}
+    assert mod.find_sample_round_entry(
+        {"sample_metrics": {"cleaned": {"label": "Lake_North ", "reads_demux": 99}}},
+        "absent", "Lake_North",
+    ) == {}
+    assert mod.find_sample_round_entry(
+        {"sample_metrics": {"legacy": {"sample_id": "Lake_North", "reads_demux": 99}}},
+        "absent", "Lake_North",
+    ) == {}
+    track = {"identity_mode": "track", "track_unit_metrics": {
+        "one": {"track_sample_label": "Lake_North", "reads_demux": 4},
+        "two": {"track_sample_label": "Lake_North", "reads_demux": 6},
+        "three": {"track_sample_label": "Lake_South", "reads_demux": 50},
+    }}
+    assert mod.find_sample_round_entry(track, "absent", "Lake_North")["reads_demux"] == 10
+    assert mod.find_sample_round_entry(track, "absent", "Pine_West") == {}
+
+
+@pytest.mark.parametrize("marker", [("COI",), ("ITS2",), ("COI", "ITS2")])
+@pytest.mark.parametrize("context", ["default", "broad_its2"])
+def test_history_sample_identity_independent_per_round_oracle(
+    tmp_path: Path, marker, context
+) -> None:
+    mod = _load_report_render_module()
+    expected = {
+        ("north", "Lake_North"): [3, 0, 0, 23, 29],
+        ("south", "Lake_South"): [7, 13, 17, 0, 31],
+        ("east", "Lake_East"): [11, 0, 19, 0, 37],
+        ("pine", "Pine_West"): [2, 4, 0, 6, 8],
+    }
+    for reverse in (False, True):
+        rounds = _sample_identity_rounds(marker, reverse)
+        for round_obj in rounds:
+            round_obj["profile"] = context
+        for (sample_id, label), per_round in expected.items():
+            rows = mod.build_sample_history_rows(rounds, sample_id, label, tmp_path / context / "report.html", "runX")
+            assert [row["reads_demux"] for row in rows] == per_round
+            assert [row["total_reads_cumulative"] for row in rows] == [
+                sum(per_round[:index]) for index in range(1, 6)
+            ]
+            assert [row["round_barcode"] for row in rows] == [f"round_{index:03d}" for index in range(1, 6)]
+
+
+def test_history_sample_identity_full_figure_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = _load_report_render_module()
+    rounds = _sample_identity_rounds(("COI", "ITS2"))
+    captured = {}
+
+    def record(rows, sample_stub, png_path, pdf_path):
+        captured[sample_stub] = rows
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        png_path.write_bytes(b"png")
+        pdf_path.write_bytes(b"pdf")
+
+    def dummy(*args):
+        png_path, pdf_path = args[-2:]
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        png_path.write_bytes(b"png")
+        pdf_path.write_bytes(b"pdf")
+
+    monkeypatch.setattr(mod, "export_sample_history_cumulative_r", record)
+    for name in ("export_sample_history_reads_r", "export_sample_history_taxonomy_r",
+                 "export_icicle_plot_png_pdf", "export_sunburst_plot_png_pdf"):
+        monkeypatch.setattr(mod, name, dummy)
+    monkeypatch.setattr(mod, "build_sample_taxonomy_tree", lambda *args, **kwargs: {"name": "empty", "value": 0})
+    out_path = tmp_path / "runs" / "runX" / "report.html"
+    mod.append_generated_sample_figures(rounds, rounds[-1], out_path, "runX")
+    oracle = {
+        "north": [3, 3, 3, 26, 55],
+        "old_south": [7, 20, 37, 37, 68],
+        "east": [11, 11, 30, 30, 67],
+        "pine": [2, 6, 6, 12, 20],
+    }
+    assert set(captured) == set(oracle)
+    for sample_id, totals in oracle.items():
+        assert [row["total_reads_cumulative"] for row in captured[sample_id]] == totals
+        figures = rounds[-1]["sample_metrics"][sample_id]["figures"]
+        cumulative = [fig for fig in figures if fig["id"] == "sample_reads_cumulative_history"]
+        assert len(cumulative) == 1
+        assert sample_id in cumulative[0]["path"]
+        assert sample_id in cumulative[0]["pdf_path"]
+
+
+@pytest.mark.skipif(shutil.which("Rscript") is None, reason="Rscript unavailable")
+def test_history_sample_identity_r_figure_matches_oracle(tmp_path: Path) -> None:
+    mod = _load_report_render_module()
+    rows = mod.build_sample_history_rows(
+        _sample_identity_rounds(("COI",)), "north", "Lake_North", tmp_path / "report.html", "runX"
+    )
+    expected = [3, 3, 3, 26, 55]
+    assert [row["total_reads_cumulative"] for row in rows] == expected
+    oracle_rows = [{**row, "total_reads_cumulative": value} for row, value in zip(rows, expected)]
+    contaminated = [{**row, "total_reads_cumulative": value} for row, value in zip(rows, [3, 16, 33, 56, 85])]
+    for name, data in (("production", rows), ("oracle", oracle_rows), ("contaminated", contaminated)):
+        mod.export_sample_history_cumulative_r(data, "north", tmp_path / f"{name}.png", tmp_path / f"{name}.pdf")
+    assert (tmp_path / "production.png").read_bytes() == (tmp_path / "oracle.png").read_bytes()
+    assert (tmp_path / "production.png").read_bytes() != (tmp_path / "contaminated.png").read_bytes()
+    assert all((tmp_path / f"{name}.pdf").stat().st_size > 0 for name in ("production", "oracle", "contaminated"))
+
+
 def test_append_generated_sample_figures_honors_sample_plot_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
