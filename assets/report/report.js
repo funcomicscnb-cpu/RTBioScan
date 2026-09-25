@@ -396,13 +396,22 @@
     return acc;
   }, { rounds: 0, reads: 0, onTarget: 0 });
   const lastRound = rounds.length ? rounds[rounds.length - 1] : null;
+  const currentRun = viewScope === "run" && lastRound
+    ? runIndex.find((run) => run && run.run_id === lastRound.run_id)
+    : null;
+  const sourceBarcode = currentRun && currentRun.run_summary_source_round;
+  const noScientificSnapshot = currentRun && currentRun.last_round_status === "failed"
+    && !Object.prototype.hasOwnProperty.call(currentRun, "run_summary");
+  const scientificRound = sourceBarcode
+    ? (rounds.find((round) => round && round.round_barcode === sourceBarcode) || null)
+    : (noScientificSnapshot ? null : lastRound);
   const reportIdentityMode = (lastRound && lastRound.identity_mode === "track") ? "track" : "collapse";
   const groupViewMode = (viewScope === "run" && reportIdentityMode === "track" && reportView === "track_detail")
     ? "track_detail"
     : ((viewScope === "run" && reportIdentityMode === "track" && reportView === "replicate")
       ? "replicate"
       : "sample");
-  const consensusLatest = num(get(lastRound, ["consensus", "emitted"], 0));
+  const consensusLatest = scientificRound ? num(get(scientificRound, ["consensus", "emitted"], 0)) : "N/A";
 
   renderRunHeader();
 
@@ -1194,6 +1203,7 @@
   }
 
   function assignmentScopeText(round) {
+    if (!round) return "N/A";
     const roundBarcode = round && round.round_barcode != null
       ? String(round.round_barcode).trim()
       : "";
@@ -1221,7 +1231,7 @@
       dataRoot,
       countKey: "otu_count",
       countLabel: "OTUs",
-      emptyText: "No assignments available for this level.",
+      emptyText: round ? "No assignments available for this level." : "N/A",
       mountNode,
       readValueFn: otuSampleReads,
       extraCols: [
@@ -1239,7 +1249,7 @@
       dataRoot,
       countKey: "consensus_count",
       countLabel: "Consensus",
-      emptyText: "No consensus assignments available for this level.",
+      emptyText: round ? "No consensus assignments available for this level." : "N/A",
       mountNode,
       extraCols: [
         { header: "Consolidated Consensus", key: "consolidated_consensus_count" },
@@ -1928,7 +1938,7 @@
     section.appendChild(header);
     const intro = document.createElement("p");
     intro.className = "species-sample-help";
-    intro.textContent = "Current-state pipeline outputs at the latest round, including assignments carried forward from frozen and consolidated OTUs and consensus.";
+    intro.textContent = "Current-state pipeline outputs at the latest completed round, including assignments carried forward from frozen and consolidated OTUs and consensus.";
     section.appendChild(intro);
 
     const runsSection = runTableBody.closest("section");
@@ -1974,15 +1984,17 @@
       const prefix = lastRoundFailure.roundBarcode || "latest_round_failed";
       appendWarning(`${prefix}: ${lastRoundFailure.reason}`);
     }
-    safeRenderSection("run_sunbursts", () => renderRunSunburstCards(lastRound, currentRunResultsSection));
+    safeRenderSection("run_sunbursts", () => renderRunSunburstCards(scientificRound, currentRunResultsSection));
     safeRenderSection("assignments_by_sample", () => renderSpeciesSampleTable(currentRunResultsSection));
-    safeRenderSection("otu_assignments", () => renderOtuAssignmentsTable(lastRound, currentRunResultsSection));
-    safeRenderSection("consensus_assignments", () => renderConsensusAssignmentsTable(lastRound, currentRunResultsSection));
-    safeRenderSection("consensus_sequences", () => renderConsensusSequenceTable(lastRound, currentRunResultsSection));
-    safeRenderSection("consolidated_consensus_sequences", () => renderConsensusSequenceTable(lastRound, currentRunResultsSection, {
+    safeRenderSection("otu_assignments", () => renderOtuAssignmentsTable(scientificRound, currentRunResultsSection));
+    safeRenderSection("consensus_assignments", () => renderConsensusAssignmentsTable(scientificRound, currentRunResultsSection));
+    safeRenderSection("consensus_sequences", () => renderConsensusSequenceTable(scientificRound, currentRunResultsSection, {
+      emptyText: scientificRound ? "No consensus sequences available." : "N/A",
+    }));
+    safeRenderSection("consolidated_consensus_sequences", () => renderConsensusSequenceTable(scientificRound, currentRunResultsSection, {
       title: "Consolidated Consensus Sequences (FASTA)",
       rowsKey: "consolidated_sequence_rows",
-      emptyText: "No consolidated consensus sequences available.",
+      emptyText: scientificRound ? "No consolidated consensus sequences available." : "N/A",
       downloadBaseName: "Consolidated Consensus Sequences",
     }));
 
@@ -2215,11 +2227,10 @@
   }
 
   function buildTreemapData(sampleLabel, level, sourceKey = "otu") {
-    // Use the latest round's cumulative assignments.
+    // Use the scientific source round's cumulative assignments.
     // row.sample is the raw label from the BLAST report; normalizeBase() strips
     // replicate/marker suffixes so it matches sampleLabel (= sample_metrics.label).
-    const lastRound = rounds.length > 0 ? rounds[rounds.length - 1] : null;
-    const lvlRows = get(lastRound, [sourceKey, "assignments_by_level", level], []);
+    const lvlRows = get(scientificRound, [sourceKey, "assignments_by_level", level], []);
     if (!Array.isArray(lvlRows)) return [];
     const byTaxon = new Map();
     lvlRows.forEach((row) => {
@@ -2478,8 +2489,7 @@
   }
 
   function buildSampleTaxonomyTree(sampleLabel, sourceKey, marker, includeRow) {
-    const lastRound = rounds.length > 0 ? rounds[rounds.length - 1] : null;
-    const assignments = get(lastRound, [sourceKey, "assignments_by_level"], null);
+    const assignments = get(scientificRound, [sourceKey, "assignments_by_level"], null);
     const expectedLabel = (sampleLabel || "").toString();
     return buildAssignmentTaxonomyTree(
       assignments,
@@ -3415,8 +3425,8 @@
     [
       ["Demultiplexed Reads", num(totals.reads_demux)],
       ["BLAST-assigned Reads", num(totals.reads_blast_assigned)],
-      ["Number of OTUs", num(current.otu_total != null ? current.otu_total : current.otu_active)],
-      ["Number of Consensus", num(current.consensus_total != null ? current.consensus_total : current.consensus_emitted)],
+      ["Number of OTUs", scientificRound ? num(current.otu_total != null ? current.otu_total : current.otu_active) : "N/A"],
+      ["Number of Consensus", scientificRound ? num(current.consensus_total != null ? current.consensus_total : current.consensus_emitted) : "N/A"],
     ].forEach(([label, value]) => {
       const div = document.createElement("div");
       div.className = "card";
@@ -3681,7 +3691,7 @@
     const target = mountNode || document.getElementById("global-overview");
     if (!target || viewScope !== "run") return;
 
-    const lastRound = rounds.length > 0 ? rounds[rounds.length - 1] : null;
+    const lastRound = scientificRound;
     const samplesWithReads = new Set();
     rounds.forEach((r) => {
       const sm = (reportIdentityMode === "track" && hasTrackUnitMetrics(r))
@@ -4215,7 +4225,7 @@
       headingRow.appendChild(backLink);
       panel.appendChild(headingRow);
 
-      s.current = getSampleRoundSnapshot(rounds.length ? rounds[rounds.length - 1] : null, s.sample_id, s.label) || {};
+      s.current = getSampleRoundSnapshot(scientificRound, s.sample_id, s.label) || {};
       renderSampleEvolutionSection(panel, s);
       renderCurrentSampleResults(panel, s);
 

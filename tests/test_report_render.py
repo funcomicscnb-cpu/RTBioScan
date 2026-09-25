@@ -1104,7 +1104,7 @@ console.log(JSON.stringify({
     assert [item["text"] for item in rendered["caseInsensitive"]] == ["Current state through round 007"] * 2
     assert [item["text"] for item in rendered["unrelated"]] == ["Current state through round MYRUN_12"] * 2
     assert [item["text"] for item in rendered["embedded"]] == ["Current state through round ground_006"] * 2
-    assert [item["text"] for item in rendered["noRound"]] == ["Current state through latest completed round"] * 2
+    assert [item["text"] for item in rendered["noRound"]] == ["N/A"] * 2
     assert [item["text"] for item in rendered["empty"]] == ["Current state through latest completed round"] * 2
     assert [item["text"] for item in rendered["htmlLike"]] == [
         "Current state through round <img src=x onerror=alert(1)>"
@@ -1694,7 +1694,7 @@ def test_main_authoritative_consumers_receive_full_history_before_page_trimming(
             raise AuthoritativeHistoryError(f"{consumer_name} received incomplete oldest-round consensus assignments")
         calls.append(consumer_name)
 
-    def fake_build_chart_exports(sorted_rounds, _sorted_runs, _out_path, _run_id):
+    def fake_build_chart_exports(sorted_rounds, _sorted_runs, _out_path, _run_id, assignment_round=None):
         assert_complete_history("build_chart_exports", sorted_rounds)
         return {}
 
@@ -2776,6 +2776,7 @@ const sampleDetails = new Element("div");
 const viewScope = "run";
 const groupViewMode = "sample";
 let rounds = [];
+let scientificRound = null;
 let reportIdentityMode = "collapse";
 const drawDemuxByMarkerPerSample = () => {};
 const renderCurrentSampleResults = (panel, entry) => {
@@ -2812,6 +2813,7 @@ function render(entries, identityMode, reverse, marker = "COI") {
       sample: entry.label, taxon: entry.taxon,
     }))}},
   }];
+  scientificRound = rounds[0];
   renderSampleSections();
   return sampleDetails.children.map((panel) => ({
     ...panel.sample,
@@ -2887,3 +2889,345 @@ console.log(JSON.stringify({
         assert (len(observed["forward"]) != 2
                 or by_label(observed["forward"]) != expected(collision)
                 or by_label(observed["reverse"]) != expected(collision)), name
+
+
+_F02_DOM_HARNESS = r'''
+const fs = require("fs"), vm = require("vm");
+class Element {
+  constructor(tag = "div") {
+    this.tagName = tag.toUpperCase(); this.children = []; this.parentNode = null;
+    this._text = ""; this._html = ""; this.className = ""; this.style = {};
+    this.dataset = {}; this.attributes = {}; this.id = "";
+    this.classList = {add: (s) => { this.className += " " + s; }, remove() {},
+      contains: (s) => this.className.split(" ").includes(s), toggle() {}};
+  }
+  set textContent(v) { this._text = String(v); this.children = []; }
+  get textContent() { return this._text + this.children.map((c) => c.textContent).join(""); }
+  set innerHTML(v) { this._html = String(v); this.children = []; this._text = ""; }
+  get innerHTML() { return this._html; }
+  get firstChild() { return this.children[0] || null; }
+  get nextSibling() { return this.parentNode && this.parentNode.children[this.parentNode.children.indexOf(this) + 1] || null; }
+  get childNodes() { return this.children; }
+  appendChild(c) { c.parentNode = this; this.children.push(c); return c; }
+  removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); c.parentNode = null; return c; }
+  insertBefore(c, r) { const i = this.children.indexOf(r); c.parentNode = this; if (i < 0) this.children.push(c); else this.children.splice(i, 0, c); return c; }
+  setAttribute(k, v) { this.attributes[k] = String(v); if (k === "id") this.id = String(v); }
+  getAttribute(k) { return this.attributes[k] || null; }
+  addEventListener() {} querySelector() { return null; } querySelectorAll() { return []; }
+  closest() { return null; } remove() { if (this.parentNode) this.parentNode.removeChild(this); }
+}
+const nodes = {};
+for (const id of ["summary-cards", "summary-section", "warnings", "warnings-section", "charts",
+  "figures", "figures-section", "runs-info-section", "run-index-pager", "sample-index",
+  "sample-index-section", "sample-details", "sample-details-section", "rounds-section",
+  "report-index-link", "run-name", "run-links", "global-overview"]) nodes[id] = new Element();
+const runHead = new Element("thead"), runBody = new Element("tbody");
+const runsSection = new Element("section"), global = nodes["global-overview"];
+global.appendChild(runsSection); runsSection.appendChild(runHead); runsSection.appendChild(runBody);
+runHead.closest = () => runsSection; runBody.closest = () => runsSection;
+const document = {body: new Element("body"), createElement: (t) => new Element(t),
+  createElementNS: (_, t) => new Element(t),
+  createTextNode: (t) => { const n = new Element("#text"); n.textContent = t; return n; },
+  getElementById: (id) => nodes[id] || null,
+  querySelector: (s) => s === "#runs-table thead" ? runHead : s === "#runs-table tbody" ? runBody : null,
+  addEventListener() {}};
+const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const window = {REPORT_PAYLOAD: payload, REPORT_META: {auto_refresh_enabled: false}, location: {reload() {}}};
+vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"),
+  {window, document, console, Blob, URL, setTimeout, Date, Intl, Map, Set, Number, String,
+    Array, Object, Math, JSON, Promise}, {filename: process.argv[1]});
+function descendants(n) { return [n, ...n.children.flatMap(descendants)]; }
+function cards(n) { return descendants(n).filter((x) => x.className.split(" ").includes("card"))
+  .map((x) => ({label: descendants(x).find((y) => y.className === "label")?.textContent,
+    value: descendants(x).find((y) => y.className === "value")?.textContent}))
+  .filter((x) => x.label); }
+const assignments = descendants(global).filter((x) => x.className === "chart-card")
+  .map((x) => x.textContent);
+const tables = {};
+for (const card of descendants(global).filter((x) => x.className === "chart-card")) {
+  const title = descendants(card).find((x) => x.tagName === "H3")?.textContent;
+  if (title === "OTU Assignments" || title === "Consensus Assignments") {
+    tables[title] = descendants(card).filter((x) => x.tagName === "TR"
+      && x.children.some((child) => child.tagName === "TD"))
+      .map((row) => row.children.map((cell) => cell.textContent));
+  }
+}
+console.log(JSON.stringify({summary: cards(nodes["summary-cards"]),
+  samples: descendants(nodes["sample-details"]).filter((x) => x.className === "sample-panel")
+    .map((x) => ({label: descendants(x).find((y) => y.tagName === "H3")?.textContent, cards: cards(x)})),
+  assignments, tables, runName: nodes["run-name"].textContent,
+  warnings: nodes["warnings"].textContent}));
+'''
+
+
+def _f02_round(number: int, status="ok", empty: bool = False,
+               marker: str = "COI") -> dict:
+    labels = ("Lake_North", "Lake_South")
+    markers = ("COI", "ITS2") if marker == "MIXED" else (marker, marker)
+    rows_otu = [] if empty else [
+        {"taxon": f"O{number}_{label}", "sample": label, "marker": markers[i],
+         "otu_count": number + i, "frozen_otu_count": 1 if i == 0 else 0,
+         "reads_total": 7 + i} for i, label in enumerate(labels)
+    ]
+    rows_consensus = [] if empty else [
+        {"taxon": f"C{number}_{label}", "sample": label, "marker": markers[i],
+         "consensus_count": number + i, "consolidated_consensus_count": 1 if i == 1 else 0,
+         "reads_total": 7 + i} for i, label in enumerate(labels)
+    ]
+    otu_levels = {level: ([dict(row, taxon=f"{level}_{row['taxon']}") for row in rows_otu]
+                          if level != "species" else rows_otu)
+                  for level in ("species", "genus", "family")}
+    consensus_levels = {level: ([dict(row, taxon=f"{level}_{row['taxon']}") for row in rows_consensus]
+                                if level != "species" else rows_consensus)
+                        for level in ("species", "genus", "family")}
+    row = {
+        "run_id": "runA", "barcode": "B1", "round_barcode": f"round_{number:03d}",
+        "timestamp_utc": f"2026-03-06T00:{number:02d}:00Z",
+        "read_fate": {"demux_enabled": True}, "reads": {"total": 15},
+        "markers": {"order": list(dict.fromkeys(markers))},
+        "sample_metrics": {label.lower(): {"sample_id": label.lower(), "label": label,
+            "reads_demux": 7 + i, "otu_total": 0 if empty else number + i,
+            "consensus_total": 0 if empty else number + i}
+            for i, label in enumerate(labels)},
+        "otu": {"assignments_by_level": otu_levels},
+        "consensus": {"emitted": 0 if empty else 2 * number + 1,
+            "assignments_by_level": consensus_levels},
+        "warnings": [],
+    }
+    if status is not None:
+        row["round_status"] = status
+    if status == "failed":
+        row["failure_reason"] = f"failure_{number}"
+    return row
+
+
+def _f02_browser(payload: dict, tmp_path: Path) -> dict:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not found in PATH")
+    payload_path = tmp_path / "payload.json"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    result = subprocess.run([node, "-e", _F02_DOM_HARNESS, str(JS), str(payload_path)],
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("case,statuses,empty_last,reverse,marker", [
+    ("A", ("ok", "ok"), False, False, "COI"),
+    ("B", ("ok", "failed"), False, False, "COI"),
+    ("C", ("failed", "failed"), False, False, "COI"),
+    ("M", ("failed", "failed"), False, False, "COI"),
+    ("N", ("ok", "failed"), False, False, "COI"),
+    ("P", ("ok", "failed"), False, False, "COI"),
+    ("D", ("ok", "failed", "ok"), False, False, "COI"),
+    ("E", ("ok", "ok"), True, False, "COI"),
+    ("F", ("ok", "failed"), False, False, "COI"),
+    ("G", (None, "failed"), False, False, "COI"),
+    ("H", ("ok", "failed"), False, False, "MIXED"),
+    ("I", ("ok", "failed"), False, True, "COI"),
+    ("J", ("ok", "failed"), False, False, "COI"),
+    ("L", ("ok", "failed"), False, False, "ITS2"),
+])
+def test_f02_scientific_source_and_latest_attempt_are_independent(
+    tmp_path: Path, case: str, statuses: tuple, empty_last: bool,
+    reverse: bool, marker: str,
+) -> None:
+    rows = [_f02_round(i, status, empty_last and i == len(statuses), marker)
+            for i, status in enumerate(statuses, 1)]
+    if case in ("F", "M"):
+        rows[-1]["otu"]["assignments_by_level"]["species"][0]["otu_count"] = 999
+        rows[-1]["consensus"]["emitted"] = 999
+    # Oracle uses only the round comparator, status, and the run-index source key.
+    order = lambda row: int(row["round_barcode"].rsplit("_", 1)[1])
+    latest_attempt = max(rows, key=order)
+    eligible = [row for row in rows if row.get("round_status", "ok") != "failed"]
+    oracle_source = max(eligible, key=order) if eligible else None
+    if case == "N":
+        oracle_source = None
+    run_record = {"run_id": "runA", "run_status_read_fate": {},
+                  "last_round_barcode": latest_attempt["round_barcode"],
+                  "last_round_status": latest_attempt.get("round_status", "ok")}
+    if case in ("M", "N"):
+        del run_record["run_status_read_fate"]
+    if latest_attempt.get("round_status") == "failed":
+        run_record["last_round_failure_reason"] = latest_attempt["failure_reason"]
+    if oracle_source is not None:
+        run_record["run_summary_source_round"] = oracle_source["round_barcode"]
+        run_record["run_summary"] = {"consensus": oracle_source["consensus"]}
+    if case == "P":
+        run_record["run_summary_source_round"] = "round_999"
+    source_key = run_record.get("run_summary_source_round")
+    assert source_key == ("round_999" if case == "P" else (oracle_source["round_barcode"] if oracle_source else None))
+    oracle_source = next((row for row in rows if row["round_barcode"] == source_key), None)
+    history = tmp_path / "history.jsonl"
+    history.write_text("\n".join(json.dumps(row) for row in (reversed(rows) if reverse else rows)) + "\n",
+                       encoding="utf-8")
+    run_index = tmp_path / "runs_index.jsonl"
+    run_index.write_text(json.dumps(run_record) + "\n", encoding="utf-8")
+    out = tmp_path / "runs" / "runA" / "report.html"
+    out.parent.mkdir(parents=True)
+    result = _run(history, out, out.with_name("report_state.json"), extra_args=[
+        "--run-id-filter", "runA", "--run-index", str(run_index), "--sample-plot-max", "0",
+        "--auto-refresh-enabled", "0"])
+    assert result.returncode == 0, result.stderr
+    payload = _extract_js_json(out.read_text(encoding="utf-8"), "window.REPORT_PAYLOAD = ")
+    browser = _f02_browser(payload, tmp_path)
+    assert "render_failed:" not in browser["warnings"]
+    assert payload["rounds"][-1]["round_barcode"] == latest_attempt["round_barcode"]
+    assert payload["run_index"][0]["last_round_barcode"] == latest_attempt["round_barcode"]
+    assert payload["run_index"][0]["last_round_status"] == latest_attempt.get("round_status", "ok")
+    if case == "C":
+        assert payload["run_index"][0]["run_status_read_fate"] == {}
+    if case == "M":
+        assert all(key not in payload["run_index"][0] for key in
+                   ("run_status_read_fate", "run_summary", "run_summary_source_round"))
+        assert latest_attempt["otu"]["assignments_by_level"]["species"][0]["otu_count"] == 999
+    assert browser["runName"].count("Latest round failed") == (1 if latest_attempt.get("round_status") == "failed" else 0)
+    if latest_attempt.get("round_status") == "failed":
+        assert latest_attempt["failure_reason"] in browser["warnings"]
+    summary = {item["label"]: item["value"] for item in browser["summary"]}
+    assert summary["Consensus Emitted (Latest Round)"] == (
+        str(oracle_source["consensus"]["emitted"]) if oracle_source else "N/A")
+    source_rows = oracle_source["otu"]["assignments_by_level"]["species"] if oracle_source else []
+    consensus_rows = oracle_source["consensus"]["assignments_by_level"]["species"] if oracle_source else []
+    kept = [row for row in payload["rounds"]
+            if row["otu"]["assignments_by_level"]["species"]]
+    assert [row["round_barcode"] for row in kept] == ([oracle_source["round_barcode"]] if source_rows else [])
+    assert [row["otu"]["assignments_by_level"]["species"] for row in kept] == ([source_rows] if source_rows else [])
+    cards = {entry["label"]: {card["label"]: card["value"] for card in entry["cards"]}
+             for entry in browser["samples"]}
+    for label in ("Lake_North", "Lake_South"):
+        assert cards[label]["Number of OTUs"] == (
+            str(oracle_source["sample_metrics"][label.lower()]["otu_total"]) if oracle_source else "N/A")
+        assert cards[label]["Number of Consensus"] == (
+            str(oracle_source["sample_metrics"][label.lower()]["consensus_total"]) if oracle_source else "N/A")
+    assignment_text = " ".join(browser["assignments"])
+    assert (f"Current state through round {order(oracle_source):03d}" if oracle_source else "N/A") in assignment_text
+    for row in source_rows + consensus_rows:
+        assert row["taxon"] in assignment_text
+    for title, expected_rows, count_field in (
+        ("OTU Assignments", source_rows, "otu_count"),
+        ("Consensus Assignments", consensus_rows, "consensus_count"),
+    ):
+        rendered_rows = {row[0]: row for row in browser["tables"][title]}
+        assert set(rendered_rows) == {row["taxon"] for row in expected_rows}
+        for row in expected_rows:
+            rendered = rendered_rows[row["taxon"]]
+            assert rendered[1:4] == [row["sample"], row["marker"], str(row[count_field])]
+            assert rendered[5] == str(row["reads_total"])
+    if oracle_source is not latest_attempt:
+        for source_key in ("otu", "consensus"):
+            for row in latest_attempt[source_key]["assignments_by_level"]["species"]:
+                assert row["taxon"] not in assignment_text
+    tsv_specs = [(source_key, level, f"{source_key}_assignments_{level}.tsv", None)
+                 for source_key in ("otu", "consensus") for level in ("species", "genus", "family")]
+    tsv_specs.extend([
+        ("otu", "species", "frozen_otu_assignments_species.tsv", "frozen_otu_count"),
+        ("consensus", "species", "consolidated_consensus_assignments_species.tsv", "consolidated_consensus_count"),
+        ("otu", "species", "otu_assignments_by_sample_species.tsv", None),
+        ("consensus", "species", "consensus_assignments_by_sample_species.tsv", None),
+    ])
+    for source_key, level, filename, filter_field in tsv_specs:
+        expected_rows = oracle_source[source_key]["assignments_by_level"][level] if oracle_source else []
+        if filter_field:
+            expected_rows = [row for row in expected_rows if row[filter_field] > 0]
+        tsv = out.parent / "figures" / filename
+        lines = tsv.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == len(expected_rows) + 1
+        columns = lines[0].split("\t")
+        observed = [dict(zip(columns, line.split("\t"))) for line in lines[1:]]
+        assert observed == [{key: str(value) for key, value in row.items()} for row in expected_rows]
+    assert not payload["parse_warnings"]
+
+
+def test_f02_legacy_run_index_without_source_field_keeps_latest_row(tmp_path: Path) -> None:
+    rows = [_f02_round(1, "failed"), _f02_round(2, "failed")]
+    history = tmp_path / "history.jsonl"
+    history.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    run_index = tmp_path / "runs_index.jsonl"
+    run_index.write_text(json.dumps({"run_id": "runA", "last_round_barcode": "round_002"}) + "\n",
+                         encoding="utf-8")
+    out = tmp_path / "runs" / "runA" / "report.html"
+    out.parent.mkdir(parents=True)
+    result = _run(history, out, out.with_name("report_state.json"), extra_args=[
+        "--run-id-filter", "runA", "--run-index", str(run_index), "--sample-plot-max", "0",
+        "--auto-refresh-enabled", "0"])
+    assert result.returncode == 0, result.stderr
+    payload = _extract_js_json(out.read_text(encoding="utf-8"), "window.REPORT_PAYLOAD = ")
+    assert payload["rounds"][-1]["otu"]["assignments_by_level"]["species"] == rows[-1]["otu"]["assignments_by_level"]["species"]
+    browser = _f02_browser(payload, tmp_path)
+    assert "Current state through round 002" in " ".join(browser["assignments"])
+    assert "O2_Lake_North" in (out.parent / "figures" / "otu_assignments_species.tsv").read_text(encoding="utf-8")
+
+
+def test_f02_assignment_chart_exports_use_scientific_round(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = _load_report_render_module()
+    source = _f02_round(1)
+    failed = _f02_round(2, "failed")
+    for source_key in ("otu", "consensus"):
+        for row in failed[source_key]["assignments_by_level"]["species"]:
+            row["reads_total"] = 100
+    captured = {"treemaps": [], "sunbursts": []}
+
+    def write_pdf(*args):
+        path = args[-1]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"pdf")
+
+    def treemap(_title, items, path):
+        captured["treemaps"].extend(items)
+        write_pdf(path)
+
+    def sunburst(_title, _subtitle, tree, png_path, pdf_path):
+        captured["sunbursts"].append(tree)
+        write_pdf(pdf_path)
+        png_path.write_bytes(b"png")
+
+    monkeypatch.setattr(mod, "export_stacked_bar_pdf", write_pdf)
+    monkeypatch.setattr(mod, "export_vertical_bar_pdf", write_pdf)
+    monkeypatch.setattr(mod, "export_treemap_pdf", treemap)
+    monkeypatch.setattr(mod, "export_sunburst_plot_png_pdf", sunburst)
+    out = tmp_path / "runs" / "runA" / "report.html"
+    exports = mod.build_chart_exports([source, failed], [], out, "runA", assignment_round=source)
+    assert exports["run_otu_sunburst_COI"]["pdf_path"]
+    assert {item["taxon"] for item in captured["treemaps"]} == {
+        row["taxon"] for source_key in ("otu", "consensus")
+        for level in ("species", "genus", "family")
+        for row in source[source_key]["assignments_by_level"][level]
+    }
+    assert captured["sunbursts"]
+    assert all(tree["value"] < 100 for tree in captured["sunbursts"])
+    captured["treemaps"].clear()
+    captured["sunbursts"].clear()
+    missing_exports = mod.build_chart_exports([failed], [], out, "runA", assignment_round={})
+    assert not captured["treemaps"] and not captured["sunbursts"]
+    assert not missing_exports.get("run_otu_sunburst_COI", {}).get("pdf_path")
+
+
+def test_f02_reversed_history_has_same_payload_browser_and_tsvs(tmp_path: Path) -> None:
+    rows = [_f02_round(1), _f02_round(2, "failed")]
+    run_record = {"run_id": "runA", "last_round_barcode": "round_002",
+                  "last_round_status": "failed", "last_round_failure_reason": "failure_2",
+                  "run_summary_source_round": "round_001", "run_summary": {},
+                  "run_status_read_fate": {}}
+    observed = []
+    for name, history_rows in (("forward", rows), ("reverse", list(reversed(rows)))):
+        root = tmp_path / name
+        root.mkdir()
+        history = root / "history.jsonl"
+        history.write_text("\n".join(json.dumps(row) for row in history_rows) + "\n", encoding="utf-8")
+        run_index = root / "runs_index.jsonl"
+        run_index.write_text(json.dumps(run_record) + "\n", encoding="utf-8")
+        out = root / "runs" / "runA" / "report.html"
+        out.parent.mkdir(parents=True)
+        result = _run(history, out, out.with_name("report_state.json"), extra_args=[
+            "--run-id-filter", "runA", "--run-index", str(run_index), "--sample-plot-max", "0",
+            "--auto-refresh-enabled", "0"])
+        assert result.returncode == 0, result.stderr
+        payload = _extract_js_json(out.read_text(encoding="utf-8"), "window.REPORT_PAYLOAD = ")
+        payload.pop("generated_at_utc", None)
+        browser = _f02_browser(payload, root)
+        tsvs = {path.name: path.read_bytes() for path in (out.parent / "figures").glob("*.tsv")}
+        observed.append((payload, browser, tsvs))
+    assert observed[0] == observed[1]

@@ -325,14 +325,17 @@ def sort_rounds(rounds):
     return sorted(rounds, key=sort_key)
 
 
-def build_page_rounds(sorted_rounds):
-    """Keep complete latest assignments while making older page payloads lightweight."""
+def build_page_rounds(sorted_rounds, source_round_barcode=None, source_is_known=False):
+    """Keep complete scientific-source assignments while making other payloads lightweight."""
     rounds = list(sorted_rounds or [])
-    if len(rounds) <= 1:
+    if len(rounds) <= 1 and not source_is_known:
         return rounds
     page_rounds = []
     for round_index, round_obj in enumerate(rounds):
-        if round_index == len(rounds) - 1 or not isinstance(round_obj, dict):
+        keep_assignments = (round_obj.get("round_barcode") == source_round_barcode
+                            if source_is_known and isinstance(round_obj, dict)
+                            else round_index == len(rounds) - 1)
+        if keep_assignments or not isinstance(round_obj, dict):
             page_rounds.append(round_obj)
             continue
         page_round = copy.copy(round_obj)
@@ -2950,10 +2953,12 @@ def export_vertical_bar_pdf(title, bars, color, pdf_path):
     plt.close(fig)
 
 
-def build_chart_exports(sorted_rounds, sorted_runs, out_path, run_id):
+def build_chart_exports(sorted_rounds, sorted_runs, out_path, run_id, assignment_round=None):
     chart_dir = report_assets_dir(out_path) / "embedded"
     exports = {}
     latest_round = sorted_rounds[-1] if sorted_rounds else {}
+    scientific_round = assignment_round if assignment_round is not None else latest_round
+    has_scientific_round = assignment_round is None or bool(assignment_round)
     _scope = run_id if run_id else "index"
     _sig_root = report_assets_dir(out_path) / ".private_signatures" / "embedded" / _scope
     # collapse_track_units controls how track units are grouped in chart exports.
@@ -3009,10 +3014,12 @@ def build_chart_exports(sorted_rounds, sorted_runs, out_path, run_id):
         return {}
 
     def add_sunburst_export(chart_id, title, subtitle, source_key, marker, include_row=None, read_field=None):
+        if not has_scientific_round:
+            return {}
         png_path = chart_dir / f"{chart_id}.png"
         pdf_path = chart_dir / f"{chart_id}.pdf"
         sig_path = _sig_root / f"{chart_id}.sig"
-        tree = build_run_taxonomy_tree(latest_round, source_key, marker, include_row=include_row, read_field=read_field)
+        tree = build_run_taxonomy_tree(scientific_round, source_key, marker, include_row=include_row, read_field=read_field)
         sig = compute_signature({"version": RENDER_EMBEDDED_SIGNATURE_VERSION,
                                   "title": title, "tree": tree})
         if not (sig_path.exists() and pdf_path.exists() and read_signature(sig_path) == sig):
@@ -3109,9 +3116,11 @@ def build_chart_exports(sorted_rounds, sorted_runs, out_path, run_id):
                         "#2c6e49",
                     )
                     for source_key, source_title in (("otu", "OTUs"), ("consensus", "Consensus")):
+                        if not has_scientific_round:
+                            continue
                         for level in ("species", "genus", "family"):
                             items = build_sample_treemap_items(
-                                latest_round,
+                                scientific_round,
                                 sample["label"],
                                 level,
                                 source_key=source_key,
@@ -3120,7 +3129,7 @@ def build_chart_exports(sorted_rounds, sorted_runs, out_path, run_id):
                                     if CURRENT_GROUP_VIEW == "track_detail"
                                     else (
                                         "track_sample"
-                                        if collapse_track_units and latest_round.get("identity_mode") == "track"
+                                        if collapse_track_units and scientific_round.get("identity_mode") == "track"
                                         else ("normalized" if collapse_track_units else "exact")
                                     )
                                 ),
@@ -3146,7 +3155,8 @@ def build_chart_exports(sorted_rounds, sorted_runs, out_path, run_id):
                             if pdf_path.exists():
                                 exports[treemap_chart_id] = {"pdf_path": raw_pdf_path(pdf_name)}
         _run_sunburst_specs = []
-        for _mk in marker_order_from_data(sorted_rounds):
+        _assignment_markers = (sorted_rounds if scientific_round is latest_round else [scientific_round])
+        for _mk in marker_order_from_data(_assignment_markers):
             _slug = marker_slug(_mk)
             _suffix = _mk if _mk in ("COI", "ITS2") else _slug
             _run_sunburst_specs.extend([
@@ -3233,10 +3243,10 @@ def map_chart_export_paths(chart_exports, run_id, url_prefix):
                     page["pdf_path"] = prefix_url(page["pdf_path"], url_prefix)
 
 
-def write_chart_tsvs(sorted_rounds, tsv_dir, run_id=None, sig_root=None, report_html_name="report.html"):
+def write_chart_tsvs(sorted_rounds, tsv_dir, run_id=None, sig_root=None, report_html_name="report.html", assignment_round=None):
     """Write TSV data tables for every chart in the run report (best-effort; errors are silently skipped)."""
     tsv_dir.mkdir(parents=True, exist_ok=True)
-    latest_round = sorted_rounds[-1] if sorted_rounds else {}
+    latest_round = assignment_round if assignment_round is not None else (sorted_rounds[-1] if sorted_rounds else {})
     _scope = run_id if run_id else "index"
 
     def _write_tsv(path, header, rows, na_token=""):
@@ -3295,7 +3305,7 @@ def write_chart_tsvs(sorted_rounds, tsv_dir, run_id=None, sig_root=None, report_
         except Exception:
             pass
 
-    # Assignment tables from the latest round
+    # Assignment tables from the scientific source round
     def empty_assignment_columns(src_key, level):
         common = ["taxon", "sample", "marker", "family", "genus", "species"]
         if src_key == "otu":
@@ -3474,13 +3484,28 @@ def main():
     sorted_rounds = sort_rounds(rounds)
     latest_round = sorted_rounds[-1] if sorted_rounds else {}
     sorted_runs = sort_runs(run_index)
+    current_run_entry = next((run for run in sorted_runs if isinstance(run, dict)
+                              and run.get("run_id") == args.run_id_filter), None) if args.run_id_filter else None
+    source_is_known = isinstance(current_run_entry, dict) and (
+        bool(current_run_entry.get("run_summary_source_round")) or (
+            current_run_entry.get("last_round_status") == "failed"
+            and "run_summary" not in current_run_entry
+        )
+    )
+    scientific_round = (next((r for r in sorted_rounds
+                              if r.get("round_barcode") == current_run_entry.get("run_summary_source_round")), None)
+                        if source_is_known and current_run_entry.get("run_summary_source_round")
+                        else (None if source_is_known else latest_round))
     url_prefix = args.url_prefix or ""
     if url_prefix and not url_prefix.endswith("/"):
         url_prefix = url_prefix + "/"
 
     chart_exports = {}
     try:
-        chart_exports = build_chart_exports(sorted_rounds, sorted_runs, out_path, args.run_id_filter)
+        chart_exports = build_chart_exports(
+            sorted_rounds, sorted_runs, out_path, args.run_id_filter,
+            assignment_round=scientific_round if scientific_round is not None else {},
+        )
     except Exception as exc:
         parse_warnings.append(f"chart_pdf_export_failed:{exc.__class__.__name__}")
     run_start_epoch = None
@@ -3508,22 +3533,22 @@ def main():
         )
     except Exception as exc:
         parse_warnings.append(f"sample_plot_export_failed:{exc.__class__.__name__}")
-    if args.run_id_filter and isinstance(latest_round, dict):
-        consensus = latest_round.get("consensus")
+    if args.run_id_filter and isinstance(scientific_round, dict):
+        consensus = scientific_round.get("consensus")
         if not isinstance(consensus, dict):
             consensus = {}
-            latest_round["consensus"] = consensus
+            scientific_round["consensus"] = consensus
         all_sequence_rows = collect_consensus_sequence_rows(
             args.run_id_filter,
             out_path,
-            latest_round.get("state_id") if isinstance(latest_round, dict) else None,
+            scientific_round.get("state_id"),
         )
         consensus["sequence_rows"] = all_sequence_rows
         consensus["consolidated_sequence_rows"] = [row for row in all_sequence_rows if row.get("is_consolidated")]
         # Attach per-replicate OTU read counts to each sequence row.
         # otu_replicate_reads is emitted by report_round_json.pl in collapse mode
         # and keyed by OTU_id -> [{label, count}, ...].
-        _otu_rep_reads = latest_round.get("otu", {}).get("replicate_reads") or {}
+        _otu_rep_reads = scientific_round.get("otu", {}).get("replicate_reads") or {}
         if _otu_rep_reads and isinstance(all_sequence_rows, list):
             for _seq_row in all_sequence_rows:
                 _ok = _seq_row.get("otu_key", "")
@@ -3542,6 +3567,7 @@ def main():
                 run_id=args.run_id_filter,
                 sig_root=report_assets_dir(out_path) / ".private_signatures",
                 report_html_name=out_path.name,
+                assignment_round=scientific_round if scientific_round is not None else {},
             )
         except Exception as exc:
             parse_warnings.append(f"chart_tsv_export_failed:{exc.__class__.__name__}")
@@ -3571,13 +3597,6 @@ def main():
                     for key in ("report_rel_path", "report_url"):
                         if isinstance(view.get(key), str):
                             view[key] = relativize_run_url(view.get(key), args.run_id_filter)
-
-    current_run_entry = None
-    if args.run_id_filter:
-        for _run in sorted_runs:
-            if isinstance(_run, dict) and _run.get("run_id") == args.run_id_filter:
-                current_run_entry = _run
-                break
 
     run_identity_mode = "collapse"
     if isinstance(latest_round, dict) and latest_round.get("identity_mode") == "track":
@@ -3623,7 +3642,11 @@ def main():
             "is_active": True,
         }]
     figures_payload = latest_round.get("figures", []) if args.run_id_filter else []
-    page_rounds = build_page_rounds(sorted_rounds)
+    page_rounds = build_page_rounds(
+        sorted_rounds,
+        source_round_barcode=scientific_round.get("round_barcode") if scientific_round else None,
+        source_is_known=source_is_known,
+    )
 
     payload = {
         "rounds": page_rounds,
