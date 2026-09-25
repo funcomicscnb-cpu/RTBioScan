@@ -368,6 +368,9 @@ ReportingParserStateTxn::recover_leftover_transaction_or_die(
 	barcode => $barcode_pipeline,
 	context => $boundary_context,
 );
+my $current_round_replay = preflight_current_round_first_seen_replay(
+	$temp_dir, $round_dir, $barcode_pipeline, $round_demult_report,
+);
 my $round_demult_sidecar_meta = ReportingContractSidecar::read_sidecar($round_demult_sidecar);
 die "ERROR: current-round demux sidecar context mismatch in '$round_demult_sidecar'\n"
 	if $round_demult_sidecar_meta->{context} ne $boundary_context;
@@ -664,7 +667,105 @@ sub build_first_seen_snapshot {
 	}
 
 	unshift @snapshot_lines, $header_line;
+	if (my $expected = $args{expected_lines}) {
+		die "ERROR: current-round first-seen snapshot changed during replay: $source_path\n"
+			unless snapshots_semantically_equal(\@snapshot_lines, $expected);
+	}
 	write_named_snapshot_files($snapshot_paths_ref, \@snapshot_lines);
+	return \@snapshot_lines;
+}
+
+sub retained_first_seen_snapshot {
+	my ($path, $expected_header, $seen_ref, $allow_multiple_rows) = @_;
+	open my $fh, '<', $path or die "ERROR: unable to open retained snapshot '$path'\n";
+	my $header = <$fh>;
+	die "ERROR: malformed retained first-seen snapshot '$path'\n"
+		unless defined $header;
+	chomp $header;
+	$header =~ s/\r$//;
+	die "ERROR: malformed retained first-seen snapshot header '$path'\n"
+		unless $header eq $expected_header;
+	my @header_cols = split /\t/, $header, -1;
+	my @lines = ($header);
+	my %ids;
+	while (my $line = <$fh>) {
+		chomp $line;
+		$line =~ s/\r$//;
+		next if $line =~ /^\s*$/;
+		my @fields = split /\t/, $line, -1;
+		my $rid = normalize_read_id_for_read_fate($fields[0]);
+		die "ERROR: malformed retained first-seen snapshot row '$path'\n"
+			if @fields != @header_cols || $rid eq '' || $line eq $header;
+		die "ERROR: duplicate retained first-seen demux ID '$rid' in '$path'\n"
+			if !$allow_multiple_rows && $ids{$rid};
+		die "ERROR: retained first-seen ID '$rid' absent from cumulative seen state '$path'\n"
+			unless exists $seen_ref->{$rid};
+		$ids{$rid} = 1;
+		push @lines, $line;
+	}
+	close $fh;
+	return (\@lines, \%ids);
+}
+
+sub snapshots_semantically_equal {
+	my ($actual, $retained) = @_;
+	return 0 unless @$actual && @$retained && $actual->[0] eq $retained->[0];
+	my @canonical;
+	for my $lines ($actual, $retained) {
+		my @rows;
+		for my $line (@$lines[1 .. $#$lines]) {
+			my @fields = split /\t/, $line, -1;
+			$fields[0] = normalize_read_id_for_read_fate($fields[0]);
+			push @rows, join("\t", @fields);
+		}
+		push @canonical, join("\n", sort @rows);
+	}
+	return $canonical[0] eq $canonical[1];
+}
+
+sub preflight_current_round_first_seen_replay {
+	my ($temp_path, $round_path, $barcode, $demult_path) = @_;
+	my $round_report_dir = derive_round_report_dir($temp_path, $round_path);
+	return undef if $round_report_dir eq '';
+	my $demux_path = "$round_report_dir/${barcode}_read_fate_demult_first_seen.tsv";
+	my $blast_path = "$round_report_dir/${barcode}_read_fate_blast_first_seen.tsv";
+	my $has_demux = -e $demux_path;
+	my $has_blast = -e $blast_path;
+	return undef if !$has_demux && !$has_blast;
+	die "ERROR: incomplete retained current-round first-seen snapshot pair\n"
+		unless $has_demux && $has_blast && -f $demux_path && -f $blast_path;
+	my $demux_sidecar = "$temp_path/${barcode}_read_fate_demux_seen.tsv";
+	my $blast_sidecar = "$temp_path/${barcode}_read_fate_blast_seen.tsv";
+	die "ERROR: retained first-seen snapshots lack cumulative seen sidecars\n"
+		unless -f $demux_sidecar && -f $blast_sidecar;
+	my $demux_seen = load_seen_ids_sidecar($demux_sidecar);
+	my $blast_seen = load_seen_ids_sidecar($blast_sidecar);
+	my $demux_header = ReportingContractSidecar::canonical_header('demult_rpt');
+	my $blast_header = "read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_taxid\totu_kingdom\totu_phylum\totu_class\totu_order\totu_family\totu_genus\totu_species";
+	my ($demux_lines, $demux_ids) = retained_first_seen_snapshot($demux_path, $demux_header, $demux_seen, 0);
+	my ($blast_lines, $blast_ids) = retained_first_seen_snapshot($blast_path, $blast_header, $blast_seen, 1);
+	my $allowed_ids = {};
+	replay_read_info_seen_ids("${barcode}_read_info_rpt.txt", $allowed_ids);
+	my %demux_historical = %$demux_seen;
+	my %blast_historical = %$blast_seen;
+	delete @demux_historical{keys %$demux_ids};
+	delete @blast_historical{keys %$blast_ids};
+	my $demux_recomputed = build_first_seen_snapshot(
+		source_path => $demult_path, default_header => $demux_header,
+		seen_ref => \%demux_historical, allowed_ids_ref => $allowed_ids,
+		snapshot_paths => [],
+	);
+	my $blast_recomputed = build_first_seen_snapshot(
+		source_path => "${barcode}_blast_otu_pretax_rpt.txt", default_header => $blast_header,
+		seen_ref => \%blast_historical, allowed_ids_ref => $allowed_ids,
+		snapshot_paths => [], keep_all_rows_for_new_ids => 1,
+	);
+	die "ERROR: retained current-round demux first-seen snapshot differs from replay inputs\n"
+		unless snapshots_semantically_equal($demux_recomputed, $demux_lines);
+	die "ERROR: retained current-round BLAST first-seen snapshot differs from replay inputs\n"
+		unless snapshots_semantically_equal($blast_recomputed, $blast_lines);
+	return { demux_lines => $demux_lines, blast_lines => $blast_lines,
+		demux_ids => $demux_ids, blast_ids => $blast_ids };
 }
 
 sub load_seen_ids_sidecar {
@@ -1059,6 +1160,10 @@ my ($on_target_state_ref, $on_target_barcode_ref);
 my $round_read_info_ids_ref;
 my $read_fate_demux_seen_ref = load_seen_ids_sidecar($read_fate_demux_seen_sidecar);
 my $read_fate_blast_seen_ref = load_seen_ids_sidecar($read_fate_blast_seen_sidecar);
+if ($current_round_replay) {
+	delete @{$read_fate_demux_seen_ref}{keys %{$current_round_replay->{demux_ids}}};
+	delete @{$read_fate_blast_seen_ref}{keys %{$current_round_replay->{blast_ids}}};
+}
 my ($demux_annotation_cache_rows_ref, $demux_annotation_cache_seen_ref) =
 	load_annotation_cache_sidecar($demux_annotation_cache_sidecar, $demult_snapshot_header);
 
@@ -1090,6 +1195,7 @@ build_first_seen_snapshot(
 	snapshot_paths => \@round_read_fate_demux_paths,
 	cache_rows_ref => $demux_annotation_cache_rows_ref,
 	cache_seen_ref => $demux_annotation_cache_seen_ref,
+	($current_round_replay ? (expected_lines => $current_round_replay->{demux_lines}) : ()),
 );
 build_first_seen_snapshot(
 	source_path => $round_blast_otu,
@@ -1098,6 +1204,7 @@ build_first_seen_snapshot(
 	allowed_ids_ref => $round_read_info_ids_ref,
 	snapshot_paths => \@round_read_fate_blast_paths,
 	keep_all_rows_for_new_ids => 1,
+	($current_round_replay ? (expected_lines => $current_round_replay->{blast_lines}) : ()),
 );
 write_seen_ids_sidecar($read_fate_demux_seen_sidecar, $read_fate_demux_seen_ref);
 write_seen_ids_sidecar($read_fate_blast_seen_sidecar, $read_fate_blast_seen_ref);

@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 import subprocess
@@ -6,6 +7,22 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "bin" / "report_run_json.pl"
+
+
+def _oracle_normalized_id(raw: str) -> str:
+    return raw.strip().split()[0].split("|")[0] if raw.strip() and raw.strip().upper() != "NA" else ""
+
+
+def _oracle_live_counts(state_dir: Path) -> tuple[int, int]:
+    with (state_dir / "RTBioScan_read_info_rpt.txt").open(encoding="utf-8") as handle:
+        total_ids = {_oracle_normalized_id(row["read_id"]) for row in csv.DictReader(handle, delimiter="\t")}
+    with (state_dir / "RTBioScan_on_target_rpt.txt").open(encoding="utf-8") as handle:
+        target_ids = {
+            _oracle_normalized_id(row["read_id"])
+            for row in csv.DictReader(handle, delimiter="\t")
+            if row["on_target_kingdom"].upper() == "ON_TARGET"
+        }
+    return len(total_ids - {""}), len(target_ids - {""})
 
 
 def _commit_cumulative_state(state_dir: Path, pretax: str) -> None:
@@ -309,6 +326,61 @@ def test_report_run_json_emits_run_status_read_fate_from_cumulative_state(tmp_pa
     assert read_fate["chart_blast_skipped_coi"] == 0
     assert read_fate["chart_on_target_not_demultiplexed"] == 1
     assert read_fate["chart_off_target"] == 1
+
+    # Independent ID-set oracle: the live view is invariant to rolling replay rows.
+    assert _oracle_live_counts(state_dir) == (4, 3)
+    baseline = dict(data)
+    baseline.pop("last_updated_utc", None)
+    baseline.pop("status_age_seconds", None)
+    rc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    assert rc.returncode == 0, rc.stderr
+    duplicate_free = json.loads(out.read_text(encoding="utf-8"))
+    duplicate_free.pop("last_updated_utc", None)
+    duplicate_free.pop("status_age_seconds", None)
+    assert duplicate_free == baseline
+
+    read_info = state_dir / "RTBioScan_read_info_rpt.txt"
+    on_target = state_dir / "RTBioScan_on_target_rpt.txt"
+    with read_info.open("a", encoding="utf-8") as handle:
+        handle.write("r1\tr1.pod5\trunA\tbc\t100\t10\t100\t12\tNA\tNA\n")
+    with on_target.open("a", encoding="utf-8") as handle:
+        handle.write("r1\tIN\tON_TARGET\n")
+    assert _oracle_live_counts(state_dir) == (4, 3)
+    rc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    assert rc.returncode == 0, rc.stderr
+    exact_duplicate = json.loads(out.read_text(encoding="utf-8"))["run_status_read_fate"]
+    assert exact_duplicate == read_fate
+
+    with read_info.open("a", encoding="utf-8") as handle:
+        handle.write("r1|variant\tr1.pod5\trunA\tbc\t100\t10\t100\t12\tNA\tNA\n")
+        handle.write("r2 trailing_text\tr2.pod5\trunA\tbc\t101\t10\t101\t12\tNA\tNA\n")
+    with on_target.open("a", encoding="utf-8") as handle:
+        handle.write("r1|variant\tIN\tON_TARGET\n")
+        handle.write("r1\tIN\tOFF_TARGET\n")
+    expected_total, expected_target = _oracle_live_counts(state_dir)
+    assert (expected_total, expected_target) == (4, 3)
+    rc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    assert rc.returncode == 0, rc.stderr
+    normalized_duplicate = json.loads(out.read_text(encoding="utf-8"))["run_status_read_fate"]
+    assert normalized_duplicate == read_fate
+    assert sum(normalized_duplicate[key] for key in (
+        "chart_blast_assigned_coi", "chart_blast_assigned_its2",
+        "chart_blast_unassigned_coi", "chart_blast_unassigned_its2",
+        "chart_blast_skipped_coi", "chart_blast_skipped_its2",
+        "chart_on_target_not_demultiplexed", "chart_off_target",
+    )) == expected_total
+
+    ordinary_out = tmp_path / "ordinary_round.json"
+    ordinary = subprocess.run(
+        ["perl", str(REPO_ROOT / "bin" / "report_round_json.pl"),
+         "--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "round_002",
+         "--out", str(ordinary_out), "--read-info", str(read_info), "--on-target", str(on_target)],
+        capture_output=True, text=True,
+    )
+    assert ordinary.returncode == 0, ordinary.stderr
+    ordinary_report = json.loads(ordinary_out.read_text(encoding="utf-8"))
+    assert ordinary_report["reads"]["total"] == 7
+    assert ordinary_report["reads"]["on_target"] == 5
 
 
 def test_report_run_json_propagates_latest_failed_round_metadata(tmp_path: Path) -> None:

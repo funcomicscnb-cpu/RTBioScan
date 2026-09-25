@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -8,12 +9,26 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APPEND_REPORTS = REPO_ROOT / "bin" / "append_reports.pl"
+ROUND_REPORT = REPO_ROOT / "bin" / "report_round_json.pl"
+RUN_REPORT = REPO_ROOT / "bin" / "report_run_json.pl"
 
 DEMUX_SAMPLE = "sample_demo_alpha_1"
 NOADAPTER_SAMPLE = "no_adapter_alpha_beta_1"
 BARCODE = "RTBioScan"
 ROUND_DIR = "round_001"
 DEMUX_IDENTITY_CONTEXT = "full_collapse"
+
+
+def _oracle_normalized_id(raw):
+    return raw.strip().split()[0].split("|")[0] if raw.strip() and raw.strip().upper() != "NA" else ""
+
+
+def _oracle_first_seen_ids(rows, round_read_ids, historical_ids):
+    return {
+        rid for row in rows
+        if (rid := _oracle_normalized_id(row["read_id"]))
+        and rid in round_read_ids and rid not in historical_ids
+    }
 
 READ_INFO_HEADER = [
     "read_id",
@@ -566,6 +581,8 @@ def test_append_reports_emits_first_seen_read_fate_snapshots_and_cache(tmp_path)
     assert len(demux_lines) == 1
     assert len(blast_lines) == 2
     assert blast_lines[1].startswith("demux_read\t")
+    original_demux = round_demux.read_bytes()
+    original_blast = round_blast.read_bytes()
     assert load_nonempty_lines(demux_seen) == ["demux_boundary_row"]
     assert load_nonempty_lines(blast_seen) == ["demux_read"]
     cache_lines = load_nonempty_lines(demux_cache)
@@ -577,19 +594,94 @@ def test_append_reports_emits_first_seen_read_fate_snapshots_and_cache(tmp_path)
     blast_lines = load_nonempty_lines(round_blast)
     cache_lines = load_nonempty_lines(demux_cache)
     assert len(demux_lines) == 1
-    assert len(blast_lines) == 1
+    assert len(blast_lines) == 2  # same-round replay retains its original first-seen BLAST row
+    assert round_demux.read_bytes() == original_demux
+    assert round_blast.read_bytes() == original_blast
+    assert load_nonempty_lines(blast_seen) == ["demux_read"]
     assert len(cache_lines) == 2
+
+
+def test_replay_refuses_malformed_or_inconsistent_retained_snapshot_before_replacement(tmp_path):
+    temp_dir = run_append_reports(tmp_path, include_noadapter=False)
+    retained = tmp_path / ROUND_DIR / f"{BARCODE}_read_fate_blast_first_seen.tsv"
+    blast_seen = temp_dir / f"{BARCODE}_read_fate_blast_seen.tsv"
+    rolling = temp_dir / f"{BARCODE}_read_info_rpt.txt"
+    original_retained = retained.read_bytes()
+    original_seen = blast_seen.read_bytes()
+    original_rolling = rolling.read_bytes()
+    seq_file = tmp_path / "sequencing_template.tsv"
+    pod5_path = tmp_path / f"{ROUND_DIR}.pod5"
+    env = dict(os.environ)
+    env["RTBIOSCAN_DEMUX_IDENTITY_CONTEXT"] = DEMUX_IDENTITY_CONTEXT
+    cmd = ["perl", str(APPEND_REPORTS), ROUND_DIR, str(temp_dir), str(pod5_path), BARCODE, str(seq_file)]
+
+    retained.write_text("wrong_header\n", encoding="utf-8")
+    result = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "malformed retained first-seen snapshot header" in result.stderr
+    assert retained.read_text(encoding="utf-8") == "wrong_header\n"
+    assert blast_seen.read_bytes() == original_seen
+    assert rolling.read_bytes() == original_rolling
+
+    retained.write_bytes(original_retained)
+    blast_seen.write_text("", encoding="utf-8")
+    result = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "absent from cumulative seen state" in result.stderr
+    assert retained.read_bytes() == original_retained
+    assert blast_seen.read_bytes() == b""
+    assert rolling.read_bytes() == original_rolling
 
 
 def test_append_reports_only_snapshots_reads_from_current_round_read_info(tmp_path):
     temp_dir = tmp_path / "temp"
     temp_dir.mkdir(parents=True, exist_ok=True)
-    (tmp_path / "round_001").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "round_002").mkdir(parents=True, exist_ok=True)
+    first_round = "feeder_A_round_001"
+    second_round = "feeder_B_round_001"
+    (tmp_path / first_round).mkdir(parents=True, exist_ok=True)
+    (tmp_path / second_round).mkdir(parents=True, exist_ok=True)
     seq_file = tmp_path / "sequencing_template.tsv"
     sequencing_template(seq_file)
     env = dict(os.environ)
     env["RTBIOSCAN_DEMUX_IDENTITY_CONTEXT"] = DEMUX_IDENTITY_CONTEXT
+
+    old_demux = {
+        "read_id": "r_old", "barcode_by_homology": "COI", "basecalling_model": "hac",
+        "sample": DEMUX_SAMPLE, "platform": "nanopore", "sampling_method": "grab",
+        "subsample": "sub1", "replicate": "1", "identity_scope": "sample",
+        "identity_value": DEMUX_SAMPLE,
+    }
+    old_blast = {
+        "read_id": "r_old", "barcode_by_homology": "COI", "basecalling_model": "hac",
+        "sample": DEMUX_SAMPLE, "hit_id": "hit_old", "taxid": "123",
+        "aln_length": 500, "perc_id": 99.1, "otu_id": "OTUB_1-COI",
+        "otu_taxid": "201", "otu_kingdom": "Metazoa", "otu_phylum": "Chordata",
+        "otu_class": "Aves", "otu_order": "Accipitriformes", "otu_family": "Accipitridae",
+        "otu_genus": "GenusOld", "otu_species": "SpeciesOld",
+    }
+
+    def invoke_round(round_dir: str):
+        pod5_path = tmp_path / f"{round_dir}.pod5"
+        return subprocess.run(
+            ["perl", str(APPEND_REPORTS), round_dir, str(temp_dir), str(pod5_path), BARCODE, str(seq_file)],
+            cwd=tmp_path, env=env, capture_output=True, text=True,
+        )
+
+    def compose_round_report(round_dir: str):
+        out = tmp_path / f"{round_dir}.json"
+        cmd = [
+            "perl", str(ROUND_REPORT), "--run-id", "run001", "--barcode", BARCODE,
+            "--round-barcode", round_dir, "--out", str(out),
+            "--timestamp-utc", "2026-09-25T09:00:00Z",
+            "--targets", "COI", "--target-taxa", "Metazoa",
+            "--read-info", str(tmp_path / f"{BARCODE}_read_info_rpt.txt"),
+            "--on-target", str(tmp_path / f"{BARCODE}_on_target_rpt.txt"),
+            "--read-fate-demult", str(tmp_path / round_dir / f"{BARCODE}_read_fate_demult_first_seen.tsv"),
+            "--read-fate-blast", str(tmp_path / round_dir / f"{BARCODE}_read_fate_blast_first_seen.tsv"),
+        ]
+        result = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        return json.loads(out.read_text(encoding="utf-8"))
 
     def run_round(round_dir: str, read_info_rows, on_target_rows, demult_rows, blast_rows) -> None:
         write_tsv(tmp_path / f"{BARCODE}_read_info_rpt.txt", READ_INFO_HEADER, read_info_rows)
@@ -612,23 +704,11 @@ def test_append_reports_only_snapshots_reads_from_current_round_read_info(tmp_pa
         )
         pod5_path = tmp_path / f"{round_dir}.pod5"
         pod5_path.write_bytes(b"test")
-        subprocess.run(
-            [
-                "perl",
-                str(APPEND_REPORTS),
-                round_dir,
-                str(temp_dir),
-                str(pod5_path),
-                BARCODE,
-                str(seq_file),
-            ],
-            check=True,
-            cwd=tmp_path,
-            env=env,
-        )
+        result = invoke_round(round_dir)
+        assert result.returncode == 0, result.stderr
 
     run_round(
-        "round_001",
+        first_round,
         [
             {
                 "read_id": "r_old",
@@ -644,13 +724,20 @@ def test_append_reports_only_snapshots_reads_from_current_round_read_info(tmp_pa
             }
         ],
         [{"read_id": "r_old", "barcode": DEMUX_SAMPLE, "on_target_kingdom": "ON_TARGET"}],
-        [],
-        [],
+        [old_demux],
+        [old_blast],
     )
+    first_report = compose_round_report(first_round)
 
     run_round(
-        "round_002",
+        second_round,
         [
+            {
+                "read_id": "r_old", "filename": "round1.pod5", "run_id": "run001",
+                "barcode": DEMUX_SAMPLE, "fast_length": 100, "fast_mean_qscore": 10,
+                "hac_length": 100, "hac_mean_qscore": 12, "sup_length": 100,
+                "sup_mean_qscore": 15,
+            },
             {
                 "read_id": "r_new",
                 "filename": "round2.pod5",
@@ -664,20 +751,12 @@ def test_append_reports_only_snapshots_reads_from_current_round_read_info(tmp_pa
                 "sup_mean_qscore": 15,
             }
         ],
-        [{"read_id": "r_new", "barcode": DEMUX_SAMPLE, "on_target_kingdom": "ON_TARGET"}],
         [
-            {
-                "read_id": "r_old",
-                "barcode_by_homology": "COI",
-                "basecalling_model": "hac",
-                "sample": DEMUX_SAMPLE,
-                "platform": "nanopore",
-                "sampling_method": "grab",
-                "subsample": "sub1",
-                "replicate": "1",
-                "identity_scope": "sample",
-                "identity_value": DEMUX_SAMPLE,
-            },
+            {"read_id": "r_old", "barcode": DEMUX_SAMPLE, "on_target_kingdom": "ON_TARGET"},
+            {"read_id": "r_new", "barcode": DEMUX_SAMPLE, "on_target_kingdom": "ON_TARGET"},
+        ],
+        [
+            old_demux,
             {
                 "read_id": "r_new",
                 "barcode_by_homology": "COI",
@@ -692,25 +771,7 @@ def test_append_reports_only_snapshots_reads_from_current_round_read_info(tmp_pa
             },
         ],
         [
-            {
-                "read_id": "r_old",
-                "barcode_by_homology": "COI",
-                "basecalling_model": "hac",
-                "sample": DEMUX_SAMPLE,
-                "hit_id": "hit_old",
-                "taxid": "123",
-                "aln_length": 500,
-                "perc_id": 99.1,
-                "otu_id": "OTUB_1-COI",
-                "otu_taxid": "201",
-                "otu_kingdom": "Metazoa",
-                "otu_phylum": "Chordata",
-                "otu_class": "Aves",
-                "otu_order": "Accipitriformes",
-                "otu_family": "Accipitridae",
-                "otu_genus": "GenusOld",
-                "otu_species": "SpeciesOld",
-            },
+            old_blast,
             {
                 "read_id": "r_new",
                 "barcode_by_homology": "COI",
@@ -732,20 +793,80 @@ def test_append_reports_only_snapshots_reads_from_current_round_read_info(tmp_pa
             },
         ],
     )
+    second_report = compose_round_report(second_round)
 
-    round1_demux = load_nonempty_lines(tmp_path / "round_001" / f"{BARCODE}_read_fate_demult_first_seen.tsv")
-    round1_blast = load_nonempty_lines(tmp_path / "round_001" / f"{BARCODE}_read_fate_blast_first_seen.tsv")
-    round2_demux = load_nonempty_lines(tmp_path / "round_002" / f"{BARCODE}_read_fate_demult_first_seen.tsv")
-    round2_blast = load_nonempty_lines(tmp_path / "round_002" / f"{BARCODE}_read_fate_blast_first_seen.tsv")
+    round1_demux = load_nonempty_lines(tmp_path / first_round / f"{BARCODE}_read_fate_demult_first_seen.tsv")
+    round1_blast = load_nonempty_lines(tmp_path / first_round / f"{BARCODE}_read_fate_blast_first_seen.tsv")
+    round2_demux = load_nonempty_lines(tmp_path / second_round / f"{BARCODE}_read_fate_demult_first_seen.tsv")
+    round2_blast = load_nonempty_lines(tmp_path / second_round / f"{BARCODE}_read_fate_blast_first_seen.tsv")
 
-    assert len(round1_demux) == 1
-    assert len(round1_blast) == 1
+    assert len(round1_demux) == 2
+    assert len(round1_blast) == 2
     assert len(round2_demux) == 2
     assert len(round2_blast) == 2
     assert round2_demux[1].startswith("r_new\t")
     assert round2_blast[1].startswith("r_new\t")
     assert not any(line.startswith("r_old\t") for line in round2_demux[1:])
     assert not any(line.startswith("r_old\t") for line in round2_blast[1:])
+
+    with (tmp_path / f"{BARCODE}_read_info_rpt.txt").open(encoding="utf-8") as handle:
+        round_ids = {_oracle_normalized_id(row["read_id"]) for row in csv.DictReader(handle, delimiter="\t")}
+    historical_demux = {_oracle_normalized_id(line.split("\t")[0]) for line in round1_demux[1:]}
+    historical_blast = {_oracle_normalized_id(line.split("\t")[0]) for line in round1_blast[1:]}
+    with (tmp_path / f"{BARCODE}_demult_rpt.txt").open(encoding="utf-8") as handle:
+        demux_rows = list(csv.DictReader(handle, delimiter="\t"))
+    with (tmp_path / f"{BARCODE}_blast_otu_pretax_rpt.txt").open(encoding="utf-8") as handle:
+        blast_rows = list(csv.DictReader(handle, delimiter="\t"))
+    assert _oracle_first_seen_ids(demux_rows, round_ids, historical_demux) == {"r_new"}
+    assert _oracle_first_seen_ids(blast_rows, round_ids, historical_blast) == {"r_new"}
+
+    second_demux_path = tmp_path / second_round / f"{BARCODE}_read_fate_demult_first_seen.tsv"
+    second_blast_path = tmp_path / second_round / f"{BARCODE}_read_fate_blast_first_seen.tsv"
+    original_demux = second_demux_path.read_bytes()
+    original_blast = second_blast_path.read_bytes()
+    result = invoke_round(second_round)
+    assert result.returncode == 0, result.stderr
+    assert second_demux_path.read_bytes() == original_demux
+    assert second_blast_path.read_bytes() == original_blast
+    assert load_nonempty_lines(temp_dir / f"{BARCODE}_read_fate_demux_seen.tsv") == ["r_new", "r_old"]
+    assert load_nonempty_lines(temp_dir / f"{BARCODE}_read_fate_blast_seen.tsv") == ["r_new", "r_old"]
+    replay_report = compose_round_report(second_round)
+    assert replay_report["read_fate"] == second_report["read_fate"]
+    assert not any("missing_or_unusable" in code for code in replay_report["read_fate"]["data_reason_codes"])
+
+    history = temp_dir / "report_history.jsonl"
+    history.write_text("\n".join(json.dumps(report) for report in (first_report, replay_report)) + "\n", encoding="utf-8")
+    run_out = tmp_path / "run_report.json"
+    result = subprocess.run(
+        ["perl", str(RUN_REPORT), "--history", str(history), "--out", str(run_out),
+         "--run-id", "run001", "--barcode", BARCODE, "--outdir", "results",
+         "--report-rel-path", "runs/run001/report.html"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    run_report = json.loads(run_out.read_text(encoding="utf-8"))
+    assert run_report["rounds_count"] == 2
+    assert run_report["run_totals"]["reads"]["total"] == 3
+    assert run_report["run_summary"]["reads"]["total"] == 2
+
+    third_round = "feeder_B_round_002"
+    (tmp_path / third_round).mkdir()
+    third_demux = dict(old_demux, read_id="r_third")
+    third_blast = dict(old_blast, read_id="r_third", otu_id="OTUB_3-COI")
+    run_round(
+        third_round,
+        [{"read_id": "r_third", "filename": "round3.pod5", "run_id": "run001",
+          "barcode": DEMUX_SAMPLE, "fast_length": 102, "fast_mean_qscore": 10,
+          "hac_length": 102, "hac_mean_qscore": 12, "sup_length": 102,
+          "sup_mean_qscore": 15}],
+        [{"read_id": "r_third", "barcode": DEMUX_SAMPLE, "on_target_kingdom": "ON_TARGET"}],
+        [old_demux, third_demux], [old_blast, third_blast],
+    )
+    third_demux_lines = load_nonempty_lines(tmp_path / third_round / f"{BARCODE}_read_fate_demult_first_seen.tsv")
+    third_blast_lines = load_nonempty_lines(tmp_path / third_round / f"{BARCODE}_read_fate_blast_first_seen.tsv")
+    assert len(third_demux_lines) == len(third_blast_lines) == 2
+    assert third_demux_lines[1].startswith("r_third\t")
+    assert third_blast_lines[1].startswith("r_third\t")
 
 
 def test_matched_reads_cumulative_is_sticky_on_target(tmp_path):

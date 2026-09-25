@@ -927,6 +927,20 @@ sub count_rows {
   return $count;
 }
 
+sub count_unique_live_read_ids {
+  my ($path, $target_column, $target_value) = @_;
+  my $rows = get_parsed_rows($path);
+  return undef unless defined $rows;
+  my %seen;
+  for my $row (@$rows) {
+    next if defined $target_column
+      && uc($row->{$target_column} // '') ne $target_value;
+    my $rid = normalize_read_id($row->{read_id});
+    $seen{$rid} = 1 if $rid ne '';
+  }
+  return scalar keys %seen;
+}
+
 sub count_non_na_in_column {
   my ($path, $header_name) = @_;
   return undef unless defined $path && $path ne '';
@@ -4956,9 +4970,16 @@ get_parsed_rows($opt{demult});
 
 my $reads_total    = count_rows($opt{read_info}, 1);
 my $reads_on_target= count_value_in_column($opt{on_target}, 'on_target_kingdom', 'ON_TARGET');
+if ($opt{read_fate_live_current}) {
+  $reads_total = count_unique_live_read_ids($opt{read_info});
+  $reads_on_target = count_unique_live_read_ids($opt{on_target}, 'on_target_kingdom', 'ON_TARGET')
+    if defined $reads_on_target;
+}
 if (!defined $reads_on_target) {
   # Backward-compatible fallback for legacy on_target reports that only include target hits.
-  $reads_on_target = count_rows($opt{on_target}, 1);
+  $reads_on_target = $opt{read_fate_live_current}
+    ? count_unique_live_read_ids($opt{on_target})
+    : count_rows($opt{on_target}, 1);
   if (defined $reads_on_target && defined $opt{on_target} && $opt{on_target} ne '') {
     warn_once("on_target_count_fallback_rows:$opt{on_target}");
   }
