@@ -2032,6 +2032,7 @@
     if (!text) return "";
     if (reportIdentityMode === "track" && groupViewMode === "track_detail") return text;
     if (reportIdentityMode === "track" && groupViewMode === "replicate") return text;
+    if (reportIdentityMode === "collapse") return text;
     return normalizeBase(text);
   }
 

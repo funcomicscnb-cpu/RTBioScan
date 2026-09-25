@@ -2579,3 +2579,175 @@ def test_render_stage_three_views_isolate_output_paths(tmp_path: Path) -> None:
         "report_assets_replicates/embedded/run_reads_fate.pdf",
         "report_assets_replicates_primers/embedded/run_reads_fate.pdf",
     ]
+
+
+def test_report_js_collapse_uses_producer_sample_identity_and_keeps_panels_separate() -> None:
+    node_path = shutil.which("node")
+    if node_path is None:
+        pytest.skip("node not found in PATH")
+    producer = _load_report_render_module()
+    source_forms = ("W_eDNA_1_COI", "W_eDNA_2_COI")
+    labels = [producer.sample_group_label(value, collapse_track_units=True) for value in source_forms]
+    assert labels == ["W_eDNA_1", "W_eDNA_2"]
+    assert [producer.sample_group_label(value.replace("_COI", "_ITS2"), collapse_track_units=True)
+            for value in source_forms] == labels
+
+    source = JS.read_text(encoding="utf-8")
+
+    def extract(name: str) -> str:
+        start = source.index(f"  function {name}(")
+        opening = source.index(") {", start) + 2
+        depth = 0
+        for position in range(opening, len(source)):
+            if source[position] == "{":
+                depth += 1
+            elif source[position] == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:position + 1]
+        raise AssertionError(name)
+
+    functions = "\n".join(extract(name) for name in (
+        "canonicalMarkerToken", "markerOrderFromData", "normalizeBase", "groupEntityLabel",
+        "currentGroupLabel", "stableDomId", "currentGroupId", "metricGroupLabel",
+        "assignmentGroupLabel", "hasTrackUnitMetrics", "trackSampleReplicateLabel",
+        "mergeMarkerCounts", "getGroupedSampleMetricEntries", "aggregateSampleMetricEntries",
+        "getSampleRoundSnapshot", "countSampleAssignmentsByLevel", "makeAssetLink",
+        "detectDemuxEnabled", "appendFigureCard", "renderFigureGallery",
+        "renderSampleEvolutionSection", "renderSampleSections",
+    ))
+    harness = r'''
+class Element {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase();
+    this.children = [];
+    this.className = "";
+    this.textContent = "";
+    this.dataset = {};
+  }
+  appendChild(child) { this.children.push(child); return child; }
+  setAttribute(name, value) { this[name] = value; }
+}
+const document = { createElement(tag) { return new Element(tag); } };
+const get = (obj, path, fallback) => {
+  let value = obj;
+  for (const key of path) value = value && value[key];
+  return value == null ? fallback : value;
+};
+const num = (value) => typeof value === "number" && Number.isFinite(value) ? value : 0;
+const sampleIndex = new Element("div");
+const sampleDetails = new Element("div");
+const viewScope = "run";
+const groupViewMode = "sample";
+let rounds = [];
+let reportIdentityMode = "collapse";
+const drawDemuxByMarkerPerSample = () => {};
+const renderCurrentSampleResults = (panel, entry) => {
+  panel.sample = {
+    label: panel.children[0].children[0].textContent,
+    reads: entry.totals.reads_demux,
+    otus: entry.current.otu_total,
+    taxa: countSampleAssignmentsByLevel(rounds[0], entry.label, "otu").species,
+    members: rounds[0].otu.assignments_by_level.species
+      .filter((row) => assignmentGroupLabel(row) === entry.label).map((row) => row.taxon),
+  };
+};
+function links(node, tag) {
+  const own = node.tagName === tag && (node.href || node.src) ? [node.href || node.src] : [];
+  return own.concat(...node.children.map((child) => links(child, tag)));
+}
+function render(entries, identityMode, reverse, marker = "COI") {
+  reportIdentityMode = identityMode;
+  sampleDetails.children = [];
+  const ordered = reverse ? entries.slice().reverse() : entries;
+  rounds = [{
+    identity_mode: identityMode,
+    read_fate: {demux_enabled: true},
+    round_barcode: "round_001",
+    markers: {order: [marker]},
+    sample_metrics: Object.fromEntries(ordered.map((entry) => [entry.id, {
+      label: entry.label,
+      reads_demux: entry.reads,
+      otu_total: entry.otus,
+      figures: [{id: "sample_reads_time_history", section: "Other", exists: true,
+        path: entry.png, pdf_exists: true, pdf_path: entry.pdf}],
+    }])),
+    otu: {assignments_by_level: {species: ordered.map((entry) => ({
+      sample: entry.label, taxon: entry.taxon,
+    }))}},
+  }];
+  renderSampleSections();
+  return sampleDetails.children.map((panel) => ({
+    ...panel.sample,
+    pdf: links(panel, "A").filter((href) => href.endsWith(".pdf")),
+    png: links(panel, "IMG"),
+  }));
+}
+console.log(JSON.stringify({
+  forward: render(INPUT, "collapse", false),
+  reverse: render(INPUT, "collapse", true),
+  ordinary: render(ORDINARY, "collapse", false),
+  final: render(FINAL, "collapse", false),
+  broad: render(INPUT, "collapse", false, "ITS2"),
+  track: render(TRACK, "track", false),
+}));
+'''
+    collision = [
+        {"id": f"id_{i}", "label": label, "reads": 10 * i, "otus": i,
+         "taxon": f"Taxon {i}", "png": f"figures/{label}.png", "pdf": f"figures/{label}.pdf"}
+        for i, label in enumerate(labels, 1)
+    ]
+    ordinary = [dict(collision[0], label="lakeA"), dict(collision[1], label="siteB")]
+    final = [dict(collision[0], label="control"), dict(collision[1], label="blank")]
+    track = [dict(collision[0], label="W_eDNA_1_COI"), dict(collision[1], label="W_eDNA_2_COI")]
+    inputs = "\n".join(f"const {key} = {json.dumps(value)};" for key, value in (
+        ("INPUT", collision), ("ORDINARY", ordinary), ("FINAL", final), ("TRACK", track),
+    ))
+
+    def run(js_functions: str) -> dict:
+        result = subprocess.run([node_path, "-e", inputs + js_functions + harness],
+                                capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    def expected(entries: list[dict]) -> dict:
+        return {entry["label"]: {
+            "label": entry["label"], "reads": entry["reads"], "otus": entry["otus"],
+            "taxa": 1, "members": [entry["taxon"]],
+            "pdf": [entry["pdf"]], "png": [entry["png"]],
+        } for entry in entries}
+
+    def by_label(panels: list[dict]) -> dict:
+        return {panel["label"]: panel for panel in panels}
+
+    result = run(functions)
+    for key in ("forward", "reverse", "broad"):
+        assert len(result[key]) == 2
+        assert by_label(result[key]) == expected(collision)
+    assert result["forward"] == result["reverse"]
+    assert by_label(result["ordinary"]) == expected(ordinary)
+    assert by_label(result["final"]) == expected(final)
+    assert {label: (panel["reads"], panel["otus"], panel["taxa"], panel["members"])
+            for label, panel in by_label(result["track"]).items()} == {
+        label: (entry["reads"], entry["otus"], 1, [entry["taxon"]])
+        for label, entry in zip(labels, track)
+    }
+
+    mutants = {
+        "double_clean": functions.replace('if (reportIdentityMode === "collapse") return text;',
+                                          'if (reportIdentityMode === "collapse") return normalizeBase(text);'),
+        "merge_then_deduplicate": functions.replace(
+            'const groupId = useTrackUnitMetrics ? currentGroupId(label) : currentGroupId(label);',
+            'const groupId = currentGroupId(normalizeBase(label));'),
+        "display_second_clean": functions.replace('h.textContent = s.label;',
+                                                   'h.textContent = normalizeBase(s.label);'),
+        "figure_based_group": functions.replace(
+            'const groupId = useTrackUnitMetrics ? currentGroupId(label) : currentGroupId(label);',
+            'const groupId = currentGroupId(raw.figures && raw.figures.length ? "has_figure" : label);'),
+    }
+    for name, mutant in mutants.items():
+        assert mutant != functions, name
+        observed = run(mutant)
+        assert (len(observed["forward"]) != 2
+                or by_label(observed["forward"]) != expected(collision)
+                or by_label(observed["reverse"]) != expected(collision)), name
