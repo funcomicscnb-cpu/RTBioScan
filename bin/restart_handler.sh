@@ -10,6 +10,10 @@ FORCE="${FORCE}"
 OPERATION_ID="${OPERATION_ID:-}"
 
 if [ -z "$OUTDIR" ]; then
+    if [ "$MODE" = "reset" ]; then
+        printf 'ERROR: output root does not exist; reset will not create it: <empty>\n' 1>&2
+        exit 1
+    fi
     exit 0
 fi
 
@@ -59,9 +63,128 @@ case "$RUN_NAME" in
         ;;
 esac
 
-mkdir -p "${OUTDIR}/temp"
+if [ "$MODE" = "reset" ]; then
+    if [ "${RTB_RESET_SUPERVISED:-}" != "1" ]; then
+        RTB_RESET_USER_OUTDIR="$OUTDIR"
+        unset RTB_RESET_SUFFIX_IDS
+        # Keep a trailing marker so command substitution preserves even a
+        # canonical pathname ending in a newline. Parse the numeric tail.
+        reset_root_info="$(perl -MCwd=realpath -MFcntl=:mode -MErrno=ENOENT -e '
+            my ($user) = @ARGV;
+            my @entry = lstat($user);
+            if (!@entry && $! == ENOENT) {
+                die "ERROR: output root does not exist; reset will not create it: $user\n";
+            }
+            die "ERROR: cannot inspect reset output root $user: $!\n" unless @entry;
+            my $canonical = realpath($user);
+            die "ERROR: cannot resolve reset output root $user: $!\n" unless defined($canonical);
+            my @root = lstat($canonical);
+            die "ERROR: reset output root is not a directory: $user\n"
+                unless @root && S_ISDIR($root[2]);
+            print $canonical, "\n", $root[0], "\n", $root[1], ".";
+        ' "$RTB_RESET_USER_OUTDIR")" || exit 1
+        reset_root_info="${reset_root_info%.}"
+        RTB_RESET_ROOT_INO="${reset_root_info##*$'\n'}"
+        reset_root_info="${reset_root_info%$'\n'*}"
+        RTB_RESET_ROOT_DEV="${reset_root_info##*$'\n'}"
+        OUTDIR="${reset_root_info%$'\n'*}"
+        export OUTDIR RTB_RESET_USER_OUTDIR RTB_RESET_ROOT_DEV RTB_RESET_ROOT_INO
+        exec 8< "$OUTDIR"
+    fi
+    verify_reset_root() {
+        perl -MCwd=realpath -MFcntl=:mode -e '
+            my ($user, $canonical, $dev, $ino, $state_id) = @ARGV;
+            die "ERROR: missing reset output-root identity\n"
+                unless defined($user) && defined($canonical)
+                    && defined($dev) && $dev =~ /\A[0-9]+\z/
+                    && defined($ino) && $ino =~ /\A[0-9]+\z/;
+            open(my $pinned, "<&8") or die "ERROR: missing pinned reset output root\n";
+            my $resolved = realpath($user);
+            my @held = stat($pinned); my @current = lstat($canonical);
+            die "ERROR: reset output root identity changed: $user\n"
+                unless defined($resolved) && $resolved eq $canonical
+                    && @held && @current && S_ISDIR($current[2])
+                    && $held[0] == $dev && $held[1] == $ino
+                    && $current[0] == $dev && $current[1] == $ino;
+            if (defined($ENV{RTB_RESET_SUFFIX_IDS})) {
+                my @ids = split /,/, $ENV{RTB_RESET_SUFFIX_IDS}, -1;
+                my @parts = ("temp", "ongoing", "state", $state_id, "_state");
+                die "ERROR: missing reset suffix identity\n" unless @ids == @parts;
+                my $path = $canonical;
+                for my $i (0 .. $#parts) {
+                    $path .= "/$parts[$i]";
+                    my @st = lstat($path);
+                    die "ERROR: reset suffix inode changed: $path\n"
+                        unless @st && S_ISDIR($st[2])
+                            && "$st[0]:$st[1]" eq $ids[$i];
+                }
+            }
+        ' "$RTB_RESET_USER_OUTDIR" "$OUTDIR" \
+            "$RTB_RESET_ROOT_DEV" "$RTB_RESET_ROOT_INO" "$STATE_ID"
+    }
+    verify_reset_root || exit 1
+    SENTINEL="${OUTDIR}/temp/.restart_applied.${STATE_ID}"
+    LOCKDIR="${SENTINEL}.lockdir"
+    SENTINEL_TMP="${SENTINEL}.tmp.${OPERATION_ID}"
+fi
 
-if [ "${RTB_JOINT_RESTART_OWNER:-}" != "$$" ]; then
+if [ "$MODE" = "reset" ]; then
+    # temp is the first permitted control-plane ancestor. Validate its real
+    # inode before the existing restart lockdir is created inside it.
+    perl -MFcntl=:mode -MErrno=EEXIST,ENOENT -e '
+        my ($outdir, $temp) = @ARGV;
+        umask 077;
+        my @base = lstat($outdir);
+        die "ERROR: reset output root identity changed: $outdir\n"
+            unless @base && S_ISDIR($base[2]);
+        my @st = lstat($temp);
+        if (!@st) {
+            die "ERROR: cannot inspect reset ancestor $temp: $!\n" unless $! == ENOENT;
+            if (!mkdir($temp, 0700)) {
+                die "ERROR: cannot initialize reset ancestor $temp: $!\n" unless $! == EEXIST;
+            }
+            @st = lstat($temp);
+        }
+        die "ERROR: unsafe reset ancestor $temp\n"
+            unless @st && S_ISDIR($st[2]);
+    ' "$OUTDIR" "${OUTDIR}/temp" || exit 1
+else
+    mkdir -p "${OUTDIR}/temp"
+fi
+
+if [ "${RTB_RESTART_DIR_LOCKED:-}" = "1" ]; then
+    perl -MFcntl=:flock,:mode -e '
+        my ($path) = @ARGV;
+        open(my $dir, "<&9") or die "ERROR: missing inherited restart directory lock\n";
+        my @a = stat($dir); my @b = lstat($path);
+        die "ERROR: invalid inherited restart directory lock\n"
+            unless @a && @b && S_ISDIR($b[2]) && $a[0] == $b[0] && $a[1] == $b[1];
+        flock($dir, LOCK_EX | LOCK_NB)
+            or die "ERROR: inherited restart directory lock is not held\n";
+    ' "${OUTDIR}/temp" || exit 1
+else
+    # Serialize both modes on the existing temp inode. Reset cannot create
+    # and remove the old lockdir: that would alter temp mtime on a refusal.
+    # This startup lock is separate from the stable _state reset barrier.
+    exec 9< "${OUTDIR}/temp"
+    perl -MFcntl=:flock -MTime::HiRes=time,sleep -MErrno=EWOULDBLOCK,EAGAIN -e '
+        my ($wait) = @ARGV;
+        die "ERROR: invalid restart lock timeout\n"
+            unless defined($wait) && $wait =~ /\A[0-9]+\z/ && $wait <= 86400;
+        open(my $dir, "<&9") or die "ERROR: cannot open restart directory descriptor: $!\n";
+        my $deadline = time() + $wait;
+        while (!flock($dir, LOCK_EX | LOCK_NB)) {
+            die "ERROR: cannot acquire restart directory lock: $!\n"
+                unless $! == EWOULDBLOCK || $! == EAGAIN;
+            die "ERROR: timed out acquiring restart directory lock\n" if time() >= $deadline;
+            sleep 0.05;
+        }
+    ' "$LOCK_WAIT" || exit 1
+    export RTB_RESTART_DIR_LOCKED=1
+fi
+
+if [ "$MODE" = "restore" ] &&
+   [ "${RTB_JOINT_RESTART_OWNER:-}" != "$$" ]; then
 waited=0
 while ! mkdir "$LOCKDIR" 2>/dev/null; do
     sleep 1
@@ -84,7 +207,9 @@ cleanup_restart_handler() {
     if [ "$SENTINEL_TMP_OWNED" -eq 1 ]; then
         rm -f "$SENTINEL_TMP" 2>/dev/null || true
     fi
-    rmdir "$LOCKDIR" 2>/dev/null || true
+    if [ "$MODE" = "restore" ] && [ "${RTB_JOINT_RESTART_OWNER:-}" != "$$" ]; then
+        rmdir "$LOCKDIR" 2>/dev/null || true
+    fi
     exit "$status"
 }
 trap 'cleanup_restart_handler "$?"' EXIT
@@ -284,6 +409,177 @@ case "${BASH_SOURCE[0]}" in
     */*) RESTART_HANDLER_DIR="$PWD/${BASH_SOURCE[0]%/*}" ;;
     *) RESTART_HANDLER_DIR="$PWD" ;;
 esac
+case "${BASH_SOURCE[0]}" in
+    /*) RESET_HANDLER_PATH="${BASH_SOURCE[0]}" ;;
+    *) RESET_HANDLER_PATH="$PWD/${BASH_SOURCE[0]}" ;;
+esac
+
+# Mandatory Stage A contract: a writer first opens and takes a shared lock on
+# this exact barrier, before opening, creating, adopting, or modifying any
+# per-state lock or fence. It retains the shared descriptor through every
+# writing descendant, then takes its per-state kernel lock, compatibility
+# fence, and only then mutates protected state.
+# Reset takes the exclusive barrier and retains it with every governed lock
+# descriptor through the complete wipe and applied-sentinel publication.
+# Any future A2 or Stage B stable kernel-lock name must be added to the two
+# declared lists and the scan allow-list in the same reviewed candidate.
+RESET_BARRIER="$ONGOING_STATE/.rtbioscan_state_reset.flock"
+if [ "$MODE" = "reset" ]; then
+    if [ "${RTB_RESET_SUPERVISED:-}" = "1" ]; then
+        # A caller cannot bypass supervision by setting the environment flag:
+        # every inherited descriptor must still lock the expected stable inode.
+        perl -MFcntl=:flock,:mode -e '
+            my ($root, $fds) = @ARGV;
+            my @names = (".rtbioscan_state_reset.flock",
+                ".dorado.lock.flock", ".blastreport.lock.flock",
+                ".blastreport_sup.lock.flock", ".qced_reads.lock.flock",
+                ".otu_size_streak.lock.flock", ".sup_basecall_cache.lock.flock",
+                ".done_pod5.lock.flock");
+            my @fds = split /,/, $fds, -1;
+            die "ERROR: missing reset lock descriptors\n" unless @fds == @names;
+            for my $i (0 .. $#names) {
+                die "ERROR: invalid reset lock descriptor\n" unless $fds[$i] =~ /^[0-9]+$/;
+                open(my $fh, "<&$fds[$i]") or die "ERROR: missing reset lock descriptor\n";
+                my @a = stat($fh); my @b = lstat("$root/$names[$i]");
+                die "ERROR: reset control inode changed: $names[$i]\n"
+                    unless @a && @b && S_ISREG($b[2]) && $a[0] == $b[0] && $a[1] == $b[1]
+                        && $b[3] <= 1 && ($i != 0 || $b[7] == 0);
+                flock($fh, LOCK_EX | LOCK_NB)
+                    or die "ERROR: reset control descriptor is not locked: $names[$i]\n";
+            }
+        ' "$ONGOING_STATE" "${RTB_RESET_FDS:-}" || exit 1
+    else
+        # Perl owns the stable open descriptions, then execs this script. The
+        # outer shell keeps the existing restart serialization until it returns.
+        if perl - "$OUTDIR" "$STATE_ID" "$RESET_HANDLER_PATH" "$LOCK_WAIT" <<'RESET_PERL'
+use strict;
+use warnings;
+use Fcntl qw(:DEFAULT :flock :mode F_SETFD);
+use Errno qw(EEXIST ENOENT EWOULDBLOCK EAGAIN);
+use Time::HiRes qw(time sleep);
+use Cwd qw(realpath);
+my ($outdir, $state_id, $script, $wait) = @ARGV;
+die "ERROR: invalid reset barrier timeout\n" unless defined($wait) && $wait =~ /\A[0-9]+\z/ && $wait <= 86400;
+umask 077;
+sub verify_root {
+    my $user = $ENV{RTB_RESET_USER_OUTDIR};
+    my $dev = $ENV{RTB_RESET_ROOT_DEV};
+    my $ino = $ENV{RTB_RESET_ROOT_INO};
+    die "ERROR: missing reset output-root identity\n"
+        unless defined($user) && defined($dev) && $dev =~ /\A[0-9]+\z/
+            && defined($ino) && $ino =~ /\A[0-9]+\z/;
+    open(my $pinned, "<&8") or die "ERROR: missing pinned reset output root\n";
+    my $resolved = realpath($user);
+    my @held = stat($pinned); my @current = lstat($outdir);
+    die "ERROR: reset output root identity changed: $user\n"
+        unless defined($resolved) && $resolved eq $outdir
+            && @held && @current && S_ISDIR($current[2])
+            && $held[0] == $dev && $held[1] == $ino
+            && $current[0] == $dev && $current[1] == $ino;
+}
+verify_root();
+my $root = "$outdir/temp";
+my @suffix_ids;
+my @temp_st = lstat($root);
+die "ERROR: unsafe reset ancestor $root\n" unless @temp_st && S_ISDIR($temp_st[2]);
+push @suffix_ids, "$temp_st[0]:$temp_st[1]";
+for my $part ('ongoing', 'state', $state_id, '_state') {
+    $root .= "/$part";
+    my @st = lstat($root);
+    if (!@st) {
+        die "ERROR: cannot inspect reset state root $root: $!\n" unless $! == ENOENT;
+        if (!mkdir($root, 0700)) {
+            die "ERROR: cannot initialize reset state root $root: $!\n" unless $! == EEXIST;
+        }
+        @st = lstat($root);
+    }
+    die "ERROR: round-lock state-fence path is a symlink: $root\n"
+        if $part eq '_state' && @st && S_ISLNK($st[2]);
+    die "ERROR: unsafe reset state root $root\n"
+        unless @st && S_ISDIR($st[2]);
+    push @suffix_ids, "$st[0]:$st[1]";
+}
+sub verify_suffix {
+    my $path = "$outdir";
+    my @parts = ('temp', 'ongoing', 'state', $state_id, '_state');
+    for my $i (0 .. $#parts) {
+        $path .= "/$parts[$i]";
+        my @st = lstat($path);
+        die "ERROR: reset suffix inode changed: $path\n"
+            unless @st && S_ISDIR($st[2])
+                && "$st[0]:$st[1]" eq $suffix_ids[$i];
+    }
+}
+my @names = ('.rtbioscan_state_reset.flock',
+    '.dorado.lock.flock', '.blastreport.lock.flock',
+    '.blastreport_sup.lock.flock', '.qced_reads.lock.flock',
+    '.otu_size_streak.lock.flock', '.sup_basecall_cache.lock.flock',
+    '.done_pod5.lock.flock');
+my @handles;
+sub stable_open {
+    my ($path, $is_barrier) = @_;
+    my @before = lstat($path);
+    my $fh;
+    if (!@before) {
+        die "ERROR: cannot inspect reset control $path: $!\n" unless $! == ENOENT;
+        if (!sysopen($fh, $path, O_RDWR | O_CREAT | O_EXCL, 0600)) {
+            die "ERROR: cannot initialize reset control $path: $!\n" unless $! == EEXIST;
+            undef $fh;
+        }
+    }
+    @before = lstat($path);
+    die "ERROR: unsafe reset control $path\n"
+        unless @before && S_ISREG($before[2]) && $before[3] <= 1
+            && (!$is_barrier || $before[7] == 0);
+    sysopen($fh, $path, O_RDONLY) or die "ERROR: cannot open reset control $path: $!\n"
+        unless defined($fh);
+    my @opened = stat($fh);
+    my @current = lstat($path);
+    die "ERROR: reset control inode changed: $path\n"
+        unless @opened && @current && S_ISREG($current[2])
+            && $opened[0] == $before[0] && $opened[1] == $before[1]
+            && $opened[0] == $current[0] && $opened[1] == $current[1];
+    fcntl($fh, F_SETFD, 0) or die "ERROR: cannot retain reset control descriptor: $path: $!\n";
+    return $fh;
+}
+my $barrier = stable_open("$root/$names[0]", 1);
+my $deadline = time() + $wait;
+while (!flock($barrier, LOCK_EX | LOCK_NB)) {
+    die "ERROR: cannot acquire exclusive reset barrier $root/$names[0]: $!\n"
+        unless $! == EWOULDBLOCK || $! == EAGAIN;
+    die "ERROR: timed out acquiring exclusive reset barrier $root/$names[0]\n"
+        if time() >= $deadline;
+    sleep 0.05;
+}
+push @handles, $barrier;
+verify_root();
+verify_suffix();
+for my $i (1 .. $#names) {
+    my $path = "$root/$names[$i]";
+    my $fh = stable_open($path, 0);
+    die "ERROR: active governed reset lock $path\n"
+        unless flock($fh, LOCK_EX | LOCK_NB);
+    push @handles, $fh;
+}
+for my $i (0 .. $#names) {
+    my $path = "$root/$names[$i]";
+    my @a = stat($handles[$i]); my @b = lstat($path);
+    die "ERROR: reset control inode changed: $path\n"
+        unless @a && @b && S_ISREG($b[2]) && $a[0] == $b[0] && $a[1] == $b[1];
+}
+$ENV{RTB_RESET_SUPERVISED} = '1';
+$ENV{RTB_RESET_FDS} = join(',', map { fileno($_) } @handles);
+$ENV{RTB_RESET_SUFFIX_IDS} = join(',', @suffix_ids);
+exec '/bin/bash', $script or die "ERROR: cannot exec supervised reset: $!\n";
+RESET_PERL
+        then
+            RESTART_HANDLER_SUCCESS=1
+            exit 0
+        else
+            exit "$?"
+        fi
+    fi
+fi
 
 # The cumulative BLAST OTU generation is restored with its authority, never as
 # bare public tables (RTBioScan::R4DCumulative::restore_cli): `prepare`
@@ -332,6 +628,34 @@ wipe_dir_contents() {
     fi
     # Parser-state transaction artifacts are excluded explicitly; do not rely on hidden-dir glob omission.
     rm -rf "$dir/.parser_state_txn"
+}
+
+# Keep the state directory itself and its stable control inodes. The parent
+# reset removed _state as one item; deleting that directory would unlink a
+# locked inode and allow a second writer to lock a replacement pathname.
+wipe_reset_ongoing() {
+    local item name dotglob_was_set=0
+    local items=()
+    [ -d "$ONGOING" ] || return 0
+    items=( "$ONGOING"/* )
+    for item in ${items[@]+"${items[@]}"}; do
+        [ "$item" = "$ONGOING_STATE" ] && continue
+        rm -rf "$item"
+    done
+    if [ -e "$ONGOING/.parser_state_txn" ] || [ -L "$ONGOING/.parser_state_txn" ]; then
+        rm -rf "$ONGOING/.parser_state_txn"
+    fi
+    if shopt -q dotglob; then dotglob_was_set=1; else shopt -s dotglob; fi
+    items=( "$ONGOING_STATE"/* )
+    if [ "$dotglob_was_set" -eq 0 ]; then shopt -u dotglob; fi
+    for item in ${items[@]+"${items[@]}"}; do
+        name="${item##*/}"
+        case "$name" in
+            .rtbioscan_state_reset.flock|*.flock|.rtbioscan_lock_host_v1|.rtbioscan_lock_host_v1.guard|.lock_migration.log)
+                continue ;;
+        esac
+        rm -rf "$item"
+    done
 }
 
 is_round_lock_namespace() {
@@ -408,6 +732,33 @@ scan_restart_tree() {
             restart_refuse_path "$entry" "protected round-lock namespace in ${purpose}"
             return 1
         fi
+        if [ "$MODE" = "reset" ]; then
+            case "$name" in
+                *.lockdir|*.lockdir.*)
+                    restart_refuse_path "$entry" "compatibility or legacy lock fence in ${purpose}"
+                    return 1 ;;
+                *.flock|.rtbioscan_lock_host_v1|.rtbioscan_lock_host_v1.guard)
+                    if [ -L "$entry" ] || [ ! -f "$entry" ]; then
+                        restart_refuse_path "$entry" "unsafe stable control in ${purpose}"
+                        return 1
+                    fi
+                    case "$entry" in
+                        "$ONGOING_STATE/.rtbioscan_state_reset.flock"|\
+                        "$ONGOING_STATE/.dorado.lock.flock"|\
+                        "$ONGOING_STATE/.blastreport.lock.flock"|\
+                        "$ONGOING_STATE/.blastreport_sup.lock.flock"|\
+                        "$ONGOING_STATE/.qced_reads.lock.flock"|\
+                        "$ONGOING_STATE/.otu_size_streak.lock.flock"|\
+                        "$ONGOING_STATE/.sup_basecall_cache.lock.flock"|\
+                        "$ONGOING_STATE/.done_pod5.lock.flock"|\
+                        "$ONGOING_STATE/.rtbioscan_lock_host_v1"|\
+                        "$ONGOING_STATE/.rtbioscan_lock_host_v1.guard") ;;
+                        *)
+                            restart_refuse_path "$entry" "undeclared or misplaced stable control"
+                            return 1 ;;
+                    esac ;;
+            esac
+        fi
         if [ -L "$entry" ]; then
             if [ "$reject_symlinks" -eq 1 ]; then
                 if [ "$MODE" = restore ] && [ "$purpose" = "restore snapshot state" ] &&
@@ -476,10 +827,13 @@ fi
 
 # Publish the process-crash-visible operation epoch only after every read-only
 # refusal check has passed, and before the first destructive state mutation.
+if [ "$MODE" = "reset" ]; then
+    verify_reset_root || exit 1
+fi
 write_restart_sentinel applying
 
 if [ "$MODE" = "reset" ]; then
-    wipe_dir_contents "$ONGOING"
+    wipe_reset_ongoing
     wipe_dir_contents "$LEGACY_CURRENT"
     write_restart_sentinel applied
     exit 0

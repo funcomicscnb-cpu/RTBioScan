@@ -212,7 +212,8 @@ def test_normal_reset_still_wipes_both_mutable_state_roots(tmp_path: Path) -> No
     result = _run("reset", outdir)
 
     assert result.returncode == 0, result.stderr
-    assert list(paths["ongoing"].iterdir()) == []
+    assert [item.name for item in paths["ongoing"].iterdir()] == ["_state"]
+    assert {item.name for item in paths["state"].iterdir()} == set(CONTROL)
     assert list(paths["legacy"].iterdir()) == []
     assert paths["sentinel"].read_text(encoding="utf-8") == _applied_record("reset")
 
@@ -615,6 +616,7 @@ exec /bin/rm "$@"
 
 def test_exit_cleanup_preserves_fatal_status_after_applying(tmp_path: Path) -> None:
     outdir = tmp_path / "results"
+    outdir.mkdir()
     paths = _paths(outdir)
     mutated_handler = tmp_path / "restart-handler-with-fatal.sh"
     source = HANDLER.read_text(encoding="utf-8")
@@ -1370,3 +1372,955 @@ def test_restart_refuses_symlink_at_the_state_fence_path(tmp_path: Path) -> None
     )
     assert _identity(outside_payload) == payload_before
     assert not paths["sentinel"].exists()
+# Stage A0 reset barrier and stable lock inode regressions (all state is scratch).
+
+import fcntl
+import pathlib
+import signal
+import stat
+import time
+
+
+CONTROL = (
+    ".rtbioscan_state_reset.flock",
+    ".dorado.lock.flock",
+    ".blastreport.lock.flock",
+    ".blastreport_sup.lock.flock",
+    ".qced_reads.lock.flock",
+    ".otu_size_streak.lock.flock",
+    ".sup_basecall_cache.lock.flock",
+    ".done_pod5.lock.flock",
+)
+
+
+def state_root(outdir):
+    state = outdir / "temp/ongoing/state/SID/_state"
+    state.mkdir(parents=True, exist_ok=True)
+    return state
+
+
+def env_for(outdir, *, wait="2", mode="reset"):
+    return dict(
+        os.environ,
+        MODE=mode,
+        OUTDIR=str(outdir),
+        LOCK_WAIT=wait,
+        RUN_NAME="stage-a0",
+        STATE_ID="SID",
+        FORCE="1",
+        OPERATION_ID="a" * 64,
+    )
+
+
+def run_reset(outdir, *, wait="2", mode="reset", handler=HANDLER):
+    return subprocess.run(
+        ["/bin/bash", str(handler)],
+        env=env_for(outdir, wait=wait, mode=mode),
+        capture_output=True,
+        text=True,
+        timeout=12,
+    )
+
+
+def inventory(root):
+    found = {}
+    for base, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            path = pathlib.Path(base) / name
+            s = path.lstat()
+            found[str(path.relative_to(root))] = (
+                stat.S_IFMT(s.st_mode),
+                stat.S_IMODE(s.st_mode),
+                s.st_uid,
+                s.st_ino,
+                s.st_mtime_ns,
+                os.readlink(path) if path.is_symlink() else
+                path.read_bytes() if path.is_file() else None,
+            )
+    return found
+
+
+def assert_refusal_delta(before, after):
+    assert not (before.keys() - after.keys())
+    added = after.keys() - before.keys()
+    assert added <= set(CONTROL)
+    for path in before:
+        old, new = before[path], after[path]
+        if path == "." or (old[0] == stat.S_IFDIR and any(
+            pathlib.PurePath(name).parent == pathlib.PurePath(path) for name in added
+        )):
+            assert old[:4] == new[:4]
+            assert old[5] == new[5]
+        else:
+            assert old == new, path
+    for path in added:
+        kind, mode, owner, _, _, data = after[path]
+        assert kind == stat.S_IFREG and mode == 0o600 and owner == os.getuid()
+        assert data == b""
+
+
+def assert_root_refusal_delta(before, after):
+    chain = ("temp/ongoing", "temp/ongoing/state",
+             "temp/ongoing/state/SID", "temp/ongoing/state/SID/_state")
+    control_paths = {f"{chain[-1]}/{name}" for name in CONTROL}
+    added = after.keys() - before.keys()
+    assert not (before.keys() - after.keys())
+    assert added <= set(chain) | control_paths
+    for path in before:
+        old, new = before[path], after[path]
+        if old[0] == stat.S_IFDIR and any(
+            pathlib.PurePath(name).parent == pathlib.PurePath(path) for name in added
+        ):
+            assert old[:4] == new[:4] and old[5] == new[5], path
+        else:
+            assert old == new, path
+    for path in added:
+        kind, mode, owner, _, _, data = after[path]
+        assert owner == os.getuid()
+        if path in chain:
+            assert kind == stat.S_IFDIR and mode == 0o700 and data is None
+        else:
+            assert kind == stat.S_IFREG and mode == 0o600 and data == b""
+
+
+def make_lock(path):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def test_empty_state_and_success_preserve_all_control_inodes(tmp_path):
+    state = state_root(tmp_path)
+    (state / "scientific.txt").write_bytes(b"original")
+    assert run_reset(tmp_path).returncode == 0
+    assert not (state / "scientific.txt").exists()
+    first = {name: inventory(state)[name] for name in CONTROL}
+    assert set(first) == set(CONTROL)
+    assert all(value[0] == stat.S_IFREG and value[1] == 0o600 and value[5] == b""
+               for value in first.values())
+    assert run_reset(tmp_path).returncode == 0
+    assert {name: inventory(state)[name] for name in CONTROL} == first
+
+
+def test_reset_initializes_absent_state_root(tmp_path):
+    assert run_reset(tmp_path).returncode == 0
+    state = tmp_path / "temp/ongoing/state/SID/_state"
+    assert state.is_dir()
+    assert {item.name for item in state.iterdir()} == set(CONTROL)
+
+
+@pytest.mark.parametrize("existing_depth", range(5))
+def test_refusal_may_complete_only_missing_control_ancestors(tmp_path, existing_depth):
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    legacy_fence = temp / "current/state/SID/.legacy.lockdir"
+    legacy_fence.mkdir(parents=True)
+    chain = [temp / "ongoing", temp / "ongoing/state",
+             temp / "ongoing/state/SID", temp / "ongoing/state/SID/_state"]
+    for item in chain[:existing_depth]:
+        item.mkdir()
+    before = inventory(tmp_path)
+    first = run_reset(tmp_path)
+    assert first.returncode != 0 and "lock fence" in first.stderr
+    after = inventory(tmp_path)
+    assert_root_refusal_delta(before, after)
+    assert not (temp / ".restart_applied.SID").exists()
+    second = run_reset(tmp_path)
+    assert second.returncode != 0
+    assert inventory(tmp_path) == after
+    assert set(item.name for item in chain[-1].iterdir()) == set(CONTROL)
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "file"])
+def test_unsafe_partial_ancestor_refuses_without_deeper_creation(tmp_path, unsafe):
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    ongoing = temp / "ongoing"
+    if unsafe == "symlink":
+        target = tmp_path / "outside"
+        target.mkdir()
+        ongoing.symlink_to(target, target_is_directory=True)
+    elif unsafe == "file":
+        ongoing.write_bytes(b"unsafe")
+    before = inventory(tmp_path)
+    result = run_reset(tmp_path)
+    assert result.returncode != 0
+    assert inventory(tmp_path) == before
+    assert not (temp / ".restart_applied.SID").exists()
+
+
+@pytest.mark.parametrize("active", CONTROL[1:])
+def test_active_lock_refuses_without_applying_and_second_refusal_is_identical(tmp_path, active):
+    state = state_root(tmp_path)
+    scientific = state / "scientific.txt"
+    scientific.write_bytes(b"untouched")
+    fd = make_lock(state / active)
+    try:
+        before = inventory(state)
+        first = run_reset(tmp_path)
+        after = inventory(state)
+        assert first.returncode != 0 and "active governed reset lock" in first.stderr
+        assert_refusal_delta(before, after)
+        assert after.keys() - before.keys() == set(CONTROL[:CONTROL.index(active)]) - before.keys()
+        assert not (tmp_path / "temp/.restart_applied.SID").exists()
+        parent_mtime = state.stat().st_mtime_ns
+        second = run_reset(tmp_path)
+        assert second.returncode != 0
+        assert inventory(state) == after
+        assert state.stat().st_mtime_ns == parent_mtime
+    finally:
+        os.close(fd)
+    assert run_reset(tmp_path).returncode == 0
+    for name in after.keys() & set(CONTROL):
+        assert (state / name).stat().st_ino == after[name][3]
+
+
+@pytest.mark.parametrize("bad", ["barrier-symlink", "barrier-directory", "lock-symlink", "fence-ownerless", "fence-token", "fence-tokenized", "fence-legacy-owner", "unknown-lock"])
+def test_unsafe_control_or_fence_refuses_before_applying(tmp_path, bad):
+    state = state_root(tmp_path)
+    sentinel = state / "scientific.txt"
+    sentinel.write_bytes(b"untouched")
+    if bad == "barrier-symlink":
+        (state / CONTROL[0]).symlink_to(sentinel)
+    elif bad == "barrier-directory":
+        (state / CONTROL[0]).mkdir()
+    elif bad == "lock-symlink":
+        (state / CONTROL[1]).symlink_to(sentinel)
+    elif bad == "unknown-lock":
+        fd = os.open(state / ".unknown.lock.flock", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+    else:
+        fence = state / (".qced_reads.lock.lockdir.reclaim-" + TOKEN
+                         if bad == "fence-tokenized" else ".qced_reads.lock.lockdir")
+        fence.mkdir()
+        if bad == "fence-token":
+            (fence / "v2owner").write_text("rtbioscan-fence-v2\t0123456789abcdef\n")
+        elif bad == "fence-legacy-owner":
+            (fence / "meta.env").write_text("pid=1\nhost=host\n")
+    before = inventory(state)
+    result = run_reset(tmp_path)
+    assert result.returncode != 0
+    assert_refusal_delta(before, inventory(state))
+    assert not (tmp_path / "temp/.restart_applied.SID").exists()
+
+
+@pytest.mark.parametrize("partial_count", [1, 2])
+def test_partial_control_set_is_completed_without_replacement(tmp_path, partial_count):
+    state = state_root(tmp_path)
+    for name in CONTROL[:partial_count]:
+        fd = os.open(state / name, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+    before = {name: (state / name).stat().st_ino for name in CONTROL[:partial_count]}
+    assert run_reset(tmp_path).returncode == 0
+    assert {name: (state / name).stat().st_ino for name in CONTROL[:partial_count]} == before
+    assert all((state / name).exists() for name in CONTROL)
+
+
+def test_host_record_and_inactive_stable_files_survive_success(tmp_path):
+    state = state_root(tmp_path)
+    host = state / ".rtbioscan_lock_host_v1"
+    host.write_bytes(b"rtbioscan-lock-host-v1\t686f7374\n")
+    before_host = inventory(state)[host.name]
+    before_lock = {}
+    for name in CONTROL[1:]:
+        fd = os.open(state / name, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        before_lock[name] = inventory(state)[name]
+    assert run_reset(tmp_path).returncode == 0
+    after = inventory(state)
+    assert after[host.name] == before_host
+    assert {name: after[name] for name in before_lock} == before_lock
+
+
+def test_several_preexisting_stable_locks_with_late_active_holder(tmp_path):
+    state = state_root(tmp_path)
+    for name in CONTROL:
+        fd = os.open(state / name, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+    (state / "scientific.txt").write_bytes(b"unchanged")
+    active = os.open(state / CONTROL[-1], os.O_RDONLY)
+    fcntl.flock(active, fcntl.LOCK_EX)
+    try:
+        before = inventory(state)
+        parent_mtime = state.stat().st_mtime_ns
+        result = run_reset(tmp_path)
+        assert result.returncode != 0 and "active governed reset lock" in result.stderr
+        assert inventory(state) == before
+        assert state.stat().st_mtime_ns == parent_mtime
+        assert not (tmp_path / "temp/.restart_applied.SID").exists()
+    finally:
+        os.close(active)
+    assert run_reset(tmp_path).returncode == 0
+    assert all((state / name).stat().st_ino == before[name][3] for name in CONTROL)
+
+
+def test_shared_holder_blocks_reset_then_same_inode_is_used(tmp_path):
+    state = state_root(tmp_path)
+    assert run_reset(tmp_path).returncode == 0
+    barrier = state / CONTROL[0]
+    fd = os.open(barrier, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    before = inventory(state)
+    try:
+        result = run_reset(tmp_path, wait="0")
+        assert result.returncode != 0 and "exclusive reset barrier" in result.stderr
+        assert inventory(state) == before
+    finally:
+        os.close(fd)
+    assert run_reset(tmp_path).returncode == 0
+    assert barrier.stat().st_ino == before[barrier.name][3]
+
+
+def test_eight_simultaneous_initializers_converge(tmp_path):
+    state = state_root(tmp_path)
+    env = env_for(tmp_path, wait="8")
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    entry_dir = tmp_path / "in-reset"
+    overlap = tmp_path / "overlap"
+    shim = shim_dir / "rm"
+    shim.write_text("#!/bin/sh\n"
+                    'if ! mkdir "$RTB_RESET_ENTRY_DIR" 2>/dev/null; then\n'
+                    '  : > "$RTB_RESET_OVERLAP"\n'
+                    'else\n'
+                    '  sleep 0.05\n'
+                    '  rmdir "$RTB_RESET_ENTRY_DIR"\n'
+                    'fi\n'
+                    'exec /bin/rm "$@"\n')
+    shim.chmod(0o755)
+    env["PATH"] = str(shim_dir) + os.pathsep + env["PATH"]
+    env["RTB_RESET_ENTRY_DIR"] = str(entry_dir)
+    env["RTB_RESET_OVERLAP"] = str(overlap)
+    jobs = [subprocess.Popen(["/bin/bash", str(HANDLER)], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(8)]
+    for job in jobs:
+        _, err = job.communicate(timeout=15)
+        assert job.returncode == 0, err
+    assert not overlap.exists(), "two resets entered destructive work together"
+    first = inventory(state)
+    assert set(CONTROL) <= first.keys()
+    assert run_reset(tmp_path).returncode == 0
+    assert all(inventory(state)[name] == first[name] for name in CONTROL)
+
+
+def test_space_and_non_ascii_state_path(tmp_path):
+    outdir = tmp_path / "espaço and spaces"
+    state = state_root(outdir)
+    fd = make_lock(state / CONTROL[4])
+    try:
+        assert run_reset(outdir).returncode != 0
+    finally:
+        os.close(fd)
+    assert run_reset(outdir).returncode == 0
+
+
+@pytest.mark.parametrize("bad", ["directory", "symlink", "hardlink"])
+def test_malformed_partial_control_file_is_never_replaced(tmp_path, bad):
+    state = state_root(tmp_path)
+    barrier = state / CONTROL[0]
+    fd = os.open(barrier, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    target = state / CONTROL[1]
+    if bad == "directory":
+        target.mkdir()
+    elif bad == "symlink":
+        target.symlink_to(barrier)
+    elif bad == "hardlink":
+        other = state / "hardlink-target"
+        other.write_bytes(b"informational")
+        os.link(other, target)
+    before = inventory(state)
+    result = run_reset(tmp_path)
+    assert result.returncode != 0
+    assert_refusal_delta(before, inventory(state))
+    assert barrier.stat().st_ino == before[barrier.name][3]
+    assert not (tmp_path / "temp/.restart_applied.SID").exists()
+
+
+def test_reset_exclusive_blocks_shared_writer_and_transition_holder(tmp_path):
+    state = state_root(tmp_path)
+    (state / "scientific.txt").write_bytes(b"wipe me")
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    marker = tmp_path / "reset-entered"
+    shim = shim_dir / "rm"
+    shim.write_text("#!/bin/sh\n"
+                    'if [ ! -e "$RTB_RESET_TEST_MARKER" ]; then\n'
+                    '  : > "$RTB_RESET_TEST_MARKER"\n'
+                    '  sleep 1\n'
+                    'fi\n'
+                    'exec /bin/rm "$@"\n')
+    shim.chmod(0o755)
+    env = env_for(tmp_path)
+    env["PATH"] = str(shim_dir) + os.pathsep + env["PATH"]
+    env["RTB_RESET_TEST_MARKER"] = str(marker)
+    reset = subprocess.Popen(["/bin/bash", str(HANDLER)], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists(), reset.poll()
+        inode = (state / CONTROL[4]).stat().st_ino
+        shared_done = tmp_path / "shared-entered"
+        transition_done = tmp_path / "transition-entered"
+        shared_acquire = ("" if os.environ.get("RTB_A0_MUTANT_WRITER_NO_SHARED") == "1"
+                          else "fcntl.flock(f, fcntl.LOCK_SH); ")
+        shared_script = (
+            "import fcntl, pathlib, sys; "
+            "f=open(sys.argv[1], 'rb'); " + shared_acquire +
+            "pathlib.Path(sys.argv[2]).write_text('entered')"
+        )
+        transition_script = (
+            "import fcntl, pathlib, sys; "
+            "f=open(sys.argv[1], 'rb'); fcntl.flock(f, fcntl.LOCK_EX); "
+            "pathlib.Path(sys.argv[2]).write_text('entered')"
+        )
+        shared = subprocess.Popen(["python3", "-c", shared_script,
+                                   str(state / CONTROL[0]), str(shared_done)])
+        transition = subprocess.Popen(["python3", "-c", transition_script,
+                                       str(state / CONTROL[4]), str(transition_done)])
+        try:
+            time.sleep(0.2)
+            assert not shared_done.exists() and not transition_done.exists()
+            _, err = reset.communicate(timeout=10)
+            assert reset.returncode == 0, err
+            assert shared.wait(timeout=5) == 0
+            assert transition.wait(timeout=5) == 0
+            assert shared_done.exists() and transition_done.exists()
+            assert (state / CONTROL[4]).stat().st_ino == inode
+            assert not (state / "scientific.txt").exists()
+        finally:
+            for proc in (shared, transition):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=3)
+    finally:
+        if reset.poll() is None:
+            reset.kill()
+            reset.wait(timeout=3)
+
+
+def test_child_inherits_transition_lock_after_parent_exits(tmp_path):
+    state = state_root(tmp_path)
+    path = state / CONTROL[4]
+    ready = tmp_path / "child-pid"
+    script = (
+        "import fcntl, os, pathlib, sys, time; "
+        "fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT|os.O_EXCL, 0o600); "
+        "fcntl.flock(fd, fcntl.LOCK_EX); pid=os.fork(); "
+        "time.sleep(8) if pid == 0 else pathlib.Path(sys.argv[2]).write_text(str(pid))"
+    )
+    parent = subprocess.Popen(["python3", "-c", script, str(path), str(ready)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        child_pid = int(ready.read_text())
+        assert parent.wait(timeout=3) == 0
+        before = inventory(state)
+        refused = run_reset(tmp_path)
+        assert refused.returncode != 0 and "active governed reset lock" in refused.stderr
+        assert_refusal_delta(before, inventory(state))
+    finally:
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, 9)
+            except ProcessLookupError:
+                pass
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=3)
+
+
+@pytest.mark.parametrize("signal_number", [15, 9])
+def test_task_shell_signal_keeps_child_transition_lock(tmp_path, signal_number):
+    state = state_root(tmp_path)
+    target = state / CONTROL[4]
+    fd = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    child_pid_file = tmp_path / "child-pid"
+    ready = tmp_path / "ready"
+    script = r'''set -e
+exec 9< "$1"
+perl -MFcntl=:flock -e 'open(my $f, "<&9") or die; flock($f, LOCK_EX) or die'
+sleep 8 &
+printf '%s\n' "$!" > "$2"
+: > "$3"
+wait
+'''
+    shell = subprocess.Popen(["/bin/bash", "-c", script, "_", str(target),
+                              str(child_pid_file), str(ready)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        child_pid = int(child_pid_file.read_text())
+        os.kill(shell.pid, signal_number)
+        shell.wait(timeout=3)
+        before = inventory(state)
+        refused = run_reset(tmp_path)
+        assert refused.returncode != 0 and "active governed reset lock" in refused.stderr
+        assert_refusal_delta(before, inventory(state))
+    finally:
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, 9)
+            except ProcessLookupError:
+                pass
+        if shell.poll() is None:
+            shell.kill()
+            shell.wait(timeout=3)
+    assert run_reset(tmp_path).returncode == 0
+
+
+@pytest.mark.parametrize("late", ["active", "symlink", "barrier-replaced"])
+def test_control_path_created_or_replaced_while_reset_waits(tmp_path, late):
+    state = state_root(tmp_path)
+    scientific = state / "scientific.txt"
+    scientific.write_bytes(b"must survive")
+    barrier = state / CONTROL[0]
+    fd = os.open(barrier, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    reset = subprocess.Popen(["/bin/bash", str(HANDLER)], env=env_for(tmp_path),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    late_fd = None
+    try:
+        barrier_ready = state / CONTROL[0]
+        deadline = time.monotonic() + 5
+        while not barrier_ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert barrier_ready.exists()
+        time.sleep(0.1)
+        if late == "active":
+            late_fd = make_lock(state / CONTROL[4])
+        elif late == "symlink":
+            (state / CONTROL[1]).symlink_to(scientific)
+        else:
+            barrier.rename(state / "old-barrier")
+            new_fd = os.open(barrier, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(new_fd)
+        os.close(fd)
+        fd = None
+        _, err = reset.communicate(timeout=8)
+        assert reset.returncode != 0, err
+        assert scientific.read_bytes() == b"must survive"
+        assert not (tmp_path / "temp/.restart_applied.SID").exists()
+        if late == "active":
+            assert b"active governed reset lock" in err
+        elif late == "symlink":
+            assert b"unsafe reset control" in err
+        else:
+            assert b"reset control inode changed" in err
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if late_fd is not None:
+            os.close(late_fd)
+        if reset.poll() is None:
+            reset.kill()
+            reset.wait(timeout=3)
+
+
+def test_unwritable_state_root_refuses_before_applying(tmp_path):
+    state = state_root(tmp_path)
+    scientific = state / "scientific.txt"
+    scientific.write_bytes(b"untouched")
+    state.chmod(0o500)
+    try:
+        result = run_reset(tmp_path)
+        assert result.returncode != 0
+        assert not (tmp_path / "temp/.restart_applied.SID").exists()
+        assert scientific.read_bytes() == b"untouched"
+    finally:
+        state.chmod(0o700)
+
+
+def test_barrier_symlink_to_valid_file_is_refused(tmp_path):
+    state = state_root(tmp_path)
+    target = state / "valid-target"
+    fd = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    barrier = state / CONTROL[0]
+    barrier.symlink_to(target)
+    before = inventory(state)
+    result = run_reset(tmp_path)
+    assert result.returncode != 0
+    assert_refusal_delta(before, inventory(state))
+    assert not (tmp_path / "temp/.restart_applied.SID").exists()
+
+
+def test_whole_holder_process_group_sigkill_releases_stable_inode(tmp_path):
+    state = state_root(tmp_path)
+    target = state / CONTROL[4]
+    fd = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    ready = tmp_path / "ready"
+    script = r'''set -e
+exec 9< "$1"
+perl -MFcntl=:flock -e 'open(my $f, "<&9") or die; flock($f, LOCK_EX) or die'
+sleep 8 &
+: > "$2"
+wait
+'''
+    shell = subprocess.Popen(["/bin/bash", "-c", script, "_", str(target), str(ready)],
+                             start_new_session=True, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        inode = target.stat().st_ino
+        assert run_reset(tmp_path).returncode != 0
+        os.killpg(shell.pid, signal.SIGKILL)
+        shell.wait(timeout=3)
+        assert run_reset(tmp_path).returncode == 0
+        assert target.stat().st_ino == inode
+    finally:
+        if shell.poll() is None:
+            os.killpg(shell.pid, signal.SIGKILL)
+            shell.wait(timeout=3)
+
+
+# P2 correction: advisory bytes and effective filesystem modes are preserved.
+STAGE_A_RECORD = (
+    b"v=2 host=stage-a0.local pid=93530 ppid=93530 started=1790457301 "
+    b"token=9ba2210f7001e3dc label=.qced_reads.lock boot=-\n"
+)
+
+
+@pytest.mark.parametrize("record", [
+    b"", b"owner=previous-holder\n", STAGE_A_RECORD,
+    b"arbitrary informational bytes\x00" * 8192,
+])
+def test_nonempty_stable_lock_record_survives_success(tmp_path, record):
+    state = state_root(tmp_path)
+    target = state / CONTROL[4]
+    target.write_bytes(record)
+    target.chmod(0o666)
+    before = inventory(state)[target.name]
+    assert run_reset(tmp_path).returncode == 0
+    assert inventory(state)[target.name] == before
+
+
+def test_actual_paused_stage_a_owner_record_survives_success(tmp_path):
+    path = os.environ.get("RTBIOSCAN_PAUSED_STAGE_A_RECORD")
+    record = pathlib.Path(path).read_bytes() if path else STAGE_A_RECORD
+    assert record.startswith(b"v=2 host=") and b" label=.qced_reads.lock boot=-\n" in record
+    assert 100 <= len(record) <= 200
+    state = state_root(tmp_path)
+    target = state / CONTROL[4]
+    target.write_bytes(record)
+    before = inventory(state)[target.name]
+    assert run_reset(tmp_path).returncode == 0
+    assert inventory(state)[target.name] == before
+
+
+def test_all_seven_nonempty_lock_records_survive_success_and_refusal(tmp_path):
+    state = state_root(tmp_path)
+    for index, name in enumerate(CONTROL[1:]):
+        target = state / name
+        target.write_bytes((b"owner record %d\n" % index) * (index + 1))
+        target.chmod(0o664)
+    before = {name: inventory(state)[name] for name in CONTROL[1:]}
+    active = os.open(state / CONTROL[-1], os.O_RDONLY)
+    fcntl.flock(active, fcntl.LOCK_EX)
+    try:
+        refused = run_reset(tmp_path)
+        assert refused.returncode != 0 and "active governed reset lock" in refused.stderr
+        assert {name: inventory(state)[name] for name in before} == before
+        assert not (tmp_path / "temp/.restart_applied.SID").exists()
+    finally:
+        os.close(active)
+    assert run_reset(tmp_path).returncode == 0
+    assert {name: inventory(state)[name] for name in before} == before
+
+
+def test_preexisting_group_writable_directories_and_control_modes_survive(tmp_path):
+    state = state_root(tmp_path)
+    for directory in (tmp_path, tmp_path / "temp", tmp_path / "temp/ongoing", state):
+        directory.chmod(0o775)
+    for name in CONTROL:
+        target = state / name
+        target.write_bytes(b"" if name == CONTROL[0] else b"record\n")
+        target.chmod(0o666)
+    before_dirs = {str(path): (path.stat().st_ino, stat.S_IMODE(path.stat().st_mode))
+                   for path in (tmp_path, tmp_path / "temp", tmp_path / "temp/ongoing", state)}
+    before_files = {name: inventory(state)[name] for name in CONTROL}
+    assert run_reset(tmp_path).returncode == 0
+    assert {str(path): (path.stat().st_ino, stat.S_IMODE(path.stat().st_mode))
+            for path in (tmp_path, tmp_path / "temp", tmp_path / "temp/ongoing", state)} == before_dirs
+    assert {name: inventory(state)[name] for name in CONTROL} == before_files
+
+
+def test_missing_output_root_is_explicitly_refused_without_creation(tmp_path):
+    missing = tmp_path / "missing-output"
+    result = run_reset(missing)
+    assert result.returncode != 0
+    assert "output root does not exist; reset will not create it" in result.stderr
+    assert not missing.exists()
+
+
+def test_empty_output_root_is_explicitly_refused_for_reset(tmp_path):
+    env = env_for(tmp_path)
+    env["OUTDIR"] = ""
+    result = subprocess.run(["/bin/bash", str(HANDLER)], env=env,
+                            capture_output=True, text=True, timeout=12)
+    assert result.returncode != 0
+    assert "output root does not exist; reset will not create it" in result.stderr
+    assert not (tmp_path / "temp").exists()
+
+
+@pytest.mark.parametrize("fences", [
+    (".report_history.lock.lockdir",),
+    (".qced_reads.lock.lockdir",),
+    (".qced_reads.lock.lockdir.reclaim-" + TOKEN,),
+    (".report_history.lock.lockdir", ".qced_reads.lock.lockdir"),
+])
+def test_existing_compatibility_fences_refuse_and_preserve(tmp_path, fences):
+    state = state_root(tmp_path)
+    for name in fences:
+        fence = state / name
+        fence.mkdir()
+        (fence / "owner").write_bytes(b"existing owner\n")
+    before = inventory(state)
+    result = run_reset(tmp_path)
+    assert result.returncode != 0
+    assert any(str(state / name) in result.stderr for name in fences)
+    assert_refusal_delta(before, inventory(state))
+    assert not (tmp_path / "temp/.restart_applied.SID").exists()
+
+
+def test_migration_audit_survives_success_and_refusal(tmp_path):
+    state = state_root(tmp_path)
+    audit = state / ".lock_migration.log"
+    audit.write_bytes(b"adoption audit\nrebind intent\n")
+    audit.chmod(0o640)
+    unrelated = state / ".lookalike.log"
+    unrelated.write_bytes(b"delete me")
+    before = inventory(state)[audit.name]
+    fence = state / ".qced_reads.lock.lockdir"
+    fence.mkdir()
+    refused = run_reset(tmp_path)
+    assert refused.returncode != 0
+    assert inventory(state)[audit.name] == before
+    fence.rmdir()
+    assert run_reset(tmp_path).returncode == 0
+    assert inventory(state)[audit.name] == before
+    assert not unrelated.exists()
+
+
+def test_fixed_future_lock_inventory_matches_all_current_names():
+    source = HANDLER.read_text()
+    for name in CONTROL[1:]:
+        assert source.count(name) == 3, name
+    assert "Any future A2 or Stage B stable kernel-lock name" in source
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_symlinked_output_root_resolves_once_and_preserves_user_link(tmp_path, relative):
+    real = tmp_path / "réal output with spaces"
+    real.mkdir()
+    link = tmp_path / "résults link"
+    destination = os.path.relpath(real, link.parent) if relative else str(real)
+    link.symlink_to(destination, target_is_directory=True)
+    original = (link.lstat().st_ino, os.readlink(link))
+    state = state_root(real)
+    scientific = state / "scientific.txt"
+    scientific.write_bytes(b"remove on target")
+    assert run_reset(link).returncode == 0
+    assert (link.lstat().st_ino, os.readlink(link)) == original
+    assert not scientific.exists()
+    assert (real / "temp/.restart_applied.SID").exists()
+    assert {name for name in CONTROL} <= {item.name for item in state.iterdir()}
+
+
+def test_symlinked_output_root_retargeted_before_barrier_refuses(tmp_path):
+    original = tmp_path / "original"
+    replacement = tmp_path / "replacement"
+    original.mkdir()
+    replacement.mkdir()
+    link = tmp_path / "results"
+    link.symlink_to(original, target_is_directory=True)
+    state = state_root(original)
+    scientific = state / "scientific.txt"
+    scientific.write_bytes(b"keep")
+    barrier = state / CONTROL[0]
+    barrier.write_bytes(b"")
+    holder = os.open(barrier, os.O_RDONLY)
+    fcntl.flock(holder, fcntl.LOCK_SH)
+    reset = subprocess.Popen(["/bin/bash", str(HANDLER)], env=env_for(link, wait="4"),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        time.sleep(0.2)
+        assert reset.poll() is None
+        link.unlink()
+        link.symlink_to(replacement, target_is_directory=True)
+        os.close(holder)
+        holder = None
+        _, err = reset.communicate(timeout=7)
+        assert reset.returncode != 0 and b"output root identity changed" in err
+        assert scientific.read_bytes() == b"keep"
+        assert not (original / "temp/.restart_applied.SID").exists()
+        assert not (replacement / "temp").exists()
+    finally:
+        if holder is not None:
+            os.close(holder)
+        if reset.poll() is None:
+            reset.kill()
+            reset.wait(timeout=3)
+
+
+@pytest.mark.parametrize("change", ["retarget", "replace-target", "suffix-symlink"])
+def test_output_root_identity_rechecked_immediately_before_applying(tmp_path, change):
+    original = tmp_path / "original"
+    replacement = tmp_path / "replacement"
+    original.mkdir()
+    replacement.mkdir()
+    link = tmp_path / "results"
+    link.symlink_to(original, target_is_directory=True)
+    state = state_root(original)
+    scientific = state / "scientific.txt"
+    scientific.write_bytes(b"keep")
+    marker = tmp_path / "at-final-check"
+    release = tmp_path / "release-final-check"
+    source = HANDLER.read_text()
+    anchor = 'if [ "$MODE" = "reset" ]; then\n    verify_reset_root || exit 1\nfi\nwrite_restart_sentinel applying'
+    assert source.count(anchor) == 1
+    injected = (
+        'if [ "$MODE" = "reset" ]; then\n'
+        '    : > "$RTB_TEST_FINAL_MARKER"\n'
+        '    while [ ! -e "$RTB_TEST_FINAL_RELEASE" ]; do sleep 0.02; done\n'
+        '    verify_reset_root || exit 1\n'
+        'fi\nwrite_restart_sentinel applying'
+    )
+    handler = tmp_path / "instrumented-restart.sh"
+    handler.write_text(source.replace(anchor, injected, 1))
+    env = env_for(link, wait="4")
+    env["RTB_TEST_FINAL_MARKER"] = str(marker)
+    env["RTB_TEST_FINAL_RELEASE"] = str(release)
+    reset = subprocess.Popen(["/bin/bash", str(handler)], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    moved = tmp_path / "moved-original"
+    try:
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists(), reset.poll()
+        if change == "retarget":
+            link.unlink()
+            link.symlink_to(replacement, target_is_directory=True)
+        elif change == "replace-target":
+            original.rename(moved)
+            original.mkdir()
+        else:
+            moved_state = tmp_path / "moved-state"
+            state.rename(moved_state)
+            state.symlink_to(moved_state, target_is_directory=True)
+        release.write_bytes(b"")
+        _, err = reset.communicate(timeout=7)
+        expected = (b"reset suffix inode changed" if change == "suffix-symlink"
+                    else b"output root identity changed")
+        assert reset.returncode != 0 and expected in err
+        preserved_scientific = (moved / "temp/ongoing/state/SID/_state/scientific.txt"
+                                if change == "replace-target" else scientific)
+        assert preserved_scientific.read_bytes() == b"keep"
+        assert not (moved / "temp/.restart_applied.SID").exists()
+        assert not (original / "temp/.restart_applied.SID").exists()
+        assert not (replacement / "temp/.restart_applied.SID").exists()
+    finally:
+        release.write_bytes(b"")
+        if reset.poll() is None:
+            reset.kill()
+            reset.wait(timeout=3)
+
+
+def test_symlinked_output_root_does_not_allow_nested_suffix_symlink(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "results"
+    link.symlink_to(real, target_is_directory=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    temp = real / "temp"
+    temp.mkdir()
+    (temp / "ongoing").symlink_to(outside, target_is_directory=True)
+    before = inventory(real)
+    result = run_reset(link)
+    assert result.returncode != 0
+    assert inventory(real) == before
+    assert not (outside / "state").exists()
+
+
+@pytest.mark.parametrize("synthetic", ["noncurrent-uid", "nonposix-mode"])
+def test_reset_accepts_synthetic_external_drive_metadata(tmp_path, synthetic):
+    # Model a filesystem reporting synthesized ownership or mode through
+    # Perl lstat. The real scratch files stay on the host filesystem.
+    outdir = tmp_path / "external-drive-model"
+    outdir.mkdir()
+    module_dir = tmp_path / "perl-fixture"
+    module_dir.mkdir()
+    (module_dir / "FakeMetadata.pm").write_text(r'''package FakeMetadata;
+use strict;
+use warnings;
+BEGIN {
+    *CORE::GLOBAL::lstat = sub {
+        my @s = CORE::lstat($_[0]);
+        if (@s && index($_[0], $ENV{RTB_FAKE_ROOT}) == 0) {
+            $s[4] = $< + 1 if $ENV{RTB_FAKE_UID};
+            if ($ENV{RTB_FAKE_MODE}) {
+                $s[2] = ($s[2] & 0170000) |
+                    (($s[2] & 0170000) == 0040000 ? 0775 : 0666);
+            }
+        }
+        return @s;
+    };
+}
+1;
+''')
+    env = env_for(outdir)
+    env["PERL5LIB"] = str(module_dir)
+    env["PERL5OPT"] = "-MFakeMetadata"
+    env["RTB_FAKE_ROOT"] = str(outdir)
+    env["RTB_FAKE_UID"] = "1" if synthetic == "noncurrent-uid" else ""
+    env["RTB_FAKE_MODE"] = "1" if synthetic == "nonposix-mode" else ""
+    first = subprocess.run(["/bin/bash", str(HANDLER)], env=env,
+                           capture_output=True, text=True, timeout=12)
+    assert first.returncode == 0, first.stderr
+    state = outdir / "temp/ongoing/state/SID/_state"
+    before = {name: inventory(state)[name] for name in CONTROL}
+    second = subprocess.run(["/bin/bash", str(HANDLER)], env=env,
+                            capture_output=True, text=True, timeout=12)
+    assert second.returncode == 0, second.stderr
+    assert {name: inventory(state)[name] for name in CONTROL} == before
+
+
+def test_lock_replacement_after_validation_refuses_before_applying(tmp_path):
+    state = state_root(tmp_path)
+    target = state / CONTROL[4]
+    target.write_bytes(b"record before replacement\n")
+    scientific = state / "scientific.txt"
+    scientific.write_bytes(b"keep")
+    source = HANDLER.read_text()
+    anchor = '    sysopen($fh, $path, O_RDONLY) or die "ERROR: cannot open reset control $path: $!\\n"'
+    assert source.count(anchor) == 1
+    injected = (
+        '    if ($path =~ /[.]qced_reads[.]lock[.]flock$/) {\n'
+        '        rename($path, "$path.old") or die;\n'
+        '        sysopen(my $replacement, $path, O_RDWR | O_CREAT | O_EXCL, 0600) or die;\n'
+        '        close $replacement;\n'
+        '    }\n' + anchor
+    )
+    handler = tmp_path / "replace-between-checks.sh"
+    handler.write_text(source.replace(anchor, injected, 1))
+    result = run_reset(tmp_path, handler=handler)
+    assert result.returncode != 0 and "reset control inode changed" in result.stderr
+    assert scientific.read_bytes() == b"keep"
+    assert not (tmp_path / "temp/.restart_applied.SID").exists()
