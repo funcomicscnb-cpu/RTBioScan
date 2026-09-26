@@ -66,6 +66,82 @@ def _load_report_render_module():
     return module
 
 
+def test_jsonl_readers_frame_only_on_lf_and_keep_mixed_history(tmp_path: Path) -> None:
+    mod = _load_report_render_module()
+    labels = ["old Ã\u0085land", "Río", "Åland", "児島", "prąd", "N\u0085E", "L\u2028S", "P\u2029S"]
+    rows = [
+        {"run_id": "runA", "barcode": "B1", "round_barcode": f"round_{idx}", "label": label}
+        for idx, label in enumerate(labels)
+    ]
+    history = tmp_path / "history.jsonl"
+    wire = b"\n".join(json.dumps(row, ensure_ascii=False).encode("utf-8") for row in rows) + b"\n"
+    history.write_bytes(wire)
+    # The oracle frames bytes on 0x0A before decoding any JSON record.
+    oracle = [json.loads(line) for line in wire.split(b"\n") if line]
+    assert oracle == rows
+    parsed, warnings = mod.load_history(history)
+    assert parsed == oracle and warnings == []
+    assert history.read_bytes() == wire
+
+    index = tmp_path / "runs_index.jsonl"
+    index.write_bytes(wire)
+    parsed, warnings = mod.load_run_index(index)
+    assert parsed == oracle and warnings == []
+    assert index.read_bytes() == wire
+
+    history.write_bytes(wire + b"{bad json\n\n")
+    parsed, warnings = mod.load_history(history)
+    assert parsed == oracle
+    assert warnings == [f"malformed_history_line:{len(rows) + 1}"]
+    index.write_bytes(wire + b"{bad json\n\n")
+    parsed, warnings = mod.load_run_index(index)
+    assert parsed == oracle
+    assert warnings == [f"malformed_run_index_line:{len(rows) + 1}"]
+
+    history.write_bytes(b"")
+    assert mod.load_history(history) == ([], [])
+    index.write_bytes(b"")
+    assert mod.load_run_index(index) == ([], [])
+
+
+def test_report_rebuild_run_index_lookup_uses_literal_lf(tmp_path: Path) -> None:
+    outdir = tmp_path / "results"
+    run_dir = outdir / "report_html" / "runs" / "runA"
+    run_dir.mkdir(parents=True)
+    state_id = "state\u0085x"
+    index_obj = {"run_id": "runA", "state_id": state_id}
+    index = outdir / "report_html" / "runs_index.jsonl"
+    index_wire = json.dumps(index_obj, ensure_ascii=False).encode("utf-8") + b"\n"
+    index.write_bytes(index_wire)
+    assert [json.loads(row) for row in index_wire.split(b"\n") if row] == [index_obj]
+    history = tmp_path / "history.jsonl"
+    history.write_bytes(
+        json.dumps({"run_id": "runA", "barcode": "B1", "round_barcode": "round_1"}).encode() + b"\n"
+    )
+    result = subprocess.run(
+        ["/bin/bash", str(REPO_ROOT / "bin" / "report_rebuild.sh"),
+         "--outdir", str(outdir), "--history", str(history), "--run-id", "runA",
+         "--skip-run-json", "--skip-root-report"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    html = (run_dir / "report.html").read_text(encoding="utf-8")
+    marker = "window.REPORT_META = "
+    meta = json.loads(html.split(marker, 1)[1].split(";\n", 1)[0])
+    assert meta["state_dir_url"] == f"../../../current/state/{state_id}/README.html"
+    assert index.read_bytes() == index_wire
+
+
+def test_non_history_tsv_fasta_readers_keep_their_stage1_scope() -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    for expression in (
+        'consolidated_ids_path.read_text(encoding="utf-8").splitlines()',
+        'fasta_path.read_text(encoding="utf-8").splitlines()',
+    ):
+        assert expression in source
+    assert source.count('path.read_text(encoding="utf-8").splitlines()') == 4
+
+
 def test_ensure_pdf_from_png_skips_up_to_date_pdf_and_regenerates_stale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     report_render = _load_report_render_module()
     png_path = tmp_path / "figure.png"

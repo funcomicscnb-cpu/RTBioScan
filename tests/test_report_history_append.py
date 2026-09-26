@@ -81,3 +81,19 @@ def test_history_append_keeps_other_rounds(tmp_path: Path) -> None:
 
     lines = [ln for ln in history.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert len(lines) == 2
+
+
+def test_history_append_preserves_old_garbled_line_and_adds_utf8_line(tmp_path: Path) -> None:
+    history = tmp_path / "history.jsonl"
+    old = {"run_id": "run1", "barcode": "RTBioScan", "round_barcode": "round_001", "label": "old Ã\u0085land"}
+    new = {"run_id": "run1", "barcode": "RTBioScan", "round_barcode": "round_002", "label": "Åland"}
+    old_wire = json.dumps(old, ensure_ascii=False).encode("utf-8") + b"\n"
+    history.write_bytes(old_wire)
+    round_json = tmp_path / "round.json"
+    round_json.write_bytes(json.dumps(new, ensure_ascii=False).encode("utf-8") + b"\n")
+    result = _run(round_json, history, tmp_path / ".history.lock")
+    assert result.returncode == 0, result.stderr
+    wire = history.read_bytes()
+    assert wire.startswith(old_wire)
+    records = [json.loads(raw) for raw in wire.split(b"\n") if raw]
+    assert records == [old, new]

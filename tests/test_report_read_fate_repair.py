@@ -1,10 +1,41 @@
 import json
+import importlib.util
 import subprocess
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "bin" / "report_read_fate_repair.py"
+
+
+def test_repair_history_readers_frame_only_on_lf(tmp_path: Path) -> None:
+    spec = importlib.util.spec_from_file_location("report_read_fate_repair_test_module", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    state_dir = tmp_path / "state1"
+    state_dir.mkdir()
+    rows = [
+        {"run_id": "runA", "round_barcode": "round_1", "label": "old Ã\u0085land"},
+        {"run_id": "runA", "round_barcode": "round_2", "label": "L\u2028S\u2029P"},
+    ]
+    for row in rows:
+        round_dir = state_dir / row["round_barcode"]
+        round_dir.mkdir()
+        (round_dir / "round_report.json").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    current = {"run_id": "runA", "round_barcode": "round_3"}
+    entries = [(state_dir / row["round_barcode"], row) for row in [*rows, current]]
+    history = tmp_path / "history.jsonl"
+    wire = b"\n".join(json.dumps(row, ensure_ascii=False).encode("utf-8") for row in rows) + b"\n"
+    history.write_bytes(wire)
+    assert [json.loads(raw) for raw in wire.split(b"\n") if raw] == rows
+    assert module.history_publish_mode(state_dir, history, "round_3") == "append"
+    mapping = {"round_1": 1, "round_2": 2, "round_3": 3}
+    assert module.authoritative_history_publish_mode(history, "round_3", mapping, entries) == "append"
+    assert history.read_bytes() == wire
+    history.write_bytes(wire + b"broken\n\n")
+    assert module.history_publish_mode(state_dir, history, "round_3") == "normalize"
+    assert module.authoritative_history_publish_mode(history, "round_3", mapping, entries) == "normalize"
 
 
 def write_text(path: Path, text: str) -> None:

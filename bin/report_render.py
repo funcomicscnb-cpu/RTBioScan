@@ -202,7 +202,7 @@ def load_history(path: Path):
     warnings = []
     if not path.exists() or path.stat().st_size == 0:
         return rounds, warnings
-    for idx, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for idx, raw in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
         line = raw.strip()
         if not line:
             continue
@@ -227,7 +227,7 @@ def load_run_index(path: Path):
     warnings = []
     if not path.exists() or path.stat().st_size == 0:
         return runs, warnings
-    for idx, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for idx, raw in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
         line = raw.strip()
         if not line:
             continue

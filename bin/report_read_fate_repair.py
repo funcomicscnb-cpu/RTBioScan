@@ -248,7 +248,7 @@ def history_publish_mode(state_dir: Path, history_path: Path, current_round_barc
         str(obj.get("round_barcode") or "")
         for obj in (
             json.loads(line)
-            for line in history_path.read_text(encoding="utf-8").splitlines()
+            for line in history_path.read_text(encoding="utf-8").split("\n")
             if line.strip()
         )
         if isinstance(obj, dict) and obj.get("round_barcode")
@@ -482,7 +482,7 @@ def authoritative_history_publish_mode(history_path: Path, current: str, mapping
         return "append" if not expected else "normalize"
     seen = []
     malformed = False
-    for line in history_path.read_text(encoding="utf-8").splitlines():
+    for line in history_path.read_text(encoding="utf-8").split("\n"):
         if not line.strip():
             continue
         try:

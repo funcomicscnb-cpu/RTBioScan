@@ -2299,6 +2299,8 @@ Enable or disable incremental HTML report rendering (`${params.outdir}/report_ht
      - index: `${params.outdir}/report_html/report.html`
      - run report: `${params.outdir}/report_html/runs/<run_id>/report.html`
 - History dedupe key is `run_id + barcode + round_barcode` (resume-safe).
+- Report metadata and sample text are emitted as valid UTF-8. Invalid UTF-8 fails before round JSON publication.
+- JSONL and history records are framed by literal LF. Existing history is not automatically migrated.
 - Missing source TSVs are recorded in `warnings[]`; report generation does not fail the round.
 - Report schema version is `2.0`.
 - Round and run records retain their own data `schema_version`; `REPORT_META.schema_version` and `report_state.json.schema_version` identify the rendered HTML/sidecar artifact produced by the current renderer.

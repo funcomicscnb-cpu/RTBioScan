@@ -1268,6 +1268,57 @@ def test_every_proven_pdf_family_and_history_destination(tmp_path,path):
     assert auth('select','s',tmp_path/'live',t1,t2).returncode==0
     assert auth('presentation-leaf',t2,p).returncode==0
 
+
+def test_mixed_utf8_history_remains_an_admissible_snapshot_member(tmp_path):
+    root = joint_fixture(tmp_path / 't1')
+    (root / 'tables').mkdir()
+    rows = [
+        {'run_id': 'runA', 'barcode': 'b', 'round_barcode': 'runA_0', 'label': 'old Ã\u0085land'},
+        {'run_id': 'runA', 'barcode': 'b', 'round_barcode': 'runA_1', 'label': 'Åland'},
+    ]
+    wire = b'\n'.join(json.dumps(row, ensure_ascii=False).encode('utf-8') for row in rows) + b'\n'
+    history = root / 'tables/report_history.jsonl'
+    history.write_bytes(wire)
+    (root / 'state_authority/AUTHORITY').write_bytes(fixture_record(root))
+    peer = tmp_path / 't2'
+    shutil.copytree(root, peer)
+    result = auth('select', 's', tmp_path / 'live', root, peer)
+    assert result.returncode == 0, result.stderr
+    assert history.read_bytes() == (peer / 'tables/report_history.jsonl').read_bytes() == wire
+
+
+@pytest.mark.parametrize('label,tail', [
+    ('L\u2028S', b''), ('P\u2029S', b''), ('N\u0085E', b''),
+    ('ASCII', b''), ('ASCII', b'\n'), ('ASCII', b'{bad json\n'),
+])
+def test_rebuild_run_json_keeps_literal_lf_history_record(tmp_path, label, tail):
+    outdir = tmp_path / 'results'
+    history = outdir / 'temp/ongoing/state/s/_state/report_history.jsonl'
+    history.parent.mkdir(parents=True)
+    row = {'schema_version': '2.1', 'state_id': 's', 'run_id': 'runA',
+           'barcode': 'b', 'round_barcode': 'runA_0',
+           'sample_metrics': {'sample': {'sample_label': label}}}
+    wire = json.dumps(row, ensure_ascii=False).encode('utf-8') + b'\n' + tail
+    history.write_bytes(wire)
+    result = subprocess.run(
+        ['/bin/bash', str(REPO / 'bin/report_rebuild.sh'), '--outdir', str(outdir),
+         '--state-id', 's', '--history', str(history), '--run-id', 'runA', '--skip-root-report'],
+        capture_output=True, text=True, check=False,
+        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
+    )
+    assert result.returncode == 0, result.stderr
+    run_report = outdir / 'report_html/runs/runA/run_report.json'
+    run_index = outdir / 'report_html/runs_index.jsonl'
+    assert run_report.is_file() and run_index.is_file()
+    assert json.loads(run_report.read_text())['schema_version'] == '2.1'
+    assert json.loads(run_index.read_text())['schema_version'] == '2.1'
+    assert history.read_bytes() == wire
+    html = (outdir / 'report_html/runs/runA/report.html').read_text(encoding='utf-8')
+    payload = json.loads(html.split('window.REPORT_PAYLOAD = ', 1)[1].split(';\n', 1)[0])
+    rendered = payload['rounds'][0]
+    assert all(rendered[key] == value for key, value in row.items() if key != 'sample_metrics')
+    assert rendered['sample_metrics']['sample']['sample_label'] == label
+
 @pytest.mark.parametrize('fault',['unknown-tsv','unknown-pdf','wrong-depth','empty-unknown-dir','ancestor-alias','leaf-directory','history-traversal','history-unknown','mismatched-sample','unsafe-sample'])
 def test_presentation_namespace_refuses_unknown_destinations(tmp_path,fault):
     t1=joint_fixture(tmp_path/'t1');t2=tmp_path/'t2';shutil.copytree(t1,t2)

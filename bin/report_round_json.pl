@@ -2,7 +2,7 @@
 use strict;
 use warnings;
 use Getopt::Long qw(GetOptions);
-use JSON::PP qw(encode_json);
+use JSON::PP;
 use POSIX qw(strftime);
 use FindBin;
 require "$FindBin::Bin/lib/sample_label.pl";
@@ -6167,8 +6167,15 @@ for my $key (sort keys %r4d_cumulative_resolved) {
   die 'R4-D cumulative: the snapshot in ' . (split /\t/, $key)[0] . " was republished while it was being read; rerun\n"
     unless RTBioScan::R4DCumulative::still_current($r4d_cumulative_resolved{$key});
 }
+my $json = JSON::PP->new->latin1->encode($obj);
+if ($json =~ /[\x80-\xFF]/) {
+  require Encode;
+  my $copy = $json;
+  eval { Encode::decode('UTF-8', $copy, Encode::FB_CROAK()); 1 }
+    or die "invalid UTF-8 in round report JSON: $@";
+}
 open my $OUT, '>', $opt{out} or die "open $opt{out}: $!";
-print {$OUT} encode_json($obj), "\n";
+print {$OUT} $json, "\n";
 close $OUT;
 
 exit 0;

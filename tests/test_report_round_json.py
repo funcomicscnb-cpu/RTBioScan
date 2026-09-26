@@ -1,12 +1,91 @@
 import json
 import hashlib
 import os
+import re
 import subprocess
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "bin" / "report_round_json.pl"
+
+
+def _wire_case(tmp_path: Path, label: bytes, out: Path, locale: str = "C"):
+    demult = tmp_path / "demult.tsv"
+    demult.write_bytes(
+        b"read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\tsubsample\treplicate\tidentity_scope\tidentity_value\n"
+        + b"r1\tCOI\thac\t" + label
+        + b"\tunknown\tunknown\tunknown\tunknown\tsample\t" + label + b"\n"
+    )
+    return subprocess.run(
+        [b"perl", os.fsencode(SCRIPT), b"--run-id", b"runA", b"--barcode", b"RTBioScan",
+         b"--round-barcode", b"round_1", b"--demult", os.fsencode(demult),
+         b"--out", os.fsencode(out)],
+        capture_output=True,
+        env=dict(os.environ, LC_ALL=locale, PERL_HASH_SEED="0", PERL_PERTURB_KEYS="0"),
+        check=False,
+    )
+
+
+def test_round_json_utf8_wire_preserves_raw_sample_bytes(tmp_path: Path) -> None:
+    labels = ["Sam-ple.A", "Río", "MuestraÑ", "Åland", "児島", "prąd", "Ri\u0301o"]
+    seen = {}
+    for idx, label in enumerate(labels):
+        raw = label.encode("utf-8")
+        out = tmp_path / f"round_{idx}.json"
+        result = _wire_case(tmp_path, raw, out)
+        assert result.returncode == 0, result.stderr
+        wire = out.read_bytes()
+        assert wire.endswith(b"\n") and not wire.endswith(b"\n\n")
+        # Independent JSON string oracle: source UTF-8 bytes plus RFC 8259 escaping.
+        expected = json.dumps(label, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        assert b'"label":' + expected in wire
+        assert [row["label"] for row in json.loads(wire)["sample_metrics"].values()] == [label]
+        seen[label] = expected
+    assert seen["Río"] != seen["Ri\u0301o"]
+
+
+def test_round_json_wire_is_locale_independent(tmp_path: Path) -> None:
+    locales = subprocess.check_output(["locale", "-a"], text=True).splitlines()
+    utf8 = next(value for value in locales if "utf-8" in value.lower())
+    for _ in range(5):
+        c_out = tmp_path / "c.json"
+        utf8_out = tmp_path / "utf8.json"
+        c = _wire_case(tmp_path, "MuestraÑ".encode(), c_out, "C")
+        u = _wire_case(tmp_path, "MuestraÑ".encode(), utf8_out, utf8)
+        assert c.returncode == u.returncode == 0, (c.stderr, u.stderr)
+        c_wire, u_wire = c_out.read_bytes(), utf8_out.read_bytes()
+        if json.loads(c_wire)["timestamp_utc"] == json.loads(u_wire)["timestamp_utc"]:
+            assert c_wire == u_wire
+            break
+    else:
+        raise AssertionError("could not sample both locales within one timestamp second")
+
+
+def test_round_json_invalid_utf8_fails_before_open(tmp_path: Path) -> None:
+    for idx, raw in enumerate((b"R\xffo", b"\xc0\xaf", b"\xed\xa0\x80")):
+        absent = tmp_path / f"absent_{idx}.json"
+        result = _wire_case(tmp_path, raw, absent)
+        assert result.returncode != 0 and b"invalid UTF-8" in result.stderr
+        assert not absent.exists()
+        existing = tmp_path / f"existing_{idx}.json"
+        existing.write_bytes(b"existing\x00\xff")
+        before = hashlib.sha256(existing.read_bytes()).digest()
+        before_stat = existing.stat()
+        result = _wire_case(tmp_path, raw, existing)
+        assert result.returncode != 0 and b"invalid UTF-8" in result.stderr
+        assert hashlib.sha256(existing.read_bytes()).digest() == before
+        assert existing.stat().st_ino == before_stat.st_ino
+        assert existing.stat().st_mtime_ns == before_stat.st_mtime_ns
+
+
+def test_round_json_validated_wire_is_printed_without_reencoding() -> None:
+    writer = SCRIPT.read_text(encoding="utf-8").split(
+        "my $json = JSON::PP->new->latin1->encode($obj);", 1
+    )[1].split("open my $OUT, '>'", 1)[0]
+    assert "my $copy = $json;" in writer
+    assert "Encode::encode" not in writer
+    assert re.search(r"^\s*\$json\s*=(?!=)", writer, re.M) is None
 
 
 def _run(args):

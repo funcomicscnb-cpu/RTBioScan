@@ -18,7 +18,7 @@ def _parse_embedded_json(html_text: str, marker: str):
 
 def _load_history(path: Path):
     rounds = []
-    for idx, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for idx, raw in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
         line = raw.strip()
         if not line:
             continue

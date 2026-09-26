@@ -192,7 +192,7 @@ from pathlib import Path
 run_index = Path(sys.argv[1])
 run_id = sys.argv[2]
 state_id = run_id
-for raw in run_index.read_text(encoding="utf-8").splitlines():
+for raw in run_index.read_text(encoding="utf-8").split("\n"):
     line = raw.strip()
     if not line:
         continue
@@ -244,7 +244,7 @@ from pathlib import Path
 path = Path(sys.argv[1])
 field_name = sys.argv[2]
 value = ""
-for raw in path.read_text(encoding="utf-8").splitlines():
+for raw in path.read_text(encoding="utf-8").split("\n"):
     line = raw.strip()
     if not line:
         continue
