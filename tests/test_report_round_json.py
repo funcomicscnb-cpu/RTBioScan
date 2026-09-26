@@ -5803,3 +5803,178 @@ def test_informative_barplot_uses_cumulative_blast(tmp_path: Path) -> None:
         f"got {otu_break['coi_assigned']}"
     )
     assert otu_break["coi_unassigned"] == 0
+
+
+
+def _stage2_sample_id(raw: str) -> str:
+    """Independent oracle for the stable ID of the ASCII raw identities below."""
+    base = re.sub(r"_+", "_", re.sub(r"[^a-z0-9._-]+", "_", raw.lower())).strip("_")
+    return f"{base}_{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:8]}"
+
+
+def _stage2_track_case(tmp_path: Path, markers, reverse=False, seed="0", locale="C"):
+    # The expected map is built from raw Pipeline_IDs, never from a label normalizer.
+    identities = ["Soil", "Soil_COI", "Soil_1", "Soil_10", "Prefix", "PrefixLong"]
+    units = [(f"Bio{i}", pid, marker, f"{pid}_{marker}")
+             for i, pid in enumerate(identities) for marker in markers]
+    roster_rows = [f"Bio{i}\t{pid}\t{i + 1}" for i, pid in enumerate(identities)]
+    map_rows = [f"{sid}\t{pid}\t{int(sid[3:]) + 1}\t{marker}\t{label}"
+                for sid, pid, marker, label in units]
+    demult_rows = [f"r{i}\t{marker}\thac\t{label}" for i, (_, _, marker, label) in enumerate(units)]
+    blast_rows = [f"r{i}\t{marker}\thac\t{label}\thit{i}\t{100 + i}\t400\t98.0\tOTU{i}-{marker}\tF{i}\tG{i}\tTaxon{i}"
+                  for i, (_, _, marker, label) in enumerate(units)]
+    consensus_rows = [f"Cons{i}\t{marker}\tconsensus\t{i + 1}\t{label}\t{100 + i}\thit{i}\t400\t98.0\tK\tP\tC\tO\tF{i}\tG{i}\tTaxon{i}"
+                      for i, (_, _, marker, label) in enumerate(units)]
+    if reverse:
+        roster_rows.reverse()
+        map_rows.reverse()
+        demult_rows.reverse()
+        blast_rows.reverse()
+        consensus_rows.reverse()
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text("sample_id\ttrack_id\treplicate_number\n" + "\n".join(roster_rows) + "\n", encoding="utf-8")
+    identity = tmp_path / "track_identity.tsv"
+    identity.write_text("sample_id\ttrack_id\treplicate_number\tmarker_id\tunit_id_track\n"
+                        + "\n".join(map_rows) + "\n", encoding="utf-8")
+    demult = tmp_path / "demult.tsv"
+    demult.write_text("read_id\tbarcode_by_homology\tbasecalling_model\tsample\n"
+                      + "\n".join(demult_rows) + "\n", encoding="utf-8")
+    blast = tmp_path / "blast.tsv"
+    blast.write_text("read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\totu_id\totu_family\totu_genus\totu_species\n"
+                     + "\n".join(blast_rows) + "\n", encoding="utf-8")
+    consensus = tmp_path / "consensus.tsv"
+    consensus.write_text("consensus_id\tbarcode_by_homology\tbasecalling_model\tnumber_of_reads\tsample\ttaxid\tblast_hit\taln_length\tperc_id\tconsensus_kingdom\tconsensus_phylum\tconsensus_class\tconsensus_order\tconsensus_family\tconsensus_genus\tconsensus_species\n"
+                         + "\n".join(consensus_rows) + "\n", encoding="utf-8")
+    out = tmp_path / "out.json"
+    args = ["perl", str(SCRIPT), "--run-id", "runA", "--barcode", "RTBioScan",
+            "--round-barcode", "round_1", "--out", str(out), "--identity-mode", "track",
+            "--sample-roster", str(roster), "--track-identity", str(identity),
+            "--demult", str(demult), "--blast-otu", str(blast), "--blast-consensus", str(consensus)]
+    result = subprocess.run(args, capture_output=True, text=True, check=False,
+                            env=dict(os.environ, LC_ALL=locale, RTBIOSCAN_TARGET_TOKENS="|".join(markers),
+                                     PERL_HASH_SEED=seed, PERL_PERTURB_KEYS="2"))
+    return result, out, units
+
+
+def test_stage2_raw_collapse_roster_keeps_numeric_identities(tmp_path: Path) -> None:
+    roster = tmp_path / "samples.txt"
+    raw = ["W_eDNA_1", "W_eDNA_2", "Site_10", "Site"]
+    roster.write_text("\n".join(f"{value}\t{value}_r1" for value in raw) + "\n", encoding="utf-8")
+    out = tmp_path / "out.json"
+    result = _run(["--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "round_1",
+                   "--out", str(out), "--sample-roster", str(roster)])
+    assert result.returncode == 0, result.stderr
+    metrics = json.loads(out.read_text(encoding="utf-8"))["sample_metrics"]
+    assert set(metrics) == {_stage2_sample_id(value) for value in raw}
+    assert {entry["label"] for entry in metrics.values()} == set(raw)
+    assert "W_eDNA" not in {entry["label"] for entry in metrics.values()}
+
+
+def test_stage2_exact_track_map_is_order_seed_and_locale_independent(tmp_path: Path) -> None:
+    locales = subprocess.check_output(["locale", "-a"], text=True).splitlines()
+    utf8 = next(value for value in locales if "utf-8" in value.lower())
+    for marker_order in (["COI"], ["ITS2"], ["COI", "ITS2"], ["ITS2", "COI"]):
+        expected_labels = {"Soil", "Soil_COI", "Soil_1", "Soil_10", "Prefix", "PrefixLong"}
+        for reverse in (False, True):
+            for seed in ("0", "17"):
+                for locale in ("C", utf8):
+                    case = tmp_path / f"{'_'.join(marker_order)}_{reverse}_{seed}_{locale}"
+                    case.mkdir()
+                    result, out, units = _stage2_track_case(case, marker_order, reverse, seed, locale)
+                    assert result.returncode == 0, result.stderr
+                    report = json.loads(out.read_text(encoding="utf-8"))
+                    metrics = report["sample_metrics"]
+                    assert set(metrics) == {_stage2_sample_id(pid) for pid in expected_labels}
+                    by_label = {entry["label"]: entry for entry in metrics.values()}
+                    assert set(by_label) == expected_labels
+                    assert all(by_label[pid]["reads_demux"] == len(marker_order) for pid in expected_labels)
+                    assert all(by_label[pid]["reads_blast_assigned"] == len(marker_order) for pid in expected_labels)
+                    track_units = report["track_unit_metrics"]
+                    assert set(track_units) == {label for _, _, _, label in units}
+                    otu_rows = {row["track_unit_id"]: row for row in report["otu"]["assignments_by_level"]["species"]}
+                    assert set(otu_rows) == set(track_units)
+                    consensus_rows = {row["track_unit_id"]: row for row in report["consensus"]["assignments_by_level"]["species"]}
+                    assert set(consensus_rows) == set(track_units)
+                    for index, (sid, pid, marker, label) in enumerate(units):
+                        assert track_units[label]["track_replicate_id"] == pid
+                        assert track_units[label]["track_sample_label"] == sid
+                        assert track_units[label]["track_primer_label"] == marker
+                        assert track_units[label]["reads_demux"] == 1
+                        assert track_units[label]["reads_blast_assigned"] == 1
+                        assert otu_rows[label]["sample"] == pid
+                        assert otu_rows[label]["taxon"] == f"Taxon{index}"
+                        assert otu_rows[label]["reads_total"] == 1
+                        assert consensus_rows[label]["sample"] == pid
+                        assert consensus_rows[label]["taxon"] == f"Taxon{index}"
+                        assert consensus_rows[label]["reads_total"] == index + 1
+
+
+def test_stage2_track_map_rejects_corrupt_rows(tmp_path: Path) -> None:
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text("sample_id\ttrack_id\treplicate_number\nBio1\tSoil\t1\nBio2\tSoil_COI\t1\nBio3\tBad/ID\t1\nBio4\tno_adapter\t1\n", encoding="utf-8")
+    identity = tmp_path / "track_identity.tsv"
+    header = "sample_id\ttrack_id\treplicate_number\tmarker_id\tunit_id_track\n"
+    good = "Bio1\tSoil\t1\tCOI\tSoil_COI\n"
+    bad_rows = [
+        (good + "Bio2\tSoil_COI\t1\tCOI\tSoil_COI\n", "conflicting rows"),
+        ("Bio1\tSoil\t1\tCOI\n", "malformed row"),
+        ("Bio1\tSoil\t1\tCOI\t\n", "empty or unsafe unit_id_track"),
+        ("Bio3\tBad/ID\t1\tCOI\tBad/ID_COI\n", "empty or unsafe unit_id_track"),
+        ("Bio4\tno_adapter\t1\tCOI\tno_adapter_COI\n", "unsafe track_id"),
+        ("Bio1\t\t1\tCOI\tSoil_COI\n", "empty track_id"),
+    ]
+    for index, (rows, diagnostic) in enumerate(bad_rows):
+        identity.write_text(header + rows, encoding="utf-8")
+        out = tmp_path / f"bad_{index}.json"
+        result = _run(["--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "round_1",
+                       "--out", str(out), "--identity-mode", "track", "--sample-roster", str(roster),
+                       "--track-identity", str(identity)])
+        assert result.returncode != 0 and diagnostic in result.stderr
+        assert not out.exists()
+
+
+def test_stage2_unmapped_track_labels_keep_legacy_fallback(tmp_path: Path) -> None:
+    roster = tmp_path / "track_roster.tsv"
+    roster.write_text("sample_id\ttrack_id\treplicate_number\n"
+                      "Bio1\tLegacy_1_MPold1\t1\nBio2\tOther\t1\n", encoding="utf-8")
+    demult = tmp_path / "demult.tsv"
+    demult.write_text("read_id\tbarcode_by_homology\tbasecalling_model\tsample\n"
+                      "r1\tCOI\thac\tLegacy_1_MPold1_COI\n"
+                      "r2\tITS2\thac\tLegacy_1_MPold1_ITS2\n", encoding="utf-8")
+    identity = tmp_path / "track_identity.tsv"
+    identity.write_text("sample_id\ttrack_id\treplicate_number\tmarker_id\tunit_id_track\n"
+                        "Bio2\tOther\t1\tCOI\tOther_COI\n", encoding="utf-8")
+    snapshots = []
+    for name, map_path in (("absent", None), ("missing_entry", identity)):
+        out = tmp_path / f"{name}.json"
+        args = ["--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "round_1",
+                "--out", str(out), "--identity-mode", "track", "--sample-roster", str(roster),
+                "--demult", str(demult)]
+        if map_path is not None:
+            args.extend(["--track-identity", str(map_path)])
+        result = _run(args)
+        assert result.returncode == 0, result.stderr
+        metrics = json.loads(out.read_text(encoding="utf-8"))["sample_metrics"]
+        assert set(metrics) == {_stage2_sample_id("Legacy_1_MPold1"), _stage2_sample_id("Other")}
+        assert metrics[_stage2_sample_id("Legacy_1_MPold1")]["reads_demux"] == 2
+        snapshots.append(metrics)
+    assert snapshots[0] == snapshots[1]
+
+
+def test_stage2_does_not_convert_collapse_rows_to_exact_map(tmp_path: Path) -> None:
+    # The collapse row heuristic and consensus partitioning are Stage 3 scope.
+    roster = tmp_path / "samples.txt"
+    roster.write_text("Plot_3_North\tPlot_3_North_r1\n"
+                      "Plot_4_North\tPlot_4_North_r1\n", encoding="utf-8")
+    demult = tmp_path / "demult.tsv"
+    demult.write_text("read_id\tbarcode_by_homology\tbasecalling_model\tsample\n"
+                      "r1\tCOI\thac\tPlot_3_North_COI\n"
+                      "r2\tCOI\thac\tPlot_4_North_COI\n", encoding="utf-8")
+    out = tmp_path / "out.json"
+    result = _run(["--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "round_1",
+                   "--out", str(out), "--sample-roster", str(roster), "--demult", str(demult)])
+    assert result.returncode == 0, result.stderr
+    metrics = json.loads(out.read_text(encoding="utf-8"))["sample_metrics"]
+    assert {entry["label"] for entry in metrics.values()} == {"Plot_3_North", "Plot_4_North", "Plot_North"}
+    assert metrics[_stage2_sample_id("Plot_North")]["reads_demux"] == 2
+    assert metrics[_stage2_sample_id("Plot_3_North")]["reads_demux"] is None

@@ -549,9 +549,14 @@ sub load_kv_tsv {
 
 sub resolve_reporting_identity {
   my ($label_raw) = @_;
-  return $opt{identity_mode} eq 'track'
-    ? normalize_track_reporting_identity($label_raw)
-    : SampleLabel::normalize_sample_base($label_raw);
+  if ($opt{identity_mode} eq 'track') {
+    my $label = trim_text($label_raw // '');
+    if (exists $TRACK_UNIT_BY_UNIT_ID{$label}) {
+      return $TRACK_UNIT_METRICS{$TRACK_UNIT_BY_UNIT_ID{$label}}{track_replicate_id};
+    }
+    return normalize_track_reporting_identity($label_raw);
+  }
+  return SampleLabel::normalize_sample_base($label_raw);
 }
 
 sub normalize_track_reporting_identity {
@@ -567,11 +572,9 @@ sub normalize_track_reporting_identity {
 }
 
 sub ensure_sample_entry {
-  my ($sample_metrics, $label_to_id, $id_to_label, $label_raw) = @_;
-  # Normalize to reporting identity: collapse mode strips replicate suffix _N so that
-  # W_eDNA_1_1, W_eDNA_1_2, ... accumulate into W_eDNA_1; track mode preserves the
-  # track unit while dropping only the terminal marker suffix used in demux reports.
-  my $label = resolve_reporting_identity($label_raw);
+  my ($sample_metrics, $label_to_id, $id_to_label, $label_raw, $raw_identity) = @_;
+  # Roster identities are raw; reporting rows use the exact track map or legacy label rules.
+  my $label = $raw_identity ? trim_text($label_raw) : resolve_reporting_identity($label_raw);
   $label = 'unknown' if !defined $label || $label eq '';
   if ($opt{identity_mode} eq 'track' && $g_roster_ready
       && $label ne 'unknown'
@@ -613,7 +616,7 @@ sub ensure_sample_entry {
 sub ensure_replicate_sub_entry {
   my ($entry, $raw_label) = @_;
   my $rep_label = $opt{identity_mode} eq 'track'
-    ? normalize_track_reporting_identity($raw_label)
+    ? resolve_reporting_identity($raw_label)
     : SampleLabel::normalize_sample_label($raw_label);
   $rep_label = 'unknown' if !defined $rep_label || $rep_label eq '';
   return undef if $rep_label eq $entry->{label};
@@ -673,7 +676,7 @@ sub seed_sample_entries_from_roster {
       my @f = split /\t/, $line, -1;
       my $tid = trim_text($f[$tid_col] // '');
       next if $tid eq '';
-      ensure_sample_entry($sample_metrics, $label_to_id, $id_to_label, $tid);
+      ensure_sample_entry($sample_metrics, $label_to_id, $id_to_label, $tid, 1);
     }
   } else {
     # Collapse mode: existing whitespace-split behavior (unchanged).
@@ -684,7 +687,7 @@ sub seed_sample_entries_from_roster {
       next unless @f;
       my $base_label = trim_text($f[0]);
       next if $base_label eq '';
-      my $sid = ensure_sample_entry($sample_metrics, $label_to_id, $id_to_label, $base_label);
+      my $sid = ensure_sample_entry($sample_metrics, $label_to_id, $id_to_label, $base_label, 1);
       next if !defined $sid || $sid eq '';
       my $entry = $sample_metrics->{$sid};
       if (defined $f[1] && trim_text($f[1]) ne '') {
@@ -785,11 +788,15 @@ sub seed_track_unit_metrics_from_identity {
     next if $line =~ /^\s*$/;
     next if is_repeated_header_line($line, $hdr);
     my @f = split /\t/, $line, -1;
+    die "ERROR: track identity '$identity_path' has a malformed row\n" if @f != @cols;
     my $unit_id = ($unit_idx <= $#f) ? trim_text($f[$unit_idx]) : '';
-    next if $unit_id eq '';
+    die "ERROR: track identity '$identity_path' has an empty or unsafe unit_id_track\n"
+      if $unit_id eq '' || $unit_id =~ /[\x09-\x0d\x20|\/]/;
     my $track_id = ($track_idx <= $#f) ? trim_text($f[$track_idx]) : '';
     die "ERROR: track identity '$identity_path' contains empty track_id for unit '$unit_id'\n"
       if $track_id eq '';
+    die "ERROR: track identity '$identity_path' contains unsafe track_id for unit '$unit_id'\n"
+      if $track_id =~ /[\x09-\x0d\x20|\/]/ || $track_id =~ /^no_adapter(?:_\d+)?$/i;
     my $marker_id = ($marker_idx <= $#f) ? trim_text($f[$marker_idx]) : '';
     my $marker_label = canonical_track_marker_label($marker_id);
     my $roster = $TRACK_ROSTER_BY_TRACK_ID{$track_id};
@@ -850,9 +857,15 @@ sub seed_track_unit_metrics_from_identity {
 }
 
 sub resolve_track_unit_metrics_entry {
-  my ($raw_sample, $sample_label, $marker_raw) = @_;
+  my ($raw_sample, $sample_label, $marker_raw, $reporting_identity) = @_;
   return undef if $opt{identity_mode} ne 'track' || !%TRACK_UNIT_METRICS;
   my $marker_label = canonical_track_marker_label($marker_raw);
+  if ($reporting_identity) {
+    my $track_id = trim_text($sample_label // '');
+    return undef if !exists $TRACK_UNIT_BY_TRACK_MARKER{$track_id};
+    my $unit_id = $TRACK_UNIT_BY_TRACK_MARKER{$track_id}{$marker_label};
+    return defined $unit_id ? $TRACK_UNIT_METRICS{$unit_id} : undef;
+  }
   for my $candidate ($raw_sample, $sample_label) {
     my $value = trim_text($candidate // '');
     next if $value eq '';
@@ -3459,7 +3472,7 @@ sub collect_otu_assignments_by_level {
           : JSON::PP::false;
       }
       if ($opt{identity_mode} eq 'track') {
-        my $track_entry = resolve_track_unit_metrics_entry($g->{sample}, $g->{sample}, $g->{marker});
+        my $track_entry = resolve_track_unit_metrics_entry($g->{sample}, $g->{sample}, $g->{marker}, 1);
         add_track_identity_fields($row_out, $track_entry);
       }
       if (defined $row_out->{frozen_otu_reads_total}
@@ -3687,7 +3700,7 @@ sub collect_consensus_assignments_by_level {
           : JSON::PP::false;
       }
       if ($opt{identity_mode} eq 'track') {
-        my $track_entry = resolve_track_unit_metrics_entry($g->{sample}, $g->{sample}, $g->{marker});
+        my $track_entry = resolve_track_unit_metrics_entry($g->{sample}, $g->{sample}, $g->{marker}, 1);
         add_track_identity_fields($row_out, $track_entry);
       }
       push @agg, $row_out;
