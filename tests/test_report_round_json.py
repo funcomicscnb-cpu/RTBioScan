@@ -5961,8 +5961,7 @@ def test_stage2_unmapped_track_labels_keep_legacy_fallback(tmp_path: Path) -> No
     assert snapshots[0] == snapshots[1]
 
 
-def test_stage2_does_not_convert_collapse_rows_to_exact_map(tmp_path: Path) -> None:
-    # The collapse row heuristic and consensus partitioning are Stage 3 scope.
+def test_stage3_collapse_rows_use_exact_identity_map(tmp_path: Path) -> None:
     roster = tmp_path / "samples.txt"
     roster.write_text("Plot_3_North\tPlot_3_North_r1\n"
                       "Plot_4_North\tPlot_4_North_r1\n", encoding="utf-8")
@@ -5970,11 +5969,17 @@ def test_stage2_does_not_convert_collapse_rows_to_exact_map(tmp_path: Path) -> N
     demult.write_text("read_id\tbarcode_by_homology\tbasecalling_model\tsample\n"
                       "r1\tCOI\thac\tPlot_3_North_COI\n"
                       "r2\tCOI\thac\tPlot_4_North_COI\n", encoding="utf-8")
+    identity = tmp_path / "replicate_identity.tsv"
+    identity.write_text(
+        "sample_id\tmarker_id\tsuffix_resolution_mode\tunit_suffix_current\tunit_id_collapse\n"
+        "Plot_3_North\tCOI\tmarker\tCOI\tPlot_3_North_COI\n"
+        "Plot_4_North\tCOI\tmarker\tCOI\tPlot_4_North_COI\n", encoding="utf-8")
     out = tmp_path / "out.json"
     result = _run(["--run-id", "runA", "--barcode", "RTBioScan", "--round-barcode", "round_1",
-                   "--out", str(out), "--sample-roster", str(roster), "--demult", str(demult)])
+                   "--out", str(out), "--sample-roster", str(roster), "--demult", str(demult),
+                   "--replicate-identity", str(identity)])
     assert result.returncode == 0, result.stderr
     metrics = json.loads(out.read_text(encoding="utf-8"))["sample_metrics"]
-    assert {entry["label"] for entry in metrics.values()} == {"Plot_3_North", "Plot_4_North", "Plot_North"}
-    assert metrics[_stage2_sample_id("Plot_North")]["reads_demux"] == 2
-    assert metrics[_stage2_sample_id("Plot_3_North")]["reads_demux"] is None
+    assert {entry["label"] for entry in metrics.values()} == {"Plot_3_North", "Plot_4_North"}
+    assert metrics[_stage2_sample_id("Plot_3_North")]["reads_demux"] == 1
+    assert metrics[_stage2_sample_id("Plot_4_North")]["reads_demux"] == 1

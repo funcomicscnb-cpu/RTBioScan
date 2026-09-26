@@ -4,6 +4,7 @@ use warnings;
 use FindBin;
 
 require "$FindBin::Bin/lib/sample_label.pl";
+require "$FindBin::Bin/collapse_identity_map.pl";
 
 my $program_name = $ENV{DETECT_CONSENSUS_SAMPLE_MODE_PROG} || $0;
 
@@ -18,6 +19,10 @@ my ($blast_report, $samples_out, $default_samples) = @ARGV;
 my $tmp_candidates = "${samples_out}.candidates.tmp.$$";
 my $tmp_out = "${samples_out}.tmp.$$";
 my $identity_mode = lc(($ENV{RTBIOSCAN_EFFECTIVE_IDENTITY_MODE} || 'collapse'));
+my $collapse_map = $identity_mode eq 'collapse'
+    && defined($ENV{RTBIOSCAN_REPLICATE_IDENTITY_TSV})
+    && $ENV{RTBIOSCAN_REPLICATE_IDENTITY_TSV} ne ''
+    ? CollapseIdentityMap::load($ENV{RTBIOSCAN_REPLICATE_IDENTITY_TSV}) : undef;
 
 END {
     unlink $tmp_candidates if defined $tmp_candidates && -e $tmp_candidates;
@@ -56,7 +61,9 @@ sub is_no_adapter_adapter {
 
 sub normalize_sample_base {
     my ($sample) = @_;
-    my $normalized = SampleLabel::normalize_sample_base($sample);
+    my $normalized = defined $collapse_map
+        ? CollapseIdentityMap::sample_for_unit($collapse_map, $sample)
+        : SampleLabel::normalize_sample_base($sample);
     return undef if !defined($normalized) || $normalized eq '';
     return $normalized;
 }
@@ -196,7 +203,11 @@ if (-s $blast_report) {
         my ($read_id) = split /\t/, $line, 2;
         next if is_header_read_id($read_id);
         my $adapter = extract_adapter_from_read_id($read_id);
-        next if !defined($adapter) || $adapter eq '';
+        if (!defined($adapter) || $adapter eq '') {
+            die "collapse mode with identity map requires adapter= token in blast row: $read_id\n"
+                if defined $collapse_map;
+            next;
+        }
         if (is_no_adapter_adapter($adapter)) {
             $observed_no_adapter = 1;
             next;
@@ -224,10 +235,33 @@ if ($observed_barcoded) {
 } elsif (defined($default_samples) && $default_samples ne '' && -s $default_samples) {
     open my $defaults_fh, '<', $default_samples or die "failed to read $default_samples: $!\n";
     open my $defaults_tmp_fh, '>', $tmp_candidates or die "failed to rewrite $tmp_candidates: $!\n";
+    my %mapped_samples = defined $collapse_map
+        ? map { $_->{sample} => 1 } values %$collapse_map : ();
     while (my $sample = <$defaults_fh>) {
         chomp $sample;
-        next if $sample eq '';
-        append_normalized_sample($defaults_tmp_fh, $sample);
+        if ($sample eq '') {
+            die "collapse mode with identity map has blank samples.txt row\n"
+                if defined $collapse_map;
+            next;
+        }
+        if (defined $collapse_map) {
+            my @fields = split / /, $sample, -1;
+            die "collapse mode with identity map requires a safe seven-field samples.txt row: $sample\n"
+                unless $sample !~ /[\x00-\x1f\x7f]/
+                && @fields == 7
+                && !(grep { $_ eq '' || /[\x00-\x20\x7f]/ } @fields)
+                && $fields[0] !~ /[|\/]/
+                && $fields[1] !~ /[|\/]/
+                && $fields[1] !~ /^no_adapter(?:_\d+)?$/i
+                && !(grep { /_/ } @fields[2 .. 4])
+                && $fields[6] eq ">" . $fields[3] . "_" . $fields[4];
+            die "collapse mode with identity map has unmapped Sample_ID '$fields[0]' in samples.txt\n"
+                unless exists $mapped_samples{$fields[0]};
+            print {$defaults_tmp_fh} "$fields[0]\n"
+                or die "failed to write candidate sample: $!\n";
+        } else {
+            append_normalized_sample($defaults_tmp_fh, $sample);
+        }
     }
     close $defaults_tmp_fh or die "failed to close $tmp_candidates: $!\n";
     close $defaults_fh or die "failed to close $default_samples: $!\n";

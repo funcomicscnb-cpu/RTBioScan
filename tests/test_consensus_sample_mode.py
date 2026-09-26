@@ -46,6 +46,52 @@ def test_detects_barcoded_samples_from_actual_adapter_names(tmp_path: Path) -> N
     assert samples_out.read_text(encoding="utf-8").splitlines() == ["sample_A", "sample_B"]
 
 
+def test_collapse_identity_map_resolves_units_exactly(tmp_path: Path) -> None:
+    identity = tmp_path / "replicate_identity.tsv"
+    identity.write_text(
+        "sample_id\tmarker_id\tsuffix_resolution_mode\tunit_suffix_current\tunit_id_collapse\n"
+        "Plot_3_North\tCOI\tmarker\tCOI\tPlot_3_North_COI\n"
+        "Plot_4_North\tCOI\tmarker\tCOI\tPlot_4_North_COI\n",
+        encoding="utf-8",
+    )
+    rows = (
+        "tag1|COI|hac2sup|adapter=Plot_3_North_COI|OTUB_1-COI\tNA\n"
+        "tag2|COI|hac2sup|adapter=Plot_4_North_COI|OTUB_1-COI\tNA\n"
+    )
+    env = {"RTBIOSCAN_REPLICATE_IDENTITY_TSV": str(identity)}
+    result, samples_out = _run(tmp_path, rows, env=env)
+    assert result.returncode == 0, result.stderr
+    assert samples_out.read_text(encoding="utf-8").splitlines() == ["Plot_3_North", "Plot_4_North"]
+
+
+def test_collapse_present_map_refuses_missing_unit_before_samples_publication(tmp_path: Path) -> None:
+    identity = tmp_path / "replicate_identity.tsv"
+    identity.write_text(
+        "sample_id\tmarker_id\tsuffix_resolution_mode\tunit_suffix_current\tunit_id_collapse\n"
+        "Plot_3_North\tCOI\tmarker\tCOI\tPlot_3_North_COI\n",
+        encoding="utf-8",
+    )
+    result, samples_out = _run(
+        tmp_path,
+        "tag1|COI|hac2sup|adapter=Plot_4_North_COI|OTUB_1-COI\tNA\n",
+        env={"RTBIOSCAN_REPLICATE_IDENTITY_TSV": str(identity)},
+    )
+    assert result.returncode != 0
+    assert "no entry" in result.stderr
+    assert not samples_out.exists()
+
+
+def test_collapse_configured_identity_path_cannot_silently_become_legacy(tmp_path: Path) -> None:
+    result, samples_out = _run(
+        tmp_path,
+        "tag1|COI|hac2sup|adapter=sample_A_COI|OTUB_1-COI\tNA\n",
+        env={"RTBIOSCAN_REPLICATE_IDENTITY_TSV": str(tmp_path / "missing.tsv")},
+    )
+    assert result.returncode != 0
+    assert "missing, empty, or unreadable" in result.stderr
+    assert not samples_out.exists()
+
+
 def test_defaults_to_no_adapter_when_only_no_adapter_reads_are_present(tmp_path: Path) -> None:
     result, samples_out = _run(
         tmp_path,
@@ -74,6 +120,89 @@ def test_falls_back_to_default_samples_when_current_round_has_no_barcoded_rows(t
     assert result.returncode == 0, result.stderr
     assert "mode\tbarcoded_fallback" in result.stdout
     assert samples_out.read_text(encoding="utf-8").splitlines() == ["sample_A", "sample_B"]
+
+
+def test_mapped_defaults_use_exact_sample_ids_and_reach_consensus_partition(tmp_path: Path) -> None:
+    identity = tmp_path / "replicate_identity.tsv"
+    identity.write_text(
+        "sample_id\tmarker_id\tsuffix_resolution_mode\tunit_suffix_current\tunit_id_collapse\n"
+        "Plot_3_North\tCOI\tmarker\tCOI\tPlot_3_North_COI\n"
+        "Plot_4_North\tCOI\tmarker\tCOI\tPlot_4_North_COI\n",
+        encoding="utf-8",
+    )
+    roster = (
+        "Plot_4_North P4N_1 1 A1 P1 runA >A1_P1\n"
+        "Plot_3_North P3N_1 1 A2 P1 runA >A2_P1\n"
+        "Plot_3_North P3N_2 2 A3 P1 runA >A3_P1\n"
+    )
+    env = {
+        "RTBIOSCAN_EFFECTIVE_IDENTITY_MODE": "collapse",
+        "RTBIOSCAN_REPLICATE_IDENTITY_TSV": str(identity),
+        "RTBIOSCAN_TARGET_TOKENS": "COI",
+        "RTBIOSCAN_TARGET_TAXA": "Metazoa",
+        "CONSENSUS_TAXONOMY_MODE": "allow_unassigned",
+    }
+    result, samples_out = _run(
+        tmp_path, "read_id\totu_id\totu_kingdom\tbarcode_by_homology\n", roster, env
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[:2] == [
+        "mode\tbarcoded_fallback", "source\tdefault_samples"
+    ]
+    assert samples_out.read_text(encoding="utf-8") == "Plot_3_North\nPlot_4_North\n"
+
+    (tmp_path / "qced_reads_hq_accumulated.fasta").write_text(
+        ">cached|COI|hac|barcode=COI|adapter=Plot_3_North_COI\nACGT\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "read_qscore.tsv").write_text("read_id\tqscore\n", encoding="utf-8")
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    for name in ("seqkit", "seqtk", "vsearch", "Rscript"):
+        stub = stubs / name
+        stub.write_text("#!/bin/sh\nexit 93\n", encoding="utf-8")
+        stub.chmod(0o755)
+    consensus = subprocess.run(
+        ["/bin/bash", str(REPO_ROOT / "bin" / "Consensus_simple.sh"),
+         str(REPO_ROOT / "bin"), "98", "1", "10", "0", "0", "", "representative", "4"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+        env={**os.environ, **env, "PATH": f"{stubs}:{os.environ['PATH']}"},
+    )
+    assert consensus.returncode == 0, consensus.stderr
+    assert "refusing fallback" not in consensus.stderr
+    partitions = tmp_path / "Consensus" / "_sample_partitions"
+    assert {path.name for path in partitions.glob("*.blast.tsv")} == {
+        "Plot_3_North.blast.tsv", "Plot_4_North.blast.tsv"
+    }
+    assert all(not path.read_bytes() for path in partitions.glob("*.blast.tsv"))
+
+
+def test_mapped_defaults_refuse_malformed_unsafe_and_unmapped_rows_before_output(tmp_path: Path) -> None:
+    identity = tmp_path / "replicate_identity.tsv"
+    identity.write_text(
+        "sample_id\tmarker_id\tsuffix_resolution_mode\tunit_suffix_current\tunit_id_collapse\n"
+        "Plot_3_North\tCOI\tmarker\tCOI\tPlot_3_North_COI\n",
+        encoding="utf-8",
+    )
+    env = {"RTBIOSCAN_EFFECTIVE_IDENTITY_MODE": "collapse",
+           "RTBIOSCAN_REPLICATE_IDENTITY_TSV": str(identity)}
+    valid = "Plot_3_North P3N_1 1 A1 P1 runA >A1_P1\n"
+    for index, bad in enumerate((
+        "Plot_3_North P3N_1 1 A1 P1 runA\n",
+        "Plot_3_North P3N_1 1 A1 P1 runA >A1_P1 extra\n",
+        "\n",
+        "Plot_3_North P3N_1 1 A1 P1 runA bad/path\n",
+        "Plot_3_North\tP3N_1 1 A1 P1 runA P3N_1\n",
+        "Plot_4_North P4N_1 1 A1 P1 runA >A1_P1\n",
+    )):
+        case = tmp_path / f"case_{index}"
+        case.mkdir()
+        sentinel = case / "samples.txt"
+        sentinel.write_text("preexisting\n", encoding="utf-8")
+        result, samples_out = _run(case, "read_id\totu_id\n", valid + bad, env)
+        assert result.returncode != 0, (index, bad, result.stderr)
+        assert samples_out.read_text(encoding="utf-8") == "preexisting\n"
+        assert not list(case.glob("samples.txt.*.tmp.*"))
 
 
 def test_observed_no_adapter_takes_priority_over_default_samples(tmp_path: Path) -> None:
@@ -224,3 +353,39 @@ def test_track_mode_preserves_exact_track_units_and_appends_observed_no_adapter(
         "sample_A_1_MPold1_ITS2",
         "no_adapter",
     ]
+
+
+def test_mapped_defaults_accept_producer_permitted_compatibility_delimiters(tmp_path: Path) -> None:
+    identity = tmp_path / "identity.tsv"
+    identity.write_text(
+        "sample_id\tmarker_id\tsuffix_resolution_mode\tunit_suffix_current\tunit_id_collapse\n"
+        "Plot_3_North\tCOI\tmarker\tCOI\tPlot_3_North_COI\n"
+        "Plot_4_North\tCOI\tmarker\tCOI\tPlot_4_North_COI\n", encoding="utf-8")
+    env = {"RTBIOSCAN_EFFECTIVE_IDENTITY_MODE": "collapse",
+           "RTBIOSCAN_REPLICATE_IDENTITY_TSV": str(identity)}
+    roster = ("Plot_4_North P4N_1 rep/2 W|2 P/2 run|A >W|2_P/2\n"
+              "Plot_3_North P3N_1 rep|1 W/1 P|1 run/A >W/1_P|1\n")
+    result, output = _run(tmp_path, "read_id\totu_id\n", roster, env)
+    assert result.returncode == 0, result.stderr
+    assert output.read_text() == "Plot_3_North\nPlot_4_North\n"
+
+    for index, bad in enumerate((
+        "Plot_3_North P|3 1 A1 P1 runA >A1_P1\n",
+        "Plot_3_North P/3 1 A1 P1 runA >A1_P1\n",
+        "Plot_3_North no_adapter 1 A1 P1 runA >A1_P1\n",
+        "Plot_3_North no_adapter_1 1 A1 P1 runA >A1_P1\n",
+        "Plot_3_North P3 1 A_1 P1 runA >A_1_P1\n",
+        "Plot_3_North P3 1 A1 P1 runA >A1_P2\n",
+        "Plot_3_North P3 1 A1 P1 runA\n",
+        "Plot_3_North P3 1 A1 P1 runA >A1_P1 extra\n",
+        "Plot_3_North P3 1 A1 P1 runA >A1_P1\r\n",
+        "Plot_3_North\tP3 1 A1 P1 runA >A1_P1\n",
+        "Plot_3_North/Bad P3 1 A1 P1 runA >A1_P1\n",
+    )):
+        case = tmp_path / f"invalid_{index}"
+        case.mkdir()
+        sentinel = case / "samples.txt"
+        sentinel.write_bytes(b"existing\n")
+        result, output = _run(case, "read_id\totu_id\n", bad, env)
+        assert result.returncode != 0, (index, result.stderr)
+        assert output.read_bytes() == b"existing\n"

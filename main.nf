@@ -382,6 +382,14 @@ def podBaseDir    = _runId ? "${workflow.launchDir}/results/pod5/${_runId}"     
 def feederGlobalLedgerDir = "${workflow.launchDir}/results/temp/_global/feeder_dedup"
 def sampleInfoDir = _runId ? "${workflow.launchDir}/results/sample_info/${_runId}" : "${workflow.launchDir}/results/sample_info"
 validateSampleInfoInventory(demuxIdentityContext)
+def collapseIdentityPath = "${sampleInfoDir}/replicate_identity.tsv"
+def collapseIdentityPresent = replicateModeCanonical == 'collapse' && new File(collapseIdentityPath).isFile()
+def collapseIdentityInput = file(collapseIdentityPresent ? collapseIdentityPath : "${baseDir}/bin/collapse_identity_map.pl")
+def collapseIdentityDigest = collapseIdentityPresent
+    ? java.security.MessageDigest.getInstance('SHA-256').digest(java.nio.file.Files.readAllBytes(new File(collapseIdentityPath).toPath())).encodeHex().toString()
+    : 'absent'
+collapseIdentityInputCh = Channel.value(collapseIdentityInput)
+collapseIdentityDigestCh = Channel.value(collapseIdentityDigest)
 
 // Fail fast if Dorado or its model directories are missing/misconfigured.
 // (We can't reliably sanity-check model load here without executing Dorado, so we do structural checks.)
@@ -4740,6 +4748,8 @@ process consensus {
 
     input: 
 	    tuple val(barcode), val(round_barcode), file(fasta_hq_qced), val(round_generation_token), val(round_lock_scope), file(blast_report), file(assigned_read_ids) from consensus_inputs
+	    file(replicate_identity_file) from collapseIdentityInputCh
+	    val(replicate_identity_sha) from collapseIdentityDigestCh
 
 	output:
 		tuple val(barcode), val(round_barcode), file("${barcode}_preblastreport_join.txt"), file("consensus_blast_report_full.txt"), file("consensus_round_provenance.tsv"), val(round_generation_token), val(round_lock_scope) into report_consensus
@@ -4782,6 +4792,9 @@ process consensus {
 	export RTBIOSCAN_ROUND_LOCK_PIN_TOKEN_FILE=".rtbioscan-round-lock-pin.consensus.\$\$"
 	source "${baseDir}/bin/round_lock_process_guard.sh"
 	rtbioscan_round_lock_pin consensus
+	if [ "${collapseIdentityPresent ? '1' : '0'}" = 1 ]; then
+		perl -I "${baseDir}/bin" -e 'require "collapse_identity_map.pl"; CollapseIdentityMap::load(\$ARGV[0]);' "${replicate_identity_file}"
+	fi
 	THREADS=${task.cpus}
 		export RTBIOSCAN_RSCRIPT="${consensusRscriptBin ?: 'Rscript'}"
 		export BLASTDB=${taxdb_dir}
@@ -4932,6 +4945,12 @@ process consensus {
 			_t_prelaunch_sample_mode_detect_start=\$(timing_now_ms)
 			RTBIOSCAN_EFFECTIVE_IDENTITY_MODE="${replicateModeCanonical}"
 			export RTBIOSCAN_EFFECTIVE_IDENTITY_MODE
+			if [ "${collapseIdentityPresent ? '1' : '0'}" = 1 ]; then
+				RTBIOSCAN_REPLICATE_IDENTITY_TSV="${replicate_identity_file}"
+				export RTBIOSCAN_REPLICATE_IDENTITY_TSV
+			else
+				unset RTBIOSCAN_REPLICATE_IDENTITY_TSV
+			fi
 			CONSENSUS_DEFAULT_SAMPLES="${sampleInfoDir}/samples.txt"
 			if [ "${replicateModeCanonical}" = "track" ]; then
 				CONSENSUS_DEFAULT_SAMPLES="${sampleInfoDir}/track_active_units.txt"
@@ -4994,6 +5013,7 @@ process consensus {
 			CONSENSUS_TAXONOMY_MODE="${consensusTaxonomyModeCanonical}" \
 			RTBIOSCAN_TRACK_ACTIVE_UNITS="${sampleInfoDir}/track_active_units.txt" \
 			RTBIOSCAN_TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv" \
+			RTBIOSCAN_REPLICATE_IDENTITY_TSV="${collapseIdentityPresent ? replicate_identity_file : ''}" \
 			CONSENSUS_CACHE_STATE_ROOT="\$CONSENSUS_CACHE_STATE_ROOT" \
 			CONSENSUS_CACHE_SYNC_SCRIPT="\$CONSENSUS_CACHE_SYNC_SCRIPT" \
 			CONSENSUS_ZERO_EMIT_POLICY="${consensusZeroEmitPolicyCanonical}" \
@@ -5914,6 +5934,8 @@ process getting_run_summary {
     publishDir "${ongoingResultsStateDir}/", mode: 'copy', overwrite: true
 	input:
 		tuple val(barcode), val(round_barcode), file(blast_otu_pretax_rpt), file(read_info_rpt), file(blast_otu_noadapter_rpt), file(blast_filter_stats), val(round_generation_token), val(round_lock_scope), file(blast_consensus_tax), file(consensus_round_provenance), file(otu_def_rpt), file(otu_members_round), file(otu_sizes_round), file(otu_def_rpt_sidecar), file(demult_rpt), file(demult_rpt_sidecar), file(on_target_rpt), file(summary), file(summary_otu), val(read_path) from getting_run_summary_with_path
+		file(report_replicate_identity_file) from collapseIdentityInputCh
+		val(report_replicate_identity_sha) from collapseIdentityDigestCh
     output:
 			tuple val(barcode), val(round_barcode), val(round_generation_token), val(round_lock_scope) into complete_round_ch
 
@@ -6296,6 +6318,7 @@ process getting_run_summary {
 		set -e
 		REPORT_SAMPLE_ROSTER_ARG=""
 		REPORT_TRACK_IDENTITY_ARG=""
+		REPORT_REPLICATE_IDENTITY_ARG=""
 		REPORT_IDENTITY_MODE_ARG=""
 		if [ "${replicateModeCanonical}" = "track" ]; then
 			_TRACK_ROSTER="${sampleInfoDir}/track_roster.tsv"
@@ -6314,6 +6337,9 @@ process getting_run_summary {
 		elif [ -s "${sampleInfoDir}/samples.txt" ]; then
 			REPORT_SAMPLE_ROSTER_ARG="--sample-roster ${sampleInfoDir}/samples.txt"
 			REPORT_IDENTITY_MODE_ARG="--identity-mode collapse"
+		fi
+		if [ "${collapseIdentityPresent ? '1' : '0'}" = 1 ]; then
+			REPORT_REPLICATE_IDENTITY_ARG="--replicate-identity ${report_replicate_identity_file}"
 		fi
 		_CONS_IDS_ARG=""
 		if [ -s "\$ROUND_DIR/${barcode}_consensus_consolidated_ids.txt" ]; then
@@ -6380,6 +6406,7 @@ process getting_run_summary {
 				--sample-fig-list "\$REPORT_SAMPLE_FIG_LIST" \
 				\$REPORT_SAMPLE_ROSTER_ARG \
 				\$REPORT_TRACK_IDENTITY_ARG \
+				\$REPORT_REPLICATE_IDENTITY_ARG \
 				--sample-fig-dir "\$REPORT_SAMPLE_STAGE_DIR" \
 				--sample-fig-url-prefix "\$REPORT_SAMPLE_FIG_URL_PREFIX" \
 				\$REPORT_IDENTITY_MODE_ARG

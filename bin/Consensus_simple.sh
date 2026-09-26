@@ -905,8 +905,12 @@ fi
 
 sample_partition_dir="$out_dir/_sample_partitions"
 sample_partition_ok=0
-if [ "$identity_mode" = "track" ] && [ ! -f "$partition_row_filter_script" ]; then
-	echo "ERROR: partition_blast_rows_by_adapter_class.sh is required in track mode" 1>&2
+if { [ "$identity_mode" = "track" ] || [ -n "${RTBIOSCAN_REPLICATE_IDENTITY_TSV:-}" ]; } && [ ! -f "$partition_row_filter_script" ]; then
+	if [ "$identity_mode" = "track" ]; then
+		echo "ERROR: partition_blast_rows_by_adapter_class.sh is required in track mode" 1>&2
+	else
+		echo "ERROR: partition_blast_rows_by_adapter_class.sh is required with collapse identity map" 1>&2
+	fi
 	exit 1
 fi
 if [ -f "$partition_row_filter_script" ]; then
@@ -914,8 +918,12 @@ if [ -f "$partition_row_filter_script" ]; then
 	if bash "$partition_row_filter_script" tmp_clean_blast_report_full.txt "$samples_file" "$sample_partition_dir"; then
 		sample_partition_ok=1
 	else
-		if [ "$identity_mode" = "track" ]; then
-			echo "ERROR: partition_blast_rows_by_adapter_class.sh failed in track mode; refusing sample-collapsing fallback" 1>&2
+		if [ "$identity_mode" = "track" ] || [ -n "${RTBIOSCAN_REPLICATE_IDENTITY_TSV:-}" ]; then
+			if [ "$identity_mode" = "track" ]; then
+				echo "ERROR: partition_blast_rows_by_adapter_class.sh failed in track mode; refusing sample-collapsing fallback" 1>&2
+			else
+				echo "ERROR: partition_blast_rows_by_adapter_class.sh failed with collapse identity map; refusing fallback" 1>&2
+			fi
 			exit 1
 		else
 			echo "WARN: partition_blast_rows_by_adapter_class.sh failed; falling back to per-sample blast filtering" 1>&2
@@ -1306,8 +1314,12 @@ while IFS= read -r sample; do
 		sample_blast="$sample_partition_dir/${sample}.blast.tsv"
 		sample_blast_cleanup=0
 	else
-		if [ "$identity_mode" = "track" ] && [ "$sample_partition_ok" -eq 1 ]; then
-			echo "ERROR: track mode partitioning did not produce expected per-unit blast partition for sample=$sample" 1>&2
+		if { [ "$identity_mode" = "track" ] || [ -n "${RTBIOSCAN_REPLICATE_IDENTITY_TSV:-}" ]; } && [ "$sample_partition_ok" -eq 1 ]; then
+			if [ "$identity_mode" = "track" ]; then
+				echo "ERROR: track mode partitioning did not produce expected per-unit blast partition for sample=$sample" 1>&2
+			else
+				echo "ERROR: collapse identity partitioning did not produce expected blast partition for sample=$sample" 1>&2
+			fi
 			exit 1
 		fi
 		if bash "$adapter_row_filter_script" \

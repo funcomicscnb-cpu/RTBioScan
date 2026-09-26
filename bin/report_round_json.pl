@@ -6,6 +6,7 @@ use JSON::PP;
 use POSIX qw(strftime);
 use FindBin;
 require "$FindBin::Bin/lib/sample_label.pl";
+require "$FindBin::Bin/collapse_identity_map.pl";
 require "$FindBin::Bin/lib/taxon_util.pl";
 require "$FindBin::Bin/lib/RTBioScan/R4DCumulative.pm" unless defined &RTBioScan::R4DCumulative::resolve;
 *trim_text           = \&TaxonUtil::trim_text;
@@ -77,6 +78,7 @@ GetOptions(
   'sample-fig-list=s'            => \$opt{sample_fig_list},
   'sample-roster=s'              => \$opt{sample_roster},
   'track-identity=s'             => \$opt{track_identity},
+  'replicate-identity=s'         => \$opt{replicate_identity},
   'identity-mode=s'              => \$opt{identity_mode},
   'sample-fig-dir=s'             => \$opt{sample_fig_dir},
   'sample-fig-url-prefix=s'      => \$opt{sample_fig_url_prefix},
@@ -114,6 +116,10 @@ our %TRACK_UNIT_METRICS;
 our %TRACK_UNIT_BY_UNIT_ID;
 our %TRACK_UNIT_BY_TRACK_MARKER;
 our %TRACK_ROSTER_BY_TRACK_ID;
+our $COLLAPSE_IDENTITY_MAP;
+our %COLLAPSE_SAMPLE_IDS;
+our %collapse_excluded_reads;
+my %collapse_excluded_otu_ids;
 
 my @warnings;
 my %warned;
@@ -192,6 +198,20 @@ sub cached_file_text {
     $text = '' if !defined $text;
     $text =~ s/\r\n/\n/g;
     $text =~ s/\r/\n/g;
+    if (defined $main::COLLAPSE_IDENTITY_MAP && %main::collapse_excluded_reads
+        && grep { defined $_ && $_ ne '' && $_ eq $path }
+          @opt{qw(demult otu_def blast_otu blast_otu_cumulative read_fate_demult read_fate_blast)}) {
+      my @lines = split /\n/, $text, -1;
+      my @columns = split /\t/, $lines[0] // '', -1;
+      my ($read_col) = grep { $columns[$_] eq 'read_id' } 0 .. $#columns;
+      if (defined $read_col) {
+        @lines = ($lines[0], grep {
+          my @fields = split /\t/, $_, -1;
+          !exists $main::collapse_excluded_reads{normalize_read_id($fields[$read_col] // '')}
+        } @lines[1 .. $#lines]);
+        $text = join "\n", @lines;
+      }
+    }
     $file_text_cache{$path} = $text;
   }
   return \$file_text_cache{$path};
@@ -548,7 +568,7 @@ sub load_kv_tsv {
 }
 
 sub resolve_reporting_identity {
-  my ($label_raw) = @_;
+  my ($label_raw, $already_sample) = @_;
   if ($opt{identity_mode} eq 'track') {
     my $label = trim_text($label_raw // '');
     if (exists $TRACK_UNIT_BY_UNIT_ID{$label}) {
@@ -556,7 +576,37 @@ sub resolve_reporting_identity {
     }
     return normalize_track_reporting_identity($label_raw);
   }
+  if (defined $COLLAPSE_IDENTITY_MAP) {
+    my $label = trim_text($label_raw // '');
+    return $label if $label eq '' || lc($label) eq 'unknown';
+    return 'no_adapter' if SampleLabel::is_no_adapter_label($label);
+    if ($already_sample) {
+      die "ERROR: collapse consensus/reporting sample '$label' is absent from identity map\n"
+        unless exists $COLLAPSE_SAMPLE_IDS{$label};
+      return $label;
+    }
+    return CollapseIdentityMap::sample_for_unit($COLLAPSE_IDENTITY_MAP, $label);
+  }
   return SampleLabel::normalize_sample_base($label_raw);
+}
+
+sub demux_marker_for_label {
+  my ($unit, $observed_marker) = @_;
+  if (defined $COLLAPSE_IDENTITY_MAP && !SampleLabel::is_no_adapter_label($unit)) {
+    my $entry = $COLLAPSE_IDENTITY_MAP->{$unit};
+    die "ERROR: collapse identity has no entry for unit '$unit'\n" unless defined $entry;
+    my $expected = canonical_marker_token($entry->{marker});
+    return $expected;
+  }
+  return SampleLabel::extract_marker_from_label($unit);
+}
+
+sub validate_collapse_provenance_sample {
+  my ($sample) = @_;
+  return unless defined $COLLAPSE_IDENTITY_MAP;
+  my $label = trim_text($sample // '');
+  die "ERROR: collapse consensus provenance has empty sample\n" if $label eq '';
+  resolve_reporting_identity($label, 1);
 }
 
 sub normalize_track_reporting_identity {
@@ -574,7 +624,9 @@ sub normalize_track_reporting_identity {
 sub ensure_sample_entry {
   my ($sample_metrics, $label_to_id, $id_to_label, $label_raw, $raw_identity) = @_;
   # Roster identities are raw; reporting rows use the exact track map or legacy label rules.
-  my $label = $raw_identity ? trim_text($label_raw) : resolve_reporting_identity($label_raw);
+  my $label = $raw_identity
+    ? (defined $COLLAPSE_IDENTITY_MAP ? resolve_reporting_identity($label_raw, 1) : trim_text($label_raw))
+    : resolve_reporting_identity($label_raw);
   $label = 'unknown' if !defined $label || $label eq '';
   if ($opt{identity_mode} eq 'track' && $g_roster_ready
       && $label ne 'unknown'
@@ -2241,6 +2293,7 @@ sub sum_consensus_round_reads {
     my $sum = 0;
     my $has_numeric = 0;
     for my $row (@$rows) {
+      validate_collapse_provenance_sample($row->{sample});
       my $v = trim_text($row->{reads_used_round});
       next if $v eq '' || uc($v) eq 'NA';
       if ($v =~ /^\d+$/) {
@@ -2277,6 +2330,9 @@ sub sum_consensus_round_reads {
     $idx{$cols[$i]} = $i;
   }
   my $reads_idx = header_index_fallback(\%idx, 'reads_used_round');
+  my $sample_idx = header_index_fallback(\%idx, 'sample');
+  die "ERROR: collapse consensus provenance '$path' lacks sample column\n"
+    if defined $COLLAPSE_IDENTITY_MAP && !defined $sample_idx;
   if (!defined $reads_idx) {
     close $FH;
     warn_once("missing_column:$path:reads_used_round");
@@ -2291,6 +2347,7 @@ sub sum_consensus_round_reads {
     next if is_repeated_header_line($line, $hdr);
     $data_rows++;
     my @f = split /\t/, $line, -1;
+    validate_collapse_provenance_sample($f[$sample_idx]) if defined $COLLAPSE_IDENTITY_MAP;
     next if $reads_idx > $#f;
     my $v = trim_text($f[$reads_idx]);
     next if $v eq '' || uc($v) eq 'NA';
@@ -2835,6 +2892,7 @@ sub load_frozen_sample_reads {
     next unless exists $selected_frozen_ids{$frozen_id};
     my $rid = normalize_read_id($member_id);
     next if $rid eq '';
+    next if defined $COLLAPSE_IDENTITY_MAP && exists $collapse_excluded_reads{$rid};
     my $adapter = _extract_adapter_from_member_id($member_id);
     next unless defined $adapter && $adapter ne '';
     my $label = resolve_reporting_identity($adapter);
@@ -3353,6 +3411,28 @@ sub collect_otu_assignments_by_level {
     push @rows, $row;
   }
 
+  if (defined $COLLAPSE_IDENTITY_MAP && %collapse_excluded_otu_ids) {
+    my %affected_otu = map { canonical_otu_alias($_, $alias_ref) => 1 }
+      keys %collapse_excluded_otu_ids;
+    my (%retained_global_reads, %seen_contribution);
+    for my $row (@rows) {
+      next unless $affected_otu{$row->{otu_id}};
+      my $key = join "\t", $row->{otu_id}, $row->{marker} // '';
+      my $sample = $row->{sample} // '';
+      next if $seen_contribution{$key}{$sample}++;
+      $retained_global_reads{$key} += $row->{otu_sample_reads};
+    }
+    for my $row (@rows) {
+      next unless $affected_otu{$row->{otu_id}};
+      my $key = join "\t", $row->{otu_id}, $row->{marker} // '';
+      next unless exists $retained_global_reads{$key};
+      $row->{global_reads} = $retained_global_reads{$key}
+        if defined $row->{global_reads};
+      $row->{frozen_global_reads} = $retained_global_reads{$key}
+        if defined $row->{frozen_global_reads};
+    }
+  }
+
   my %levels = (
     species => 'species',
     genus => 'genus',
@@ -3580,7 +3660,7 @@ sub collect_consensus_assignments_by_level {
     my $cons_id = trim_text($f[$cons_idx]);
     next if $cons_id eq '' || $seen_cons{$cons_id}++;
     my $raw_sample = (defined $sample_idx && $sample_idx <= $#f) ? trim_text($f[$sample_idx]) : '';
-    my $sample = resolve_reporting_identity($raw_sample);
+    my $sample = resolve_reporting_identity($raw_sample, 1);
     my $marker = (defined $marker_idx && $marker_idx <= $#f) ? marker_from_token($f[$marker_idx]) : marker_from_token($cons_id);
     my $kingdom = (defined $kingdom_idx && $kingdom_idx <= $#f) ? trim_text($f[$kingdom_idx]) : '';
     next unless is_kingdom_consistent($kingdom, $marker, $CONFIGURED_TARGET_TAX_MAP);
@@ -4975,11 +5055,65 @@ if (defined $opt{round_failed_file} && $opt{round_failed_file} ne '' && -s $opt{
 }
 
 # Warm parsed-row cache for inputs read multiple times per invocation.
+if ($opt{identity_mode} eq 'collapse' && defined $opt{replicate_identity}
+    && $opt{replicate_identity} ne '') {
+  $COLLAPSE_IDENTITY_MAP = CollapseIdentityMap::load($opt{replicate_identity});
+  %COLLAPSE_SAMPLE_IDS = map { $_->{sample} => 1 } values %{$COLLAPSE_IDENTITY_MAP};
+}
 get_parsed_rows($opt{read_info});
 get_parsed_rows($opt{on_target});
 get_parsed_rows($opt{otu_def});
 get_parsed_rows($opt{blast_otu});
+get_parsed_rows($opt{blast_otu_cumulative});
 get_parsed_rows($opt{demult});
+
+# The real demux and OTU producers retain the unit and scientific marker on each
+# row. Exclude a conflicting read from round and cumulative reporting sources.
+if (defined $COLLAPSE_IDENTITY_MAP) {
+  my $example;
+  for my $path (@opt{qw(demult otu_def blast_otu blast_otu_cumulative)}) {
+    next if !defined $path || $path eq '' || !defined $_parsed_rows{$path};
+    for my $row (@{$_parsed_rows{$path}}) {
+      my $unit = trim_text($row->{sample} // '');
+      my $read_id = trim_text($row->{read_id} // '');
+      if ($unit eq '' && $read_id =~ /(?:^|\|)adapter=([^|\s]+)/) {
+        $unit = $1;
+      }
+      next if $unit eq '' || SampleLabel::is_no_adapter_label($unit);
+      CollapseIdentityMap::sample_for_unit($COLLAPSE_IDENTITY_MAP, $unit);
+      my $expected = canonical_marker_token($COLLAPSE_IDENTITY_MAP->{$unit}{marker});
+      my $observed = canonical_marker_token($row->{barcode_by_homology} // '');
+      $observed = canonical_marker_token((split /\|/, $read_id)[1])
+        if !defined $observed || $observed eq 'NA';
+      next if !defined $observed || $observed eq '' || $observed eq $expected;
+      my $rid = normalize_read_id($read_id);
+      next if $rid eq '';
+      $collapse_excluded_reads{$rid} = 1;
+      my $detail = join ' ', map { substr($_ // '', 0, 80) }
+        ($rid, $unit, $expected, $observed);
+      $example = $detail if !defined($example) || $detail lt $example;
+    }
+  }
+  if (%collapse_excluded_reads) {
+    for my $path (@opt{qw(demult otu_def blast_otu blast_otu_cumulative)}) {
+      next if !defined $path || $path eq '' || !defined $_parsed_rows{$path};
+      $_parsed_rows{$path} = [grep {
+        my $excluded = exists $collapse_excluded_reads{normalize_read_id($_->{read_id} // '')};
+        if ($excluded) {
+          my $otu = trim_text($_->{OTU_id} // $_->{otu_id} // '');
+          $collapse_excluded_otu_ids{$otu} = 1 if $otu ne '';
+        }
+        !$excluded
+      } @{$_parsed_rows{$path}}];
+      delete $file_text_cache{$path};
+    }
+    my $message = 'collapse identity marker/unit mismatch: excluded '
+      . scalar(keys %collapse_excluded_reads)
+      . " read(s); example read_id unit expected_marker observed_marker: $example";
+    warn_once($message);
+    warn "WARN: $message\n";
+  }
+}
 
 my $reads_total    = count_rows($opt{read_info}, 1);
 my $reads_on_target= count_value_in_column($opt{on_target}, 'on_target_kingdom', 'ON_TARGET');
@@ -5037,6 +5171,14 @@ for my $key (qw(blast_otu_reporting_cumulative blast_otu_cumulative)) {
   };
   $R4D_ROUND_ROWS = $load->($opt{blast_otu_reporting});
   $R4D_CUMULATIVE_ROWS = $load->($opt{blast_otu_reporting_cumulative});
+  if (defined $COLLAPSE_IDENTITY_MAP && %collapse_excluded_reads) {
+    for my $rows_ref (\$R4D_ROUND_ROWS, \$R4D_CUMULATIVE_ROWS) {
+      next unless defined $$rows_ref;
+      $$rows_ref = [grep {
+        !exists $collapse_excluded_reads{normalize_read_id($_->{read_id} // '')}
+      } @{$$rows_ref}];
+    }
+  }
   if (defined $R4D_ROUND_ROWS) {
     for my $r (@$R4D_ROUND_ROWS) {
       my $entry = {
@@ -5563,7 +5705,7 @@ if (defined $opt{demult} && $opt{demult} ne '') {
           my $entry = $sample_metrics{$sid};
           $entry->{reads_demux} = 0 unless defined $entry->{reads_demux};
           $entry->{reads_demux}++;
-          my $_dmx_marker = SampleLabel::extract_marker_from_label($sample_val);
+          my $_dmx_marker = demux_marker_for_label($sample_val, $row->{barcode_by_homology});
           # For no_adapter rows, marker is encoded in barcode_by_homology as the target token
           # (e.g. "COI" or "ITS2") placed there by the second cutadapt primer-detection pass.
           if ($_dmx_marker eq '' && SampleLabel::is_no_adapter_label($sample_val)) {
@@ -5617,7 +5759,8 @@ if (defined $opt{demult} && $opt{demult} ne '') {
             my $entry = $sample_metrics{$sid};
             $entry->{reads_demux} = 0 unless defined $entry->{reads_demux};
             $entry->{reads_demux}++;
-            my $_dmx_marker = SampleLabel::extract_marker_from_label($f[$sample_idx]);
+            my $_dmx_marker = demux_marker_for_label($f[$sample_idx],
+              (defined $bchom_idx && $bchom_idx <= $#f) ? $f[$bchom_idx] : undef);
             # For no_adapter rows, marker is encoded in barcode_by_homology as the target token
             # (e.g. "COI" or "ITS2") placed there by the second cutadapt primer-detection pass.
             if ($_dmx_marker eq '' && SampleLabel::is_no_adapter_label($f[$sample_idx])
@@ -5707,7 +5850,7 @@ if (defined $opt{blast_consensus} && $opt{blast_consensus} ne '') {
             next if is_repeated_header_line($line, $hdr);
             my @f = split /\t/, $line, -1;
             next if $sample_idx > $#f || $cons_idx > $#f;
-            my $sid = ensure_sample_entry(\%sample_metrics, \%sample_label_to_id, \%sample_id_to_label, $f[$sample_idx]);
+            my $sid = ensure_sample_entry(\%sample_metrics, \%sample_label_to_id, \%sample_id_to_label, $f[$sample_idx], defined($COLLAPSE_IDENTITY_MAP) ? 1 : 0);
             my $cons_id = trim_text($f[$cons_idx]);
             next if $cons_id eq '' || uc($cons_id) eq 'NA';
             my $entry = $sample_metrics{$sid};
@@ -5767,7 +5910,7 @@ if (defined $opt{blast_consensus_consolidated} && $opt{blast_consensus_consolida
           next if is_repeated_header_line($cline, $chdr);
           my @cf = split /\t/, $cline, -1;
           next if $csample_idx > $#cf || $ccons_idx > $#cf;
-          my $csid = ensure_sample_entry(\%sample_metrics, \%sample_label_to_id, \%sample_id_to_label, $cf[$csample_idx]);
+          my $csid = ensure_sample_entry(\%sample_metrics, \%sample_label_to_id, \%sample_id_to_label, $cf[$csample_idx], defined($COLLAPSE_IDENTITY_MAP) ? 1 : 0);
           my $ccons_id = trim_text($cf[$ccons_idx]);
           next if $ccons_id eq '' || uc($ccons_id) eq 'NA';
           my $ck = "$csid\t$ccons_id";

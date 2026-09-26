@@ -3607,6 +3607,27 @@ def test_main_nf_wires_track_identity_into_demux_and_consensus_guards() -> None:
     assert 'RTBIOSCAN_TRACK_IDENTITY_TSV="${sampleInfoDir}/track_identity.tsv"' in consensus_block
 
 
+def test_main_nf_declares_collapse_identity_file_and_byte_digest_for_consensus_cache() -> None:
+    text = MAIN_NF.read_text(encoding="utf-8")
+    consensus = text.split("process consensus {", 1)[1].split("process _reporting_consensus_tax {", 1)[0]
+    report = text.split("process getting_run_summary {", 1)[1].split("process ", 1)[0]
+    assert "collapseIdentityInputCh = Channel.value(collapseIdentityInput)" in text
+    assert "collapseIdentityDigestCh = Channel.value(collapseIdentityDigest)" in text
+    assert "MessageDigest.getInstance('SHA-256').digest(java.nio.file.Files.readAllBytes" in text
+    assert "file(replicate_identity_file) from collapseIdentityInputCh" in consensus
+    assert "val(replicate_identity_sha) from collapseIdentityDigestCh" in consensus
+    assert 'CollapseIdentityMap::load(\\$ARGV[0]);' in consensus
+    assert consensus.index('CollapseIdentityMap::load(\\$ARGV[0]);') < consensus.index("# -- §2: Prelaunch gate")
+    assert 'RTBIOSCAN_REPLICATE_IDENTITY_TSV="${replicate_identity_file}"' in consensus
+    assert 'RTBIOSCAN_REPLICATE_IDENTITY_TSV="${collapseIdentityPresent ? replicate_identity_file : \'\'}"' in consensus
+    assert "file(report_replicate_identity_file) from collapseIdentityInputCh" in report
+    assert "val(report_replicate_identity_sha) from collapseIdentityDigestCh" in report
+    assert "--replicate-identity ${report_replicate_identity_file}" in report
+    # A same-size byte change changes the declared value input independently of mtime.
+    import hashlib
+    assert hashlib.sha256(b"A").digest() != hashlib.sha256(b"B").digest()
+
+
 def test_main_nf_backup_update_and_clean_uses_incremental_backup_sync_helpers() -> None:
     text = MAIN_NF.read_text(encoding="utf-8")
     backup_block = text.split("process backup_update_and_clean {", 1)[1].split('"""', 2)[1]

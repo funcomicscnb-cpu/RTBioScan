@@ -230,6 +230,123 @@ if [ "$identity_mode" = "track" ]; then
   exit 0
 fi
 
+if [ -n "${RTBIOSCAN_REPLICATE_IDENTITY_TSV:-}" ]; then
+  perl -I "$script_dir" -e '
+    use strict;
+    use warnings;
+    require "collapse_identity_map.pl";
+    my ($identity, $samples_path, $blast_path, $dir) = @ARGV;
+    my $map = CollapseIdentityMap::load($identity);
+    open my $sfh, "<", $samples_path or die "ERROR: cannot read samples list: $!\n";
+    my %samples;
+    while (my $sample = <$sfh>) {
+      chomp $sample;
+      die "ERROR: unsafe collapse sample in samples list: $sample\n"
+        if $sample eq "" || $sample =~ /[\x00-\x20\x7f|\/]/;
+      $samples{$sample} = 1;
+    }
+    close $sfh or die "ERROR: cannot close samples list: $!\n";
+    my %temp_paths;
+    my $local_map_tmp = "$dir/.sample_map.tsv.tmp.$$";
+    END {
+      unlink values %temp_paths;
+      unlink $local_map_tmp if defined $local_map_tmp;
+    }
+    my %handles;
+    my @open_order;
+    for my $sample (sort keys %samples) {
+      my $tmp = "$dir/.${sample}.blast.tsv.tmp.$$";
+      open my $out, ">", $tmp or die "ERROR: cannot write $tmp: $!\n";
+      close $out or die "ERROR: cannot close $tmp: $!\n";
+      $temp_paths{$sample} = $tmp;
+    }
+    open my $bfh, "<", $blast_path or die "ERROR: cannot read blast report: $!\n";
+    my $marker_col;
+    my $first = 1;
+    my $mismatch_count = 0;
+    my $mismatch_example;
+    sub canonical_marker {
+      my ($value) = @_;
+      $value = uc($value // "");
+      $value =~ s/^\s+|\s+$//g;
+      return "ITS2" if $value eq "ITS" || $value eq "ITS1";
+      return $value;
+    }
+    while (my $line = <$bfh>) {
+      chomp $line;
+      next if $line eq "";
+      my @f = split /\t/, $line, -1;
+      if ($first) {
+        $first = 0;
+        if ($f[0] eq "read_id" || $f[0] eq "seq_id" || $f[0] eq "long_read_id") {
+          for my $i (0 .. $#f) {
+            my $key = lc($f[$i]);
+            $marker_col = $i if $key =~ /^(?:barcode_by_homology|marker|otu_marker|target)$/;
+          }
+          next;
+        }
+      }
+      my $read_id = $f[0];
+      next if $read_id =~ /^#/ || $read_id eq "read_id" || $read_id eq "seq_id" || $read_id eq "long_read_id";
+      my ($adapter) = $read_id =~ /adapter=([^\s|]+)/;
+      die "ERROR: collapse identity requires adapter= token in blast row: $read_id\n"
+        unless defined $adapter;
+      my $sample;
+      if ($adapter =~ /^no_adapter(?:_\d+)?$/i) {
+        $sample = "no_adapter";
+      } else {
+        $sample = CollapseIdentityMap::sample_for_unit($map, $adapter);
+        my $expected = canonical_marker($map->{$adapter}{marker});
+        my $row_marker = defined($marker_col) && $marker_col <= $#f
+          ? canonical_marker($f[$marker_col]) : "";
+        $row_marker = canonical_marker((split /\|/, $read_id)[1]) if $row_marker eq "" || $row_marker eq "NA";
+        if ($row_marker ne "" && $row_marker ne $expected) {
+          $mismatch_count++;
+          my $detail = join " ", map { substr($_, 0, 80) }
+            ($read_id, $adapter, $expected, $row_marker);
+          $mismatch_example = $detail
+            if !defined($mismatch_example) || $detail lt $mismatch_example;
+          next;
+        }
+      }
+      die "ERROR: collapse sample is absent from consensus samples list: $sample\n"
+        unless exists $samples{$sample};
+      if (!exists $handles{$sample}) {
+        if (@open_order >= 64) {
+          my $oldest = shift @open_order;
+          close $handles{$oldest} or die "ERROR: cannot close collapse partition: $!\n";
+          delete $handles{$oldest};
+        }
+        open my $out, ">>", $temp_paths{$sample}
+          or die "ERROR: cannot append collapse partition: $!\n";
+        $handles{$sample} = $out;
+        push @open_order, $sample;
+      }
+      my $out = $handles{$sample};
+      print {$out} "$line\n" or die "ERROR: cannot write collapse partition: $!\n";
+    }
+    close $bfh or die "ERROR: cannot close blast report: $!\n";
+    warn "WARN: collapse identity marker/unit mismatch: excluded $mismatch_count row(s); example read_id unit expected_marker observed_marker: $mismatch_example\n"
+      if $mismatch_count;
+    for my $sample (keys %handles) {
+      close $handles{$sample} or die "ERROR: cannot close collapse partition: $!\n";
+    }
+    open my $local_map, ">", $local_map_tmp
+      or die "ERROR: cannot write collapse sample map: $!\n";
+    for my $sample (sort keys %samples) {
+      my $path = "$dir/$sample.blast.tsv";
+      print {$local_map} "$sample\t$path\n"
+        or die "ERROR: cannot write collapse sample map: $!\n";
+      rename $temp_paths{$sample}, $path
+        or die "ERROR: cannot publish collapse partition $path: $!\n";
+    }
+    close $local_map or die "ERROR: cannot close collapse sample map: $!\n";
+    rename $local_map_tmp, "$dir/.sample_map.tsv"
+      or die "ERROR: cannot publish collapse sample map: $!\n";
+  ' "$RTBIOSCAN_REPLICATE_IDENTITY_TSV" "$samples_file" "$blast_report" "$out_dir"
+  exit 0
+fi
+
 sample_map="$out_dir/.sample_map.tsv"
 target_tokens_raw="${RTBIOSCAN_TARGET_TOKENS:-}"
 : > "$sample_map"
