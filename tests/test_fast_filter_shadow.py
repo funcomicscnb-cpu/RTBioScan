@@ -4,6 +4,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "bin" / "fast_filter_shadow.py"
@@ -23,6 +25,92 @@ def main_shell_block(start_marker, end_marker, ongoing_state_dir, enabled=False)
         .replace("\\$barcode\\\\_", "${barcode}_")
         .replace("\\$", "$")
     )
+
+
+def rendered_fast_router(state_dir, enabled=False, source=None):
+    """Render the production FAST routing section with fixed DSL1 inputs."""
+    main_text = source or (REPO_ROOT / "main.nf").read_text(encoding="utf-8")
+    start = main_text.index("\tif [ ! -s \\$barcode\\\\_fast.fasta ];", main_text.index("process fast_on_target_detection"))
+    end = main_text.index("# FAST shadow state publish start", start)
+    body = main_text[start:end]
+    return (
+        body.replace("${fastFilterShadowEnabled ? 1 : 0}", "1" if enabled else "0")
+        .replace("${ongoingStateDir}", str(state_dir))
+        .replace("${baseDir}", str(REPO_ROOT))
+        .replace("${params.blast_filter_db}", "fake_db")
+        .replace("${params.targets}", "COI")
+        .replace("${params.target_taxa}", "Metazoa")
+        .replace("\\\\", "\\")
+        .replace("\\$", "$")
+        .replace("\\t", "\t")
+    )
+
+
+HIT = "read1\tCOI|Metazoa|hit\t99\t4\t0\t0\t1\t4\t1\t4\t1e-5\t50\n"
+FAST_MODES = (
+    ("hits", 0), ("comments", 0), ("empty", 0),
+    ("exit1", 1), ("exit127", 127), ("exit137", 137), ("exit143", 143),
+    ("partial1", 1), ("partial137", 137), ("malformed", 0),
+)
+
+
+def run_fast_router(tmp_path, mode, enabled=False, source=None):
+    run_dir = tmp_path / ("shadow" if enabled else "default") / mode
+    run_dir.mkdir(parents=True)
+    state_dir = run_dir / "state"
+    (state_dir / "round1").mkdir(parents=True)
+    (run_dir / "barcode01_fast.fasta").write_text(">read1\nACGT\n")
+    (run_dir / "barcode01_fast.sam").write_text("@HD\tVN:1.6\n")
+    fake_bin = run_dir / "bin"
+    fake_bin.mkdir()
+    lastal = fake_bin / "lastal"
+    lastal.write_text(
+        "#!/bin/bash\n"
+        "case $LAST_MODE in\n"
+        f" hits) printf '%s' '{HIT}' ;;\n"
+        " comments) printf '# LAST header\\n' ;;\n"
+        " empty) : ;;\n"
+        " exit1) exit 1 ;; exit127) exit 127 ;;\n"
+        " exit137) exit 137 ;; exit143) exit 143 ;;\n"
+        f" partial1) printf '%s' '{HIT}'; exit 1 ;;\n"
+        f" partial137) printf '%s' '{HIT}'; exit 137 ;;\n"
+        " malformed) printf 'bad\\n' ;;\n"
+        "esac\n"
+    )
+    lastal.chmod(0o755)
+    if enabled:
+        fake_python = fake_bin / "python3"
+        fake_python.write_text("#!/bin/sh\nexit 1\n")
+        fake_python.chmod(0o755)
+    completed = subprocess.run(
+        ["/bin/bash", "-euo", "pipefail", "-c", rendered_fast_router(state_dir, enabled, source)],
+        cwd=run_dir, capture_output=True, text=True, check=False,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
+             "LAST_MODE": mode, "barcode": "barcode01", "round_barcode": "round1", "THREADS": "1"},
+    )
+    return completed, run_dir
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["default", "shadow-fallback"])
+@pytest.mark.parametrize("mode,status", FAST_MODES)
+def test_rendered_fast_router_propagates_lastal_and_preserves_no_hit(tmp_path, mode, status, enabled):
+    completed, run_dir = run_fast_router(tmp_path, mode, enabled)
+    kingdom = run_dir / "barcode01_qced_reads_kingdom.txt"
+    targets = run_dir / "barcode01_reads_target.list"
+    failed = run_dir / "state" / "round1" / "ROUND_FAILED.txt"
+    assert completed.returncode == status, completed.stderr
+    if status:
+        assert not kingdom.exists()
+        assert not targets.exists()
+        assert not failed.exists()
+    else:
+        expected_kingdom = HIT if mode == "hits" else "bad\n" if mode == "malformed" else ""
+        assert kingdom.read_bytes() == expected_kingdom.encode()
+        assert targets.read_bytes() == (b"read1|COI\n" if mode == "hits" else b"")
+        if mode == "hits":
+            assert not failed.exists()
+        else:
+            assert failed.read_bytes() == b"No target reads for round1\n"
 
 
 def test_shadow_records_competition_without_changing_first_hit(tmp_path):

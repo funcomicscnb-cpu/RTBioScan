@@ -1386,6 +1386,12 @@ ROUND_LOCK_ACQUIRE_FIELDS
 					if lastal ${baseDir}/${params.blast_filter_db} \$barcode\\_fast.fasta -f BlastTab -P "\$THREADS" | grep -v "^#" | awk '!seen[\$1]++' > \$barcode\\_qced_reads_kingdom.txt; then
 						echo "\$barcode\\_qced_reads_kingdom.txt recovered with the legacy router" 1>&2
 					else
+						_legacy_pipe_status=( "\${PIPESTATUS[@]}" )
+						_legacy_last_status="\${_legacy_pipe_status[0]:-1}"
+						if [ "\$_legacy_last_status" -ne 0 ]; then
+							rm -f \$barcode\\_qced_reads_kingdom.txt
+							exit "\$_legacy_last_status"
+						fi
 						echo "WARN: legacy FAST router also failed; continuing with empty placeholders" 1>&2
 						: > \$barcode\\_qced_reads_kingdom.txt
 					fi
@@ -1394,6 +1400,12 @@ ROUND_LOCK_ACQUIRE_FIELDS
 				then
 					echo "\$barcode\\_qced_reads_kingdom.txt created" 1>&2
 				else
+				_legacy_pipe_status=( "\${PIPESTATUS[@]}" )
+				_legacy_last_status="\${_legacy_pipe_status[0]:-1}"
+				if [ "\$_legacy_last_status" -ne 0 ]; then
+					rm -f \$barcode\\_qced_reads_kingdom.txt
+					exit "\$_legacy_last_status"
+				fi
 				echo "WARN: \$barcode\\_qced_reads_kingdom.txt not created; continuing with empty placeholders" 1>&2
 				: > \$barcode\\_qced_reads_kingdom.txt
 			fi
