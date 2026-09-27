@@ -304,7 +304,14 @@ def should_regenerate_sample_asset(signature_path: Path, artifact_paths, signatu
     return read_signature(signature_path) != signature
 
 
-def sort_rounds(rounds):
+def sort_rounds(rounds, round_index_file=None):
+    if round_index_file:
+        import runpy
+        authority = runpy.run_path(str(Path(__file__).with_name('report_history_state.py')))
+        order = authority['index_mapping'](round_index_file, None)
+        if any(row.get('round_barcode') not in order for row in rounds):
+            raise ValueError('history round absent from authoritative index')
+        return sorted(rounds, key=lambda row: order[row['round_barcode']])
     def sort_key(item):
         round_barcode = item.get("round_barcode", "")
         natural_key = natural_round_key(round_barcode)
@@ -3425,6 +3432,7 @@ def write_chart_tsvs(sorted_rounds, tsv_dir, run_id=None, sig_root=None, report_
 def main():
     ap = argparse.ArgumentParser(description="Render RTBioScan HTML report from JSONL history")
     ap.add_argument("--history", required=True, help="Path to report_history.jsonl")
+    ap.add_argument("--round-index-file", default="", help="Stage B authoritative round order")
     ap.add_argument("--template", required=True, help="Path to HTML template")
     ap.add_argument("--css", required=True, help="Path to CSS asset")
     ap.add_argument("--js", required=True, help="Path to JS asset")
@@ -3481,7 +3489,7 @@ def main():
     if args.run_id_filter:
         rounds = [r for r in rounds if r.get("run_id") == args.run_id_filter]
 
-    sorted_rounds = sort_rounds(rounds)
+    sorted_rounds = sort_rounds(rounds, args.round_index_file or None)
     latest_round = sorted_rounds[-1] if sorted_rounds else {}
     sorted_runs = sort_runs(run_index)
     current_run_entry = next((run for run in sorted_runs if isinstance(run, dict)

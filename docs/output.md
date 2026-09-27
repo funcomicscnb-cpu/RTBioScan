@@ -150,9 +150,9 @@ Run-level summary generated after `round_report.json` is appended into history. 
 - the cross-run dashboard (`results/report_html/report.html`)
 - the per-run dashboard header cards and latest-round summary state
 
-Key top-level fields include `run_id`, `barcode`, `state_id`, `identity_mode`, `rounds_count`, `started_utc`, `last_updated_utc`, `last_round_barcode`, `report_rel_path`, `report_url`, `report_views`, `status`, `status_label`, `status_color`, and `run_summary`.
+Key top-level fields include `run_id`, `barcode`, `barcodes`, `state_id`, `identity_mode`, `rounds_count`, `started_utc`, `last_updated_utc`, `last_round_barcode`, `report_rel_path`, `report_url`, `report_views`, `status`, `status_label`, `status_color`, and `run_summary`. The optional `barcodes` array lists all retained authoritative barcodes for this `run_id` in first round-index appearance order. The scalar `barcode` names the terminal authoritative round's barcode; `run_status_read_fate` is sourced from that barcode. Runs-index rows copy the array, while old rows without it remain readable.
 
-When `--serve` starts before the first completed round, `run_report.json` can be present with `rounds_count: 0` and `status_label: "Fresh"`.
+When `--serve` starts before the first completed round, `run_report.json` can be present with `rounds_count: 0`, `barcodes: []`, and `status_label: "Fresh"`. Its scalar barcode is a non-authoritative placeholder until a completed round is published.
 
 ### Consensus sequences
 [back to Top](#rtbioscan-output)

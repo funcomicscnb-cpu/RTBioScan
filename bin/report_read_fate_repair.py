@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -474,27 +476,15 @@ def authoritative_round_context(state_dir: Path, index_file: Path, current: str)
 
 
 def authoritative_history_publish_mode(history_path: Path, current: str, mapping: dict, entries: list):
-    expected = [obj["round_barcode"] for _, obj in entries if obj["round_barcode"] != current]
-    if not history_path.exists() and not history_path.is_symlink():
-        return "append" if not expected else "normalize"
-    authoritative_regular_path(history_path)
-    if history_path.stat().st_size == 0:
-        return "append" if not expected else "normalize"
-    seen = []
-    malformed = False
-    for line in history_path.read_text(encoding="utf-8").split("\n"):
-        if not line.strip():
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            malformed = True
-            continue
-        rb = obj.get("round_barcode") if isinstance(obj, dict) else None
-        if not rb or rb not in mapping:
-            raise SystemExit("ERROR: authoritative round order: unmapped history identity")
-        seen.append(rb)
-    return "append" if not malformed and seen == expected else "normalize"
+    # Compatibility entry point; all authority decisions live in the shared classifier.
+    import runpy
+    api = runpy.run_path(str(Path(__file__).parent / "report_history_state.py"))
+    state = entries[-1][0].parent
+    view = api["History"](state, current, history_path)
+    result = view.classify()
+    if result == "invalid_authority":
+        raise SystemExit("ERROR: authoritative round order: " + view.reason)
+    return "normalize" if result == "blocked_malformed" else result
 
 
 def main() -> int:
@@ -523,6 +513,8 @@ def main() -> int:
         ),
     )
     parser.add_argument("--round-index-file", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--history-lock-fd", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--stage-b-run-report", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.blast_unassigned_min_level not in {"family", "genus", "species"}:
         raise SystemExit(f"ERROR: invalid --blast-unassigned-min-level: {args.blast_unassigned_min_level}")
@@ -545,13 +537,77 @@ def main() -> int:
         if args.valid_rounds_from_feeder_metadata:
             raise SystemExit("ERROR: authoritative ordering and feeder metadata filtering cannot be combined")
         authoritative_regular_path(Path(args.state_dir), directory=True)
-        authoritative = authoritative_round_context(state_dir, Path(args.round_index_file), args.current_round_barcode)
-        authoritative_mode = authoritative_history_publish_mode(history_path, args.current_round_barcode, *authoritative)
+        import runpy
+        stage_b = runpy.run_path(str(repo_root / "bin/report_history_state.py"))
+        history_view = stage_b["History"](state_dir, args.current_round_barcode, history_path, Path(args.round_index_file))
+        authoritative_mode = history_view.classify()
+        if authoritative_mode == "invalid_authority":
+            raise SystemExit("ERROR: authoritative round order: " + history_view.reason)
+        if not args.check_live_order:
+            if args.history_lock_fd is None:
+                # Standalone authoritative repair uses the same Stage A barrier/FD/fence.
+                command = '\n'.join([
+                    'source "$1/bin/lib/lock_utils.sh"', 'init_lock_helpers',
+                    'acquire_lock "$2/_state/.report_history.lock" || exit 74',
+                    'fd=${acquired_lock_fds[$((${#acquired_lock_fds[@]}-1))]}',
+                    'shift 2', 'exec "$@" --history-lock-fd "$fd"'])
+                fd, private_report = tempfile.mkstemp(prefix='.normalized-run.', suffix='.json', dir=state_state_dir)
+                os.close(fd)
+                try:
+                    rc = subprocess.call(["/bin/bash", "-c", command, "history-repair", str(repo_root), str(state_dir), sys.executable, "-B", str(Path(__file__).resolve()), *sys.argv[1:], "--stage-b-run-report", private_report])
+                    if rc == 0:
+                        # Standalone repair also generates derived JSON only after H closes.
+                        captured = json.loads(Path(private_report + '.command.json').read_bytes())
+                        captured_state = Path(captured[captured.index('--history') + 1]).parent
+                        captured_barcode = captured[captured.index('--barcode') + 1]
+                        record = captured_state / (captured_barcode + '_blast_otu_cumulative.commit')
+                        before_record = record.read_bytes() if record.exists() else None
+                        run_command(captured)
+                        if (record.read_bytes() if record.exists() else None) != before_record:
+                            # The unchanged resolver reached adoption/sealing in the snapshot.
+                            # Apply that same policy to live R4 only after H has closed.
+                            run_command(['perl', '-e', 'require $ARGV[0]; RTBioScan::R4DCumulative::resolve_cli($ARGV[1],$ARGV[2],"state");',
+                                         str(repo_root / 'bin/lib/RTBioScan/R4DCumulative.pm'), captured_barcode, str(state_state_dir)])
+                    if rc == 0 and Path(private_report).stat().st_size:
+                        if outdir is not None:
+                            run_id = history_view.report(args.current_round_barcode)[0]['run_id']
+                            repair = [sys.executable, '-B', str(repo_root / 'bin/report_history_state.py'), 'finalize',
+                                      '--state-dir', str(state_dir), '--current-round-barcode', args.current_round_barcode,
+                                      '--run-id', run_id, '--barcode', captured_barcode, '--outdir', str(outdir),
+                                      '--html', '0' if args.skip_render else '1', '--lock-wait', '0']
+                            if '--authority-context' not in captured:
+                                stage_b['pending_failure'](type('Pending', (), dict(state_dir=str(state_dir),
+                                    outdir=str(outdir), run_id=run_id))(), 'missing_private_authority_context')
+                                print('WARN: REPORT_HISTORY_PENDING reason=missing_private_authority_context', file=sys.stderr)
+                                print('Offline repair: ' + shlex.join(list(map(str, repair))), file=sys.stderr)
+                                return 73
+                            try:
+                                stage_b['guard_private_source'](state_dir, args.current_round_barcode, run_id,
+                                    captured_barcode, outdir, None, private_report)
+                            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                                print('WARN: REPORT_HISTORY_PENDING reason=source_guard:' + str(error), file=sys.stderr)
+                                print('Offline repair: ' + shlex.join(list(map(str, repair))), file=sys.stderr)
+                                return 73
+                            return subprocess.call(repair)
+                        stage_b["artifact_command"](state_state_dir / '.report_render.lock',
+                            [sys.executable, '-c', 'import os,sys; os.replace(sys.argv[1],sys.argv[2])', private_report,
+                             str(state_dir / args.current_round_barcode / 'run_report.json')])
+                    return rc
+                finally:
+                    Path(private_report).unlink(missing_ok=True)
+                    Path(private_report + '.command.json').unlink(missing_ok=True)
+                    Path(private_report + '.authority.json').unlink(missing_ok=True)
+                    import shutil
+                    shutil.rmtree(private_report + '.context', ignore_errors=True)
+            stage_b["lock_identity"](state_dir, args.history_lock_fd)
+            # Validate all old/future rows before scientific mutation. Publication occurs once below.
+            list(history_view.validated_rows())
+            authoritative = authoritative_round_context(state_dir, Path(args.round_index_file), args.current_round_barcode)
 
     if args.check_live_order:
         if not args.current_round_barcode:
             raise SystemExit("ERROR: --current-round-barcode is required with --check-live-order")
-        print(authoritative_mode if authoritative is not None else history_publish_mode(state_dir, history_path, args.current_round_barcode))
+        print(authoritative_mode if args.round_index_file is not None else history_publish_mode(state_dir, history_path, args.current_round_barcode))
         return 0
 
     if authoritative is not None:
@@ -689,7 +745,10 @@ def main() -> int:
         last_round_dir = round_dir
         last_round_obj = patched
 
-    atomic_write_text(history_path, "\n".join(history_lines) + "\n")
+    if authoritative is not None:
+        stage_b["reconcile"](state_dir, args.current_round_barcode, history_path, Path(args.round_index_file), lock_fd=args.history_lock_fd, outdir=outdir)
+    else:
+        atomic_write_text(history_path, "\n".join(history_lines) + "\n")
     if last_round_obj is not None:
         barcode = str(last_round_obj["barcode"])
         atomic_write_text(
@@ -718,6 +777,8 @@ def main() -> int:
             run_report_json.parent.mkdir(parents=True, exist_ok=True)
         else:
             run_report_json = last_round_dir / "run_report.json"
+        if authoritative is not None and args.stage_b_run_report:
+            run_report_json = Path(args.stage_b_run_report)
         run_started_utc = state_state_dir / "run_started_utc.txt"
         run_cmd = [
             "perl",
@@ -733,7 +794,7 @@ def main() -> int:
             "--state-id",
             state_id,
             "--schema-version",
-            str(last_round_obj.get("schema_version") or "1.6"),
+            "2.0" if authoritative is not None else str(last_round_obj.get("schema_version") or "1.6"),
             "--report-rel-path",
             report_rel_path,
         ]
@@ -741,7 +802,10 @@ def main() -> int:
             run_cmd.extend(["--outdir", str(outdir)])
         if run_started_utc.exists():
             run_cmd.extend(["--run-started-utc-file", str(run_started_utc)])
-        run_command(run_cmd)
+        if authoritative is not None and args.stage_b_run_report:
+            stage_b["capture_run_context"](run_cmd, state_dir, args.current_round_barcode, run_report_json)
+        else:
+            run_command(run_cmd)
 
         if outdir is not None and not args.live:
             run_index = outdir / "report_html" / "runs_index.jsonl"

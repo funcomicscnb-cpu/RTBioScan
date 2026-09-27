@@ -28,14 +28,14 @@ def _oracle_live_counts(state_dir: Path) -> tuple[int, int]:
     return len(total_ids - {""}), len(target_ids - {""})
 
 
-def _commit_cumulative_state(state_dir: Path, pretax: str) -> None:
+def _commit_cumulative_state(state_dir: Path, pretax: str, barcode: str = "RTBioScan") -> None:
     """R4-I2: a `_state` cumulative BLAST OTU snapshot is read only as a
     committed generation (sealed record + immutable members); a lone public
     table is an incomplete snapshot and fails closed."""
     names = {
-        "reporting": "RTBioScan_blast_otu_reporting_v1.tsv",
-        "public": "RTBioScan_blast_otu_pretax_rpt.txt",
-        "noadapter": "RTBioScan_blast_otu_noadapter_rpt.txt",
+        "reporting": f"{barcode}_blast_otu_reporting_v1.tsv",
+        "public": f"{barcode}_blast_otu_pretax_rpt.txt",
+        "noadapter": f"{barcode}_blast_otu_noadapter_rpt.txt",
     }
     texts = {"reporting": b"", "public": pretax.encode("utf-8"), "noadapter": pretax.split("\n", 1)[0].encode("utf-8") + b"\n"}
     lines = "".join(f"{p}\t{names[p]}\t{len(texts[p])}\t{hashlib.sha256(texts[p]).hexdigest()}\n" for p in names)
@@ -44,7 +44,7 @@ def _commit_cumulative_state(state_dir: Path, pretax: str) -> None:
     for p, text in texts.items():
         (state_dir / f"{names[p]}.gen-{generation}").write_bytes(text)
     (state_dir / names["public"]).write_bytes(texts["public"])
-    (state_dir / "RTBioScan_blast_otu_cumulative.commit").write_text(
+    (state_dir / f"{barcode}_blast_otu_cumulative.commit").write_text(
         head + f"#END\t{hashlib.sha256(head.encode('utf-8')).hexdigest()}\n", encoding="utf-8")
 
 
@@ -99,6 +99,7 @@ def test_report_run_json_from_history(tmp_path: Path) -> None:
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["schema_version"] == "2.0"
     assert data["run_id"] == "runA"
+    assert "barcodes" not in data  # Legacy producer calls remain readable.
     assert data["rounds_count"] == 2
     assert data["started_utc"] == "2026-03-06T00:01:00Z"
     assert data["last_round_barcode"] == "round_002"
@@ -170,6 +171,7 @@ def test_report_run_json_empty_history_emits_zero_round_fresh_status(tmp_path: P
     assert rc.returncode == 0, rc.stderr
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["rounds_count"] == 0
+    assert data["barcodes"] == [] and data["barcode"] == "B1"
     assert data["last_round_barcode"] == "0"
     assert data["started_utc"] == "2026-03-06T00:00:00Z"
     assert data["last_updated_utc"] == "2026-03-06T00:00:00Z"
@@ -660,3 +662,105 @@ def test_r6_f03_summary_uses_latest_nonfailed_and_metadata_uses_latest_attempt(
         assert data["run_summary_source_round"] == latest_nonfailed["round_barcode"]
         for field in ("reads", "read_fate", "otu", "consensus"):
             assert data["run_summary"][field] == latest_nonfailed[field]
+
+
+@pytest.mark.parametrize("invoker", ["b", "c"])
+def test_authoritative_context_fixes_identity_and_nonnumeric_order(tmp_path: Path, invoker: str) -> None:
+    history = tmp_path / "history.jsonl"
+    rows = [
+        dict(run_id="runA", barcode="b", round_barcode="zeta", timestamp_utc="2026-01-01T00:03:00Z"),
+        dict(run_id="other", barcode="foreign", round_barcode="foreign"),
+        dict(run_id="runA", barcode="c", round_barcode="alpha", timestamp_utc="2026-01-01T00:02:00Z"),
+        dict(run_id="runA", barcode="b", round_barcode="middle", timestamp_utc="2026-01-01T00:01:00Z", round_status="failed"),
+    ]
+    history.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    context = tmp_path / "authority.json"
+    ordered = [("zeta", "b"), ("alpha", "c"), ("middle", "b")]
+    order_sha = hashlib.sha256(b"".join(rb.encode() + b"\0" + bc.encode() + b"\0"
+                                     for rb, bc in ordered)).hexdigest()
+    context.write_text(json.dumps(dict(run_id="runA", barcodes=["b", "c"], barcode="b",
+        last_round_barcode="middle", rounds_count=3, round_order_sha256=order_sha)))
+    out = tmp_path / "run_report.json"
+    command = ["perl", str(SCRIPT), "--history", str(history), "--out", str(out),
+               "--run-id", "runA", "--barcode", invoker, "--authority-context", str(context)]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    obj = json.loads(out.read_bytes())
+    assert (obj["run_id"], obj["barcodes"], obj["barcode"], obj["last_round_barcode"],
+            obj["run_summary_source_round"]) == ("runA", ["b", "c"], "b", "middle", "alpha")
+    assert obj["schema_version"] == "2.0"
+    # A synthetic strict pre-extension validator rejects the additive field.
+    legacy_out = tmp_path / "legacy.json"
+    legacy_command = command[:]
+    legacy_command[legacy_command.index(str(out))] = str(legacy_out)
+    legacy_command = legacy_command[:legacy_command.index("--authority-context")]
+    legacy = subprocess.run(legacy_command, capture_output=True, text=True)
+    assert legacy.returncode == 0, legacy.stderr
+    old_keys = set(json.loads(legacy_out.read_bytes()))
+    assert "barcodes" not in old_keys and set(obj) != old_keys
+    for damaged in [dict(json.loads(context.read_text()), barcodes=["c", "b"]),
+                    dict(json.loads(context.read_text()), barcode="c"),
+                    dict(json.loads(context.read_text()), last_round_barcode="alpha")]:
+        context.write_text(json.dumps(damaged))
+        before = out.read_bytes()
+        refused = subprocess.run(command, capture_output=True, text=True)
+        assert refused.returncode != 0 and out.read_bytes() == before
+
+
+def test_authoritative_status_read_fate_uses_terminal_barcode_inputs(tmp_path: Path) -> None:
+    state = tmp_path / "_state"; state.mkdir()
+    history = state / "report_history.jsonl"
+    history.write_text("".join(json.dumps(dict(schema_version="1.6", run_id="runA", barcode=bc,
+        round_barcode=rb, markers={"order": ["COI"], "target_taxa_by_marker": {"COI": "Metazoa"}})) + "\n"
+        for bc, rb in [("b", "zeta"), ("c", "alpha")]))
+    context = tmp_path / "authority.json"
+    order_sha = hashlib.sha256(b"zeta\0b\0alpha\0c\0").hexdigest()
+    context.write_text(json.dumps(dict(run_id="runA", barcodes=["b", "c"], barcode="c",
+        last_round_barcode="alpha", rounds_count=2, round_order_sha256=order_sha)))
+    pretax_head = ("read_id\tbarcode_by_homology\tbasecalling_model\tsample\thit_id\ttaxid\taln_length\tperc_id\t"
+                   "otu_id\totu_taxid\totu_kingdom\totu_phylum\totu_class\totu_order\totu_family\totu_genus\totu_species\n")
+    for barcode, count in [("b", 1), ("c", 2)]:
+        ids = [f"{barcode}{i}" for i in range(count)]
+        (state / f"{barcode}_read_info_rpt.txt").write_text(
+            "read_id\tfilename\trun_id\tbarcode\tfast_length\tfast_mean_qscore\thac_length\thac_mean_qscore\tsup_length\tsup_mean_qscore\n" +
+            "".join(f"{read}\t{read}.pod5\trunA\t{barcode}\t100\t10\t100\t12\tNA\tNA\n" for read in ids))
+        (state / f"{barcode}_on_target_rpt.txt").write_text(
+            "read_id\tqc_filter\ton_target_kingdom\n" + "".join(f"{read}\tIN\tON_TARGET\n" for read in ids))
+        (state / f"{barcode}_demux_annotation_cache.tsv").write_text(
+            "read_id\tbarcode_by_homology\tbasecalling_model\tsample\tplatform\tsampling_method\tsubsample\treplicate\tidentity_scope\tidentity_value\n" +
+            "".join(f"{read}\tCOI\thac\tsample_A_1\tnanopore\tgrab\tsub\t1\tsample\tsample_A_1\n" for read in ids))
+        (state / f"{barcode}_blast_unassigned_current.list").write_text("")
+        _commit_cumulative_state(state, pretax_head + "".join(
+            f"{read}\tCOI\thac\tsample_A_1\thit\t123\t100\t99\tOTUB_1-COI\t111\tMetazoa\tP\tC\tO\tF\tG\tS\n"
+            for read in ids), barcode)
+    observed = {}
+    for invoker in ("b", "c"):
+        out = tmp_path / f"{invoker}.json"
+        base = ["perl", str(SCRIPT), "--history", str(history), "--out", str(out),
+                "--run-id", "runA", "--barcode", invoker]
+        legacy = subprocess.run(base, capture_output=True, text=True)
+        assert legacy.returncode == 0, legacy.stderr
+        observed[invoker] = json.loads(out.read_bytes())["run_status_read_fate"]["demux_total_reads"]
+        complete = subprocess.run(base + ["--authority-context", str(context)], capture_output=True, text=True)
+        assert complete.returncode == 0, complete.stderr
+        obj = json.loads(out.read_bytes())
+        assert (obj["barcodes"], obj["barcode"], obj["last_round_barcode"]) == (["b", "c"], "c", "alpha")
+        assert obj["run_status_read_fate"]["demux_total_reads"] == 2
+    assert observed == {"b": 1, "c": 2}
+
+
+def test_authority_order_digest_preserves_unicode_round_labels(tmp_path: Path) -> None:
+    labels = ["N\u0085E", "L\u2028S", "P\u2029S"]
+    history = tmp_path / "history.jsonl"
+    history.write_bytes(b"".join((json.dumps(dict(run_id="runA", barcode="b",
+        round_barcode=rb), ensure_ascii=False) + "\n").encode() for rb in labels))
+    digest = hashlib.sha256(b"".join(rb.encode() + b"\0b\0" for rb in labels)).hexdigest()
+    context = tmp_path / "authority.json"
+    context.write_text(json.dumps(dict(run_id="runA", barcodes=["b"], barcode="b",
+        last_round_barcode=labels[-1], rounds_count=3, round_order_sha256=digest)))
+    out = tmp_path / "run.json"
+    command = ["perl", str(SCRIPT), "--history", str(history), "--out", str(out),
+               "--run-id", "runA", "--barcode", "b", "--authority-context", str(context)]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(out.read_bytes())["last_round_barcode"] == labels[-1]

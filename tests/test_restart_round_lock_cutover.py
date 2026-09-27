@@ -1390,6 +1390,7 @@ CONTROL = (
     ".otu_size_streak.lock.flock",
     ".sup_basecall_cache.lock.flock",
     ".done_pod5.lock.flock",
+    ".report_history.lock.flock",
 )
 
 

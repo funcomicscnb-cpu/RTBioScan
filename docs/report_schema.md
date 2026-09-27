@@ -309,6 +309,7 @@ Required keys:
 
 Common optional keys:
 - `barcode` (string)
+- `barcodes` (array of strings; ordered by each barcode's first retained authoritative round-index appearance)
 - `state_id` (string)
 - `identity_mode` (string; `collapse|track`)
 - `outdir` (string)
@@ -328,6 +329,15 @@ Common optional keys:
 - `run_summary_source_round` (string; latest non-failed round used for the current summary cards; absent when all rounds failed)
 - `run_summary` (object with latest non-failed round `reads`, `otu`, `consensus`, `read_fate` snapshots; absent when all rounds failed)
 
+For completed authoritative run publication, `run_id` alone identifies the run;
+`barcode` and `last_round_barcode` describe the terminal retained round in
+`round_index.tsv` order. `run_status_read_fate` remains a current single-barcode
+snapshot sourced from that terminal barcode. `run_totals` and round history keep
+their existing aggregation semantics. A zero-round startup seed has `barcodes: []`
+and its scalar `barcode` is only a placeholder. Old records without `barcodes`
+remain valid; complete publication may later add the field without changing
+`schema_version: "2.0"`. External strict-key validators may need an update.
+
 When `report_views` is present, each entry includes:
 - `view_id` (string; `sample|replicate|track_detail`)
 - `label` (string; current writer uses `Run Info`, `Primer Comparison`, `Replicate Comparison`)
@@ -345,10 +355,9 @@ This key is used to replace an existing row for the same round instead of duplic
 ## Renderer ordering
 [back to Top](#report-schema-round-reportjson)
 
-The report renderer sorts rounds by:
-1. `timestamp_utc` ascending (missing/invalid timestamps last)
-2. `round_barcode`
-3. `barcode`
+When retained round-index authority is supplied, the renderer uses its numeric
+index positions, including for nonnumeric round labels. Standalone legacy
+rendering without that authority retains its existing fallback order.
 
 ## Runs index (`runs_index.jsonl`)
 [back to Top](#report-schema-round-reportjson)
@@ -363,6 +372,7 @@ Required keys:
 Optional keys:
 - `schema_version` (string; current writer uses `2.0`)
 - `barcode` (string)
+- `barcodes` (array of strings; optional in old rows, copied from the full run report)
 - `state_id` (string)
 - `identity_mode` (string; `collapse|track`)
 - `outdir` (string)

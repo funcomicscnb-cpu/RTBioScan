@@ -26,16 +26,28 @@ fi
 mkdir -p "$(dirname "$HISTORY_JSONL")"
 
 if [ "$use_lock" -eq 1 ]; then
-  waited=0
-  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-    sleep 1
-    waited=$((waited + 1))
-    if [ "$waited" -ge "$LOCK_WAIT" ]; then
-      echo "ERROR: failed to acquire report history lock: $LOCK_PATH" 1>&2
-      exit 2
-    fi
-  done
-  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+  source "$(dirname "$0")/lib/lock_utils.sh"
+  init_lock_helpers
+  acquire_lock "$LOCK_PATH" || exit 2
+  RTB_HISTORY_LOCK_FD=${acquired_lock_fds[$((${#acquired_lock_fds[@]}-1))]}
+  export RTB_HISTORY_LOCK_OWNER=$$
+fi
+
+# Official retained-report layout opts into the shared authority contract even
+# for direct callers. The historical three-path interface remains for legacy layouts.
+if [ -z "${RTB_HISTORY_CURRENT:-}" ] && [ "$(basename "$HISTORY_JSONL")" = report_history.jsonl ]; then
+  state_candidate="$(dirname "$(dirname "$HISTORY_JSONL")")"
+  round_directory="$(dirname "$ROUND_JSON")"
+  if [ "$(dirname "$round_directory")" = "$state_candidate" ]; then
+    RTB_HISTORY_STATE="$state_candidate"
+    RTB_HISTORY_CURRENT="$(basename "$round_directory")"
+  fi
+fi
+if [ -n "${RTB_HISTORY_CURRENT:-}" ]; then
+  python3 -B "$(dirname "$0")/report_history_state.py" rebuild-history \
+    --state-dir "${RTB_HISTORY_STATE:?}" --current-round-barcode "$RTB_HISTORY_CURRENT" \
+    --outdir "${RTB_HISTORY_OUTDIR:-}" --history "$HISTORY_JSONL" --lock-fd "${RTB_HISTORY_LOCK_FD:?}"
+  exit $?
 fi
 
 TMP="$(mktemp "${HISTORY_JSONL}.tmp.XXXXXX")"

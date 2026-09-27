@@ -410,8 +410,17 @@ sub presentation_set {
     for(qw(run_reads_fate.pdf run_otu_fate.pdf run_informative_otu.pdf run_consensus_emitted.pdf run_demultiplex_reads_by_marker.pdf)){$p{"plots/pdf/embedded/$_"}=1}
     for my$t(@{$m->{targets}}){my$slug=lc($t);$slug=~s/[^a-z0-9._-]+/_/g;$slug=~s/_+/_/g;$slug=~s/\A_+|_+\z//g;my$suffix=$t eq 'COI'||$t eq 'ITS2'?$t:$slug;for(qw(otu consensus frozen_otu consolidated_consensus)){$p{"plots/pdf/embedded/run_${_}_sunburst_$suffix.pdf"}=1}}
     my%samples;my@history;
-    for my$path("$root/tables/report_history.jsonl","$root/report_history.jsonl",defined($live)?"$live/_state/report_history.jsonl":()){
+    for my$path("$root/tables/report_history.jsonl","$root/report_history.jsonl"){
         push@history,@{presentation_history($path)} if node(dirname($path)) ne 'A';
+    }
+    if(defined($live)){
+        # Live reporting may lag scientific completion. Use the shared authority
+        # classifier for presentation hints; restore keeps its strict existing path.
+        open my$h,'-|','python3','-B',"$FindBin::Bin/report_history_state.py",'presentation-history',
+            '--state-dir',$live,'--current-round-barcode',$m->{round} or fail('presentation classifier start');
+        require JSON::PP;
+        while(my$l=<$h>){my$x=eval{JSON::PP::decode_json($l)};fail('invalid classified presentation row') if $@||ref($x) ne 'HASH';push@history,$x}
+        close($h) or fail('presentation classifier failed');
     }
     require "$FindBin::Bin/lib/sample_label.pl";
     local $ENV{RTBIOSCAN_TARGET_TOKENS}=join('|',@{$m->{targets}});
@@ -584,32 +593,10 @@ while [ ! -f "$CONTROL/ack" ]; do
     waited=$((waited + 1))
 done
 REPORT_HISTORY_LOCK="$STATE_ROOT/_state/.report_history.lock"
-REPORT_LOCK_HOST="$(hostname 2>/dev/null || uname -n)"
-REPORT_STALE_LOCK_DIR="${REPORT_HISTORY_LOCK}.lockdir"
-source "${GUARD%/*}/lib/stale_lock_utils.sh"
-remove_report_lock_if_stale() {
-    rm -f "$REPORT_STALE_LOCK_DIR/meta.env" || return 1
-    rmdir "$REPORT_STALE_LOCK_DIR" || return 1
-}
-waited=0
-while ! mkdir "$REPORT_STALE_LOCK_DIR" 2>/dev/null; do
-    reclaim_status=0
-    stale_lock_maybe_reclaim "$REPORT_STALE_LOCK_DIR" "$REPORT_STALE_LOCK_DIR/meta.env" \
-        "$REPORT_LOCK_HOST" "$REPORT_LOCK_STALE_TTL_SECONDS" 'read-fate history lock' \
-        remove_report_lock_if_stale 0 || reclaim_status=$?
-    [ "$reclaim_status" -ne 2 ] && [ "$reclaim_status" -ne 11 ] || exit 74
-    [ "$reclaim_status" -ne 10 ] || continue
-    [ "$waited" -lt "$LOCK_WAIT" ] || exit 74
-    sleep 1
-    waited=$((waited + 1))
-done
-{
-    printf 'pid=%s\n' "$$"
-    printf 'host=%s\n' "$REPORT_LOCK_HOST"
-    printf 'started_epoch=%s\n' "$(date +%s)"
-} > "$REPORT_STALE_LOCK_DIR/meta.env"
-# No trap removes H, the worker pin or pending evidence. An unsuccessful
-# worker leaves the established owner metadata and durable replay obligation.
+source "${GUARD%/*}/lib/lock_utils.sh"
+init_lock_helpers
+acquire_lock "$REPORT_HISTORY_LOCK" || exit 74
+export RTB_HISTORY_LOCK_FD="${acquired_lock_fds[$((${#acquired_lock_fds[@]}-1))]}"
 python3 "$DRIVER" prepare "$CONTROL"
 exec python3 "$DRIVER" apply "$CONTROL/active-context.json"
 RTB_WORKER_SHELL
@@ -622,6 +609,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 import runpy
+import shlex
 import stat
 import subprocess
 import sys
@@ -981,23 +969,32 @@ def expected_reports(ctx, entries, fate, outputs, inputs, stable_json, ordinal, 
     state = Path(ctx["state_root"]) / "_state"
     last = entries[-1][1]
     b = last["barcode"]
+    api = runpy.run_path(str(bindir / "report_history_state.py"))
+    authority = api["context_for_run"](ctx["state_root"], last["run_id"])
+    status_barcode = authority["barcode"]
     for name in ("round_index.tsv", "done_pod5.txt", "run_started_utc.txt", f"{b}_read_info_rpt.txt", f"{b}_on_target_rpt.txt"):
         retain(state / name, shadow / name)
+    if status_barcode != b:
+        for suffix in ("read_info_rpt.txt", "on_target_rpt.txt", "demux_annotation_cache.tsv", "blast_unassigned_current.list"):
+            retain(state / f"{status_barcode}_{suffix}", shadow / f"{status_barcode}_{suffix}")
     # R4's census and legacy provenance include foreign barcode evidence and
     # all globally mapped rounds, even beyond this reporting prefix.
     r4_names = sorted(p.name for p in state.iterdir() if "_blast_otu_" in p.name or p.name.startswith(".r4d-publish-"))
     for name in r4_names:
         retain(state / name, shadow / name)
-    for line in read(state / "round_index.tsv").decode().splitlines():
+    for line in read(state / "round_index.tsv").decode().split("\n"):
+        if not line:
+            continue
         rb = component(line.split("\t")[0])
         rd = base / rb
         rd.mkdir(exist_ok=True)
-        for suffix in ("blast_otu_pretax_rpt.txt", "blast_otu_noadapter_rpt.txt"):
-            target = rd / f"{b}_{suffix}"
-            if not target.exists():
-                original_dir = state.parent / rb
-                if original_dir.exists():
-                    retain(original_dir / target.name, target)
+        for member in {b, status_barcode}:
+            for suffix in ("blast_otu_pretax_rpt.txt", "blast_otu_noadapter_rpt.txt"):
+                target = rd / f"{member}_{suffix}"
+                if not target.exists():
+                    original_dir = state.parent / rb
+                    if original_dir.exists():
+                        retain(original_dir / target.name, target)
     for suffix, data in zip(FATE, fate):
         exclusive(shadow / f"{b}_{suffix}", data)
     for p, data in unassigned.items():
@@ -1005,29 +1002,42 @@ def expected_reports(ctx, entries, fate, outputs, inputs, stable_json, ordinal, 
     # All independently reconstructed scientific values and immutable fields
     # enter the bounded run-report calculation. Run aggregation uses its established per-run
     # selector, without changing that selector or its schema.
-    exclusive(shadow / "report_history.jsonl", b"".join(json.dumps(v).encode() + b"\n" for v in reports.values()))
+    history_view = api["History"](ctx["state_root"], entries[-1][1]["round_barcode"])
+    if history_view.classify(full=True) == "invalid_authority":
+        die(history_view.reason)
+    future = [(history_view.row(history_view.records[rb]) if rb in history_view.records else history_view.report(rb)[1])
+              for rb in history_view.rebuild_rounds if history_view.mapping[rb] > history_view.mapping[history_view.current]]
+    exclusive(shadow / "report_history.jsonl", b"".join(json.dumps(v).encode() + b"\n" for v in reports.values()) + b"".join(future))
+    expected_rounds = [(v["round_barcode"], v["barcode"]) for v in reports.values()
+                       if v.get("run_id") == last["run_id"]]
+    expected_rounds += [(obj["round_barcode"], obj["barcode"]) for obj in (api["loads"](raw) for raw in future)
+                        if obj.get("run_id") == last["run_id"]]
+    complete_authority = (len(expected_rounds) == authority["rounds_count"] and
+                          api["round_order_digest"](expected_rounds) == authority["round_order_sha256"])
     run_dest = base / "expected-run.json"
-    cmd = ["perl", str(bindir / "report_run_json.pl"), "--history", str(shadow / "report_history.jsonl"), "--out", str(run_dest), "--run-id", last["run_id"], "--barcode", b, "--state-id", str(last.get("state_id") or Path(ctx["state_root"]).name), "--schema-version", str(last.get("schema_version") or "1.6"), "--report-rel-path", f"runs/{last['run_id']}/report.html", "--outdir", ctx["outdir"]]
+    cmd = ["perl", str(bindir / "report_run_json.pl"), "--history", str(shadow / "report_history.jsonl"), "--out", str(run_dest), "--run-id", last["run_id"], "--barcode", b, "--state-id", str(last.get("state_id") or Path(ctx["state_root"]).name), "--schema-version", "2.0", "--report-rel-path", f"runs/{last['run_id']}/report.html", "--outdir", ctx["outdir"]]
+    if complete_authority:
+        authority_file = base / "authority.json"
+        exclusive(authority_file, json.dumps(authority, separators=(",", ":")).encode() + b"\n")
+        cmd += ["--authority-context", str(authority_file)]
     if (shadow / "run_started_utc.txt").exists():
         cmd += ["--run-started-utc-file", str(shadow / "run_started_utc.txt")]
-    contract_command(cmd)
-    run_obj = json.loads(read(run_dest))
-    r4 = None
+    r4_eligible = False
     # A resolver is reached after marker and accumulated-input eligibility,
     # even if it resolves absence and no run-status object is produced.
     selected = [o for o in reports.values() if o.get("run_id") == last["run_id"]]
-    picked = max(selected, key=lambda o: (int(re.search(r"(\d+)(?!.*\d)", o["round_barcode"])[1]), o["round_barcode"]))
+    picked = max(selected, key=lambda o: history_view.mapping[o["round_barcode"]])
     markers = picked.get("markers") or {}
     order = markers.get("order") or []
     taxa = markers.get("target_taxa_by_marker") or {}
     if order and all(taxa.get(m) for m in order) and all((shadow / f"{b}_{suffix}").exists() and (shadow / f"{b}_{suffix}").stat().st_size for suffix in ("read_info_rpt.txt", "on_target_rpt.txt", "demux_annotation_cache.tsv")):
-        r4 = resolved_contract(bindir, shadow, b)
+        r4_eligible = True
     # These records may legitimately be adopted/sealed by the unchanged R4
     # resolver. Their expected final contract is checked separately below.
     mutable_r4 = {str(state / f"{b}_blast_otu_cumulative.commit"), str(state / f"{b}_blast_otu_cumulative.lock")}
     for p in mutable_r4:
         inputs.pop(p, None)
-    return {"reports": reports, "unassigned": unassigned, "run": run_obj, "run_path": str(Path(ctx["outdir"]) / "report_html/runs" / component(last["run_id"]) / "run_report.json"), "r4": r4, "r4_barcode": b, "r4_names": r4_names}
+    return {"reports": reports, "unassigned": unassigned, "run_command": cmd, "run": None, "run_path": str(Path(ctx["control"]) / ("normalized-run-" + last["round_barcode"].encode().hex() + ".json")), "run_id": last["run_id"], "r4": None, "r4_eligible": r4_eligible, "r4_shadow": str(shadow), "r4_barcode": b, "r4_names": r4_names}
 
 
 def resolved_contract(bindir, state, barcode, readonly=False):
@@ -1045,7 +1055,7 @@ def resolved_contract(bindir, state, barcode, readonly=False):
     return {"mode": result.get("mode"), "kind": result.get("kind"), "generation": result.get("generation"), "members": {k: digest(p) for k, p in result["paths"].items()}}
 
 
-def verify_report_contract(ctx, expected):
+def verify_report_contract(ctx, expected, reporting=True):
     for p, obj in expected["reports"].items():
         now = json.loads(read(p))
         if json.dumps(now.get("read_fate"), sort_keys=True) != json.dumps(obj["read_fate"], sort_keys=True):
@@ -1057,6 +1067,8 @@ def verify_report_contract(ctx, expected):
     for p, value in expected["unassigned"].items():
         if read(p) != bytes.fromhex(value):
             die(f"bounded blast-unassigned mismatch {p}")
+    if not reporting:
+        return
     actual = json.loads(read(expected["run_path"]))
     # Only wall-clock freshness fields vary between independent computations.
     # Their shape is checked; every other completion/context/scientific field
@@ -1129,9 +1141,10 @@ def verify_outputs(state_path, entries, fate, outputs, stable_json):
         if not isinstance(now.get("read_fate"), dict) or not isinstance(now.get("warnings"), list):
             die(f"invalid repaired report {p}")
         expected_history.append(now)
-    history = [json.loads(row) for row in read(state_path / "_state/report_history.jsonl").splitlines()]
-    if json.dumps(history, sort_keys=True) != json.dumps(expected_history, sort_keys=True):
-        die("terminal history is not the exact ordered report prefix")
+    api = runpy.run_path(str(Path(__file__).parent / "report_history_state.py")) if (Path(__file__).parent / "report_history_state.py").exists() else runpy.run_path(str(Path(STAGE_B_HELPER)))
+    history_view = api["History"](state_path, entries[-1][1]["round_barcode"])
+    if history_view.classify(full=True) != "complete":
+        die("terminal history is not the exact ordered report prefix or validated later rows: " + history_view.reason)
     return hashes
 
 def native_start(pid):
@@ -1177,7 +1190,7 @@ def witness_census(state):
     return witness
 
 def invoke_args(ctx, boundary):
-    return [ctx["repair_helper"], "--live", "--skip-render", "--state-dir", ctx["state_root"], "--current-round-barcode", boundary, "--round-index-file", ctx["state_root"] + "/_state/round_index.tsv", "--targets", ctx["targets"], "--target-taxa", ctx["target_taxa"], "--blast-unassigned-min-level", ctx["assignment_level"], "--outdir", ctx["outdir"]]
+    return [ctx["repair_helper"], "--live", "--skip-render", "--history-lock-fd", str(ctx["history_fd"]), "--stage-b-run-report", str(Path(ctx["control"]) / ("normalized-run-" + boundary.encode().hex() + ".json")), "--state-dir", ctx["state_root"], "--current-round-barcode", boundary, "--round-index-file", ctx["state_root"] + "/_state/round_index.tsv", "--targets", ctx["targets"], "--target-taxa", ctx["target_taxa"], "--blast-unassigned-min-level", ctx["assignment_level"], "--outdir", ctx["outdir"]]
 
 def context_rounds(ctx, helper, boundary):
     state = Path(ctx["state_root"])
@@ -1277,6 +1290,8 @@ def verify_captured_records(ctx, helper, mapping, records, inputs, context):
     compare_captured_records(Path(ctx["state_root"]), records, current, context, context)
 
 def prepare_plan(ctx, helper):
+    global STAGE_B_HELPER
+    STAGE_B_HELPER = str(Path(ctx["authority_helper"]).parent / "report_history_state.py")
     worker_identity(ctx)
     state = Path(ctx["state_root"])
     witness = witness_census(state)
@@ -1285,9 +1300,12 @@ def prepare_plan(ctx, helper):
     mapping, entries = context_rounds(ctx, helper, ctx["round"])
     if entries[-1][1]["barcode"] != ctx["barcode"]:
         die("current boundary barcode mismatch")
-    mode = helper["authoritative_history_publish_mode"](state / "_state/report_history.jsonl", ctx["round"], mapping, entries)
-    if mode not in ("append", "normalize"):
-        die("unknown second order result")
+    api = runpy.run_path(str(Path(ctx["authority_helper"]).parent / "report_history_state.py"))
+    history_view = api["History"](state, ctx["round"])
+    classification = history_view.classify(full=True)
+    if classification == "invalid_authority":
+        die(history_view.reason)
+    mode = "append" if classification in ("complete", "append") else "normalize"
     units, old = [], None
     if original is not None:
         old = pending_read(witness, ctx["state"], mapping)
@@ -1352,16 +1370,16 @@ def verify_durable(ctx, helper, plan, witness):
     verify_records(Path(ctx["state_root"]), mapping, saved["records"], saved["context"], context)
 
 def release_history(ctx):
-    lock = Path(ctx["state_root"]) / "_state/.report_history.lock.lockdir"
-    if list(safe(lock, directory=True)) != ctx["history_identity"]:
+    api = runpy.run_path(str(Path(ctx["authority_helper"]).parent / "report_history_state.py"))
+    current = api["lock_identity"](ctx["state_root"], ctx["history_fd"], ctx["worker_pid"])
+    if current["identity"] != ctx["history_identity"] or current["record"] != ctx["history_record"]:
         die("history lock identity changed")
-    expected = f"pid={ctx['worker_pid']}\nhost={ctx['history_host']}\nstarted_epoch={ctx['history_epoch']}\n".encode()
-    if read(lock / "meta.env") != expected or sorted(p.name for p in lock.iterdir()) != ["meta.env"]:
-        die("history owner metadata changed")
-    (lock / "meta.env").unlink()
-    lock.rmdir()
+    os.close(ctx["history_fd"])
+
 
 def apply_plan(ctx, helper):
+    global STAGE_B_HELPER
+    STAGE_B_HELPER = str(Path(ctx["authority_helper"]).parent / "report_history_state.py")
     if os.getpid() != ctx["worker_pid"]:
         die("scientific mutator is not the pin owner")
     worker_identity(ctx)
@@ -1396,7 +1414,7 @@ def apply_plan(ctx, helper):
                 sys.argv = saved
             verify_durable(ctx, helper, plan, witness)
             verify_inputs(call["inputs"], call["input_identities"])
-            verify_report_contract(ctx, call["contracts"])
+            verify_report_contract(ctx, call["contracts"], reporting=False)
             hashes = verify_outputs(state, entries, [bytes.fromhex(x) for x in call["fate"]], {p: bytes.fromhex(x) for p, x in call["outputs"].items()}, call["stable_json"])
         else:
             hashes = plan["unchanged_unit"]
@@ -1407,7 +1425,7 @@ def apply_plan(ctx, helper):
         if plan["normalize"]:
             # Immutable historical receipts bind every verified output, not just
             # the three sidecars. Later calls replace only their own paths.
-            output_paths = list(call["outputs"]) + list(call["contracts"]["reports"]) + list(call["contracts"]["unassigned"]) + [call["contracts"]["run_path"], str(state / "_state/report_history.jsonl")]
+            output_paths = list(call["outputs"]) + list(call["contracts"]["reports"]) + list(call["contracts"]["unassigned"]) + [str(state / "_state/report_history.jsonl")]
             hashes.update({p: digest(p) for p in output_paths})
         receipt = {"unit": u, "hashes": hashes, "inputs": call["inputs"], "input_identities": call["input_identities"], "expected_sha": sha(json.dumps(call["contracts"], sort_keys=True).encode())}
         receipts.append(receipt)
@@ -1426,20 +1444,115 @@ def apply_plan(ctx, helper):
         terminal = plan["calls"][-1]
         _, entries = context_rounds(ctx, helper, ctx["round"])
         verify_outputs(state, entries, [bytes.fromhex(x) for x in terminal["fate"]], {p: bytes.fromhex(x) for p, x in terminal["outputs"].items()}, terminal["stable_json"])
-        verify_report_contract(ctx, terminal["contracts"])
-        last_r4 = {call["contracts"]["r4_barcode"]: call["contracts"] for call in plan["calls"]}
-        for expected in last_r4.values():
-            verify_r4_contract(ctx, expected)
+        verify_report_contract(ctx, terminal["contracts"], reporting=False)
     worker_identity(ctx)
     if plan["normalize"]:
         verify_durable(ctx, helper, plan, witness)
+    api = runpy.run_path(str(Path(ctx["authority_helper"]).parent / "report_history_state.py"))
+    api["reconcile"](state, ctx["round"], lock_fd=ctx["history_fd"], owner=ctx["worker_pid"], outdir=ctx["outdir"])
+    history_view = api["History"](state, ctx["round"])
+    if history_view.classify() != "complete":
+        die("history not complete before unlocked publication")
+    snapshot = state / "_state" / (".report_history.snapshot.rfpin." + str(os.getpid()) + ".jsonl")
+    api["atomic_bytes"](snapshot, read(history_view.path))
+    api["mark_pending"](history_view, ctx["outdir"])
+    try:
+        _, outstanding, authority_context = api["run_completion"](state, state / "_state/round_index.tsv", ctx["round"],
+            history_view.report(ctx["round"])[0]["run_id"], ctx["barcode"], history_view.path,
+            include_context=True)
+        reporting_ready = not outstanding
+    except (api["Refusal"], OSError, ValueError) as error:
+        reporting_ready = False
+        authority_context = None
+        print("WARN: REPORT_HISTORY_PENDING reason=run_authority:" + str(error), file=sys.stderr)
+    revision = api["revision"](history_view, authority_context)
+    if reporting_ready:
+        authority_context["report_revision"] = revision
+        api["atomic_bytes"](str(snapshot) + ".authority.json",
+            json.dumps(authority_context, ensure_ascii=False, separators=(",", ":")).encode() + b"\n")
     release_history(ctx)
-    worker_identity(ctx)
-    if plan["normalize"]:
-        verify_durable(ctx, helper, plan, witness)
-        witness.unlink()
-    elif safe(witness, required=False):
-        die("unexpected pending on append path")
+    # No history descriptor survives into a resolver or an artifact publisher.
+    published = False
+    try:
+        if plan["normalize"]:
+            for call in plan["calls"]:
+                expected = call["contracts"]
+                contract_command(expected["run_command"])
+                expected["run"] = json.loads(read(expected["run_command"][expected["run_command"].index("--out") + 1]))
+                if expected["r4_eligible"]:
+                    expected["r4"] = resolved_contract(Path(ctx["authority_helper"]).parent, Path(expected["r4_shadow"]), expected["r4_barcode"])
+                    # Preserve R4 adoption policy, now strictly after history release.
+                    resolved_contract(Path(ctx["authority_helper"]).parent, state / "_state", expected["r4_barcode"])
+                captured_command = json.loads(read(Path(expected["run_path"] + ".command.json")))
+                contract_command(captured_command)
+                verify_report_contract(ctx, expected)
+            exclusive(control / "reporting-contracts.json", json.dumps([c["contracts"] for c in plan["calls"]], sort_keys=True).encode() + b"\n")
+            terminal_contract = plan["calls"][-1]["contracts"]
+            run_id = terminal_contract["run_id"]
+            mode = history_view.report(ctx["round"])[0].get("identity_mode", "sample")
+            mode = "track" if mode == "track" else "sample"
+            options = ctx.get("report_options", {"html": "1"})
+            option_args = [value for name, value in options.items() for value in ("--" + name.replace("_", "-"), value)]
+            args = [sys.executable, "-B", str(Path(ctx["authority_helper"]).parent / "report_history_state.py"), "publish-derived",
+                    "--state-dir", str(state), "--current-round-barcode", ctx["round"], "--run-id", run_id,
+                    "--barcode", ctx["barcode"], "--outdir", ctx["outdir"], "--snapshot", str(snapshot),
+                    "--source", terminal_contract["run_path"], "--identity-mode", mode, "--lock-wait", "0", *option_args]
+            try:
+                if not reporting_ready:
+                    raise RuntimeError("run_incomplete")
+                api["publish_private_source"](state, ctx["round"], run_id, ctx["barcode"],
+                    ctx["outdir"], snapshot, terminal_contract["run_path"], args)
+                if options["html"] == "1":
+                    root_options = [value for name, value in options.items() if name != "html" for value in ("--" + name.replace("_", "-"), value)]
+                    api["artifact_command"](Path(ctx["outdir"]) / ".report_root_render.lock",
+                        ["/bin/bash", str(Path(ctx["authority_helper"]).parent / "report_rebuild.sh"), "--outdir", ctx["outdir"],
+                         "--state-id", ctx["state"], "--history", str(snapshot), "--skip-run-json", *root_options], 0)
+                published = True
+            except Exception as error:
+                from types import SimpleNamespace
+                api["pending_failure"](SimpleNamespace(state_dir=str(state), outdir=ctx["outdir"], run_id=run_id),
+                    "run_publication:" + str(error))
+                print("WARN: REPORT_HISTORY_PENDING reason=run_publication:" + str(error), file=sys.stderr)
+                repair = list(args)
+                repair[3] = "finalize"
+                for option in ("--source", "--snapshot"):
+                    position = repair.index(option)
+                    del repair[position:position + 2]
+                print("Offline repair: " + shlex.join(repair), file=sys.stderr)
+        # The same primitive reacquires H only after every downstream holder exits.
+        fd, barrier = api["acquire_history_fd"](state, 0)
+        try:
+            worker_identity(ctx)
+            current = api["History"](state, ctx["round"])
+            completion = api["run_completion"](state, state / "_state/round_index.tsv", ctx["round"],
+                history_view.report(ctx["round"])[0]["run_id"], ctx["barcode"], current.path,
+                include_context=True)
+            if current.classify() != "complete" or api["revision"](current, completion[2]) != revision:
+                die("history revision changed during unlocked reporting")
+            for p, expected_hash in latest.items():
+                if digest(p) != expected_hash:
+                    die("verified output changed during unlocked reporting: " + p)
+            if plan["normalize"]:
+                verify_durable(ctx, helper, plan, witness)
+                for expected in {c["contracts"]["r4_barcode"]: c["contracts"] for c in plan["calls"]}.values():
+                    verify_r4_contract(ctx, expected)  # explicitly read-only; cannot seal/adopt
+                witness.unlink()
+            elif safe(witness, required=False):
+                die("unexpected pending on append path")
+            if published:
+                from types import SimpleNamespace
+                check = SimpleNamespace(state_dir=str(state), current_round_barcode=ctx["round"], history=None,
+                    round_index_file=None, run_id=run_id, barcode=ctx["barcode"], outdir=ctx["outdir"],
+                    snapshot=str(snapshot), revision=revision, lock_fd=fd, html=int(options["html"]), identity_mode=mode)
+                if not api["recheck"](check, completion=completion):
+                    print("WARN: REPORT_HISTORY_PENDING reason=publication_recheck", file=sys.stderr)
+        finally:
+            os.close(fd)
+            os.close(barrier)
+    finally:
+        snapshot.unlink(missing_ok=True)
+        Path(str(snapshot) + ".run.json").unlink(missing_ok=True)
+        Path(str(snapshot) + ".authority.json").unlink(missing_ok=True)
     witness_census(state)
     receipt = {"context": ctx, "plan_sha": sha(plan_raw), "calls": receipts, "history_released": True, "pending_removed": True}
     exclusive(control / "success.receipt", json.dumps(receipt, sort_keys=True).encode() + b"\n")
@@ -1469,6 +1582,8 @@ def bootstrap(args):
     pin_path = Path(state_root) / "_state/.round_inflight.lockdir/pins" / f"ready.{worker_pin}.tsv"
     pin = dict(row.decode().split("\t", 1) for row in read(pin_path).splitlines())
     ctx = dict(state_root=state_root, state=component(sid), barcode=unhex(bh), round=unhex(rh), generation=generation, parent_pid=int(parent_pid), parent_pin=parent_pin, worker_pid=int(actual_pid), worker_pin=worker_pin, native_start=native_before, pin_start=pin["process_start"], host=pin["host"], history_host=subprocess.check_output(["hostname"], text=True).strip(), started_epoch=time.time(), generation_helper=generation_helper, authority_helper=authority_helper, repair_helper=repair_helper, targets=targets, target_taxa=target_taxa, assignment_level=assignment_level, outdir=outdir, control=control)
+    ctx["report_options"] = {name: os.environ.get("RTB_STAGE_B_" + name.upper(), default) for name, default in
+        (("html", "1"), ("url_prefix", ""), ("auto_refresh", "1"), ("refresh_seconds", "15"), ("sample_plot_max", "-1"))}
     worker_identity(ctx)
     raw = json.dumps(ctx, sort_keys=True).encode() + b"\n"
     exclusive(Path(control) / "ready.tmp", raw)
@@ -1498,13 +1613,11 @@ def activate(control):
     if read(control / "ack") != (sha(raw) + "\n").encode():
         die("parent acknowledgement differs")
     ctx = json.loads(raw)
-    lock = Path(ctx["state_root"]) / "_state/.report_history.lock.lockdir"
-    identity = safe(lock, directory=True)
-    meta = read(lock / "meta.env").decode().splitlines()
-    if len(meta) != 3 or meta[:2] != [f"pid={ctx['worker_pid']}", f"host={ctx['history_host']}"] or not re.fullmatch(r"started_epoch=[0-9]+", meta[2]):
-        die("history lock ownership differs")
-    ctx["history_identity"] = list(identity)
-    ctx["history_epoch"] = meta[2].split("=", 1)[1]
+    api = runpy.run_path(str(Path(ctx["authority_helper"]).parent / "report_history_state.py"))
+    held = api["lock_identity"](ctx["state_root"], os.environ.get("RTB_HISTORY_LOCK_FD"), ctx["worker_pid"])
+    ctx["history_identity"] = held["identity"]
+    ctx["history_record"] = held["record"]
+    ctx["history_fd"] = held["fd"]
     exclusive(control / "active-context.json", json.dumps(ctx, sort_keys=True).encode() + b"\n")
     helper = runpy.run_path(ctx["repair_helper"])
     prepare_plan(ctx, helper)
@@ -1556,7 +1669,7 @@ if __name__ == "__main__":
     else:
         die("unknown worker mode")
 RTB_WORKER_PYTHON
-    $shell =~ s/export LC_ALL=C LANG=C LC_CTYPE=C/export LC_ALL=C LANG=C LC_CTYPE=C\nLOCK_WAIT=$wait\nREPORT_LOCK_STALE_TTL_SECONDS=$ttl/;
+    $shell =~ s/export LC_ALL=C LANG=C LC_CTYPE=C/export LC_ALL=C LANG=C LC_CTYPE=C\nLOCK_WAIT=$wait/;
     for my$pair(['worker.sh',$shell],['driver.py',$driver]){sysopen(my$f,"$dir/$pair->[0]",O_WRONLY|O_CREAT|O_EXCL,0600) or fail('create private worker');print {$f} $pair->[1] or fail('write worker');close($f) or fail('close worker')}
     return 0;
 }

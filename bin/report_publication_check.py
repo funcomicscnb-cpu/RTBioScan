@@ -55,7 +55,11 @@ def main():
     ap.add_argument("--history", required=True)
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--expected-report-view", default="", help="Optional expected payload/meta report_view value")
+    ap.add_argument("--round-index-file", help="Stage B authoritative round order")
+    ap.add_argument("--current-round-barcode", help="Current authoritative boundary (required with --round-index-file)")
     args = ap.parse_args()
+    if bool(args.round_index_file) != bool(args.current_round_barcode):
+        ap.error("--round-index-file and --current-round-barcode must be supplied together")
 
     report_html = Path(args.report_html)
     report_state = Path(args.report_state)
@@ -103,7 +107,20 @@ def main():
         history_rounds = []
 
     filtered_history = [row for row in history_rounds if row.get("run_id") == args.run_id]
-    sorted_history = _sort_rounds(filtered_history)
+    if args.round_index_file:
+        try:
+            import runpy
+            authority = runpy.run_path(str(Path(__file__).with_name("report_history_state.py")))
+            order = authority["index_mapping"](args.round_index_file, args.current_round_barcode)
+            keys = [row["round_barcode"] for row in history_rounds]
+            if len(keys) != len(set(keys)) or any(key not in order for key in keys):
+                raise ValueError("duplicate_or_unmapped_history_identity")
+            sorted_history = sorted(filtered_history, key=lambda row: order[row["round_barcode"]])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"invalid_round_index_authority:{exc}", file=sys.stderr)
+            return 1
+    else:
+        sorted_history = _sort_rounds(filtered_history)
     payload_rounds = payload.get("rounds")
     if not isinstance(payload_rounds, list):
         problems.append("missing_payload_rounds")

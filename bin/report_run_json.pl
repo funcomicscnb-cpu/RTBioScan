@@ -3,6 +3,8 @@ use strict;
 use warnings;
 use Getopt::Long qw(GetOptions);
 use JSON::PP qw(encode_json decode_json);
+use Digest::SHA ();
+use Encode qw(encode);
 use Time::Local qw(timegm);
 use File::Basename qw(dirname);
 use File::Temp qw(tempfile);
@@ -12,6 +14,7 @@ my $history = '';
 my $out = '';
 my $run_id = '';
 my $barcode = '';
+my $authority_context_file = '';
 my $state_id = '';
 my $outdir = '';
 my $report_rel_path = '';
@@ -27,6 +30,7 @@ GetOptions(
     'out=s' => \$out,
     'run-id=s' => \$run_id,
     'barcode=s' => \$barcode,
+    'authority-context=s' => \$authority_context_file,
     'state-id=s' => \$state_id,
     'outdir=s' => \$outdir,
     'report-rel-path=s' => \$report_rel_path,
@@ -48,6 +52,7 @@ my $last_round_ts = '';
 my $prev_round_ts = '';
 my $last_round_obj;
 my @round_candidates;
+my $authority_context;
 my $identity_mode = 'collapse';
 
 sub parse_ts {
@@ -136,8 +141,38 @@ if (-s $history) {
     close $H;
 }
 
+if ($authority_context_file ne '') {
+    open my $C, '<', $authority_context_file or die "ERROR: open authority context: $!\n";
+    local $/;
+    my $raw = <$C>;
+    close $C;
+    $authority_context = eval { decode_json($raw) };
+    die "ERROR: invalid authority context\n" if $@ || ref($authority_context) ne 'HASH'
+        || ($authority_context->{run_id} // '') ne $run_id
+        || ref($authority_context->{barcodes}) ne 'ARRAY'
+        || !@{$authority_context->{barcodes}}
+        || ($authority_context->{rounds_count} // '') !~ /^[0-9]+$/
+        || ($authority_context->{round_order_sha256} // '') !~ /^[0-9a-f]{64}$/;
+    my (%seen_round, %seen_barcode, @roster);
+    my $order_sha = Digest::SHA->new(256);
+    for my $candidate (@round_candidates) {
+        my $rb = $candidate->{round_barcode};
+        my $member = $candidate->{obj}{barcode} // '';
+        die "ERROR: duplicate run history round in authority context\n" if $seen_round{$rb}++;
+        $order_sha->add(encode('UTF-8', $rb), "\0", encode('UTF-8', $member), "\0");
+        push @roster, $member unless $seen_barcode{$member}++;
+    }
+    die "ERROR: incomplete authority context\n" if !@round_candidates
+        || $authority_context->{rounds_count} != $rounds_count
+        || $order_sha->hexdigest ne $authority_context->{round_order_sha256}
+        || join("\0", @roster) ne join("\0", @{$authority_context->{barcodes}})
+        || ($authority_context->{barcode} // '') ne ($round_candidates[-1]{obj}{barcode} // '')
+        || ($authority_context->{last_round_barcode} // '') ne $round_candidates[-1]{round_barcode};
+    $barcode = $authority_context->{barcode};
+}
+
 if (@round_candidates) {
-    my @sorted = sort { compare_round_candidates($a, $b) } @round_candidates;
+    my @sorted = $authority_context ? @round_candidates : sort { compare_round_candidates($a, $b) } @round_candidates;
     my $picked = $sorted[-1];
     $last_round_obj = $picked->{obj};
     $last_round_barcode = $picked->{round_barcode} if defined $picked->{round_barcode};
@@ -189,8 +224,10 @@ my $record = {
     rounds_count => $rounds_count,
     status => $status,
 };
+$record->{barcodes} = $authority_context->{barcodes} if $authority_context;
 
 if ($rounds_count == 0) {
+    $record->{barcodes} = [];
     $record->{last_round_barcode} = '0';
     $record->{last_updated_utc} = $started_utc ne '' ? $started_utc : $now_utc;
     $record->{status_label} = 'Fresh';
@@ -532,7 +569,8 @@ if (defined $last_round_obj) {
         ($_->{obj}->{round_status} // 'ok') ne 'failed'
     } @round_candidates;
     my $summary_round = @summary_candidates
-        ? (sort { compare_round_candidates($a, $b) } @summary_candidates)[-1]
+        ? ($authority_context ? $summary_candidates[-1]
+                              : (sort { compare_round_candidates($a, $b) } @summary_candidates)[-1])
         : undef;
     my $summary = defined $summary_round ? extract_run_summary($summary_round->{obj}) : undef;
     my $totals = aggregate_run_summary(\@round_candidates);

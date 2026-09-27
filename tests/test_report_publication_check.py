@@ -296,3 +296,62 @@ def test_publication_check_rejects_unexpected_track_detail_view(tmp_path: Path) 
     check = _check(history, out_html, out_state, "runA", expected_view="sample")
     assert check.returncode != 0
     assert "unexpected_payload_report_view:track_detail" in check.stderr
+
+
+import pytest
+
+
+def _check_authoritative(history, html, state, index, current):
+    return subprocess.run([sys.executable,'-B',str(CHECK),'--history',str(history),'--report-html',str(html),
+        '--report-state',str(state),'--run-id','runA','--expected-report-view','sample',
+        '--round-index-file',str(index),'--current-round-barcode',current],capture_output=True,text=True)
+
+
+@pytest.mark.parametrize('timestamps',['absent','equal'])
+@pytest.mark.parametrize('reverse',[False,True])
+def test_stage_b_ten_round_order_uses_index_and_preserves_renderer_bytes(tmp_path,timestamps,reverse):
+    import re
+    rows=[dict(run_id='runA',barcode='b',round_barcode=f'r{i}',label='old Ã\u0085land L\u2028S\u2029') for i in range(1,11)]
+    if timestamps=='equal':
+        for row in rows:row['timestamp_utc']='2026-09-27T00:00:00Z'
+    history=tmp_path/'history.jsonl';_write_history(history,list(reversed(rows)) if reverse else rows)
+    index=tmp_path/'round_index.tsv';index.write_text(''.join(f'r{i}\t{i}\n' for i in range(1,11)))
+    html=tmp_path/'report.html';state=tmp_path/'report_state.json'
+    rendered=_render(history,html,state,'runA');assert rendered.returncode==0,rendered.stderr
+    before=(html.read_bytes(),state.read_bytes())
+    # r4 is an older retry with six valid later rows in the snapshot.
+    result=_check_authoritative(history,html,state,index,'r4');assert result.returncode==0,result.stderr
+    assert (html.read_bytes(),state.read_bytes())==before
+    text=html.read_text();match=re.search(r'window.REPORT_PAYLOAD =\s*(\{.*?\});',text,re.S);payload=json.loads(match[1])
+    payload['rounds'].sort(key=lambda row:row['round_barcode'])
+    html.write_text(text[:match.start(1)]+json.dumps(payload)+text[match.end(1):])
+    result=_check_authoritative(history,html,state,index,'r4')
+    assert result.returncode!=0 and 'round_barcodes_mismatch' in result.stderr
+
+
+@pytest.mark.parametrize('bad',['missing-file','missing-entry','duplicate-name','duplicate-position','malformed'])
+def test_stage_b_order_refuses_bad_index(tmp_path,bad):
+    history=tmp_path/'history.jsonl';_write_history(history,[dict(run_id='runA',barcode='b',round_barcode=f'r{i}') for i in (1,2)])
+    html=tmp_path/'report.html';state=tmp_path/'state.json';assert _render(history,html,state,'runA').returncode==0
+    index=tmp_path/'round_index.tsv'
+    values={'missing-entry':'r1\t1\n','duplicate-name':'r1\t1\nr1\t2\nr2\t3\n',
+            'duplicate-position':'r1\t1\nr2\t1\n','malformed':'r1\tbogus\nr2\t2\n'}
+    if bad!='missing-file':index.write_text(values[bad])
+    result=_check_authoritative(history,html,state,index,'r2')
+    assert result.returncode!=0 and 'invalid_round_index_authority' in result.stderr
+
+
+def test_stage_b_order_uses_nonnumeric_authoritative_names(tmp_path):
+    import hashlib
+    names=['zeta','alpha','middle']
+    history=tmp_path/'history.jsonl';rows=[dict(run_id='runA',barcode='b',round_barcode=name) for name in reversed(names)];_write_history(history,rows)
+    index=tmp_path/'round_index.tsv';index.write_text(''.join(f'{name}\t{i}\n' for i,name in enumerate(names,1)))
+    digest=hashlib.sha256(history.read_bytes()).hexdigest()
+    meta=dict(report_revision=digest,report_view='sample')
+    payload=dict(view_scope='run',report_view='sample',history_count=3,rounds=[dict(round_barcode=name) for name in names])
+    html=tmp_path/'report.html';html.write_text('window.REPORT_META = '+json.dumps(meta)+';\nwindow.REPORT_PAYLOAD = '+json.dumps(payload)+';\n')
+    state=tmp_path/'state.json';state.write_text(json.dumps(meta))
+    assert _check_authoritative(history,html,state,index,'alpha').returncode==0
+    # No natural/lexical inference may override the explicit authority.
+    index.write_text('alpha\t1\nmiddle\t2\nzeta\t3\n')
+    assert _check_authoritative(history,html,state,index,'alpha').returncode!=0

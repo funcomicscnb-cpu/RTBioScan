@@ -121,12 +121,13 @@ def test_global_history_compares_identity_order_not_suffix(tmp_path):
     names = ['runZ_9', 'runA_0', 'runB_0']
     state, mapping = rounds(tmp_path, names)
     history = state / '_state/report_history.jsonl'
-    history.write_text(''.join(json.dumps({'round_barcode': n})+'\n' for n in names[:2]))
+    history.write_bytes(b''.join((state/n/'round_report.json').read_bytes() for n in names[:2]))
     result = order_command(state, names[-1], mapping)
     assert result.returncode == 0 and result.stdout == 'append\n'
-    history.write_text(''.join(json.dumps({'round_barcode': n})+'\n' for n in reversed(names[:2])))
+    history.write_bytes(b''.join((state/n/'round_report.json').read_bytes() for n in reversed(names[:2])))
     assert order_command(state, names[-1], mapping).stdout == 'normalize\n'
-    history.write_text(json.dumps({'round_barcode': 'unknown_0'})+'\n')
+    unknown=json.loads((state/names[0]/'round_report.json').read_bytes());unknown['round_barcode']='unknown_0'
+    history.write_text(json.dumps(unknown)+'\n')
     assert order_command(state, names[-1], mapping).returncode != 0
 
 
@@ -992,7 +993,10 @@ def test_authoritative_order_semantic_mutants_are_killed(tmp_path,monkeypatch,mu
         old='key=mapping.__getitem__)'
         new='key=str)' if mutation=='lexical' else "key=lambda rb: int(rb.rsplit('_', 1)[1]))"
     assert source.count(old)==1
-    helper=tmp_path/'report_read_fate_repair.py';helper.write_text(source.replace(old,new))
+    bindir=tmp_path/'fault/bin';shutil.copytree(REPO/'bin',bindir)
+    if mutation=='missing-map':
+        source=source.replace('authoritative_mode if args.round_index_file is not None else', 'authoritative_mode if args.round_index_file is not None and Path(args.round_index_file).exists() else')
+    helper=bindir/'report_read_fate_repair.py';helper.write_text(source.replace(old,new))
     compile(helper.read_text(),str(helper),'exec')
     monkeypatch.setitem(globals(),'REPAIR',helper)
     if mutation=='missing-map':
@@ -1000,9 +1004,9 @@ def test_authoritative_order_semantic_mutants_are_killed(tmp_path,monkeypatch,mu
     else:
         names=['runB_0','runA_0'] if mutation=='lexical' else ['runZ_90','runA_0']
         state,mapping=rounds(tmp_path/'case',names)
-        r=order_command(state,names[-1],mapping)
-        assert r.returncode!=0,'mutant silently accepted non-authoritative order'
-        assert 'boundary is not terminal' in r.stderr
+        api=runpy.run_path(str(helper))
+        with pytest.raises(SystemExit,match='boundary is not terminal'):
+            api['authoritative_round_context'](state,mapping,names[-1])
 
 
 def test_pending_witness_prevents_candidate_before_root_mutation(tmp_path):
@@ -1059,8 +1063,17 @@ def test_interrupted_normalization_keeps_pending_and_prevents_success(tmp_path,m
         new=old+"    raise RuntimeError('injected normalization cut')\n"
     else:
         suffix={'history':'report_history.jsonl','demux':'_read_fate_demux_seen.tsv','blast':'_read_fate_blast_seen.tsv','annotation':'_demux_annotation_cache.tsv'}[cut]
-        old='    tmp_path.replace(path)\n'
-        new=old+f"    if path.name.endswith({suffix!r}):\n        raise RuntimeError('injected normalization cut')\n"
+        if cut=='history':
+            shared=bindir/'report_history_state.py'
+            shared_source=shared.read_text()
+            anchor='        os.replace(temp, path)\n'
+            assert shared_source.count(anchor)==1
+            shared.write_text(shared_source.replace(anchor,anchor+"        if Path(path).name == 'report_history.jsonl':\n            raise RuntimeError('injected normalization cut')\n"))
+            old='    tmp_path.replace(path)\n';new=old
+        else:
+            old='    tmp_path.replace(path)\n'
+            new=old+f"    if path.name.endswith({suffix!r}):\n        raise RuntimeError('injected normalization cut')\n"
+
     assert s.count(old)==1
     repair.write_text(s.replace(old,new));compile(repair.read_text(),str(repair),'exec')
     monkeypatch.setitem(globals(),'REPAIR',repair)
@@ -1143,8 +1156,16 @@ def test_bounded_output_mutants_fail_before_pending_commit(tmp_path, monkeypatch
         'optional-appears': "(last_round_dir/f'{barcode}_read_info_rpt.txt').write_text('read_id\\n')",
         'input-changes': "(last_round_dir/f'{barcode}_demult_rpt.txt').write_text(DEMULT_HEADER+'\\n')",
     }[fault]
-    path.write_text(s.replace(anchor,anchor+'        '+body+'\n'))
-    monkeypatch.setitem(globals(),'REPAIR',path)
+    if fault in ('run-json', 'run-missing'):
+        path=bindir/AUTH.name;s=AUTH.read_text()
+        anchor='                contract_command(captured_command)\n'
+        injected=body.replace('run_report_json', 'Path(expected["run_path"])')
+        assert s.count(anchor)==1
+        path.write_text(s.replace(anchor,anchor+'                '+injected+'\n'))
+        monkeypatch.setitem(globals(),'AUTH',path)
+    else:
+        path.write_text(s.replace(anchor,anchor+'        '+body+'\n'))
+        monkeypatch.setitem(globals(),'REPAIR',path)
     case=tmp_path/'case';case.mkdir()
     roots=[case/'t1',case/'t2']
     for root in roots:
@@ -1169,8 +1190,8 @@ def test_worker_commit_interruption_matrix(tmp_path, monkeypatch, cut):
         'unit-receipt': '        exclusive(control / f"unit-{u[2]}.receipt", json.dumps(receipt, sort_keys=True).encode() + b"\\n")\n',
         'before-history-release': '    release_history(ctx)\n',
         'after-history-release': '    release_history(ctx)\n',
-        'before-pending-unlink': '        witness.unlink()\n',
-        'after-pending-unlink': '        witness.unlink()\n',
+        'before-pending-unlink': '                witness.unlink()\n',
+        'after-pending-unlink': '                witness.unlink()\n',
         'before-success': '    exclusive(control / "success.receipt", json.dumps(receipt, sort_keys=True).encode() + b"\\n")\n',
     }
     anchor=anchors[cut];assert s.count(anchor)==1
@@ -1225,9 +1246,9 @@ def test_worker_verifies_reached_r4_and_resolved_run_status(tmp_path, monkeypatc
         (state/'b_blast_otu_cumulative.commit').write_text(body+f'#END\t{digest(body.encode())}\n')
     if mode.startswith('corrupt') or mode=='delete-r4-record':
         bindir=tmp_path/'fault/bin';shutil.copytree(REPO/'bin',bindir)
-        repair=bindir/REPAIR.name;s=repair.read_text();anchor='        run_command(run_cmd)\n';assert s.count(anchor)==1
-        body="o=json.loads(run_report_json.read_text()); o['run_status_read_fate']={}; run_report_json.write_text(json.dumps(o)+'\\n')" if mode.startswith('corrupt') else "(state_state_dir/f'{barcode}_blast_otu_cumulative.commit').unlink()"
-        repair.write_text(s.replace(anchor,anchor+'        '+body+'\n'));monkeypatch.setitem(globals(),'REPAIR',repair)
+        authority=bindir/AUTH.name;s=authority.read_text();anchor='                contract_command(captured_command)\n';assert s.count(anchor)==1
+        body="p=Path(expected['run_path']);o=json.loads(p.read_text());o['run_status_read_fate']={};p.write_text(json.dumps(o)+'\\n')" if mode.startswith('corrupt') else "(state/'_state'/(expected['r4_barcode']+'_blast_otu_cumulative.commit')).unlink()"
+        authority.write_text(s.replace(anchor,anchor+'                '+body+'\n'));monkeypatch.setitem(globals(),'AUTH',authority)
         with pytest.raises(AssertionError):
             run_actual_worker(tmp_path,live,helper,token,pin,'b','runA_0')
         assert not (tmp_path/'worker/success.receipt').exists()
@@ -1236,8 +1257,8 @@ def test_worker_verifies_reached_r4_and_resolved_run_status(tmp_path, monkeypatc
         control,output=run_actual_worker(tmp_path,live,helper,token,pin,'b','runA_0')
         result=json.loads((tmp_path/'output/report_html/runs/runA/run_report.json').read_text())
         assert ('run_status_read_fate' in result)==(mode=='committed')
-        plan=json.loads((control/'repair-plan.json').read_text())
-        assert plan['calls'][0]['contracts']['r4']['mode']==mode
+        contracts=json.loads((control/'reporting-contracts.json').read_text())
+        assert contracts[0]['r4']['mode']==mode
 
 CHART_NAMES = ['reads_fate_per_round.tsv','otu_fate_per_round.tsv','otu_active_by_marker_per_round.tsv','consensus_emitted_by_marker_per_round.tsv','otu_assignments_species.tsv','otu_assignments_genus.tsv','otu_assignments_family.tsv','consensus_assignments_species.tsv','consensus_assignments_genus.tsv','consensus_assignments_family.tsv','frozen_otu_assignments_species.tsv','consolidated_consensus_assignments_species.tsv','otu_assignments_by_sample_species.tsv','consensus_assignments_by_sample_species.tsv']
 

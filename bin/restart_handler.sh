@@ -434,7 +434,7 @@ if [ "$MODE" = "reset" ]; then
                 ".dorado.lock.flock", ".blastreport.lock.flock",
                 ".blastreport_sup.lock.flock", ".qced_reads.lock.flock",
                 ".otu_size_streak.lock.flock", ".sup_basecall_cache.lock.flock",
-                ".done_pod5.lock.flock");
+                ".done_pod5.lock.flock", ".report_history.lock.flock");
             my @fds = split /,/, $fds, -1;
             die "ERROR: missing reset lock descriptors\n" unless @fds == @names;
             for my $i (0 .. $#names) {
@@ -514,7 +514,7 @@ my @names = ('.rtbioscan_state_reset.flock',
     '.dorado.lock.flock', '.blastreport.lock.flock',
     '.blastreport_sup.lock.flock', '.qced_reads.lock.flock',
     '.otu_size_streak.lock.flock', '.sup_basecall_cache.lock.flock',
-    '.done_pod5.lock.flock');
+    '.done_pod5.lock.flock', '.report_history.lock.flock');
 my @handles;
 sub stable_open {
     my ($path, $is_barrier) = @_;
@@ -751,6 +751,7 @@ scan_restart_tree() {
                         "$ONGOING_STATE/.otu_size_streak.lock.flock"|\
                         "$ONGOING_STATE/.sup_basecall_cache.lock.flock"|\
                         "$ONGOING_STATE/.done_pod5.lock.flock"|\
+                        "$ONGOING_STATE/.report_history.lock.flock"|\
                         "$ONGOING_STATE/.rtbioscan_lock_host_v1"|\
                         "$ONGOING_STATE/.rtbioscan_lock_host_v1.guard") ;;
                         *)

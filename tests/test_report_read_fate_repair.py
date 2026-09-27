@@ -20,10 +20,16 @@ def test_repair_history_readers_frame_only_on_lf(tmp_path: Path) -> None:
         {"run_id": "runA", "round_barcode": "round_2", "label": "L\u2028S\u2029P"},
     ]
     for row in rows:
+        row.update(schema_version="2.1", barcode="b", state_id="state1")
+    for row in rows:
         round_dir = state_dir / row["round_barcode"]
         round_dir.mkdir()
         (round_dir / "round_report.json").write_text(json.dumps(row) + "\n", encoding="utf-8")
-    current = {"run_id": "runA", "round_barcode": "round_3"}
+    current = {"run_id": "runA", "round_barcode": "round_3", "schema_version": "2.1", "barcode": "b", "state_id": "state1"}
+    (state_dir / "round_3").mkdir()
+    (state_dir / "round_3/round_report.json").write_text(json.dumps(current) + "\n")
+    (state_dir / "_state").mkdir()
+    (state_dir / "_state/round_index.tsv").write_text("round_1\t1\nround_2\t2\nround_3\t3\n")
     entries = [(state_dir / row["round_barcode"], row) for row in [*rows, current]]
     history = tmp_path / "history.jsonl"
     wire = b"\n".join(json.dumps(row, ensure_ascii=False).encode("utf-8") for row in rows) + b"\n"
@@ -651,3 +657,59 @@ def test_report_read_fate_repair_live_bounds_future_rounds(tmp_path: Path) -> No
     history_lines = [line for line in (state_state_dir / "report_history.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(history_lines) == 1
     assert json.loads(history_lines[0])["round_barcode"] == "round_1"
+
+
+def test_stage_b_standalone_repair_refuses_stale_private_source(tmp_path: Path) -> None:
+    """The real standalone driver must not publish its stale private b witness."""
+    import os
+    import shutil
+    import sys
+    test_report_read_fate_repair_rebuilds_state_sidecars(tmp_path)
+    state = tmp_path / 'results/temp/ongoing/state/state1'
+    out = tmp_path / 'results'
+    index = state / '_state/round_index.tsv'
+    index.write_text('output_round_1\t1\noutput_round_2\t2\n')
+    finalizer = [sys.executable, '-B', str(REPO_ROOT / 'bin/report_history_state.py'), 'finalize',
+        '--state-dir', str(state), '--current-round-barcode', 'output_round_2', '--run-id', 'runA',
+        '--barcode', 'RTBioScan', '--outdir', str(out), '--html', '1', '--lock-wait', '0']
+    assert subprocess.run(finalizer, capture_output=True, timeout=60).returncode == 0
+    # Keep production helpers real. The test-only copy injects new retained authority
+    # after private capture and publishes it before the parent's source guard.
+    base = tmp_path / 'instrumented'
+    shutil.copytree(REPO_ROOT / 'bin', base / 'bin')
+    shutil.copytree(REPO_ROOT / 'assets', base / 'assets')
+    repair = base / 'bin/report_read_fate_repair.py'
+    code = repair.read_text()
+    anchor = '                        run_command(captured)\n'
+    assert code.count(anchor) == 1
+    hook = r"""                        if os.environ.get('RTB_INJECT_STALE_PRIVATE') == '1':
+                            extra = state_dir / 'r3'; extra.mkdir(exist_ok=True)
+                            payload = json.loads((state_dir / 'output_round_2/round_report.json').read_bytes())
+                            payload['round_barcode'] = 'r3'; payload['barcode'] = 'c'
+                            raw = (json.dumps(payload) + '\n').encode()
+                            (extra / 'round_report.json').write_bytes(raw)
+                            (state_state_dir / 'round_index.tsv').write_text('output_round_1\t1\noutput_round_2\t2\nr3\t3\n')
+                            with history_path.open('ab') as stream: stream.write(raw)
+                            fresh = [sys.executable, '-B', str(repo_root / 'bin/report_history_state.py'), 'finalize',
+                                '--state-dir', str(state_dir), '--current-round-barcode', args.current_round_barcode,
+                                '--run-id', 'runA', '--barcode', 'RTBioScan', '--outdir', str(outdir), '--html', '1', '--lock-wait', '0']
+                            subprocess.run(fresh, check=True, timeout=60)
+"""
+    repair.write_text(code.replace(anchor, anchor + hook))
+    command = [sys.executable, '-B', str(repair), '--state-dir', str(state), '--targets', 'COI',
+        '--target-taxa', 'Metazoa', '--outdir', str(out), '--round-index-file', str(index),
+        '--live', '--current-round-barcode', 'output_round_2']
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120,
+        env={**os.environ, 'RTB_INJECT_STALE_PRIVATE': '1'})
+    assert result.returncode == 73, result.stderr
+    assert 'source_run_authority_mismatch' in result.stderr
+    assert 'Offline repair:' in result.stderr
+    public = out / 'report_html/runs/runA/run_report.json'
+    rows = [json.loads(row) for row in (out / 'report_html/runs_index.jsonl').read_bytes().split(b'\n') if row]
+    assert json.loads(public.read_bytes())['barcodes'] == ['RTBioScan', 'c']
+    assert len(rows) == 1 and rows[0]['barcodes'] == ['RTBioScan', 'c']
+    assert (out / 'report_html/runs/runA/report.html').exists()
+    marker = out / 'report_html/runs/runA/.report_history_pending'
+    assert marker.exists()
+    assert subprocess.run(finalizer, capture_output=True, timeout=60).returncode == 0
+    assert not marker.exists()

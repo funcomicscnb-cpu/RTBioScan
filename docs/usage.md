@@ -2614,3 +2614,44 @@ old files are tolerated and left untouched, and a small versioned marker
 records BLAST-state initialization for new runs. The standalone
 `bin/report_round_json.pl` options `--summary` and `--summary-otu` are
 deprecated: they are still accepted, print a warning and change nothing.
+
+### Pending report history and offline completion
+
+`REPORT_HISTORY_PENDING` means scientific completion may have succeeded while
+reporting still needs work. Scientific snapshots can proceed. The advisory file
+`report_html/runs/<run_id>/.report_history_pending` is never an authority check.
+For a multi-barcode run, completion waits for every retained same-`run_id`
+barcode. The published run JSON and its single runs-index row then carry the
+same ordered `barcodes` roster; the scalar `barcode` and current
+`run_status_read_fate` refer to the terminal authoritative barcode.
+The invocation makes one additional, nonwaiting reporting-only attempt, including
+on the final round. An unsuccessful attempt prints the exact offline command.
+
+From the RTBioScan checkout, run the following with the original identities and
+absolute result/state paths (use `--identity-mode track` for track reports):
+
+```bash
+python3 -B bin/report_history_state.py finalize \
+  --state-dir /absolute/results/temp/ongoing/state/STATE_ID \
+  --current-round-barcode ROUND_BARCODE \
+  --outdir /absolute/results --run-id RUN_ID --barcode BARCODE \
+  --html 1 --identity-mode sample --lock-wait 0
+```
+
+Use `--html 0` only for a run configured without HTML. The command uses the same
+Stage A reset barrier, stable `_state/.report_history.lock.flock`, and compatibility
+fence as round publication and RF-PIN. It reconciles history, run JSON, runs index,
+and the required HTML through existing publishers. Publication uses an immutable
+history snapshot; pending clears only after an unchanged content revision and
+successful artifact checks. Exit 0 prints `REPORT_HISTORY_COMPLETE`; exit 73
+leaves pending visible and prints the repair command. Repeating it is safe.
+
+Authority comes from `round_index.tsv` and retained `round_report.json` files.
+Missing or conflicting authority refuses repair; restored scientific snapshots
+remain `invalid_authority` for reporting until retained inputs replay. Valid later
+rows are checked against retained reports and kept byte-for-byte. Malformed bytes
+are preserved exactly in `_state/report_history.quarantine.jsonl`, with repair
+identity and byte/line positions in `_state/report_history.quarantine.log`, before
+active history is replaced. Both files are derived audit evidence, not checkpoints.
+Legacy lock fences follow the existing `fd_lock.pl adopt-legacy` instructions;
+this stage never guesses that an old fence is abandoned based on its age.

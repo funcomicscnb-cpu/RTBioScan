@@ -15,6 +15,7 @@ def test_run_index_update_replaces_existing(tmp_path: Path) -> None:
     old = {
         "schema_version": "2.0",
         "run_id": "runA",
+        "barcode": "b",
         "last_updated_utc": "2026-03-06T00:00:00Z",
         "rounds_count": 0,
         "status_label": "Fresh",
@@ -30,6 +31,8 @@ def test_run_index_update_replaces_existing(tmp_path: Path) -> None:
     new = {
         "schema_version": "2.0",
         "run_id": "runA",
+        "barcode": "c",
+        "barcodes": ["b", "c"],
         "last_updated_utc": "2026-03-06T00:10:00Z",
         "rounds_count": 1,
     }
@@ -49,3 +52,4 @@ def test_run_index_update_replaces_existing(tmp_path: Path) -> None:
     updated = updated_rows[0]
     assert updated["schema_version"] == "2.0"
     assert updated["rounds_count"] == 1
+    assert updated["barcode"] == "c" and updated["barcodes"] == ["b", "c"]

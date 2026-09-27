@@ -224,6 +224,7 @@ def test_initial_seed(tmp_path, extra, seed_name, exit_code):
         report = json.loads(base64.b64decode(report_files[f'report_html/runs/{seed_name}/run_report.json']))
         rows = [json.loads(line) for line in base64.b64decode(report_files['report_html/runs_index.jsonl']).splitlines()]
         assert report['run_id'] == seed_name
+        assert report['barcodes'] == []
         assert report['state_id'] == 'X'
         assert [row['run_id'] for row in rows] == [seed_name]
         if not extra:

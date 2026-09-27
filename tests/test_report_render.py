@@ -66,6 +66,24 @@ def _load_report_render_module():
     return module
 
 
+def test_authoritative_nonnumeric_round_order_overrides_natural_order(tmp_path: Path) -> None:
+    history = tmp_path / "history.jsonl"
+    rows = [dict(run_id="runA", barcode="c", round_barcode="alpha"),
+            dict(run_id="runA", barcode="b", round_barcode="zeta")]
+    history.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    index = tmp_path / "round_index.tsv"
+    index.write_text("zeta\t1\nalpha\t2\n")
+    html, state = tmp_path / "report.html", tmp_path / "report_state.json"
+    result = _run(history, html, state, ["--round-index-file", str(index), "--run-id-filter", "runA"])
+    assert result.returncode == 0, result.stderr
+    payload = _extract_js_json(html.read_text(), "window.REPORT_PAYLOAD = ")
+    assert [row["round_barcode"] for row in payload["rounds"]] == ["zeta", "alpha"]
+    before = html.read_bytes()
+    index.write_text("zeta\t1\nalpha\t1\n")
+    refused = _run(history, html, state, ["--round-index-file", str(index), "--run-id-filter", "runA"])
+    assert refused.returncode != 0 and html.read_bytes() == before
+
+
 def test_jsonl_readers_frame_only_on_lf_and_keep_mixed_history(tmp_path: Path) -> None:
     mod = _load_report_render_module()
     labels = ["old Ã\u0085land", "Río", "Åland", "児島", "prąd", "N\u0085E", "L\u2028S", "P\u2029S"]

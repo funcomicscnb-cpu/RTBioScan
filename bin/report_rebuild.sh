@@ -295,6 +295,9 @@ render_root_report() {
   if [ -s "$RUN_INDEX" ]; then
     render_args+=(--run-index "$RUN_INDEX")
   fi
+  if [ -s "$(dirname "$HISTORY")/round_index.tsv" ]; then
+    render_args+=(--round-index-file "$(dirname "$HISTORY")/round_index.tsv")
+  fi
   "$PYTHON" "${SCRIPT_DIR}/report_render.py" "${render_args[@]}"
 }
 
@@ -347,10 +350,24 @@ rebuild_run_json() {
   if [ -n "$barcode" ]; then
     run_cmd+=(--barcode "$barcode")
   fi
+  local authority_state="$(dirname "$(dirname "$run_history")")"
+  local authority_index="${authority_state}/_state/round_index.tsv"
+  local authority_context=""
+  if [ -s "$authority_index" ]; then
+    authority_context="${run_report_json}.authority.$$.json"
+    "$PYTHON" -B "${SCRIPT_DIR}/report_history_state.py" context \
+      --state-dir "$authority_state" --current-round-barcode _unused \
+      --run-id "$run_id" --source "$authority_context"
+    run_cmd+=(--authority-context "$authority_context")
+  fi
   if [ -s "$run_started_utc_file" ]; then
     run_cmd+=(--run-started-utc-file "$run_started_utc_file")
   fi
-  "${run_cmd[@]}"
+  if ! "${run_cmd[@]}"; then
+    [ -z "$authority_context" ] || rm -f "$authority_context"
+    return 1
+  fi
+  [ -z "$authority_context" ] || rm -f "$authority_context"
 
   LOCK_WAIT="${LOCK_WAIT:-300}" bash "${SCRIPT_DIR}/report_run_index_update.sh" \
     "$run_report_json" \
@@ -412,8 +429,13 @@ render_run_report() {
       return 0
     fi
     ensure_live_round_link "$state_id" "$run_id" "$report_assets_dir_name"
+    local render_index_file=""
+    if [ -s "$(dirname "$run_history")/round_index.tsv" ]; then
+      render_index_file="$(dirname "$run_history")/round_index.tsv"
+    fi
     $PYTHON "${SCRIPT_DIR}/report_render.py" \
       --history "$run_history" \
+      --round-index-file "$render_index_file" \
       --run-index "$RUN_INDEX" \
       --template "$RUN_TEMPLATE" \
       --css "$CSS" \

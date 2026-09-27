@@ -6938,6 +6938,8 @@ process backup_update_and_clean {
 			RUN_REPORT_HTML="\$RUN_REPORT_DIR/report.html"
 			RUN_REPORT_STATE="\$RUN_REPORT_DIR/report_state.json"
 			RUN_REPORT_PENDING="\$RUN_REPORT_DIR/.report_render_pending"
+            RUN_HISTORY_PENDING="\$RUN_REPORT_DIR/.report_history_pending"
+            HISTORY_SNAPSHOT="\$STATE_TMP/.report_history.snapshot.section8.\$\$.jsonl"
 			RUN_REPORT_REL_PATH="runs/${run_name}/report.html"
 			REPORT_ASSET_DIR="${outdirResolved}/report_html/runs/${run_name}/report_assets"
 			REPORT_SAMPLE_ASSET_DIR="\$REPORT_ASSET_DIR/samples"
@@ -7067,16 +7069,21 @@ process backup_update_and_clean {
 		# if workspace cleanup is required.
 
             JOINT_READY=0
+            HISTORY_WAIT_USED=0
             if [ "\$RTBIOSCAN_ROUND_LOCK_SCOPE" = full_round ]; then
                 JOINT_CONTROL="\$PWD/.rtb-joint-worker.\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN.\$\$"
                 joint_preflight() {
                     perl "${baseDir}/bin/state_snapshot_authority.pl" emit-worker "\$JOINT_CONTROL" "${params.lock_wait_seconds}" "\$(( ${staleLockTtlMinutesStr} * 60 ))" || return 1
                     local mode pending worker_pid worker_rc worker_token
-                    mode="\$(python3 "${baseDir}/bin/report_read_fate_repair.py" --check-live-order --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --round-index-file "\$STATE_TMP/round_index.tsv" --targets "${params.targets}" --target-taxa "${params.target_taxa}")" || return 1
-                    case "\$mode" in append|normalize) ;; *) return 1 ;; esac
+                    mode="\$(python3 "${baseDir}/bin/report_read_fate_repair.py" --check-live-order --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --round-index-file "\$STATE_TMP/round_index.tsv" --targets "${params.targets}" --target-taxa "${params.target_taxa}")" || mode=invalid_authority
+                    case "\$mode" in complete|append|normalize|blocked_malformed|invalid_authority) ;; *) return 1 ;; esac
                     pending="\$(python3 "\$JOINT_CONTROL/driver.py" inspect "${ongoingStateDir}" "${stateId}")" || return 1
-                    if [ "\$mode" = normalize ] || [ "\$pending" = pending ]; then
+                    if [ "\$mode" = normalize ] || [ "\$mode" = blocked_malformed ] || [ "\$pending" = pending ]; then
+                        HISTORY_WAIT_USED=1
                         env -i PATH="\$PATH" LC_ALL=C LANG=C LC_CTYPE=C TMPDIR="\${TMPDIR:-/private/tmp}" \
+                            RTB_STAGE_B_HTML=${htmlReportEnabled ? 1 : 0} RTB_STAGE_B_URL_PREFIX="${htmlReportUrlPrefix}" \
+                            RTB_STAGE_B_AUTO_REFRESH=${htmlReportAutoRefresh ? 1 : 0} RTB_STAGE_B_REFRESH_SECONDS=${htmlReportRefreshSecondsStr} \
+                            RTB_STAGE_B_SAMPLE_PLOT_MAX=${htmlReportSamplePlotMaxStr} \
                             /bin/bash "\$JOINT_CONTROL/worker.sh" 2 "${ongoingStateDir}" "${stateId}" \
                             "\$(perl -e 'print unpack("H*",\$ARGV[0])' "${barcode}")" \
                             "\$(perl -e 'print unpack("H*",\$ARGV[0])' "${round_barcode}")" \
@@ -7094,8 +7101,14 @@ process backup_update_and_clean {
                         while kill -0 "\$worker_pid" 2>/dev/null; do
                             wait "\$worker_pid" || worker_rc=\$?
                         done
-                        [ "\$ack_rc" -eq 0 ] && [ "\$worker_rc" -eq 0 ] || return 1
-                        worker_token="\$(python3 "\$JOINT_CONTROL/driver.py" success "\$JOINT_CONTROL" "\$worker_pid" "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN")" || return 1
+                        if [ "\$worker_rc" -eq 74 ] && [ "\$ack_rc" -eq 0 ] && [ "\$pending" = absent ]; then
+                            HISTORY_WAIT_USED=1
+                            echo "WARN: REPORT_HISTORY_PENDING reason=lock_timeout; scientific snapshot may proceed" >&2
+                            worker_token="\$(cat "\$JOINT_CONTROL/worker.pin")" || return 1
+                        else
+                            [ "\$ack_rc" -eq 0 ] && [ "\$worker_rc" -eq 0 ] || return 1
+                            worker_token="\$(python3 "\$JOINT_CONTROL/driver.py" success "\$JOINT_CONTROL" "\$worker_pid" "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN")" || return 1
+                        fi
                         perl "\$RTBIOSCAN_ROUND_LOCK_HELPER" unpin --state-dir "\$STATE_TMP" --round-barcode "${round_barcode}" --scope full_round --token "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" --pin-token "\$worker_token" --best-effort || return 1
                     fi
                     perl "${baseDir}/bin/state_snapshot_authority.pl" prepare "${ongoingStateDir}" "${stateId}" "${barcode}" "${round_barcode}" "\$RTBIOSCAN_ROUND_LOCK_GENERATION_TOKEN" "\$RTBIOSCAN_ROUND_LOCK_PIN_TOKEN" "${demuxIdentityContext}" "${params.targets}" "\$JOINT_CANDIDATE" "\$CURRENT_TEMP_ROOT" "\$CURRENT_ROOT"
@@ -7290,27 +7303,40 @@ process backup_update_and_clean {
 		history_lock_acquired=0
 		release_report_history_lock() {
 			if [ "\${history_lock_acquired:-0}" -eq 1 ]; then
-				rmdir "\${REPORT_HISTORY_LOCK}.lockdir" 2>/dev/null || true
+				release_lock "\$REPORT_HISTORY_LOCK"
 				history_lock_acquired=0
 			fi
 		}
 		acquire_report_history_lock() {
-			local waited=0
-			while ! mkdir "\${REPORT_HISTORY_LOCK}.lockdir" 2>/dev/null; do
-				sleep 1
-				waited=\$((waited + 1))
-				if [ "\$waited" -ge ${params.lock_wait_seconds} ]; then
-					echo "ERROR: failed to acquire report history lock: \${REPORT_HISTORY_LOCK}" 1>&2
-					return 2
-				fi
-			done
-			history_lock_acquired=1
-			return 0
+            local wait_limit=\${LOCK_WAIT:-${params.lock_wait_seconds}}
+            [ "\${HISTORY_WAIT_USED:-0}" -eq 0 ] || wait_limit=0
+            LOCK_WAIT="\$wait_limit" acquire_lock "\$REPORT_HISTORY_LOCK" || return 2
+            history_lock_acquired=1
+            return 0
 		}
 		publish_report_history() {
             acquire_report_history_lock || return 2
-            local publish_rc=0
-            LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_history_append.sh --no-lock "\$ROUND_REPORT_JSON" "\$REPORT_HISTORY_JSONL" "\$REPORT_HISTORY_LOCK" || publish_rc=\$?
+            local publish_rc=0 classification
+            export RTB_HISTORY_LOCK_OWNER="\$\$"
+            export RTB_HISTORY_OUTDIR="${outdirResolved}"
+            export RTB_HISTORY_STATE="${ongoingStateDir}"
+            export RTB_HISTORY_CURRENT="${round_barcode}"
+            export RTB_HISTORY_LOCK_FD="\${acquired_lock_fds[\$((\${#acquired_lock_fds[@]}-1))]}"
+            classification="\$(python3 -B "${baseDir}/bin/report_history_state.py" classify --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --run-id "${run_name}" --barcode "${barcode}")" || classification=classifier_error
+            case "\$classification" in
+                complete) ;;
+                append)
+                    LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_history_append.sh --no-lock "\$ROUND_REPORT_JSON" "\$REPORT_HISTORY_JSONL" "\$REPORT_HISTORY_LOCK" || publish_rc=\$? ;;
+                normalize|blocked_malformed)
+                    if [ "\$RTBIOSCAN_ROUND_LOCK_SCOPE" = dorado_only ]; then
+                        python3 -B "${baseDir}/bin/report_history_state.py" rebuild-history --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --lock-fd "\$RTB_HISTORY_LOCK_FD" || publish_rc=4
+                    else publish_rc=4; fi ;;
+                invalid_authority) publish_rc=7 ;;
+                *) publish_rc=5 ;;
+            esac
+            if [ "\$publish_rc" -eq 0 ]; then
+                HISTORY_REVISION="\$(python3 -B "${baseDir}/bin/report_history_state.py" snapshot --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --run-id "${run_name}" --barcode "${barcode}" --outdir "${outdirResolved}" --snapshot "\$HISTORY_SNAPSHOT" --lock-fd "\$RTB_HISTORY_LOCK_FD")" || publish_rc=3
+            fi
             release_report_history_lock
             return "\$publish_rc"
         }
@@ -7339,39 +7365,42 @@ process backup_update_and_clean {
 			if [ "\$history_rc" -ne 0 ]; then
 				echo "WARN: report history publication failed (rc=\$history_rc)" 1>&2
 			fi
-			set +e
-			perl ${baseDir}/bin/report_run_json.pl \
-				--history "\$REPORT_HISTORY_JSONL" \
-				--out "\$RUN_REPORT_JSON" \
-				--run-id "${run_name}" \
-				--barcode "${barcode}" \
-				--state-id "${stateId}" \
-				--outdir "${outdirResolved}" \
-				--schema-version "2.0" \
-				--report-rel-path "\$RUN_REPORT_REL_PATH" \
-				--run-started-utc-file "${ongoingStateDir}/_state/run_started_utc.txt"
-			run_json_rc=\$?
-			set -e
-			if [ "\$run_json_rc" -ne 0 ]; then
-				echo "ERROR: report_run_json.pl failed (rc=\$run_json_rc)" 1>&2
-				exit "\$run_json_rc"
-			fi
-			if [ ! -s "\$RUN_REPORT_JSON" ]; then
-				echo "ERROR: invariant violated - report_run_json.pl did not produce \$RUN_REPORT_JSON" 1>&2
-				exit 1
-			fi
-			mkdir -p "\$RUN_REPORT_DIR"
-			RUN_REPORT_JSON_PUBLIC_TMP="\$RUN_REPORT_DIR/.run_report.json.tmp.\$\$"
-			cp "\$RUN_REPORT_JSON" "\$RUN_REPORT_JSON_PUBLIC_TMP"
-			mv "\$RUN_REPORT_JSON_PUBLIC_TMP" "\$RUN_REPORT_DIR/run_report.json"
-			set +e
-			LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_run_index_update.sh "\$RUN_REPORT_JSON" "\$RUN_INDEX_JSONL" "\$RUN_INDEX_LOCK"
-			run_index_rc=\$?
-			set -e
-			if [ "\$run_index_rc" -ne 0 ]; then
-				echo "ERROR: report_run_index_update.sh failed (rc=\$run_index_rc)" 1>&2
-				exit "\$run_index_rc"
-			fi
+            publish_report_derived() {
+                perl ${baseDir}/bin/report_run_json.pl \
+                    --history "\$HISTORY_SNAPSHOT" \
+                    --out "\$RUN_REPORT_JSON" \
+                    --run-id "${run_name}" \
+                    --barcode "${barcode}" \
+                    --authority-context "\$HISTORY_SNAPSHOT.authority.json" \
+                    --state-id "${stateId}" \
+                    --outdir "${outdirResolved}" \
+                    --schema-version "2.0" \
+                    --report-rel-path "\$RUN_REPORT_REL_PATH" \
+                    --run-started-utc-file "${ongoingStateDir}/_state/run_started_utc.txt" || return 81
+                [ -s "\$RUN_REPORT_JSON" ] || return 81
+                cp "\$RUN_REPORT_JSON" "\$HISTORY_SNAPSHOT.run.json" || return 81
+                python3 -B "${baseDir}/bin/report_history_state.py" publish-run --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --outdir "${outdirResolved}" --run-id "${run_name}" --barcode "${barcode}" --snapshot "\$HISTORY_SNAPSHOT" --source-context "\$HISTORY_SNAPSHOT.authority.json" --source "\$RUN_REPORT_JSON" || return 82
+                LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_run_index_update.sh "\$RUN_REPORT_JSON" "\$RUN_INDEX_JSONL" "\$RUN_INDEX_LOCK" || return 83
+            }
+            if [ "\$history_rc" -eq 0 ]; then
+                publish_report_derived || history_rc=\$?
+            fi
+            if [ "\$history_rc" -eq 0 ] && [ "\$HTML_REPORT_ENABLED" -eq 0 ]; then
+                if LOCK_WAIT=0 acquire_report_history_lock; then
+                    python3 -B "${baseDir}/bin/report_history_state.py" recheck --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --run-id "${run_name}" --barcode "${barcode}" --outdir "${outdirResolved}" --snapshot "\$HISTORY_SNAPSHOT" --revision "\$HISTORY_REVISION" --html 0 --lock-fd "\${acquired_lock_fds[\$((\${#acquired_lock_fds[@]}-1))]}" || history_rc=84
+                    release_report_history_lock
+                else history_rc=2; fi
+            fi
+            if [ "\$history_rc" -ne 0 ]; then
+                echo "WARN: REPORT_HISTORY_PENDING state=${stateId} run=${run_name} round=${round_barcode} scope=\$RTBIOSCAN_ROUND_LOCK_SCOPE rc=\$history_rc" >&2
+                if ! { mkdir -p "\$RUN_REPORT_DIR" &&
+                    printf 'state=%s run=%s round=%s rc=%s\n' "${stateId}" "${run_name}" "${round_barcode}" "\$history_rc" > "\$RUN_HISTORY_PENDING.tmp.\$\$" &&
+                    mv "\$RUN_HISTORY_PENDING.tmp.\$\$" "\$RUN_HISTORY_PENDING"; }; then
+                    echo "WARN: REPORT_HISTORY_PENDING marker could not be published" >&2
+                    rm -f "\$RUN_HISTORY_PENDING.tmp.\$\$" || true
+                fi
+            fi
+            rm -f "\$HISTORY_SNAPSHOT" "\$HISTORY_SNAPSHOT.run.json" "\$HISTORY_SNAPSHOT.authority.json"
 			write_report_metadata_files() {
 					RUN_CONF_FILE="${outdirResolved}/config/${run_name}/${run_name}.conf"
 					mkdir -p "\$(dirname "\$RUN_CONF_FILE")"
@@ -7401,6 +7430,23 @@ RTBCONF
 				}
 				write_report_metadata_files
 				printf 'render=0\nround_barcode=%s\n' "${round_barcode}" > "\$RENDER_REQUEST_FILE"
+                if [ "\${history_rc:-1}" -ne 0 ]; then
+                    TARGET_IDENTITY="\$(python3 -B "${baseDir}/bin/report_history_state.py" run-target --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --run-id "${run_name}" --barcode "${barcode}")" || TARGET_IDENTITY=""
+                    if [ -n "\$TARGET_IDENTITY" ]; then
+                        IFS=\$'\t' read -r TARGET_RUN TARGET_BARCODE TERMINAL_ROUND <<< "\$TARGET_IDENTITY"
+                    else
+                        TARGET_RUN="${run_name}"; TARGET_BARCODE="${barcode}"; TERMINAL_ROUND="${round_barcode}"
+                    fi
+                    if [ "\$TERMINAL_ROUND" != "${round_barcode}" ] || [ "\$TARGET_BARCODE" != "${barcode}" ]; then
+                        printf 'render=0\nround_barcode=%s\n' "\$TERMINAL_ROUND" > "\$RENDER_REQUEST_FILE"
+                    fi
+                    if [ "\$TARGET_BARCODE" != "${barcode}" ]; then
+                        printf 'run_id=%s\nbarcode=%s\n' "\$TARGET_RUN" "\$TARGET_BARCODE" >> "\$RENDER_REQUEST_FILE"
+                    fi
+                fi
+                if [ "\${history_rc:-1}" -ne 0 ]; then
+                    printf 'finalize=1\n' >> "\$RENDER_REQUEST_FILE"
+                fi
 				if [ "\$HTML_REPORT_ENABLED" -eq 1 ] && [ "\${history_rc:-1}" -eq 0 ]; then
 					mkdir -p "\$RUN_REPORT_DIR"
 					printf '%s\n' "queued:${round_barcode}" > "\$RUN_REPORT_PENDING"
@@ -7434,6 +7480,31 @@ process async_report_render {
 			export LC_ALL=C
 
 			REQUEST_RENDER="\$(awk -F= '/^render=/{print \$2; exit}' "${render_request_file}" 2>/dev/null || true)"
+            REQUEST_FINALIZE="\$(awk -F= '/^finalize=/{print \$2; exit}' "${render_request_file}" 2>/dev/null || true)"
+            REQUEST_ROUND="\$(awk -F= '/^round_barcode=/{print \$2; exit}' "${render_request_file}" 2>/dev/null || true)"
+            REQUEST_RUN="\$(awk -F= '/^run_id=/{print \$2; exit}' "${render_request_file}" 2>/dev/null || true)"
+            REQUEST_BARCODE="\$(awk -F= '/^barcode=/{print \$2; exit}' "${render_request_file}" 2>/dev/null || true)"
+            [ -n "\$REQUEST_ROUND" ] || REQUEST_ROUND="${round_barcode}"
+            [ -n "\$REQUEST_RUN" ] || REQUEST_RUN="${run_name}"
+            [ -n "\$REQUEST_BARCODE" ] || REQUEST_BARCODE="${barcode}"
+            finalize_pending_report() {
+                if [ "\$REQUEST_FINALIZE" != "1" ]; then
+                    TARGET_IDENTITY="\$(python3 -B "${baseDir}/bin/report_history_state.py" run-target --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --run-id "${run_name}" --barcode "${barcode}")" || TARGET_IDENTITY=""
+                    if [ -n "\$TARGET_IDENTITY" ]; then
+                        IFS=\$'\t' read -r REQUEST_RUN REQUEST_BARCODE REQUEST_ROUND <<< "\$TARGET_IDENTITY"
+                    fi
+                fi
+                python3 -B "${baseDir}/bin/report_history_state.py" finalize \
+                    --state-dir "${ongoingStateDir}" --current-round-barcode "\$REQUEST_ROUND" \
+                    --run-id "\$REQUEST_RUN" --barcode "\$REQUEST_BARCODE" --outdir "${outdirResolved}" \
+                    --lock-wait 0 --html ${htmlReportEnabled ? 1 : 0} --identity-mode "${replicateModeCanonical}" \
+                    --url-prefix "${htmlReportUrlPrefix}" --auto-refresh ${htmlReportAutoRefresh ? 1 : 0} \
+                    --refresh-seconds ${htmlReportRefreshSecondsStr} --sample-plot-max ${htmlReportSamplePlotMaxStr} || true
+            }
+            if [ "\$REQUEST_FINALIZE" = "1" ]; then
+                finalize_pending_report
+                exit 0
+            fi
 			if [ "\$REQUEST_RENDER" != "1" ]; then
 				exit 0
 			fi
@@ -7469,7 +7540,7 @@ process async_report_render {
 			REPORT_LOCK_STALE_TTL_SECONDS="\$(( ${staleLockTtlMinutesStr} * 60 ))"
 			REPORT_LOCK_HOST="\$(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 			REPORT_STALE_LOCK_DIR=""
-			SNAPSHOT_PATH="report_history.snapshot.jsonl"
+			SNAPSHOT_PATH="\$STATE_TMP/.report_history.snapshot.render.\$\$.jsonl"
 
 			render_lock_acquired=0
 			release_render_lock() {
@@ -7482,6 +7553,10 @@ process async_report_render {
 			trap release_render_lock EXIT HUP INT TERM
 
 			source "${baseDir}/bin/lib/stale_lock_utils.sh"
+			source "${baseDir}/bin/lib/lock_utils.sh"
+			init_lock_helpers
+            export RTB_HISTORY_LOCK_OWNER="\$\$"
+			LOCK_WAIT=${params.lock_wait_seconds}
 			remove_report_lock_if_stale() {
 				if [ -n "\${REPORT_STALE_LOCK_DIR:-}" ]; then
 					rm -f "\${REPORT_STALE_LOCK_DIR}/meta.env" 2>/dev/null || true
@@ -7564,7 +7639,8 @@ PY
 					--report-state "\$report_state" \
 					--history "\$SNAPSHOT_PATH" \
 					--run-id "${run_name}" \
-					--expected-report-view "\$expected_view"
+					--expected-report-view "\$expected_view" \
+                        --round-index-file "\$STATE_TMP/round_index.tsv" --current-round-barcode "${round_barcode}"
 			}
 			promote_report_assets() {
 				_PDF_LINK_DIR="${currentResultsStateDir}/plots/pdf"
@@ -7629,40 +7705,33 @@ PY
 				fi
 			}
 
-			if ! acquire_lock_dir_wait "\$REPORT_RENDER_LOCK" "\$RENDER_LOCK_WAIT"; then
-				echo "WARN: async render skipped for round=${round_barcode}; lock busy on \${REPORT_RENDER_LOCK}" 1>&2
-				exit 0
-			fi
-			render_lock_acquired=1
 
 			render_success=0
 			attempt=1
 			while [ "\$attempt" -le 2 ]; do
-				if ! acquire_lock_dir_wait "\$REPORT_HISTORY_LOCK" ${params.lock_wait_seconds}; then
+				if ! acquire_lock "\$REPORT_HISTORY_LOCK"; then
 					echo "WARN: async render failed to acquire report history lock for round=${round_barcode}" 1>&2
 					break
 				fi
-				if [ ! -s "\$REPORT_HISTORY_JSONL" ]; then
-					echo "WARN: async render missing report history for round=${round_barcode}" 1>&2
-					release_lock_dir "\$REPORT_HISTORY_LOCK"
-					break
-				fi
-				if ! cp "\$REPORT_HISTORY_JSONL" "\$SNAPSHOT_PATH.tmp" 2>/dev/null; then
-					echo "WARN: async render could not snapshot report history for round=${round_barcode}" 1>&2
-					release_lock_dir "\$REPORT_HISTORY_LOCK"
-					break
-				fi
-				if ! mv "\$SNAPSHOT_PATH.tmp" "\$SNAPSHOT_PATH"; then
-					echo "WARN: async render could not finalize history snapshot for round=${round_barcode}" 1>&2
-					release_lock_dir "\$REPORT_HISTORY_LOCK"
-					break
-				fi
-				snapshot_revision="\$(calc_sha256 "\$SNAPSHOT_PATH")"
-				release_lock_dir "\$REPORT_HISTORY_LOCK"
-				if [ -z "\$snapshot_revision" ]; then
-					echo "WARN: async render computed empty snapshot revision for round=${round_barcode}" 1>&2
-					break
-				fi
+                if snapshot_revision="\$(python3 -B "${baseDir}/bin/report_history_state.py" snapshot --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --run-id "${run_name}" --barcode "${barcode}" --outdir "${outdirResolved}" --snapshot "\$SNAPSHOT_PATH" --lock-fd "\${acquired_lock_fds[\$((\${#acquired_lock_fds[@]}-1))]}")"; then
+                    snapshot_rc=0
+                else
+                    snapshot_rc=\$?
+                fi
+                release_lock "\$REPORT_HISTORY_LOCK"
+                LOCK_WAIT=0
+                [ "\$snapshot_rc" -eq 0 ] || break
+                if ! python3 -B "${baseDir}/bin/report_history_state.py" guard-snapshot --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --run-id "${run_name}" --barcode "${barcode}" --outdir "${outdirResolved}" --snapshot "\$SNAPSHOT_PATH"; then
+                    break
+                fi
+                if ! acquire_lock_dir_wait "\$REPORT_RENDER_LOCK" "\$RENDER_LOCK_WAIT"; then
+                    echo "WARN: async render skipped for round=${round_barcode}; lock busy on \${REPORT_RENDER_LOCK}" >&2
+                    break
+                fi
+                render_lock_acquired=1
+                if ! python3 -B "${baseDir}/bin/report_history_state.py" generate-run --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --run-id "${run_name}" --barcode "${barcode}" --outdir "${outdirResolved}" --snapshot "\$SNAPSHOT_PATH" --guard-revision "\$snapshot_revision" --lock-wait 0; then
+                    break
+                fi
 
 				if [ "\$REPORT_IDENTITY_MODE" = "track" ]; then
 					LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
@@ -7773,30 +7842,19 @@ PY
 					fi
 				fi
 
-				if ! acquire_lock_dir_wait "\$REPORT_HISTORY_LOCK" ${params.lock_wait_seconds}; then
-					echo "WARN: async render could not recheck report history for round=${round_barcode}" 1>&2
-					break
-				fi
-				live_revision="\$(calc_sha256 "\$REPORT_HISTORY_JSONL")"
-				release_lock_dir "\$REPORT_HISTORY_LOCK"
-				if [ "\$live_revision" = "\$snapshot_revision" ] && [ -n "\$live_revision" ]; then
-					render_success=1
-					break
-				fi
-				if [ "\$attempt" -ge 2 ]; then
-					echo "WARN: async render history changed twice for round=${round_barcode}; leaving report pending" 1>&2
-					break
-				fi
-				echo "WARN: async render detected newer history during round=${round_barcode}; retrying once" 1>&2
-				attempt=\$((attempt + 1))
+                render_success=1
+                break
 			done
 
-			if [ "\$render_success" -ne 1 ]; then
-				exit 0
-			fi
+            if [ "\$render_success" -eq 1 ]; then promote_report_assets; fi
+            release_render_lock
+            if [ "\$render_success" -ne 1 ]; then
+                rm -f "\$SNAPSHOT_PATH" "\$SNAPSHOT_PATH.run.json" "\$SNAPSHOT_PATH.authority.json"
+                finalize_pending_report
+                exit 0
+            fi
 
-			promote_report_assets
-			clear_run_report_pending
+            root_publish_rc=0
 
 			if acquire_lock_dir_wait "\$REPORT_ROOT_RENDER_LOCK" "\$ROOT_LOCK_WAIT"; then
 				if ! LOCK_WAIT=${params.lock_wait_seconds} bash ${baseDir}/bin/report_rebuild.sh \
@@ -7808,11 +7866,25 @@ PY
 					--refresh-seconds "\$HTML_REPORT_REFRESH_SECONDS" \
 					--sample-plot-max "\$HTML_REPORT_SAMPLE_PLOT_MAX"; then
 					echo "WARN: async root report rebuild failed for round=${round_barcode}" 1>&2
+                    root_publish_rc=1
 				fi
 				release_lock_dir "\$REPORT_ROOT_RENDER_LOCK"
 			else
 				echo "WARN: async root report render skipped for round=${round_barcode}; lock busy on \${REPORT_ROOT_RENDER_LOCK}" 1>&2
+                root_publish_rc=1
 			fi
+            final_check_rc=0
+            if [ "\$root_publish_rc" -eq 0 ] && LOCK_WAIT=0 acquire_lock "\$REPORT_HISTORY_LOCK"; then
+                python3 -B "${baseDir}/bin/report_history_state.py" recheck --state-dir "${ongoingStateDir}" --current-round-barcode "${round_barcode}" --run-id "${run_name}" --barcode "${barcode}" --outdir "${outdirResolved}" --snapshot "\$SNAPSHOT_PATH" --revision "\$snapshot_revision" --identity-mode "\$REPORT_IDENTITY_MODE" --lock-fd "\${acquired_lock_fds[\$((\${#acquired_lock_fds[@]}-1))]}" || final_check_rc=\$?
+                release_lock "\$REPORT_HISTORY_LOCK"
+            else final_check_rc=2; fi
+            rm -f "\$SNAPSHOT_PATH" "\$SNAPSHOT_PATH.run.json" "\$SNAPSHOT_PATH.authority.json"
+            if [ "\$final_check_rc" -eq 0 ]; then
+                clear_run_report_pending
+            else
+                finalize_pending_report
+            fi
+
 		"""
 }
 
