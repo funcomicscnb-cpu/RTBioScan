@@ -141,22 +141,13 @@ printf 'final_prune_count\t%s\n'            "$(wc -l < "$final_prune" | tr -d ' 
 [[ -s "$final_prune" ]] || exit 0
 
 # --- Acquire exclusive lock (fatal on timeout) ---
-_lockdir="${lock_dir}.lockdir"
-_lock_acquired=0
-acquire() {
-	local waited=0
-	while ! mkdir "$_lockdir" 2>/dev/null; do
-		sleep 1; waited=$((waited + 1))
-		[[ "$waited" -lt "$lock_wait" ]] || {
-			echo "ERROR: timed out acquiring QCED lock for post-consensus prune" >&2; exit 1
-		}
-	done
-	_lock_acquired=1
-}
-release() { [[ "$_lock_acquired" -eq 0 ]] || rmdir "$_lockdir" 2>/dev/null || true; }
-trap release EXIT
-
-acquire
+source "$(dirname "$0")/lib/lock_utils.sh"
+LOCK_WAIT="$lock_wait"
+init_lock_helpers
+if ! acquire_lock "$lock_dir"; then
+	echo "ERROR: timed out acquiring QCED lock for post-consensus prune" >&2
+	exit 1
+fi
 
 archive_pruned_reads() {
 	local archive_file="$1"

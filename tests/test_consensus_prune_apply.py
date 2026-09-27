@@ -4,7 +4,10 @@ Covers the runtime behaviour of the post-consensus prune helper:
 subtraction logic, early-exit paths, stats output, optional snapshots,
 apply-script failure, and round-copy persistence.
 """
+import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -372,6 +375,9 @@ def test_lock_released_on_mv_failure(tmp_path):
         ro_dir.chmod(0o755)
 
     assert result.returncode != 0
+    deadline = time.monotonic() + 3
+    while lockdir.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
     assert not lockdir.exists(), "lockdir leaked after mv failure"
 
 
@@ -385,3 +391,66 @@ def test_round_cp_written_after_apply(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert d["round_cp"].exists()
+
+
+def test_killed_consensus_shell_with_live_apply_child_recovers(tmp_path):
+    d = _setup(tmp_path)
+    d["prune_ids"].write_text("read1\n", encoding="utf-8")
+    d["recovery_ids"].write_text("", encoding="utf-8")
+    original_fasta = d["fasta"].read_bytes()
+    ready = tmp_path / "apply-ready"
+    done = tmp_path / "apply-done"
+    slow = tmp_path / "slow_apply.pl"
+    slow.write_text(_APPLY_STUB_OK.replace(
+        "use strict;",
+        "use strict;\n"
+        'open my $marker, ">", $ENV{RTB_APPLY_READY} or die $!;\n'
+        'print $marker $$; close $marker;\n'
+        'sleep 1;\n'
+        'open my $done, ">", $ENV{RTB_APPLY_DONE} or die $!;\n'
+        'print $done "done"; close $done;'))
+    cmd = [
+        "bash", str(SCRIPT),
+        "--prune-ids", str(d["prune_ids"]), "--recovery-ids", str(d["recovery_ids"]),
+        "--fasta", str(d["fasta"]), "--fasta-tmp", str(d["fasta_tmp"]),
+        "--apply-stats", str(d["apply_stats"]), "--prune-stats", str(d["prune_stats"]),
+        "--round-cp", str(d["round_cp"]), "--lock-dir", str(d["lock_dir"]),
+        "--apply-script", str(slow), "--lock-wait", "0",
+    ]
+    env = dict(os.environ, RTB_APPLY_READY=str(ready), RTB_APPLY_DONE=str(done))
+    owner = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 3
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists()
+        child_pid = int(ready.read_text())
+        os.kill(owner.pid, signal.SIGKILL)
+        owner.wait(timeout=3)
+        assert not done.exists()
+        contender = _run(tmp_path, lock_wait="0", **d)
+        assert contender.returncode != 0
+        assert d["fasta"].read_bytes() == original_fasta
+        deadline = time.monotonic() + 4
+        while not done.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert done.exists()
+        fence = Path(str(d["lock_dir"]) + ".lockdir")
+        deadline = time.monotonic() + 3
+        while fence.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not fence.exists()
+        recovered = _run(tmp_path, lock_wait="3", **d)
+        assert recovered.returncode == 0, recovered.stderr
+        assert d["fasta"].read_bytes() == original_fasta
+    finally:
+        if owner.poll() is None:
+            os.killpg(owner.pid, signal.SIGKILL)
+            owner.wait(timeout=3)
+        if child_pid is not None and not done.exists():
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass

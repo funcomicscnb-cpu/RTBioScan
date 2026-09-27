@@ -1,9 +1,19 @@
 import subprocess
+import time
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "bin" / "lib" / "lock_utils.sh"
+
+
+def _assert_released(lock_target: Path) -> None:
+    """The drain reaper removes the fence after the last descriptor closes."""
+    fence = Path(f"{lock_target}.lockdir")
+    deadline = time.monotonic() + 3
+    while fence.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not fence.exists()
 
 
 def test_init_lock_helpers_handles_empty_exit_hook_list_under_nounset(tmp_path: Path) -> None:
@@ -23,7 +33,7 @@ acquire_lock "{lock_target}"
     )
 
     assert result.returncode == 0, result.stderr
-    assert not Path(f"{lock_target}.lockdir").exists()
+    _assert_released(lock_target)
 
 
 def test_init_lock_helpers_preserves_existing_exit_trap_and_releases_locks(tmp_path: Path) -> None:
@@ -46,7 +56,7 @@ acquire_lock "{lock_target}"
 
     assert result.returncode == 0, result.stderr
     assert marker.read_text(encoding="utf-8") == "caller"
-    assert not Path(f"{lock_target}.lockdir").exists()
+    _assert_released(lock_target)
 
 
 def test_init_lock_helpers_handles_existing_exit_trap_with_single_quotes(tmp_path: Path) -> None:
@@ -70,7 +80,7 @@ acquire_lock "{lock_target}"
 
     assert result.returncode == 0, result.stderr
     assert marker.read_text(encoding="utf-8") == "x"
-    assert not Path(f"{lock_target}.lockdir").exists()
+    _assert_released(lock_target)
 
 
 def test_init_lock_helpers_runs_cleanup_even_if_existing_exit_trap_fails(tmp_path: Path) -> None:
@@ -93,7 +103,7 @@ acquire_lock "{lock_target}"
 
     assert result.returncode == 0, result.stderr
     assert marker.read_text(encoding="utf-8") == "fail"
-    assert not Path(f"{lock_target}.lockdir").exists()
+    _assert_released(lock_target)
     assert "WARN: EXIT hook 1 failed with status 1" in result.stderr
 
 
@@ -117,7 +127,7 @@ acquire_lock "{lock_target}"
 
     assert result.returncode == 0, result.stderr
     assert marker.read_text(encoding="utf-8") == "exit"
-    assert not Path(f"{lock_target}.lockdir").exists()
+    _assert_released(lock_target)
 
 
 def test_init_lock_helpers_preserves_original_exit_status_for_existing_trap(tmp_path: Path) -> None:
@@ -141,7 +151,7 @@ exit 7
 
     assert result.returncode == 7
     assert marker.read_text(encoding="utf-8") == "7"
-    assert not Path(f"{lock_target}.lockdir").exists()
+    _assert_released(lock_target)
 
 
 def test_init_lock_helpers_preserves_original_exit_status_when_existing_trap_fails(tmp_path: Path) -> None:
@@ -165,5 +175,5 @@ exit 7
 
     assert result.returncode == 7
     assert marker.read_text(encoding="utf-8") == "7"
-    assert not Path(f"{lock_target}.lockdir").exists()
+    _assert_released(lock_target)
     assert "WARN: EXIT hook 1 failed with status 1" in result.stderr
