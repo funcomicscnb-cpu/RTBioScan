@@ -27,24 +27,29 @@ if ! [[ "$WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-lockdir="${LOCK_TARGET}.lockdir"
-mkdir -p "$(dirname "$LOCK_TARGET")"
-
-waited=0
-while ! mkdir "$lockdir" 2>/dev/null; do
-  sleep 1
-  waited=$((waited + 1))
-  if [ "$WAIT_SECONDS" -gt 0 ] && [ "$waited" -ge "$WAIT_SECONDS" ]; then
-    echo "ERROR: timed out acquiring Dorado lock: $LOCK_TARGET label=$LABEL" 1>&2
-    exit 1
-  fi
+normalized_wait="$WAIT_SECONDS"
+while [ "${normalized_wait#0}" != "$normalized_wait" ]; do
+  normalized_wait="${normalized_wait#0}"
 done
+[ -n "$normalized_wait" ] || normalized_wait=0
+if [ "${#normalized_wait}" -gt 5 ] || [ "$normalized_wait" -gt 86400 ]; then
+  echo "ERROR: wait_seconds exceeds the supported maximum of 86400, got '$WAIT_SECONDS'" 1>&2
+  exit 2
+fi
 
-cleanup() {
-  rmdir "$lockdir" 2>/dev/null || true
-}
-trap cleanup EXIT
+mkdir -p "$(dirname "$LOCK_TARGET")"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/lock_utils.sh"
+init_lock_helpers
+[ "$normalized_wait" -ne 0 ] || normalized_wait=86400
+trap 'exit 143' TERM
+
+if ! LOCK_WAIT="$normalized_wait" acquire_lock "$LOCK_TARGET"; then
+  echo "ERROR: failed acquiring Dorado lock: $LOCK_TARGET label=$LABEL" 1>&2
+  exit 1
+fi
 
 echo "INFO: dorado_lock acquired label=$LABEL at $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" 1>&2
-"$@"
+rc=0
+"$@" || rc=$?
+[ "$rc" -eq 0 ] || exit "$rc"
 echo "INFO: dorado_lock released label=$LABEL at $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" 1>&2
