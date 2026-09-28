@@ -56,7 +56,6 @@ if [ ! -d "$stage_root/report_assets" ] || [ ! -d "$stage_root/tables" ] || [ ! 
   exit 2
 fi
 
-lock_dir="${lock_path}.lockdir"
 payload_root="$state_root/.live_round_payloads"
 tmp_payload="$payload_root/${round_barcode}.tmp.$$"
 publish_stamp="$(
@@ -68,23 +67,18 @@ final_payload_rel=".live_round_payloads/$payload_name"
 state_live_link="$state_root/live_round"
 run_live_link="$run_asset_root/live_round"
 
+source "$(dirname "$0")/lib/lock_utils.sh"
+init_lock_helpers
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if ! acquire_lock "$lock_path"; then
+  echo "ERROR: failed to acquire live-round publish lock: $lock_path" 1>&2
+  exit 2
+fi
+
 mkdir -p "$payload_root" "$run_asset_root"
-
-waited=0
-lock_wait="${LOCK_WAIT:-300}"
-while ! mkdir "$lock_dir" 2>/dev/null; do
-  sleep 1
-  waited=$((waited + 1))
-  if [ "$waited" -ge "$lock_wait" ]; then
-    echo "ERROR: failed to acquire live-round publish lock: $lock_path" 1>&2
-    exit 2
-  fi
-done
-
-cleanup() {
-  rmdir "$lock_dir" 2>/dev/null || true
-}
-trap cleanup EXIT HUP INT TERM
 
 atomic_replace_path() {
   local src="$1"

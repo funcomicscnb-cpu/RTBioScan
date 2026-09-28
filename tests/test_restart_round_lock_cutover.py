@@ -1391,6 +1391,7 @@ CONTROL = (
     ".sup_basecall_cache.lock.flock",
     ".done_pod5.lock.flock",
     ".report_history.lock.flock",
+    ".report_live_publish.lock.flock",
 )
 
 
