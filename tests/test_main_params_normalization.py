@@ -567,6 +567,7 @@ def _make_wrapper_root(tmp_path: Path) -> tuple[Path, Path]:
 def _install_wrapper_report_renderer(wrapper_root: Path) -> None:
     for relative_path in (
         "bin/report_render.py",
+        "bin/report_run_index_update.sh",
         "assets/report/template.html",
         "assets/report/report.css",
         "assets/report/report.js",

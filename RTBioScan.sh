@@ -748,22 +748,8 @@ prune_seeded_run_status_if_stale() {
   rm -rf "$_run_dir" 2>/dev/null || true
 
   if [[ -f "$_run_index" ]] && command -v python3 >/dev/null 2>&1; then
-    local _tmp=""
-    _tmp="$(mktemp "${_run_index}.tmp.XXXXXX")"
-    if python3 - "${_run_name}" "$_run_index" <<'PYEOF' > "$_tmp"; then
-import sys, json
-rid, path = sys.argv[1], sys.argv[2]
-for line in open(path, encoding="utf-8"):
-    try:
-        if json.loads(line).get('run_id') != rid:
-            sys.stdout.write(line)
-    except Exception:
-        sys.stdout.write(line)
-PYEOF
-      mv "$_tmp" "$_run_index"
-    else
-      rm -f "$_tmp"
-    fi
+    LOCK_WAIT="${LOCK_WAIT:-300}" bash "${SCRIPT_DIR}/bin/report_run_index_update.sh" \
+      --prune-seeded "$_run_name" "$_run_index" "${_outdir_path}/.runs_index.lock" || true
   fi
 
   if [[ -f "$_root_html" && -f "${SCRIPT_DIR}/assets/report/template.html" ]] && command -v python3 >/dev/null 2>&1; then
@@ -1643,20 +1629,10 @@ if [[ -n "$clean_run_id" || $clean_all -eq 1 || -n "$clean_temp_run_id" || $clea
     _idx="$_outdir/report_html/runs_index.jsonl"
     if [[ -f "$_idx" ]]; then
       if command -v python3 >/dev/null 2>&1; then
-        _tmp="$(mktemp)"
-        if python3 - "${_filter_id}" "$_idx" <<'PYEOF' > "$_tmp" && mv "$_tmp" "$_idx"; then
-import sys, json
-rid, path = sys.argv[1], sys.argv[2]
-for line in open(path, encoding="utf-8"):
-    try:
-        if json.loads(line).get('run_id') != rid:
-            sys.stdout.write(line)
-    except Exception:
-        sys.stdout.write(line)
-PYEOF
+        if LOCK_WAIT="${LOCK_WAIT:-300}" bash "${SCRIPT_DIR}/bin/report_run_index_update.sh" \
+            --clean-filter "${_filter_id}" "$_idx" "$_outdir/.runs_index.lock"; then
           echo "    Filtered: $_idx"
         else
-          rm -f "$_tmp"
           echo "WARN: failed to filter $_idx after clean" >&2
         fi
       else
