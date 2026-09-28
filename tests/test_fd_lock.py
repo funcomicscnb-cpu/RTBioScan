@@ -443,7 +443,7 @@ def test_hostname_candidate_record_requires_explicit_rebind(tmp_path):
 def test_failed_rebind_keeps_binding_byte_exact(tmp_path):
     a, _ = scratch_source(tmp_path / "A", identity=ID_A)
     _, helper_b = scratch_source(tmp_path / "B", identity=ID_B)
-    target = tmp_path / "state.lock"
+    target = tmp_path / ".qced_reads.lock"
     assert run_lock(target, source=a).returncode == 0
     assert_drained(target)
     binding = tmp_path / ".rtbioscan_lock_host_v1"
@@ -659,7 +659,7 @@ def test_two_simulated_first_hosts_only_one_wins(tmp_path):
 def test_rebind_refuses_live_lock_and_any_fence_and_serializes(tmp_path):
     a, _ = scratch_source(tmp_path / "A", host="host-a", identity=ID_A)
     b, helper_b = scratch_source(tmp_path / "B", host="host-b", identity=ID_B)
-    target = tmp_path / "rebind.lock"
+    target = tmp_path / ".qced_reads.lock"
     old, new = ID_A, ID_B
     ready = tmp_path / "ready"
     owner = subprocess.Popen([BASH, "-c", 'set -euo pipefail; source "$1"; LOCK_WAIT=3; init_lock_helpers; acquire_lock "$2"; : > "$3"; sleep 0.6; release_lock "$2"',
@@ -680,15 +680,45 @@ def test_rebind_refuses_live_lock_and_any_fence_and_serializes(tmp_path):
     blocked = subprocess.run(command, capture_output=True, timeout=8)
     assert blocked.returncode != 0 and b"compatibility fence exists" in blocked.stderr
     fence.rmdir()
-    ps = [subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) for _ in range(2)]
+    fence.mkdir()
+    (fence / "v2owner").write_text("rtbioscan-fence-v2\t0123456789abcdef\n")
+    binding = tmp_path / ".rtbioscan_lock_host_v1"
+    before_binding = binding.read_bytes()
+    stable = pathlib.Path(str(target) + ".flock")
+    barrier = tmp_path / ".rtbioscan_state_reset.flock"
+    stable_inodes = (stable.stat().st_ino, barrier.stat().st_ino)
+    audit = tmp_path / ".lock_migration.log"
+    before_audit = audit.read_text() if audit.exists() else ""
+    concurrent = [BASH, "-c",
+                  'perl "$1" rebind-host "$2" "$3" "$4" --confirm || exit $?; cat "$2/.rtbioscan_lock_host_v1"',
+                  "_", str(helper_b), str(tmp_path), old, new]
+    ps = [subprocess.Popen(concurrent, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           start_new_session=True) for _ in range(2)]
+    observed = {before_binding}
     try:
+        while any(p.poll() is None for p in ps):
+            observed.add(binding.read_bytes())
+            time.sleep(0.002)
         output = [p.communicate(timeout=8) for p in ps]
-        assert sorted(p.returncode for p in ps) == [0, 74], output
+        assert sorted(p.returncode for p in ps) == [0, 0], output
     finally:
         for p in ps:
             if p.poll() is None:
                 os.killpg(p.pid, signal.SIGKILL)
                 p.wait(timeout=3)
+    final_binding = binding.read_bytes()
+    assert all(stdout == final_binding for stdout, _ in output)
+    assert observed <= {before_binding, final_binding}
+    assert not list(tmp_path.glob(".rtbioscan_lock_host_v1.new.*"))
+    delta = audit.read_text()[len(before_audit):]
+    assert final_binding != before_binding and ID_B.split(":")[-1].encode() in final_binding
+    assert delta.count("rebind-host complete ") == 1
+    assert delta.count("rebind-host fence-recovery complete ") == 1
+    assert not fence.exists()
+    assert (stable.stat().st_ino, barrier.stat().st_ino) == stable_inodes
+    before_retry_audit = audit.read_bytes()
+    assert subprocess.run(command, capture_output=True, timeout=8).returncode == 0
+    assert binding.read_bytes() == final_binding and audit.read_bytes() == before_retry_audit
 
 
 def test_host_check_omission_mutant_and_inode_probe_mutant(tmp_path):

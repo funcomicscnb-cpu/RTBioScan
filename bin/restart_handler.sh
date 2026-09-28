@@ -686,6 +686,22 @@ restart_refuse_path() {
     return 1
 }
 
+# Quote a pathname as one Bash word without interpreting its contents.
+restart_shell_word() {
+    local value="$1"
+    value=${value//\'/\'\\\'\'}
+    printf "'%s'" "$value"
+}
+
+restart_fence_recovery_hint() {
+    local entry="$1"
+    local target="${entry%.lockdir}"
+    local helper="$RESTART_HANDLER_DIR/lib/lock_utils.sh"
+    printf 'Recovery command (run after related writers have stopped): bash -c '\''source "$1"; init_lock_helpers; LOCK_WAIT=0 acquire_lock "$2"'\'' fence-recovery %s %s\n' \
+        "$(restart_shell_word "$helper")" "$(restart_shell_word "$target")" 1>&2
+    printf 'After successful recovery, rerun restart_mode=reset.\n' 1>&2
+}
+
 # Reset and restore predate the fenced round-lock protocol.  They must never
 # erase, copy, or follow that protocol's live state or durable evidence.
 # Completed rounds retain protected history, so force cannot make them eligible.
@@ -737,7 +753,16 @@ scan_restart_tree() {
         if [ "$MODE" = "reset" ]; then
             case "$name" in
                 *.lockdir|*.lockdir.*)
-                    restart_refuse_path "$entry" "compatibility or legacy lock fence in ${purpose}"
+                    restart_refuse_path "$entry" "compatibility or legacy lock fence in ${purpose}" || :
+                    if [ "$root" = "$ONGOING_STATE" ]; then
+                        case "$name" in
+                            .dorado.lock.lockdir|.blastreport.lock.lockdir|.blastreport_sup.lock.lockdir|\
+                            .qced_reads.lock.lockdir|.otu_size_streak.lock.lockdir|\
+                            .sup_basecall_cache.lock.lockdir|.done_pod5.lock.lockdir|\
+                            .report_history.lock.lockdir|.report_live_publish.lock.lockdir)
+                                restart_fence_recovery_hint "$entry" ;;
+                        esac
+                    fi
                     return 1 ;;
                 *.flock|.rtbioscan_lock_host_v1|.rtbioscan_lock_host_v1.guard)
                     if [ -L "$entry" ] || [ ! -f "$entry" ]; then

@@ -204,7 +204,7 @@ sub ensure_binding {
     my $bound = read_binding($path, $current);
     if ($bound ne $current) {
         my $cmd = 'perl ' . qsh($0) . ' rebind-host ' . qsh($dir) . ' ' . qsh($bound) . ' ' . qsh($current) . ' --confirm';
-        fail(74, "HOST_BINDING_MISMATCH $path: expected=$bound actual=$current; run: $cmd");
+        fail(74, "HOST_BINDING_MISMATCH $path: expected=$bound actual=$current; first ensure the old host is stopped or no longer writing, all prior pipeline/task writers are stopped, and state uses one host with coherent local kernel locks; run: $cmd");
     }
 }
 sub probe_conformance {
@@ -339,14 +339,21 @@ sub token {
     return unpack('H*', $raw);
 }
 sub remove_fence_if_token {
-    my ($dir, $expected) = @_;
+    my ($dir, $expected, $dir_dev, $dir_ino, $owner_dev, $owner_ino) = @_;
+    my @directory = defined($dir_dev) ? lstat($dir) : ();
+    return 0 if defined($dir_dev) && (!@directory || !S_ISDIR($directory[2])
+        || $directory[0] != $dir_dev || $directory[1] != $dir_ino);
     my ($kind, $found) = fence_info($dir);
     return 0 unless $kind eq 'v2' && $found eq $expected;
     my @before = lstat("$dir/v2owner");
+    return 0 if defined($owner_dev) && (!@before || $before[0] != $owner_dev || $before[1] != $owner_ino);
     my $record = exact_file("$dir/v2owner", 128);
     return 0 unless defined($record) && $record eq "$FENCE_VERSION\t$expected\n";
     my @after = lstat("$dir/v2owner");
-    return 0 unless @before && @after && $before[0] == $after[0] && $before[1] == $after[1];
+    my @directory_after = defined($dir_dev) ? lstat($dir) : ();
+    return 0 unless @before && @after && $before[0] == $after[0] && $before[1] == $after[1]
+        && (!defined($dir_dev) || (@directory_after && S_ISDIR($directory_after[2])
+            && $directory_after[0] == $dir_dev && $directory_after[1] == $dir_ino));
     unlink("$dir/v2owner") or return 0;
     rmdir($dir) or return 0;
     return 1;
@@ -597,46 +604,143 @@ sub rebind_command {
     fail(70, 'invalid machine identities')
         unless ($old =~ /^hostname-v1:[0-9a-f]{2,128}\z/ || valid_identity($old))
             && valid_identity($new) && $old ne $new;
+    my $root_id = root_identity($dir);
     fail(74, 'new identity is not this machine') unless $new eq machine_identity();
     my $guard = open_guard($dir, LOCK_EX);
     probe_conformance($dir, $guard);
     $guard = open_guard($dir, LOCK_EX);
     my $path = "$dir/$BINDING";
-    fail(74, 'expected old machine identity does not match') unless read_binding($path, $new, 1) eq $old;
+    my $bound = read_binding($path, $new, 1);
+    fail(74, 'expected old machine identity does not match') unless $bound eq $old || $bound eq $new;
+    my @binding_inode = lstat($path);
+    fail(74, 'host binding unsafe') unless @binding_inode && S_ISREG($binding_inode[2]) && $binding_inode[3] <= 1;
     opendir(my $dh, $dir) or fail(74, 'cannot inspect state directory');
     my @entries = readdir($dh);
     closedir $dh;
+    my %eligible = map { $_ => 1 } qw(
+        .dorado.lock.lockdir .blastreport.lock.lockdir .blastreport_sup.lock.lockdir
+        .qced_reads.lock.lockdir .otu_size_streak.lock.lockdir
+        .sup_basecall_cache.lock.lockdir .done_pod5.lock.lockdir
+        .report_history.lock.lockdir .report_live_publish.lock.lockdir
+    );
+    my @fences;
+    my @lock_names;
     for my $name (@entries) {
         next if $name eq '.' || $name eq '..';
-        fail(74, "cannot rebind while compatibility fence exists: $name") if $name =~ /\.lockdir\z/;
-        next unless $name =~ /\.flock\z/;
+        fail(74, "cannot rebind while compatibility fence exists: $name")
+            if $name =~ /\.lockdir\z/ && !$eligible{$name};
+        if ($eligible{$name}) {
+            my $target = substr($name, 0, -length('.lockdir'));
+            push @fences, [$name, $target];
+        }
+        push @lock_names, $name if $name =~ /\.flock\z/ && $name ne $BARRIER;
+    }
+    # Keep every independent OFD locked until the fence and binding work is done.
+    # The barrier is first, then the stable locks; no later step waits.
+    my $barrier_path = stable_barrier($dir);
+    sysopen(my $barrier, $barrier_path, O_RDWR) or fail(74, 'cannot inspect reset barrier');
+    fail(74, 'reset barrier unsafe') unless same_inode($barrier, $barrier_path);
+    flock($barrier, LOCK_EX|LOCK_NB) or fail(74, 'cannot rebind while kernel lock active: reset barrier');
+    fail(74, 'reset barrier changed') unless same_inode($barrier, $barrier_path);
+    my @held = ($barrier);
+    my %locked;
+    for my $name (@lock_names) {
         my $lock_path = "$dir/$name";
         sysopen(my $fh, $lock_path, O_RDWR) or fail(74, "cannot inspect stable lock $name");
         fail(74, "stable lock file unsafe: $name") unless same_inode($fh, $lock_path);
         flock($fh, LOCK_EX|LOCK_NB) or fail(74, "cannot rebind while kernel lock active: $name");
-        close $fh;
+        fail(74, "stable lock file changed: $name") unless same_inode($fh, $lock_path);
+        push @held, $fh;
+        $locked{$name} = $fh;
     }
-    my ($out, $temp) = temp_file($dir, '.rtbioscan_lock_host_v1.new');
-    unless (write_all($out, binding_record($new)) && close($out)) {
-        unlink($temp);
-        fail(74, 'cannot write new host binding');
+    my @recover;
+    for my $fence (@fences) {
+        my ($name, $target) = @$fence;
+        fail(74, "compatibility fence changed: $name")
+            unless $eligible{$name} && $target eq substr($name, 0, -length('.lockdir'));
+        fail(74, "stable lock missing for compatibility fence: $name")
+            unless exists $locked{"$target.flock"};
+        my $fence_path = "$dir/$name";
+        my ($kind, $token) = fence_info($fence_path);
+        fail(74, "cannot rebind while compatibility fence exists: $name") unless $kind eq 'v2';
+        my @st = lstat($fence_path);
+        my @owner = lstat("$fence_path/v2owner");
+        fail(74, "compatibility fence changed: $name")
+            unless @st && S_ISDIR($st[2]) && @owner && S_ISREG($owner[2]) && $owner[3] <= 1;
+        push @recover, [$name, $target, $token, $st[0], $st[1], $owner[0], $owner[1]];
+    }
+    if ($bound eq $new && !@recover) {
+        close $_ for @held;
+        close $guard;
+        exit 0;
+    }
+    my ($out, $temp);
+    if ($bound ne $new) {
+        ($out, $temp) = temp_file($dir, '.rtbioscan_lock_host_v1.new');
+        unless (write_all($out, binding_record($new)) && close($out)) {
+            unlink($temp);
+            fail(74, 'cannot write new host binding');
+        }
     }
     my $audit = "$dir/.lock_migration.log";
     my $log;
+    my @audit_before = lstat($audit);
+    fail(74, 'migration audit unsafe') if @audit_before && !S_ISREG($audit_before[2]);
     unless (sysopen($log, $audit, O_WRONLY|O_CREAT|O_APPEND, 0600)) {
-        unlink($temp);
+        unlink($temp) if defined $temp;
         fail(74, 'cannot open migration audit log');
     }
-    unless (write_all($log, 'rebind-host intent time=' . int(time()) . " old=$old new=$new host=" . host_hex() . "\n")) {
+    fail(74, 'migration audit inode changed') unless same_inode($log, $audit);
+    if (defined $temp && !write_all($log, 'rebind-host intent time=' . int(time()) . " old=$bound new=$new host=" . host_hex() . "\n")) {
         unlink($temp);
         fail(74, 'cannot write migration audit');
     }
-    unless (rename($temp, $path)) {
+    for my $fence (@recover) {
+        my ($name, $target, $token, $dev, $ino, $owner_dev, $owner_ino) = @$fence;
+        my $fence_path = "$dir/$name";
+        my @st = lstat($fence_path);
+        my @owner = lstat("$fence_path/v2owner");
+        my ($kind, $current_token) = fence_info($fence_path);
+        fail(74, "compatibility fence changed: $name")
+            unless @st && S_ISDIR($st[2]) && $st[0] == $dev && $st[1] == $ino
+                && @owner && S_ISREG($owner[2]) && $owner[3] <= 1
+                && $owner[0] == $owner_dev && $owner[1] == $owner_ino
+                && $eligible{$name} && $target eq substr($name, 0, -length('.lockdir'))
+                && $kind eq 'v2' && $current_token eq $token
+                && root_identity($dir) eq $root_id
+                && same_inode($locked{"$target.flock"}, "$dir/$target.flock")
+                && same_inode($barrier, $barrier_path);
+        write_all($log, 'rebind-host fence-recovery intent time=' . int(time()) . " namespace=$target\n")
+            or fail(74, 'cannot audit fence recovery intent');
+        remove_fence_if_token($fence_path, $token, $dev, $ino, $owner_dev, $owner_ino)
+            or fail(74, "cannot remove exact stale compatibility fence: $name");
+        write_all($log, 'rebind-host fence-recovery complete time=' . int(time()) . " namespace=$target\n")
+            or fail(74, 'cannot audit fence recovery completion');
+    }
+    fail(74, 'state root changed before host binding publication') unless root_identity($dir) eq $root_id;
+    fail(74, 'reset barrier changed before host binding publication') unless same_inode($barrier, $barrier_path);
+    for my $name (keys %locked) {
+        fail(74, "stable lock changed before host binding publication: $name")
+            unless same_inode($locked{$name}, "$dir/$name");
+    }
+    opendir(my $final_dh, $dir) or fail(74, 'cannot reinspect state directory');
+    my @final_fences = grep { $eligible{$_} } readdir($final_dh);
+    closedir $final_dh;
+    fail(74, 'compatibility fence appeared before host binding publication') if @final_fences;
+    my @binding_final = lstat($path);
+    fail(74, 'host binding changed before publication')
+        unless @binding_final && S_ISREG($binding_final[2]) && $binding_final[3] <= 1
+            && $binding_final[0] == $binding_inode[0] && $binding_final[1] == $binding_inode[1]
+            && read_binding($path, $new, 1) eq $bound;
+    if (defined $temp && !rename($temp, $path)) {
         unlink($temp);
         fail(74, 'cannot replace host binding atomically');
     }
-    write_all($log, 'rebind-host complete time=' . int(time()) . " old=$old new=$new host=" . host_hex() . "\n") or fail(74, 'cannot complete migration audit');
+    if (defined $temp) {
+        write_all($log, 'rebind-host complete time=' . int(time()) . " old=$bound new=$new host=" . host_hex() . "\n") or fail(74, 'cannot complete migration audit');
+    }
     close $log;
+    close $_ for @held;
     close $guard;
     exit 0;
 }
