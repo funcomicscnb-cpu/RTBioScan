@@ -3351,8 +3351,12 @@ def write_chart_tsvs(sorted_rounds, tsv_dir, run_id=None, sig_root=None, report_
                     rows = [r for r in level_rows
                             if isinstance(r, dict)
                             and (not count_field or num_any(r.get(count_field, 0)) > 0)]
-        cols = (list(dict.fromkeys(k for r in rows for k in r))
-                if rows else empty_assignment_columns(src_key, level))
+        canonical = empty_assignment_columns(src_key, level)
+        if len(canonical) != len(set(canonical)):
+            raise ValueError("duplicate assignment columns in canonical schema")
+        present = {k for r in rows for k in r}
+        cols = ([c for c in canonical if c in present] + sorted(present.difference(canonical))
+                if rows else canonical)
         _write_tsv_with_sig(tsv_dir / fname, cols, [[r.get(c, "") for c in cols] for r in rows])
 
     for _lvl in ("species", "genus", "family"):
