@@ -35,6 +35,7 @@ dependencies:
   - r-dplyr >=1.1       # Time_* plots
   - r-tidyr >=1.3       # Read_counts / Read_info_quality
   - r-ggrepel >=0.9     # Time_* label repulsion
+  - r-ape >=5.7         # TreeFan_cladogram.R fan cladograms (required)
   - r-treemapify >=2.5  # Treemap_* plots (optional fallback handled in script)
 
   # ── R Bioconductor packages ──────────────────────────────────────────────────

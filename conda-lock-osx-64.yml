@@ -13,7 +13,7 @@
 version: 1
 metadata:
   content_hash:
-    osx-64: f58859e6cdaabd8503c7fb49baf3b59b9ab45696d66f5578ae4311b728620233
+    osx-64: abbeb498a38d10ddf4b1ce549e3a7a6c37a36ce1442be1e293bab33a017ca01c
   channels:
   - url: conda-forge
     used_env_vars: []
@@ -776,7 +776,7 @@ package:
   dependencies:
     bzip2: '>=1.0.8,<2.0a0'
     libcurl: '>=8.8.0,<9.0a0'
-    libdeflate: '>=1.20,<1.26.0a0'
+    libdeflate: '>=1.20,<1.27.0a0'
     libzlib: '>=1.2.13,<2.0a0'
     xz: '>=5.2.6,<6.0a0'
   url: https://conda.anaconda.org/bioconda/osx-64/htslib-1.21-hec81eee_0.tar.bz2
@@ -1614,6 +1614,7 @@ package:
   manager: conda
   platform: osx-64
   dependencies:
+    __unix: ''
     perl: '>=5.32.1,<6.0a0'
     perl-exporter: ''
     perl-extutils-makemaker: ''
@@ -1628,6 +1629,7 @@ package:
   manager: conda
   platform: osx-64
   dependencies:
+    __unix: ''
     perl: '>=5.32.1,<6.0a0'
   url: https://conda.anaconda.org/conda-forge/noarch/perl-common-sense-3.75-pl5321hd8ed1ab_0.tar.bz2
   hash:
@@ -1695,6 +1697,7 @@ package:
   manager: conda
   platform: osx-64
   dependencies:
+    __unix: ''
     perl: '>=5.32.1,<6.0a0'
   url: https://conda.anaconda.org/conda-forge/noarch/perl-exporter-5.74-pl5321hd8ed1ab_0.tar.bz2
   hash:
@@ -1707,6 +1710,7 @@ package:
   manager: conda
   platform: osx-64
   dependencies:
+    __unix: ''
     perl: '>=5.32.1,<6.0a0'
   url: https://conda.anaconda.org/conda-forge/noarch/perl-exporter-tiny-1.002002-pl5321hd8ed1ab_0.tar.bz2
   hash:
@@ -1719,6 +1723,7 @@ package:
   manager: conda
   platform: osx-64
   dependencies:
+    __unix: ''
     perl: '>=5.32.1,<6.0a0'
   url: https://conda.anaconda.org/conda-forge/noarch/perl-extutils-makemaker-7.70-pl5321hd8ed1ab_0.conda
   hash:
@@ -1814,6 +1819,7 @@ package:
   manager: conda
   platform: osx-64
   dependencies:
+    __unix: ''
     perl: '>=5.32.1,<6.0a0'
   url: https://conda.anaconda.org/conda-forge/noarch/perl-parent-0.243-pl5321hd8ed1ab_0.conda
   hash:
@@ -2049,6 +2055,26 @@ package:
     sha256: 22a9789bdacdf592c052f3f35f6035063fbc2209cc9f00bae1aca0a2628f77f0
   category: main
   optional: false
+- name: r-ape
+  version: '5.8_1'
+  manager: conda
+  platform: osx-64
+  dependencies:
+    __osx: '>=10.13'
+    libblas: '>=3.9.0,<4.0a0'
+    libcxx: '>=19'
+    liblapack: '>=3.9.0,<4.0a0'
+    r-base: '>=4.3,<4.4.0a0'
+    r-digest: ''
+    r-lattice: ''
+    r-nlme: ''
+    r-rcpp: '>=0.12.0'
+  url: https://conda.anaconda.org/conda-forge/osx-64/r-ape-5.8_1-r43h1934be7_1.conda
+  hash:
+    md5: 2d74281b34cd277fe96f70b949e86c6e
+    sha256: 066edd91ef65fa3dbd1ada5b79d85cc7d30a9ce61f4c7694d9f36f0f9d2eeeec
+  category: main
+  optional: false
 - name: r-base
   version: 4.3.3
   manager: conda
@@ -2251,6 +2277,20 @@ package:
   hash:
     md5: 6a3941852688f1291271e4ef5772425d
     sha256: 1d57582451ba07ab7b21973bcbb3cfc35526374c3eec6237085cc5f37ae717b8
+  category: main
+  optional: false
+- name: r-digest
+  version: 0.6.37
+  manager: conda
+  platform: osx-64
+  dependencies:
+    __osx: '>=10.13'
+    libcxx: '>=16'
+    r-base: '>=4.3,<4.4.0a0'
+  url: https://conda.anaconda.org/conda-forge/osx-64/r-digest-0.6.37-r43h25d921d_0.conda
+  hash:
+    md5: e5f5fe851f7abbbc85a9be4d1fadb319
+    sha256: 48c04ba806a9bc541add3c958a2dc64f768ff364da832cc4634bdd0046c4144f
   category: main
   optional: false
 - name: r-dplyr
@@ -3064,7 +3104,7 @@ package:
   manager: conda
   platform: osx-64
   dependencies:
-    htslib: '>=1.21,<1.24.0a0'
+    htslib: '>=1.21,<1.25.0a0'
     libzlib: '>=1.2.13,<2.0a0'
     ncurses: '>=6.5,<7.0a0'
   url: https://conda.anaconda.org/bioconda/osx-64/samtools-1.21-h94387ee_0.tar.bz2

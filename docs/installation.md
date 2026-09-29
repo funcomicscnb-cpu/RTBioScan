@@ -212,11 +212,11 @@ BiocManager::install(c(
   "muscle"        # Alignment back-end used by DECIPHER
 ))
 
-# Phylogenetics (optional — needed for tree visualisation outputs)
+# Treemap plotting (optional fallback handled by the script)
 install.packages("treemapify")
 ```
 
-`ape` is already included above and is used for cladogram plots. `treemapify` is optional: if it is absent, treemap reports fall back to placeholder images instead of failing the whole pipeline.
+`ape` is required for fan cladograms and is included in both locked Conda runtimes. `treemapify` is optional: if it is absent, treemap reports fall back to placeholder images instead of failing the whole pipeline.
 
 Verify the critical packages load without errors:
 
@@ -225,6 +225,7 @@ library(Biostrings)
 library(DECIPHER)
 library(parallel)
 library(ggplot2)
+library(ape)
 ```
 
 ---
