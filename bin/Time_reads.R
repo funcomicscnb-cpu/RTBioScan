@@ -58,7 +58,7 @@ p <- ggplot(data_cumulative, aes(x = hours, y = reads, color = data)) +
   theme_journal() +
   theme(legend.position = "none") +
   scale_color_manual(values = palette, drop = FALSE) +
-  geom_text_repel(aes(label = label), size = 3.5, nudge_x = 0.3, na.rm = TRUE) +
+  geom_text_repel(aes(label = label), size = 3.5, nudge_x = 0.3, na.rm = TRUE, seed = 1L) +
   scale_y_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
   labs(y = "Cumulative Reads", x = "Time (h)", title = "Cumulative Reads Over Time")
 

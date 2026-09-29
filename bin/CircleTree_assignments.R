@@ -181,7 +181,8 @@ if (nrow(label_df) > 0) {
       aes(x = x, y = y, label = name),
       size = 3,
       segment.size = 0.2,
-      max.overlaps = Inf
+      max.overlaps = Inf,
+      seed = 1L
     )
   } else {
     p <- p + geom_text(
