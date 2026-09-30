@@ -1077,12 +1077,14 @@ def main():
     parser.add_argument('--guard-revision')
     parser.add_argument('--lock-wait', type=int, default=0)
     parser.add_argument('--html', type=int, choices=[0, 1], default=1)
-    parser.add_argument('--identity-mode', choices=['sample', 'track'], default='sample')
+    parser.add_argument('--identity-mode', choices=['sample', 'collapse', 'track'], default='sample')
     parser.add_argument('--url-prefix', default='')
     parser.add_argument('--auto-refresh', default='1')
     parser.add_argument('--refresh-seconds', default='15')
     parser.add_argument('--sample-plot-max', default='-1')
     args = parser.parse_args()
+    if args.identity_mode == 'collapse':
+        args.identity_mode = 'sample'
     if args.lock_wait < 0:
         parser.error('--lock-wait must be nonnegative')
     required = {'terminal': ('run_id', 'barcode'), 'run-target': ('run_id', 'barcode'),
