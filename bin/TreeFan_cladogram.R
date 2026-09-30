@@ -1,8 +1,4 @@
 #!/usr/bin/env Rscript
-suppressPackageStartupMessages({
-  have_ape <- requireNamespace("ape", quietly = TRUE)
-})
-
 source(file.path(dirname(normalizePath(sub("^--file=", "", grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)[1]))), "plot_style.R"))
 
 args <- commandArgs(trailingOnly = TRUE)
@@ -15,33 +11,66 @@ out_path <- args[2]
 plot_title <- if (length(args) >= 3) args[3] else ""
 plot_subtitle <- if (length(args) >= 4) args[4] else ""
 
+require_ape <- function() {
+  available <- tryCatch({
+    if (!requireNamespace("ape", quietly = TRUE)) {
+      FALSE
+    } else {
+      suppressPackageStartupMessages(library(ape))
+      native <- getLoadedDLLs()[["ape"]]
+      !is.null(native) && length(getDLLRegisteredRoutines(native)$.Call) > 0
+    }
+  }, error = function(e) FALSE)
+  if (!available) stop("R package 'ape' is required for fan cladograms", call. = FALSE)
+}
+
+publish_plot <- function(draw, include_pdf = FALSE) {
+  temporary_png <- tempfile(".treefan-", tmpdir = dirname(out_path), fileext = ".png")
+  temporary_pdf <- sub("\\.png$", ".pdf", temporary_png)
+  on.exit(unlink(c(temporary_png, temporary_pdf)), add = TRUE)
+  draw(temporary_png)
+  if (!file.exists(temporary_png) || (include_pdf && !file.exists(temporary_pdf))) {
+    stop("TreeFan output was not created")
+  }
+  if (include_pdf) {
+    final_pdf <- sub("\\.[Pp][Nn][Gg]$", ".pdf", out_path)
+    if (dir.exists(out_path) || dir.exists(final_pdf)) stop("TreeFan output path is a directory")
+    had_pdf <- file.exists(final_pdf)
+    backup_pdf <- tempfile(".treefan-backup-", tmpdir = dirname(out_path), fileext = ".pdf")
+    if (had_pdf && !file.rename(final_pdf, backup_pdf)) stop("Could not preserve existing TreeFan PDF")
+    published_pdf <- FALSE
+    committed <- FALSE
+    on.exit({
+      if (!committed) {
+        if (published_pdf) unlink(final_pdf)
+        if (had_pdf) file.rename(backup_pdf, final_pdf)
+      }
+      unlink(backup_pdf)
+    }, add = TRUE)
+    if (!file.rename(temporary_pdf, final_pdf)) stop("Could not publish TreeFan PDF")
+    published_pdf <- TRUE
+  }
+  if (!file.rename(temporary_png, out_path)) stop("Could not publish TreeFan PNG")
+  if (include_pdf) committed <- TRUE
+}
+
 safe_placeholder <- function(message) {
-  save_plot_placeholder(out_path, plot_title, message)
+  publish_plot(function(path) save_plot_placeholder(path, plot_title, message), include_pdf = TRUE)
 }
-
-if (!have_ape) {
-  safe_placeholder("ape not installed")
-  quit(save = "no")
-}
-
-suppressPackageStartupMessages({
-  library(ape)
-})
 
 read_input <- function(path) {
-  if (is.null(path) || path == "" || !file.exists(path) || file.info(path)$size == 0) {
-    return(data.frame())
-  }
-  df <- tryCatch(
-    read.delim(path, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE),
-    error = function(e) data.frame()
-  )
-  if (ncol(df) < 3) {
-    return(data.frame())
+  if (is.null(path) || path == "" || !file.exists(path)) stop("TreeFan input is missing")
+  if (file.info(path)$size == 0) return(data.frame())
+  df <- read.delim(path, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+  if (!all(c("marker", "path", "weight") %in% names(df))) {
+    stop("TreeFan input requires marker, path and weight columns")
   }
   df$path <- trimws(df$path)
   df$weight <- suppressWarnings(as.numeric(df$weight))
-  df <- df[!is.na(df$weight) & is.finite(df$weight) & df$weight > 0 & df$path != "", , drop = FALSE]
+  if (any(!is.finite(df$weight)) || any(df$weight > 0 & df$path == "")) {
+    stop("TreeFan input contains invalid path or weight")
+  }
+  df <- df[df$weight > 0, , drop = FALSE]
   df
 }
 
@@ -276,17 +305,22 @@ build_internal_label_candidates <- function(x, y, labels, colors, weights, cex, 
   Filter(Negate(is.null), out)
 }
 
-plot_tree <- function(tree, tip_weights, internal_weights, tip_colors, node_colors, edge_colors, title, subtitle) {
+plot_tree <- function(tree, tip_weights, internal_weights, tip_colors, node_colors, edge_colors, title, subtitle, output_png) {
   side_in <- max(plot_style$width_in, plot_style$height_in, 11.44)
-  preview <- ape::plot.phylo(
-    tree,
-    type = "fan",
-    edge.color = edge_colors,
-    edge.width = 3,
-    show.tip.label = FALSE,
-    no.margin = FALSE,
-    plot = FALSE
-  )
+  preview <- local({
+    grDevices::pdf(NULL)
+    preview_device <- grDevices::dev.cur()
+    on.exit(if (preview_device %in% grDevices::dev.list()) grDevices::dev.off(which = preview_device))
+    ape::plot.phylo(
+      tree,
+      type = "fan",
+      edge.color = edge_colors,
+      edge.width = 3,
+      show.tip.label = FALSE,
+      no.margin = FALSE,
+      plot = FALSE
+    )
+  })
   expand_limits <- function(lim, factor = 1.28) {
     center <- mean(lim, na.rm = TRUE)
     half <- diff(lim) * 0.5 * factor
@@ -295,13 +329,14 @@ plot_tree <- function(tree, tip_weights, internal_weights, tip_colors, node_colo
   plot_xlim <- expand_limits(preview$x.lim)
   plot_ylim <- expand_limits(preview$y.lim)
   grDevices::png(
-    filename = out_path,
+    filename = output_png,
     width = side_in,
     height = side_in,
     units = "in",
     res = plot_style$dpi
   )
-  on.exit(grDevices::dev.off(), add = TRUE)
+  output_device <- grDevices::dev.cur()
+  on.exit(if (output_device %in% grDevices::dev.list()) grDevices::dev.off(which = output_device), add = TRUE)
 
   par(mar = c(3.4, 3.4, 4.9, 3.4), xpd = NA)
   ape::plot.phylo(
@@ -357,11 +392,46 @@ plot_tree <- function(tree, tip_weights, internal_weights, tip_colors, node_colo
   }
 }
 
-tryCatch({
+plot_single_taxon <- function(label, weight, color, title, subtitle, output_png) {
+  side_in <- max(plot_style$width_in, plot_style$height_in, 11.44)
+  grDevices::png(output_png, width = side_in, height = side_in, units = "in", res = plot_style$dpi)
+  output_device <- grDevices::dev.cur()
+  on.exit(if (output_device %in% grDevices::dev.list()) grDevices::dev.off(which = output_device))
+  par(mar = c(3.4, 3.4, 4.9, 3.4), xpd = NA)
+  plot.new()
+  plot.window(xlim = c(-1, 1), ylim = c(-1, 1), asp = 1)
+  points(0, 0, pch = 21, bg = color, col = color, cex = 2)
+  displayed <- paste0(label, " (", format(weight, trim = TRUE, scientific = FALSE), ")")
+  text(0, -0.12, labels = displayed, col = color, cex = min(1.17, 1.8 / max(1, strwidth(displayed, cex = 1.17, units = "user"))))
+  if (nzchar(title) || nzchar(subtitle)) title(main = title, sub = subtitle, cex.main = 1.4, cex.sub = 1.0)
+}
+
+plot_single_lineage <- function(ids, weights, colors, title, subtitle, output_png) {
+  side_in <- max(plot_style$width_in, plot_style$height_in, 11.44)
+  grDevices::png(output_png, width = side_in, height = side_in, units = "in", res = plot_style$dpi)
+  output_device <- grDevices::dev.cur()
+  on.exit(if (output_device %in% grDevices::dev.list()) grDevices::dev.off(which = output_device))
+  par(mar = c(3.4, 3.4, 4.9, 3.4), xpd = NA)
+  plot.new()
+  plot.window(xlim = c(-1, 1), ylim = c(-1, 1), asp = 1)
+  # Depth fixes biological order independently of producer row order or weight.
+  depth <- lengths(strsplit(ids, ";", fixed = TRUE))
+  y <- 0.75 - 1.5 * (depth - min(depth)) / (max(depth) - min(depth))
+  for (i in seq_along(ids)) {
+    if (i > 1L) segments(0, y[i - 1L], 0, y[i], col = "#6c7a64", lwd = 3)
+    points(0, y[i], pch = 21, bg = colors[i], col = colors[i], cex = 2)
+    displayed <- paste0(extract_label(ids[i]), " (", format(weights[i], trim = TRUE, scientific = FALSE), ")")
+    text(0.08, y[i], labels = displayed, col = colors[i], adj = c(0, 0.5),
+         cex = min(1.17, 0.85 / max(1, strwidth(displayed, cex = 1.17, units = "user")), 4 / length(ids)))
+  }
+  if (nzchar(title) || nzchar(subtitle)) title(main = title, sub = subtitle, cex.main = 1.4, cex.sub = 1.0)
+}
+
+run_treefan <- function() {
   df <- read_input(in_path)
   if (!nrow(df)) {
     safe_placeholder("No data available")
-    quit(save = "no")
+    return(invisible(NULL))
   }
 
   paths <- strsplit(df$path, ";", fixed = TRUE)
@@ -371,23 +441,23 @@ tryCatch({
   df <- df[keep_idx, , drop = FALSE]
   if (!length(paths)) {
     safe_placeholder("No data available")
-    quit(save = "no")
+    return(invisible(NULL))
   }
 
   nodes <- build_nodes(paths)
   if (!nrow(nodes)) {
     safe_placeholder("No data available")
-    quit(save = "no")
+    return(invisible(NULL))
   }
 
+  require_ape()
   tree <- build_phylo(nodes)
-  if (is.null(tree)) {
-    safe_placeholder("No data available")
-    quit(save = "no")
-  }
+  if (is.null(tree)) stop("TreeFan tree conversion failed")
 
   leaf_weights <- tapply(df$weight, df$path, sum)
   leaf_weights[is.na(leaf_weights)] <- 0
+  # Direct assignments remain separate from propagated tree weights.
+  direct_weights <- leaf_weights
   node_weights <- calc_node_weights(paths, as.numeric(df$weight))
 
   internal_ids <- sort(unique(nodes$id[!(nodes$id %in% tree$tip.label)]))
@@ -411,7 +481,19 @@ tryCatch({
   internal_weights <- vapply(internal_ids, function(id) node_weights[[id]] %||% 0, numeric(1))
 
   tip_weights <- as.numeric(leaf_weights[tree$tip.label])
-  plot_tree(tree, tip_weights, internal_weights, tip_colors, node_colors, edge_colors, plot_title, plot_subtitle)
-}, error = function(e) {
-  safe_placeholder("Tree render failed")
+  if (length(direct_weights) == 1) {
+    publish_plot(function(path) plot_single_taxon(tip_labels[1], tip_weights[1], tip_colors[1], plot_title, plot_subtitle, path))
+  } else if (length(tree$tip.label) == 1) {
+    assigned_ids <- names(direct_weights)
+    assigned_ids <- assigned_ids[order(lengths(strsplit(assigned_ids, ";", fixed = TRUE)))]
+    assigned_colors <- make_label_colors(vapply(assigned_ids, extract_label, character(1)), taxon_colors)
+    publish_plot(function(path) plot_single_lineage(assigned_ids, as.numeric(direct_weights[assigned_ids]), assigned_colors, plot_title, plot_subtitle, path))
+  } else {
+    publish_plot(function(path) plot_tree(tree, tip_weights, internal_weights, tip_colors, node_colors, edge_colors, plot_title, plot_subtitle, path))
+  }
+}
+
+tryCatch(run_treefan(), error = function(e) {
+  cat("ERROR: TreeFan_cladogram.R: ", conditionMessage(e), "\n", sep = "", file = stderr())
+  quit(save = "no", status = 1)
 })
