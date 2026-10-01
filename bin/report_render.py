@@ -1535,27 +1535,33 @@ def find_sample_round_entry(round_obj, sample_id, sample_label):
     return {}
 
 
-def collect_round_sample_model_counts(run_id, sample_label, round_barcode, out_path, identity_mode="collapse"):
-    results_root = out_path.parents[2] if len(out_path.parents) >= 3 else out_path.parent
-    round_dir = results_root / "temp" / "ongoing" / "state" / run_id / str(round_barcode or "")
-    demult_path = round_dir / "RTBioScan_demult_rpt.txt"
-    if not demult_path.exists() or not demult_path.is_file():
-        gz_path = demult_path.with_suffix(demult_path.suffix + ".gz")
-        demult_path = gz_path if gz_path.exists() else demult_path
-    counts = {"hac": 0, "sup": 0}
-    if not demult_path.exists():
-        return counts
-    opener = gzip.open if demult_path.suffix == ".gz" else open
+def results_root_for_report(out_path):
+    for parent in out_path.parents:
+        if parent.name == "report_html":
+            return parent.parent
+    # Preserve legacy synthetic layouts without a report_html ancestor.
+    return out_path.parents[2] if len(out_path.parents) >= 3 else out_path.parent
+
+
+_ROUND_MODEL_COUNTS = {}
+
+
+def _round_model_counts_by_sample(demult_path, identity_mode):
+    by_sample = {}
     try:
+        stat = demult_path.stat()
+        key = (str(demult_path.resolve()), identity_mode, stat.st_size, stat.st_mtime_ns)
+        cached = _ROUND_MODEL_COUNTS.get(key)
+        if cached is not None:
+            return cached
+        opener = gzip.open if demult_path.suffix == ".gz" else open
         with opener(demult_path, "rt", encoding="utf-8") as fh:
-            header = fh.readline().rstrip("\n")
-            cols = header.split("\t")
+            cols = fh.readline().rstrip("\n").split("\t")
             idx = {name: pos for pos, name in enumerate(cols)}
             sample_idx = idx.get("sample")
             model_idx = idx.get("basecalling_model")
             if sample_idx is None or model_idx is None:
-                return counts
-            sample_base = normalize_sample_base(sample_label)
+                return by_sample
             for line in fh:
                 if not line.strip():
                     continue
@@ -1563,17 +1569,32 @@ def collect_round_sample_model_counts(run_id, sample_label, round_barcode, out_p
                 if sample_idx >= len(fields) or model_idx >= len(fields):
                     continue
                 if identity_mode == "track":
-                    if track_sample_label_value(fields[sample_idx]) != str(sample_label or "").strip():
-                        continue
+                    sample_key = track_sample_label_value(fields[sample_idx])
                 else:
-                    if normalize_sample_base(fields[sample_idx]) != sample_base:
-                        continue
+                    sample_key = normalize_sample_base(fields[sample_idx])
                 model = str(fields[model_idx]).strip().lower()
-                if model in counts:
+                if model in ("hac", "sup"):
+                    counts = by_sample.setdefault(sample_key, {"hac": 0, "sup": 0})
                     counts[model] += 1
     except Exception:
-        return counts
-    return counts
+        # Keep partial counts, but retry failed reads on the next calculation.
+        return by_sample
+    _ROUND_MODEL_COUNTS[key] = by_sample
+    return by_sample
+
+
+def collect_round_sample_model_counts(run_id, sample_label, round_barcode, out_path, identity_mode="collapse", state_id=None, barcode=None):
+    results_root = results_root_for_report(out_path)
+    round_dir = results_root / "temp" / "ongoing" / "state" / (state_id or run_id) / str(round_barcode or "")
+    demult_path = round_dir / f"{barcode or 'RTBioScan'}_demult_rpt.txt"
+    if not demult_path.exists() or not demult_path.is_file():
+        gz_path = demult_path.with_suffix(demult_path.suffix + ".gz")
+        demult_path = gz_path if gz_path.exists() else demult_path
+    if not demult_path.exists():
+        return {"hac": 0, "sup": 0}
+    by_sample = _round_model_counts_by_sample(demult_path, identity_mode)
+    sample_key = str(sample_label or "").strip() if identity_mode == "track" else normalize_sample_base(sample_label)
+    return dict(by_sample.get(sample_key, {"hac": 0, "sup": 0}))
 
 
 def collect_sample_round_metrics(round_obj, sample_id, sample_label):
@@ -1659,6 +1680,8 @@ def build_sample_history_rows(sorted_rounds, sample_id, sample_label, out_path, 
             round_barcode,
             out_path,
             identity_mode=(round_obj.get("identity_mode") if isinstance(round_obj, dict) else "collapse"),
+            state_id=(round_obj.get("state_id") if isinstance(round_obj, dict) else None),
+            barcode=(round_obj.get("barcode") if isinstance(round_obj, dict) else None),
         )
         hac_round = int(model_counts.get("hac", 0))
         sup_round = int(model_counts.get("sup", 0))
