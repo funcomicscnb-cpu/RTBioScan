@@ -21,6 +21,17 @@ if (!("sample_name" %in% colnames(sample_info))) {
   )
 }
 has_track_cols <- all(c("track_sample_label", "track_replicate_suffix", "track_replicate_number", "track_plate_label") %in% colnames(sample_info))
+# All-empty columns are typed logical NA by read.delim and nzchar(NA) is TRUE,
+# which flipped sample-mode inputs into track grouping. Normalize the track
+# grouping columns so missing means empty, matching the shell caller's
+# awk test ($col != "").
+if (has_track_cols) {
+  for (.track_col in c("track_sample_label", "track_replicate_suffix", "track_replicate_number", "track_plate_label")) {
+    .track_vals <- as.character(sample_info[[.track_col]])
+    .track_vals[is.na(.track_vals)] <- ""
+    sample_info[[.track_col]] <- .track_vals
+  }
+}
 group_col <- "sample_name"
 if (has_track_cols && any(nzchar(as.character(sample_info$track_sample_label)))) {
   group_col <- "track_sample_label"
