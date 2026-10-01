@@ -2,6 +2,10 @@
 set -euo pipefail
 _SCRIPT_VERSION="read-counts-plots-v4"
 
+_sha256_stdin() {
+  perl -C0 -MDigest::SHA -e 'binmode STDIN, ":raw" or die "binmode: $!"; print Digest::SHA->new(256)->addfile(\*STDIN)->hexdigest, "\n";'
+}
+
 summary_file=""
 out_dir=""
 max_samples="10"
@@ -126,7 +130,7 @@ awk -F'\t' -v group_col="$group_column" '
 if [ -n "$sig_dir" ]; then
   mkdir -p "$sig_dir"
   printf '%s\n%s\n%s\n' "$_SCRIPT_VERSION" "$max_samples" "$(cat "$tmp_top")" \
-    | sha256sum | awk '{print $1}' > "$sig_dir/selection.sig"
+    | _sha256_stdin | awk '{print $1}' > "$sig_dir/selection.sig"
 fi
 
 while IFS=$'\t' read -r sample_label _total_reads; do
@@ -159,7 +163,7 @@ while IFS=$'\t' read -r sample_label _total_reads; do
           }
       ' "$summary_file"
       echo "$_SCRIPT_VERSION"
-      ) | sha256sum | awk '{print $1}'
+      ) | _sha256_stdin | awk '{print $1}'
     )"
 
     _sample_sig_file="$sig_dir/${sample_id}.sig"
