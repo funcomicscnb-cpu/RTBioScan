@@ -622,7 +622,7 @@ if (defined $age_seconds && defined $cadence_seconds && $cadence_seconds > 0) {
 }
 
 open my $O, '>', $out or die "ERROR: open out: $!";
-print {$O} encode_json($record), "\n";
+print {$O} JSON::PP->new->canonical->utf8->encode($record), "\n";
 close $O;
 
 exit 0;

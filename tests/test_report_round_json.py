@@ -81,7 +81,7 @@ def test_round_json_invalid_utf8_fails_before_open(tmp_path: Path) -> None:
 
 def test_round_json_validated_wire_is_printed_without_reencoding() -> None:
     writer = SCRIPT.read_text(encoding="utf-8").split(
-        "my $json = JSON::PP->new->latin1->encode($obj);", 1
+        "my $json = JSON::PP->new->canonical->latin1->encode($obj);", 1
     )[1].split("open my $OUT, '>'", 1)[0]
     assert "my $copy = $json;" in writer
     assert "Encode::encode" not in writer

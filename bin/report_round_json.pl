@@ -3433,6 +3433,14 @@ sub collect_otu_assignments_by_level {
     }
   }
 
+  @rows = sort {
+    (!defined($a->{family}) || $a->{family} eq '') <=> (!defined($b->{family}) || $b->{family} eq '')
+      || ($a->{family} // '') cmp ($b->{family} // '')
+      || (!defined($a->{genus}) || $a->{genus} eq '') <=> (!defined($b->{genus}) || $b->{genus} eq '')
+      || ($a->{genus} // '') cmp ($b->{genus} // '')
+      || ($a->{otu_id} // '') cmp ($b->{otu_id} // '')
+  } @rows;
+
   my %levels = (
     species => 'species',
     genus => 'genus',
@@ -3452,8 +3460,8 @@ sub collect_otu_assignments_by_level {
         taxon => $taxon,
         sample => $sample,
         marker => $marker,
-        family => undef,
-        genus => undef,
+        family => ($level eq 'family' ? undef : $row->{family}),
+        genus => ($level eq 'species' ? $row->{genus} : undef),
         species => undef,
         otu_ids => {},
         reads_total => 0,
@@ -3474,9 +3482,13 @@ sub collect_otu_assignments_by_level {
         aln_min => undef,
         aln_max => undef,
       };
-      $g->{family} = $row->{family} if defined $row->{family} && (!defined $g->{family} || $g->{family} eq '');
-      $g->{genus} = $row->{genus} if defined $row->{genus} && (!defined $g->{genus} || $g->{genus} eq '');
-      $g->{species} = $row->{species} if defined $row->{species} && (!defined $g->{species} || $g->{species} eq '');
+      $g->{family} = $row->{family} if $level eq 'family' && defined $row->{family} && (!defined $g->{family} || $g->{family} eq '');
+      $g->{genus} = $row->{genus} if $level ne 'species' && defined $row->{genus} && $row->{genus} ne ''
+        && (!defined $g->{genus} || $g->{genus} eq ''
+            || ($level eq 'family' && ($row->{genus} cmp $g->{genus}) < 0));
+      $g->{species} = $row->{species} if defined $row->{species} && $row->{species} ne ''
+        && (!defined $g->{species} || $g->{species} eq ''
+            || (($level eq 'family' || $level eq 'genus') && ($row->{species} cmp $g->{species}) < 0));
       $g->{otu_ids}{$row->{otu_id}} = 1 if defined $row->{otu_id};
       if (defined $row->{otu_id} && exists $otu_rep_reads{$row->{otu_id}}) {
         my $smp = $row->{sample} // '';
@@ -3688,6 +3700,14 @@ sub collect_consensus_assignments_by_level {
   }
   close $FH;
 
+  @rows = sort {
+    (!defined($a->{family}) || $a->{family} eq '') <=> (!defined($b->{family}) || $b->{family} eq '')
+      || ($a->{family} // '') cmp ($b->{family} // '')
+      || (!defined($a->{genus}) || $a->{genus} eq '') <=> (!defined($b->{genus}) || $b->{genus} eq '')
+      || ($a->{genus} // '') cmp ($b->{genus} // '')
+      || ($a->{consensus_id} // '') cmp ($b->{consensus_id} // '')
+  } @rows;
+
   my %levels = (
     species => 'species',
     genus => 'genus',
@@ -3706,8 +3726,8 @@ sub collect_consensus_assignments_by_level {
         taxon => $taxon,
         sample => $sample,
         marker => $marker,
-        family => undef,
-        genus => undef,
+        family => ($level eq 'family' ? undef : $row->{family}),
+        genus => ($level eq 'species' ? $row->{genus} : undef),
         species => undef,
         cons_ids => {},
         reads_total => 0,
@@ -3719,9 +3739,13 @@ sub collect_consensus_assignments_by_level {
         aln_min => undef,
         aln_max => undef,
       };
-      $g->{family} = $row->{family} if defined $row->{family} && (!defined $g->{family} || $g->{family} eq '');
-      $g->{genus} = $row->{genus} if defined $row->{genus} && (!defined $g->{genus} || $g->{genus} eq '');
-      $g->{species} = $row->{species} if defined $row->{species} && (!defined $g->{species} || $g->{species} eq '');
+      $g->{family} = $row->{family} if $level eq 'family' && defined $row->{family} && (!defined $g->{family} || $g->{family} eq '');
+      $g->{genus} = $row->{genus} if $level ne 'species' && defined $row->{genus} && $row->{genus} ne ''
+        && (!defined $g->{genus} || $g->{genus} eq ''
+            || ($level eq 'family' && ($row->{genus} cmp $g->{genus}) < 0));
+      $g->{species} = $row->{species} if defined $row->{species} && $row->{species} ne ''
+        && (!defined $g->{species} || $g->{species} eq ''
+            || (($level eq 'family' || $level eq 'genus') && ($row->{species} cmp $g->{species}) < 0));
       $g->{cons_ids}{$row->{consensus_id}} = 1 if defined $row->{consensus_id};
       if (defined $row->{reads}) {
         $g->{reads_total} += $row->{reads};
@@ -6323,7 +6347,7 @@ for my $key (sort keys %r4d_cumulative_resolved) {
   die 'R4-D cumulative: the snapshot in ' . (split /\t/, $key)[0] . " was republished while it was being read; rerun\n"
     unless RTBioScan::R4DCumulative::still_current($r4d_cumulative_resolved{$key});
 }
-my $json = JSON::PP->new->latin1->encode($obj);
+my $json = JSON::PP->new->canonical->latin1->encode($obj);
 if ($json =~ /[\x80-\xFF]/) {
   require Encode;
   my $copy = $json;

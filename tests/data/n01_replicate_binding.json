@@ -1,0 +1,14 @@
+{
+  "authority": "owner clarification 2026-10-03",
+  "mapping": [
+    {
+      "production": "rep_1",
+      "symbolic": "S1_1"
+    },
+    {
+      "production": "rep_2",
+      "symbolic": "S1_2"
+    }
+  ],
+  "scope": "diagnostic table projection only"
+}

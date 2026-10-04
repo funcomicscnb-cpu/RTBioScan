@@ -28,6 +28,7 @@ _marker_color_cache = {}
 RENDER_SIGNATURE_VERSION = "sample-assets-v1"
 RENDER_EMBEDDED_SIGNATURE_VERSION = "embedded-v4"
 RENDER_FIGURES_SIGNATURE_VERSION = "figures-v1"
+RENDER_ASSIGNMENTS_N01_SIGNATURE_VERSION = "assignments-n01-v1"
 DEFAULT_REPORT_ASSETS_DIR_NAME = "report_assets"
 DEFAULT_FIGURES_DIR_NAME = "figures"
 CURRENT_REPORT_ASSETS_DIR_NAME = DEFAULT_REPORT_ASSETS_DIR_NAME
@@ -3279,25 +3280,31 @@ def write_chart_tsvs(sorted_rounds, tsv_dir, run_id=None, sig_root=None, report_
     latest_round = assignment_round if assignment_round is not None else (sorted_rounds[-1] if sorted_rounds else {})
     _scope = run_id if run_id else "index"
 
-    def _write_tsv(path, header, rows, na_token=""):
+    def _write_tsv(path, header, rows, na_token="", atomic=False):
+        if atomic:
+            data = "\t".join(str(c) for c in header) + "\n"
+            data += "".join("\t".join(na_token if v is None else str(v) for v in row) + "\n" for row in rows)
+            atomic_write_text(path, data)
+            return
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("\t".join(str(c) for c in header) + "\n")
             for row in rows:
                 fh.write("\t".join(na_token if v is None else str(v) for v in row) + "\n")
 
-    def _write_tsv_with_sig(path, header, rows, na_token=""):
+    def _write_tsv_with_sig(path, header, rows, na_token="", n01_affected=False):
         if sig_root is not None:
             tsv_name = path.name
             sig_path = sig_root / "figures" / _scope / f"{tsv_name}.sig"
-            sig = compute_signature({"version": RENDER_FIGURES_SIGNATURE_VERSION,
+            sig = compute_signature({"version": (RENDER_ASSIGNMENTS_N01_SIGNATURE_VERSION
+                                                  if n01_affected else RENDER_FIGURES_SIGNATURE_VERSION),
                                      "header": list(header), "rows": [list(r) for r in rows], "na_token": na_token})
             if sig_path.exists() and path.exists() and read_signature(sig_path) == sig:
                 return
-            _write_tsv(path, header, rows, na_token=na_token)
+            _write_tsv(path, header, rows, na_token=na_token, atomic=n01_affected)
             if path.exists():
                 atomic_write_text(sig_path, sig + "\n")
         else:
-            _write_tsv(path, header, rows, na_token=na_token)
+            _write_tsv(path, header, rows, na_token=na_token, atomic=n01_affected)
 
     def stacked_to_tsv(rows, order, path, na_token=""):
         data_rows = []
@@ -3380,7 +3387,13 @@ def write_chart_tsvs(sorted_rounds, tsv_dir, run_id=None, sig_root=None, report_
         present = {k for r in rows for k in r}
         cols = ([c for c in canonical if c in present] + sorted(present.difference(canonical))
                 if rows else canonical)
-        _write_tsv_with_sig(tsv_dir / fname, cols, [[r.get(c, "") for c in cols] for r in rows])
+        display_fields = (("genus", "species") if level == "family" else
+                          (("family", "species") if level == "genus" else ("family", "genus")))
+        source_count = "otu_count" if src_key == "otu" else "consensus_count"
+        n01_affected = "replicate_reads" in cols or any(
+            num_any(r.get(source_count, 0)) > 1 and any(r.get(c) not in (None, "") for c in display_fields)
+            for r in rows)
+        _write_tsv_with_sig(tsv_dir / fname, cols, [[r.get(c, "") for c in cols] for r in rows], n01_affected=n01_affected)
 
     for _lvl in ("species", "genus", "family"):
         write_assignments("otu",       _lvl, None,                        f"otu_assignments_{_lvl}.tsv")
